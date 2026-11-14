@@ -1,0 +1,17 @@
+[package]
+name = "fbtt-core"
+description = "featherbittorrent core: config, platform paths, the library lock and the client interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added by later tasks, always with `dep.workspace = true`: serde, serde_norway,
+# directories and thiserror with the config (Task 2), fbt with the backend
+# (Task 4).

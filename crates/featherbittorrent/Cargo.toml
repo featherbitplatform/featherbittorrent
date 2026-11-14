@@ -1,0 +1,17 @@
+[package]
+name = "featherbittorrent"
+description = "BitTorrent client for the terminal: a local TUI, and a server with milestone 2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# fbtt-core and fbtt-tui join here when main.rs starts using them (Task 7); an
+# unused dependency is a warning under `cargo clippy -D warnings`.
+clap.workspace = true

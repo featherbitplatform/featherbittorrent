@@ -1,0 +1,16 @@
+[package]
+name = "fbtt-tui"
+description = "featherbittorrent TUI: the model (keys in, actions out) and its ratatui rendering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added by later tasks, always with `dep.workspace = true`: ratatui and
+# crossterm with the views (Task 5), fbtt-core with the model's snapshot types.

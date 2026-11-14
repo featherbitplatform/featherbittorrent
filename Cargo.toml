@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+# Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/featherbitplatform/featherbittorrent"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Every dependency is declared here and inherited with `dep.workspace = true`;
+# crates never pin their own versions. Later tasks add what they need: fbt (git,
+# tag v0.8.0) plus serde, serde_norway, directories, thiserror, tokio, ratatui
+# and crossterm arrive with the code that uses them.
+[workspace.dependencies]
+clap = { version = "4.6", features = ["derive"] }
