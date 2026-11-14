@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.8.0`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface and the local backend over `fbt::Session`), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering) and `featherbittorrent` (the binary that wires terminal, runtime and backend together).
 
-Status: milestone 1 in progress. The scaffold and gates are in place; the local engine and the TUI over it come next in this milestone. No release yet, and the workspace version (`0.0.0`) is bumped on the first `release/X.Y.Z` branch.
+Status: milestone 1 in progress. The scaffold, the gates, the config, the library lock and the local backend (the client interface plus the engine over `fbt::Session`) are in place; the TUI over them is next in this milestone. No release yet, and the workspace version (`0.0.0`) is bumped on the first `release/X.Y.Z` branch.
 
 Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. The current plan is `docs/superpowers/plans/2026-11-14-milestone-1-local-client.md`, and its Global Constraints are the rules below.
 
@@ -30,7 +30,7 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 - **No attribution of any kind:** no `Co-Authored-By` trailer, no `Claude-Session` line or session link in commits, no "Generated with" footer or session link in PR bodies.
 - **Semantic versioning.** The workspace version is bumped on the `release/X.Y.Z` branch; the annotated `vX.Y.Z` tag on `main` triggers the release workflow.
 - **Changelog:** `CHANGELOG.md` at the root (Keep a Changelog); user-visible changes go under `## [Unreleased]`, each ending in its PR link.
-- **CI gates:** `cargo fmt --all --check` (Linux), `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on Linux, macOS and Windows, `cargo doc` with warnings denied, cargo-deny, plus the security scans in `.github/workflows/security.yml` (semgrep, grype, gitleaks over the full history; also weekly on `main`). Their configs live at the repo root (`deny.toml`, `.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`); every ignore carries a one-line reason. PRs merge only when every gate is green.
+- **CI gates:** `cargo fmt --all --check` (Linux), `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --workspace --all-features` on Linux, macOS and Windows, `cargo doc` with warnings denied, cargo-deny, plus the security scans in `.github/workflows/security.yml` (semgrep, grype, gitleaks over the full history; also weekly on `main`). Their configs live at the repo root (`deny.toml`, `.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`); every ignore carries a one-line reason. `--all-features` is what makes `fbtt-core`'s `local` test target run at all: it requires that crate's `test-support` feature, and a filtered-out test is a test nobody noticed. PRs merge only when every gate is green.
 
 ## Commands
 
@@ -42,8 +42,8 @@ cargo run -p featherbittorrent
 
 # Full gate, as CI runs it (fmt is Linux-only in CI; deny runs as cargo-deny-action)
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cargo deny check
 
 # Local security scans via Docker (semgrep, deny, grype, gitleaks); one tool:

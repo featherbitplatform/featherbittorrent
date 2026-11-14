@@ -259,8 +259,9 @@ fn user_download_dir() -> Option<PathBuf> {
 }
 
 /// `path` with `suffix` added to its file name: `config.yaml` becomes
-/// `config.yaml.bad`.
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+/// `config.yaml.bad`. The session state save uses the same convention for
+/// `session.state` ([`crate::LocalBackend`]).
+pub(crate) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or(path.as_os_str()).to_os_string();
     name.push(suffix);
     path.with_file_name(name)
@@ -283,6 +284,13 @@ fn problem_line(path: &Path, error: &serde_norway::Error) -> String {
     } else {
         format!("{name}: {message}")
     }
+}
+
+/// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
+/// file beside the target, synced, then renamed over it. The session state save shares
+/// this so both files are replaced by the same rules ([`crate::LocalBackend`]).
+pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, bytes)
 }
 
 /// Writes `bytes` to `temp`, synced, then renames it over `path`. The temp file

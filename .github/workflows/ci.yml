@@ -29,9 +29,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # `--all-features` so the gated code is compiled too: `fbtt-core`'s local
+        # backend test target requires its `test-support` feature, and an unrun test
+        # is a test nobody noticed.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
   docs:
     name: docs
