@@ -23,9 +23,10 @@ fbt.workspace = true
 serde.workspace = true
 serde_norway.workspace = true
 thiserror.workspace = true
-# The backend task, its channels and its two timers (Task 4). `select!` needs no
-# feature; `spawn_blocking` is `rt`, the state save's cadence is `time`.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
+# it needs `macros`; `spawn_blocking` is `rt`, the state save's cadence is `time`, and
+# the queues are `sync`.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]`, and a runtime with worker threads: each test runs two live

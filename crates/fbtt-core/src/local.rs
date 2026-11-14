@@ -60,12 +60,15 @@ impl LocalBackend {
     /// `lock` is this library's, taken with [`LibraryLock::acquire`]: the backend holds
     /// it until its state is written. The returned handle resolves once `Shutdown` has
     /// been answered and that file is on disk, which is what a quit (or a test) waits on
-    /// before starting again on the same directories.
+    /// before starting again on the same directories. Its `Err` is one line about a final
+    /// save that did not happen: the library on disk is then the one from before this run,
+    /// and only the person running it can act on that, so the binary prints it after
+    /// putting the terminal back.
     pub async fn start(
         config: Config,
         paths: &Paths,
         lock: LibraryLock,
-    ) -> Result<(Client, JoinHandle<()>), SessionError> {
+    ) -> Result<(Client, JoinHandle<Result<(), String>>), SessionError> {
         let (client, task, _) = spawn(config.session_settings(), config, paths, lock).await?;
         Ok((client, task))
     }
@@ -77,7 +80,7 @@ impl LocalBackend {
         config: Config,
         paths: &Paths,
         lock: LibraryLock,
-    ) -> Result<(Client, JoinHandle<()>), SessionError> {
+    ) -> Result<(Client, JoinHandle<Result<(), String>>), SessionError> {
         let (client, task, _) = spawn(settings, config, paths, lock).await?;
         Ok((client, task))
     }
@@ -90,24 +93,25 @@ impl LocalBackend {
         config: Config,
         paths: &Paths,
         lock: LibraryLock,
-    ) -> Result<(Client, JoinHandle<()>, Session), SessionError> {
+    ) -> Result<(Client, JoinHandle<Result<(), String>>, Session), SessionError> {
         spawn(settings, config, paths, lock).await
     }
 }
 
 /// Starts the session and the task that owns it, `paths` and `lock`.
 ///
-/// A state file that cannot be read is kept aside rather than deleted, and both that
-/// and every torrent that will not come back are reported as notices. The engine clone
-/// comes back with the client so a caller can drive the same session.
+/// A state file that cannot be read is left where it is and this run stops writing it; one
+/// that does not decode is kept aside under another name. Resume data that will not come back
+/// is copied out from under it before any save happens. All of that arrives as notices. The
+/// engine clone comes back with the client so a caller can drive the same session.
 async fn spawn(
     settings: Settings,
     config: Config,
     paths: &Paths,
     lock: LibraryLock,
-) -> Result<(Client, JoinHandle<()>, Session), SessionError> {
-    let (saved, problems) = state::read_state(&paths.state_file());
-    let (session, failed) = match &saved {
+) -> Result<(Client, JoinHandle<Result<(), String>>, Session), SessionError> {
+    let reading = state::read_state(&paths.state_file());
+    let (session, failed) = match &reading.state {
         Some(loaded) => Session::restore(settings, loaded).await?,
         None => (Session::new(settings).await?, Vec::new()),
     };
@@ -117,13 +121,33 @@ async fn spawn(
     // reading yet, so these wait in the queue, and past its room they are dropped:
     // that is what a notice always means. A restore reports one per torrent it could
     // not add, which is how many there can be.
-    let mut problems = problems;
-    if let Some(loaded) = &saved {
-        problems.extend(
-            failed.into_iter().map(|(index, error)| {
-                Notice::Error(state::restored_problem(loaded, index, &error))
-            }),
-        );
+    let mut problems = reading.notices;
+    if let Some(loaded) = &reading.state {
+        // Torrents that did not come back deserve kept bytes: the save this run makes describes
+        // only what it has, so without a copy those torrents would leave the library twice over
+        // - once unseen by the session and once overwritten in the file that described them.
+        let kept = if failed.is_empty() {
+            None
+        } else {
+            match state::keep_copy(&paths.state_file(), &reading.bytes) {
+                Ok(copy) => Some(copy),
+                Err(problem) => {
+                    problems.push(Notice::Error(format!(
+                        "the saved state could not be copied aside ({problem}); what could not \
+                         be restored will not come back"
+                    )));
+                    None
+                }
+            }
+        };
+        problems.extend(failed.into_iter().map(|(index, error)| {
+            Notice::Error(state::restored_problem(
+                loaded,
+                index,
+                &error,
+                kept.as_deref(),
+            ))
+        }));
     }
 
     // The first snapshot is taken here rather than in the task, so a client never sees
@@ -151,6 +175,7 @@ async fn spawn(
         paths: paths.clone(),
         watching: None,
         stalled,
+        writes_blocked: reading.writes_blocked,
         published: initial,
         snapshot_tx: channels.snapshot,
         notices: channels.notices,
@@ -161,10 +186,10 @@ async fn spawn(
 
 /// The table and the header totals for the session as it is now.
 ///
-/// `stalled` is updated as it goes: a torrent that took anything has its clock reset,
-/// one seen for the first time starts it now, and one no longer in the session loses
-/// its entry. So a download only counts as stalled from when it last had a chance to
-/// make progress.
+/// `stalled` is updated as it goes, one entry per torrent the session holds: [`map::stalled_clock`]
+/// keeps a torrent's count running only while it is downloading and taking nothing, and starts it
+/// again from `now` at every other moment, so a download is only called stalled from the last time
+/// it had a chance to make progress. A torrent no longer in the session loses its entry.
 fn rows(
     session: &Session,
     now: Instant,
@@ -179,16 +204,14 @@ fn rows(
         .into_iter()
         .map(|status| {
             let id = TorrentId::from_wire_hash(status.info_hashes.wire_hash());
-            let last_rate = seen.get(&id).copied();
-            let row = map::row(&status, last_rate, now);
-            next.insert(
-                id,
-                if status.download_rate > 0 {
-                    now
-                } else {
-                    last_rate.unwrap_or(now)
-                },
+            let zero_since = map::stalled_clock(
+                status.state,
+                status.download_rate,
+                seen.get(&id).copied(),
+                now,
             );
+            let row = map::row(&status, zero_since, now);
+            next.insert(id, zero_since);
             down_rate = down_rate.saturating_add(status.download_rate);
             up_rate = up_rate.saturating_add(status.upload_rate);
             row
@@ -217,8 +240,13 @@ struct Backend {
     paths: Paths,
     /// The pane to keep fresh, and for which torrent.
     watching: Option<(TorrentId, DetailTab)>,
-    /// When each torrent last took anything, for the stalled column.
+    /// When each torrent's stalled count last started running: while it is downloading and
+    /// taking nothing. See [`map::stalled_clock`].
     stalled: HashMap<TorrentId, Instant>,
+    /// Set when this run could not read what was under `session.state`, or could not move an
+    /// unreadable file out of the way: no state write happens at all while it is set, because
+    /// saving would replace bytes this run never read with a library of its own.
+    writes_blocked: bool,
     /// The snapshot the screen is looking at, so that only a change publishes.
     published: Arc<Snapshot>,
     /// Where snapshots go out.
@@ -229,9 +257,17 @@ struct Backend {
 
 impl Backend {
     /// Answers commands and keeps the snapshot fresh until asked to stop, then saves and
-    /// releases the library. The lock goes with the last line here, after the state file
-    /// is written.
-    async fn run(mut self, mut commands: mpsc::Receiver<Command>, _lock: LibraryLock) {
+    /// releases the library. The lock goes with the last line here, after the state file is
+    /// written.
+    ///
+    /// The `Err` is one line about a final save that did not happen. Nothing in this process
+    /// can fix that - the library on disk is the one from before this run - so it travels out
+    /// of the task for the binary to print after restoring the terminal.
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<Command>,
+        _lock: LibraryLock,
+    ) -> Result<(), String> {
         // Both intervals are ready at once on their first tick. The snapshot's goes with
         // it; the save's would write a file that has not changed since it was read, so
         // that one is spent before the loop starts.
@@ -241,7 +277,7 @@ impl Backend {
         save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         save.tick().await;
 
-        loop {
+        let outcome = loop {
             // Which thing woke the task. A command and a tick do the same work afterwards
             // (rebuild the snapshot), so only the two kinds of work get names.
             enum Wake {
@@ -260,19 +296,17 @@ impl Backend {
                 _ = save.tick() => Wake::Save,
             };
             match wake {
-                Wake::Command(Command::Shutdown) => {
-                    self.save_and_stop().await;
-                    break;
-                }
+                Wake::Command(Command::Shutdown) => break self.save_and_stop().await,
                 Wake::Command(command) => self.handle(command).await,
                 Wake::Tick => {}
                 Wake::Save => self.periodic_save().await,
             }
             self.publish().await;
-        }
-        // `_lock` is released on the way out of here, after the state file was written:
-        // another featherbittorrent may start on the new state, never beside a
+        };
+        // `_lock` is released on the way out of here, after the state file was written or
+        // failed to be: another featherbittorrent may start on the new state, never beside a
         // half-written one.
+        outcome
     }
 
     /// Rebuilds the snapshot and publishes it only when it differs from what is out
@@ -387,12 +421,9 @@ impl Backend {
         }
         match priorities.get_mut(file) {
             Some(slot) => *slot = map::priority(priority),
-            None => {
-                return self.notify(Notice::Error(format!(
-                    "this torrent has {} files, not {file}",
-                    files.len()
-                )));
-            }
+            // Ids and indices both come from the screen, and a pane that has not caught up
+            // with a removal names an index that is no longer there.
+            None => return self.notify(Notice::Error(format!("no file with index {file}"))),
         }
         self.report(torrent.set_file_priorities(priorities).await);
     }
@@ -446,22 +477,36 @@ impl Backend {
     }
 
     /// Writes the state while the app runs, so a crash costs a re-check and nothing else.
+    /// A run that could not read what was under the state file writes nothing at all: its
+    /// empty library is not evidence about what the file held.
     async fn periodic_save(&self) {
+        if self.writes_blocked {
+            return;
+        }
         match self.session.save_state().await {
             Ok((state, left_out)) => {
                 self.report_left_out(&left_out);
-                self.write_state(&state).await;
+                if let Err(problem) = self.write_state(&state).await {
+                    self.notify(Notice::Error(problem));
+                }
             }
             Err(error) => self.notify(Notice::Error(map::clean(&error.to_string()))),
         }
     }
 
-    /// The last save. `shutdown_and_save` stops every torrent with its bytes written
-    /// first, so what is saved here is trusted next run and nothing has to be re-checked.
-    async fn save_and_stop(&self) {
+    /// The last save, and the task's answer. `shutdown_and_save` stops every torrent with its
+    /// bytes written first, so what is saved here is trusted next run and nothing has to be
+    /// re-checked. A failure here cannot be fixed from in here - the library on disk stays the
+    /// one from before this run - so it goes out as the message the binary prints.
+    async fn save_and_stop(&self) -> Result<(), String> {
+        if self.writes_blocked {
+            // Nothing to write, so nothing to fail and no reason to stop the torrents for it:
+            // whatever is under `session.state` stays exactly as this run found it.
+            return Ok(());
+        }
         let (state, left_out) = self.session.shutdown_and_save().await;
         self.report_left_out(&left_out);
-        self.write_state(&state).await;
+        self.write_state(&state).await
     }
 
     /// A torrent whose resume data could not be taken is out of the saved state: it will
@@ -474,8 +519,10 @@ impl Backend {
 
     /// Puts the state where the next run will find it. The bytes are written beside the
     /// file, synced and renamed over it on a blocking thread, so a crash leaves either
-    /// the old state or the new one and never half of either.
-    async fn write_state(&self, state: &SessionState) {
+    /// the old state or the new one and never half of either. The `Err` is one line already
+    /// fit to print: whoever asked for this save either reports it as a notice or carries it
+    /// out of the task for the binary.
+    async fn write_state(&self, state: &SessionState) -> Result<(), String> {
         let path = self.paths.state_file();
         let bytes = state.to_bytes();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -484,11 +531,8 @@ impl Backend {
         })
         .await;
         match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(problem)) => self.notify(Notice::Error(map::clean(&problem))),
-            Err(joined) => self.notify(Notice::Error(format!(
-                "the session state could not be written: {joined}"
-            ))),
+            Ok(outcome) => outcome.map_err(|problem| map::clean(&problem)),
+            Err(joined) => Err(format!("the session state could not be written: {joined}")),
         }
     }
 

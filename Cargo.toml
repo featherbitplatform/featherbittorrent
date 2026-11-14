@@ -32,6 +32,7 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_norway = "0.9"
 thiserror = "2"
 # No default features: every crate names the parts it needs, so nothing pulls a
-# runtime flavour nobody asked for. `macros` (for `#[tokio::test]`) arrives in
-# dev-dependencies only.
+# runtime flavour nobody asked for. `macros` is for the macros a crate's own code uses
+# (`select!` in the backend task) and for `#[tokio::test]`, which arrives in
+# dev-dependencies too.
 tokio = { version = "1", default-features = false }

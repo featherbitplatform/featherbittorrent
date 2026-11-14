@@ -132,7 +132,7 @@ impl Library {
 
     /// Takes the library lock and starts a backend on it. The returned session is
     /// the same engine the backend drives, so a test can point it at a peer.
-    async fn start(&self) -> (Client, JoinHandle<()>, fbt::Session) {
+    async fn start(&self) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
         let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
         within(LocalBackend::start_for_test(
             loopback(&self.config),
@@ -196,13 +196,15 @@ fn info_text(notice: Notice) -> String {
     }
 }
 
-/// Asks the backend to stop and waits for it: its task only resolves once the
-/// state file is written and the library lock is released.
-async fn shutdown(client: Client, task: JoinHandle<()>) {
+/// Asks the backend to stop and waits for it: its task only resolves once the state file is
+/// written and the library lock is released. Its `Err` is the message the binary would print,
+/// so a test that expected the save to work fails on it rather than on a missing file later.
+async fn shutdown(client: Client, task: JoinHandle<Result<(), String>>) {
     assert!(client.send(Command::Shutdown), "the queue takes Shutdown");
-    within(task)
+    let outcome = within(task)
         .await
         .expect("the backend stopped cleanly, with its state written");
+    assert_eq!(outcome, Ok(()), "the last save reported no problem");
 }
 
 /// Waits for `session` to have a torrent that is seeding: the seed must have its
@@ -226,7 +228,15 @@ async fn wait_until_seeding(session: &fbt::Session) {
 /// A library with one complete torrent already on disk: it seeds itself without
 /// a peer, so the backend's check is the only thing to wait for. Returns the
 /// row id and the file's path.
-async fn seeding_library(tag: &str) -> (Library, Client, JoinHandle<()>, TorrentId, PathBuf) {
+async fn seeding_library(
+    tag: &str,
+) -> (
+    Library,
+    Client,
+    JoinHandle<Result<(), String>>,
+    TorrentId,
+    PathBuf,
+) {
     let lib = Library::new(tag);
     let file = write_file(&lib.config.download_dir, "payload.bin", &sample(MIB));
     let bytes = torrent_for(&file).await;
@@ -392,6 +402,109 @@ async fn corrupt_state_is_kept_aside() {
     // The run itself is ordinary: it shuts down and writes a state file of its own.
     shutdown(client, task).await;
     assert!(lib.paths.state_file().exists(), "the new run starts fresh");
+}
+
+/// A state file this run cannot read at all - here a directory where the file belongs - does
+/// not turn into an empty library: nothing is written over it while the run lasts, and the
+/// notice says both halves of that.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreadable_state_is_never_overwritten() {
+    let lib = Library::new("local_unreadable_state");
+    fs::create_dir_all(&lib.paths.data_dir).expect("the data directory");
+    fs::create_dir(lib.paths.state_file()).expect("a state path that is a directory");
+
+    let (mut client, task, _) = lib.start().await;
+    let problem = error_text(notice(&mut client).await);
+    assert!(
+        problem.contains("could not be read") && problem.contains("will not save torrents"),
+        "the notice says the file is unreadable and that this run keeps its hands off it: {problem}"
+    );
+
+    // Something worth saving, so that a backend which saved an empty state would be caught
+    // here rather than looking correct.
+    let uri = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=keep-off";
+    assert!(client.send(Command::Add {
+        source: AddSource::Magnet(uri.to_string()),
+        dir: None,
+    }));
+    let id = id_of(&fbt::Magnet::parse(uri).expect("a valid magnet").info_hashes);
+    wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+
+    shutdown(client, task).await;
+
+    assert!(
+        lib.paths.state_file().is_dir(),
+        "what could not be read is still there, not a file this run wrote over it"
+    );
+}
+
+/// A second unreadable state file does not replace the first copy: `<name>.bad` keeps what run
+/// one found and this run's goes to `<name>.bad.1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_corruption_keeps_first_copy() {
+    let lib = Library::new("local_corrupt_twice");
+    fs::create_dir_all(&lib.paths.data_dir).expect("the data directory");
+    let state = lib.paths.state_file();
+    let first: &[u8] = b"first garbage";
+    fs::write(&state, first).expect("a state file that is not one");
+
+    let (mut client, task, _) = lib.start().await;
+    let problem = error_text(notice(&mut client).await);
+    assert!(
+        problem.contains("session.state.bad"),
+        "the notice names the copy: {problem}"
+    );
+    shutdown(client, task).await;
+    let aside = suffixed(&state, ".bad");
+    assert_eq!(fs::read(&aside).expect("the first copy"), first);
+
+    // That run wrote a state file of its own. Make it unreadable too and start a third time:
+    // the older copy stays where it is and this one goes to the next free name.
+    fs::write(&state, b"second garbage").expect("a second state file that is not one");
+    let (mut client, task, _) = lib.start().await;
+    let problem = error_text(notice(&mut client).await);
+    assert!(
+        problem.contains("session.state.bad.1"),
+        "the second copy takes the next free name: {problem}"
+    );
+    shutdown(client, task).await;
+
+    assert_eq!(
+        fs::read(&aside).expect("the first copy is still readable"),
+        first,
+        "a corruption from an earlier run is not overwritten by this one"
+    );
+    assert_eq!(
+        fs::read(suffixed(&state, ".bad.1")).expect("the second copy"),
+        b"second garbage"
+    );
+}
+
+/// Resume data that will not come back is copied out from under the state file before anything
+/// is saved: a run that restores half a library does not also delete the other half's bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_restore_keeps_backup() {
+    let lib = Library::new("local_restore_backup");
+    fs::create_dir_all(&lib.paths.data_dir).expect("the data directory");
+    // A state file that decodes, holding one entry that is not resume data at all.
+    let mut saved = fbt::SessionState::default();
+    saved.torrents.push(b"not resume data".to_vec());
+    let bytes = saved.to_bytes();
+    fs::write(lib.paths.state_file(), &bytes).expect("a state file with one bad entry");
+
+    let (mut client, task, _) = lib.start().await;
+    let problem = error_text(notice(&mut client).await);
+    assert!(
+        problem.contains("could not be restored") && problem.contains("session.state.bak"),
+        "the notice names the backup the bytes went to: {problem}"
+    );
+    assert_eq!(
+        fs::read(suffixed(&lib.paths.state_file(), ".bak")).expect("the copy of the state file"),
+        bytes,
+        "the file as it was read is kept, so the entry that failed survives in it"
+    );
+
+    shutdown(client, task).await;
 }
 
 /// A bad magnet, then the same good magnet twice: both are refused with a notice

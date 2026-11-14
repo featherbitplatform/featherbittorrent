@@ -48,24 +48,55 @@ pub(super) fn limits(session: &Session) -> LiveLimits {
     }
 }
 
-/// One row from one torrent's status.
+/// Where the stalled clock stands after one more look at a torrent.
 ///
-/// `last_rate` is when this torrent was last seen taking anything, `None` the first
-/// time it appears in a snapshot. A download that has taken nothing since before
-/// [`STALL_AFTER`] is stalled: it is running, but nothing is arriving, and a person
-/// scanning the table needs to see that rather than a bar stuck at 40 %.
-pub(super) fn row(status: &TorrentStatus, last_rate: Option<Instant>, now: Instant) -> TorrentRow {
-    let state = match status.state {
+/// It keeps running only while the torrent is downloading and taking nothing. Every other
+/// moment - stopped, queued, checking, waiting for metadata, or actually taking bytes -
+/// resets it to `now`, so the count measures how long a *running* download has been getting
+/// nothing and not how long since the torrent was last moving in some wider sense. A torrent
+/// resumed after an hour paused therefore starts from zero, which is what someone reading the
+/// stalled column expects: `previous` is the value from the last look, `None` the first time
+/// this torrent appears in a snapshot.
+pub(super) fn stalled_clock(
+    state: TorrentState,
+    down_rate: u64,
+    previous: Option<Instant>,
+    now: Instant,
+) -> Instant {
+    if state == TorrentState::Downloading && down_rate == 0 {
+        previous.unwrap_or(now)
+    } else {
+        now
+    }
+}
+
+/// What the table says a torrent is doing.
+///
+/// `zero_since` comes from [`stalled_clock`]: since when this torrent has been downloading
+/// while taking nothing. A download that has done that for [`STALL_AFTER`] is stalled - it is
+/// running, but nothing is arriving, and a person scanning the table needs to see that rather
+/// than a bar stuck at 40 %.
+pub(super) fn row_state(
+    state: TorrentState,
+    progress: f64,
+    down_rate: u64,
+    zero_since: Instant,
+    now: Instant,
+) -> RowState {
+    match state {
         TorrentState::DownloadingMetadata => RowState::Metadata,
         // Waiting for a check slot stops a torrent exactly like waiting for a place
         // in the queue, so the table shows one thing for both.
         TorrentState::QueuedForChecking | TorrentState::Queued => RowState::Queued,
         TorrentState::CheckingFiles { progress } => RowState::Checking(progress),
         TorrentState::Downloading => {
-            let waiting_too_long = last_rate
-                .and_then(|since| now.checked_duration_since(since))
-                .is_some_and(|waiting| waiting >= STALL_AFTER);
-            if status.download_rate == 0 && status.progress < 1.0 && waiting_too_long {
+            let waiting = now.checked_duration_since(zero_since);
+            // A rate above zero means the clock was reset this very tick, and everything at
+            // 100 % is about to be seeding: neither belongs in the stalled column.
+            if down_rate == 0
+                && progress < 1.0
+                && waiting.is_some_and(|waiting| waiting >= STALL_AFTER)
+            {
                 RowState::Stalled
             } else {
                 RowState::Downloading
@@ -77,12 +108,25 @@ pub(super) fn row(status: &TorrentStatus, last_rate: Option<Instant>, now: Insta
         // A state newer than this mapping is a torrent that is running: show it as
         // one rather than pretending it stopped.
         _ => RowState::Downloading,
-    };
+    }
+}
+
+/// One row from one torrent's status.
+///
+/// `zero_since` is where [`stalled_clock`] left this torrent's stalled count at the look that
+/// produced `status`, so the row and the map agree about what the torrent has been doing.
+pub(super) fn row(status: &TorrentStatus, zero_since: Instant, now: Instant) -> TorrentRow {
     TorrentRow {
         id: TorrentId::from_wire_hash(status.info_hashes.wire_hash()),
         name: clean(&status.name),
         progress: status.progress,
-        state,
+        state: row_state(
+            status.state,
+            status.progress,
+            status.download_rate,
+            zero_since,
+            now,
+        ),
         down_rate: status.download_rate,
         up_rate: status.upload_rate,
         peers: status.num_peers,
@@ -179,4 +223,152 @@ pub(super) fn left_out(hashes: &InfoHashes, error: &SessionError) -> String {
         TorrentId::from_wire_hash(hashes.wire_hash()).0,
         clean(&error.to_string())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STALL_AFTER, row_state, stalled_clock};
+    use crate::client::RowState;
+    use fbt::TorrentState;
+    use std::time::{Duration, Instant};
+
+    /// One step of test time: long enough to stand for a tick, short enough that the 30 s
+    /// rule is a handful of steps rather than a wait.
+    const STEP: Duration = Duration::from_secs(1);
+
+    /// A torrent seen now has no clock, one running at zero rate keeps whatever clock it had,
+    /// and the column turns stalled only once the gap reaches 30 s.
+    #[test]
+    fn stalled_after_30s_zero_rate() {
+        let started = Instant::now();
+        assert_eq!(
+            stalled_clock(TorrentState::Downloading, 0, Some(started), started + STEP),
+            started,
+            "the count keeps running while a download takes nothing"
+        );
+
+        let seen_now = stalled_clock(TorrentState::Downloading, 0, None, started);
+        assert_eq!(
+            seen_now, started,
+            "a torrent first seen starts its own count"
+        );
+        assert_eq!(
+            row_state(TorrentState::Downloading, 0.4, 0, seen_now, started + STEP),
+            RowState::Downloading,
+            "one tick of nothing is not a stall"
+        );
+
+        assert_eq!(
+            row_state(
+                TorrentState::Downloading,
+                0.4,
+                0,
+                started,
+                started + STALL_AFTER - STEP
+            ),
+            RowState::Downloading,
+            "29 s is a slow tracker reply, not a stalled download"
+        );
+        assert_eq!(
+            row_state(
+                TorrentState::Downloading,
+                0.4,
+                0,
+                started,
+                started + STALL_AFTER
+            ),
+            RowState::Stalled
+        );
+    }
+
+    /// The count does not carry over across the moments when the torrent was not downloading:
+    /// resume must never look stalled because it was paused for an hour.
+    #[test]
+    fn not_stalled_right_after_resume() {
+        let stopped_at = Instant::now();
+        let mut zero_since = stopped_at;
+        for step in 0u32..60 {
+            let now = stopped_at + step * STEP;
+            for state in [
+                TorrentState::Paused,
+                TorrentState::Queued,
+                TorrentState::QueuedForChecking,
+                TorrentState::DownloadingMetadata,
+                TorrentState::CheckingFiles { progress: 0.5 },
+            ] {
+                zero_since = stalled_clock(state, 0, Some(zero_since), now);
+                assert_eq!(zero_since, now, "{state:?} does not count towards a stall");
+            }
+        }
+
+        // A minute after the torrent entered the library and one tick after it resumed: the
+        // minute it spent stopped is not this download's history.
+        let resumed_at = stopped_at + 61 * STEP;
+        assert_eq!(
+            row_state(TorrentState::Downloading, 0.4, 0, zero_since, resumed_at),
+            RowState::Downloading,
+            "a resumed download starts the count again"
+        );
+
+        assert_eq!(
+            stalled_clock(
+                TorrentState::Downloading,
+                4096,
+                Some(stopped_at),
+                resumed_at
+            ),
+            resumed_at,
+            "bytes arriving end the count"
+        );
+    }
+
+    /// Everything at 100 % and a zero rate is an ordinary moment, not a stall, and no clock
+    /// changes what the other states say.
+    #[test]
+    fn not_stalled_when_complete() {
+        let now = Instant::now();
+        let long_ago = now - 2 * STALL_AFTER;
+
+        assert_eq!(
+            row_state(TorrentState::Downloading, 1.0, 0, long_ago, now),
+            RowState::Downloading,
+            "a download that has everything is about to seed, not stalled"
+        );
+        assert_eq!(
+            row_state(TorrentState::Downloading, 0.4, 1, long_ago, now),
+            RowState::Downloading,
+            "a torrent taking bytes is not stalled however long the gap before it"
+        );
+
+        assert_eq!(
+            row_state(TorrentState::Paused, 0.4, 0, long_ago, now),
+            RowState::Paused
+        );
+        assert_eq!(
+            row_state(TorrentState::Seeding, 1.0, 0, long_ago, now),
+            RowState::Seeding
+        );
+        assert_eq!(
+            row_state(TorrentState::DownloadingMetadata, 0.0, 0, long_ago, now),
+            RowState::Metadata
+        );
+        assert_eq!(
+            row_state(TorrentState::Queued, 0.4, 0, long_ago, now),
+            RowState::Queued
+        );
+        assert_eq!(
+            row_state(
+                TorrentState::CheckingFiles { progress: 0.25 },
+                0.1,
+                0,
+                long_ago,
+                now
+            ),
+            RowState::Checking(0.25)
+        );
+        assert_eq!(
+            row_state(TorrentState::Error, 0.4, 0, long_ago, now),
+            RowState::Error
+        );
+    }
 }
