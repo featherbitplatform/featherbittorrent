@@ -9,9 +9,11 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod lock;
 pub mod paths;
 
 pub use config::{Config, ConfigError, ConfigLoad};
+pub use lock::{LibraryLock, LockError};
 pub use paths::Paths;
 
 /// A directory under the system temp dir, removed when the test that made it
