@@ -6,10 +6,13 @@
 //! `p` means for the torrent under the cursor; deciding that the engine did it is not its
 //! business, so a command that a peer keeps waiting for cannot freeze the screen.
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::KeyEvent;
-use fbtt_core::{Command, DetailTab, RowState, Snapshot, TorrentId, TorrentRow};
+use fbtt_core::{Command, DetailTab, Notice, RowState, Snapshot, TorrentId, TorrentRow};
 
 use crate::keys;
+use crate::modal::Modal;
 
 /// Which of the two screens is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,12 +76,9 @@ impl SortKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Descending(pub bool);
 
-/// A dialog open on top of the main view.
-///
-/// It has no variants yet: Task 6 adds them, along with the keys that open a dialog. Until
-/// then nothing can put one in [`Model::modal`], and every screen draws without one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Modal {}
+/// How long a notice stays on the footer. Long enough to read a line about something that just
+/// failed, short enough that the screen is not still reporting it a minute later.
+const NOTICE_TTL: Duration = Duration::from_secs(5);
 
 /// The tabs of the detail pane, in the order `Tab` moves through them.
 const TABS: [DetailTab; 4] = [
@@ -106,6 +106,12 @@ pub struct Model {
     pub detail_tab: DetailTab,
     /// The dialog over the main view, when one is open.
     pub modal: Option<Modal>,
+    /// Whether the cursor is in the detail pane's file list, which `Enter` puts it in and `Esc`
+    /// takes out again. While it is there, `j` and `k` mean files rather than torrents.
+    pub files_focused: bool,
+    /// Which file in that list the cursor is on. Every user of it clamps this to the list, so a
+    /// snapshot with fewer files than the last one cannot leave it past the end.
+    pub file_cursor: usize,
     /// `q` has been confirmed: the binary should stop.
     quit: bool,
     /// A `q` that found something still downloading and is waiting to be confirmed.
@@ -113,6 +119,9 @@ pub struct Model {
     /// Where the selection last sat among the visible rows, so that a torrent going away
     /// leaves the selection in its place rather than at the top of the table.
     index_hint: usize,
+    /// The last notice from the backend and when it arrived. The footer shows it until
+    /// [`NOTICE_TTL`] has passed, which [`tick`](Self::tick) is what drops.
+    notice: Option<(Notice, Instant)>,
 }
 
 impl Model {
@@ -126,9 +135,12 @@ impl Model {
             filter: String::new(),
             detail_tab: DetailTab::Files,
             modal: None,
+            files_focused: false,
+            file_cursor: 0,
             quit: false,
             quit_armed: false,
             index_hint: 0,
+            notice: None,
         }
     }
 
@@ -154,6 +166,41 @@ impl Model {
     /// is selected. The binary sends [`Command::Watch`] whenever this changes.
     pub fn watch(&self) -> Option<(TorrentId, DetailTab)> {
         self.selected.clone().map(|id| (id, self.detail_tab))
+    }
+
+    /// Records one line of feedback from the backend for the footer to show until it expires.
+    ///
+    /// An error that arrives while the add dialog is open goes into the dialog instead: it is the
+    /// answer to what was just typed there, and a line under the box would read as something else
+    /// having gone wrong. `now` is a parameter rather than a clock reading so that a test can say
+    /// when a notice arrived instead of waiting for one.
+    pub fn push_notice(&mut self, notice: Notice, now: Instant) {
+        if let Some(Modal::Add(form)) = &mut self.modal
+            && let Notice::Error(text) = &notice
+        {
+            form.error = Some(text.clone());
+            return;
+        }
+        self.notice = Some((notice, now));
+    }
+
+    /// Drops a notice that has been on the footer for [`NOTICE_TTL`]. The binary calls this with
+    /// each frame's clock reading so a line about something goes away without a key press; a
+    /// `now` earlier than the notice arrived counts as no time passed.
+    pub fn tick(&mut self, now: Instant) {
+        let keep = self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < NOTICE_TTL);
+        if !keep {
+            self.notice = None;
+        }
+    }
+
+    /// The notice the footer shows, or `None` when there is nothing to say. It stops being shown
+    /// by [`tick`](Self::tick), which is what knows how long it has been up.
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref().map(|(notice, _)| notice)
     }
 
     /// Points the selection at something the table is actually showing.
@@ -224,6 +271,23 @@ impl Model {
         self.sort = (self.sort.0, Descending(!self.sort.1.0));
     }
 
+    /// Puts the cursor in the detail pane's file list, or takes it out again. Leaving it starts
+    /// the next visit at the top of the list, which is where a person who just came back expects it.
+    pub(crate) fn set_files_focused(&mut self, focused: bool) {
+        self.files_focused = focused;
+        if !focused {
+            self.file_cursor = 0;
+        }
+    }
+
+    /// Moves the file cursor within a list of `count` files, stopping at either end like the
+    /// torrent selection does. An empty list leaves it at zero.
+    pub(crate) fn step_file_cursor(&mut self, delta: i32, count: usize) {
+        let last = count.saturating_sub(1);
+        let from = self.file_cursor.min(last);
+        self.file_cursor = (from as i64 + i64::from(delta)).clamp(0, last as i64) as usize;
+    }
+
     /// Moves the detail pane one tab along, wrapping at either end.
     pub(crate) fn step_detail_tab(&mut self, forward: bool) {
         let current = match self.detail_tab {
@@ -239,6 +303,9 @@ impl Model {
             (current + count - 1) % count
         };
         self.detail_tab = TABS[next];
+        // The focus belongs to one pane: moving on leaves the file list behind rather than
+        // leaving a cursor in a list nobody is looking at.
+        self.set_files_focused(false);
     }
 
     /// Switches between the full and the minimal screen.

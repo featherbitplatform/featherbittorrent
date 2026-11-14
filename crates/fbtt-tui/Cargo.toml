@@ -19,3 +19,6 @@ fbt.workspace = true
 # ratatui's backend uses, so one crossterm serves both.
 crossterm.workspace = true
 ratatui.workspace = true
+# The add dialog expands a leading `~/` in a path someone typed, which is the home
+# directory this platform says it has.
+directories.workspace = true

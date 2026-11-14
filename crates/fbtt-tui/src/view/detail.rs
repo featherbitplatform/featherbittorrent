@@ -134,7 +134,9 @@ fn content(frame: &mut Frame, area: Rect, model: &Model, snap: &Snapshot) {
         _ => None,
     };
     match (model.detail_tab, watched) {
-        (DetailTab::Files, Some(Detail::Files(files))) => files_table(frame, area, row, files),
+        (DetailTab::Files, Some(Detail::Files(files))) => {
+            files_table(frame, area, model, row, files)
+        }
         (DetailTab::Peers, Some(Detail::Peers(peers))) => peers_table(frame, area, peers),
         (DetailTab::Trackers, Some(Detail::Trackers(trackers))) => {
             trackers_table(frame, area, trackers);
@@ -201,9 +203,9 @@ impl FileShape {
     }
 }
 
-/// The shapes, richest first. The priority word goes first: until Task 6 puts a focus in this
-/// list it is something a person reads about a file they cannot change, and the path is what
-/// tells them which file that is. Then the bar shrinks, and last it gives way to its percent.
+/// The shapes, richest first. The priority word goes first: it is the only thing in this list a
+/// person can change, so a focused list keeps it at whatever width the ladder leaves. Then the bar
+/// shrinks, and last it gives way to its percent.
 const FILE_SHAPES: [FileShape; 4] = [
     FileShape {
         bar: WIDEST_FILE_BAR,
@@ -225,19 +227,40 @@ const FILE_SHAPES: [FileShape; 4] = [
 
 /// The file list: a path, how much of it is on disk, and what is being downloaded of it.
 ///
-/// Task 6 gives this list a focus of its own so priorities can be changed from the keyboard;
-/// until then it shows what fits from the top.
-fn files_table(frame: &mut Frame, area: Rect, row: &TorrentRow, files: &[FileRow]) {
+/// While the list has its own focus (`Enter` puts the cursor in it and `Esc` takes it out) the row
+/// under the cursor is lifted onto the surface colour and the list scrolls to keep it in view. A
+/// focused list also keeps the priority word: `+` and `-` change a value that has to be readable at
+/// the same time, so a pane too narrow for both gives up the bar before it gives up the word.
+fn files_table(frame: &mut Frame, area: Rect, model: &Model, row: &TorrentRow, files: &[FileRow]) {
     let colour_of = theme::state_colour(row.state);
-    let shape = *view::richest_fitting(&FILE_SHAPES, area.width, |shape| shape.cells_needed());
+    let cursor = if model.files_focused && !files.is_empty() {
+        Some(model.file_cursor.min(files.len() - 1))
+    } else {
+        None
+    };
 
-    let body: Vec<Row<'static>> = files
+    // A focused list also has to show the word that `+` and `-` change, so it keeps that column at
+    // whatever width the ladder left behind: the name is what gives way, as it does whenever else
+    // the pane is out of room.
+    let mut shape = *view::richest_fitting(&FILE_SHAPES, area.width, |shape| shape.cells_needed());
+    if model.files_focused {
+        shape.priority = true;
+    }
+
+    // Only the rows that fit are built at all. With the cursor in the list the window moves down
+    // to keep it on screen, which an unfocused list never needs because nothing points at a row.
+    let start = cursor.map_or(0, |at| {
+        view::window_start(files.len(), area.height, Some(at))
+    });
+    let end = (start + usize::from(area.height)).min(files.len());
+
+    let body: Vec<Row<'static>> = files[start..end]
         .iter()
-        .take(usize::from(area.height))
-        .map(|file| {
+        .enumerate()
+        .map(|(offset, file)| {
             let progress = share(file.done, file.size);
-            // A file that is whole is green even while its torrent is still downloading the
-            // rest, which is the point of listing them separately.
+            // A file that is whole is green even while its torrent is still downloading the rest,
+            // which is the point of listing them separately.
             let colour = if file.done >= file.size {
                 theme::GREEN_500
             } else {
@@ -262,7 +285,13 @@ fn files_table(frame: &mut Frame, area: Rect, row: &TorrentRow, files: &[FileRow
                     .style(Style::new().fg(theme::INK_400)),
                 );
             }
-            Row::new(cells).style(Style::new().fg(theme::INK_300))
+
+            let style = if cursor == Some(start + offset) {
+                Style::new().bg(theme::INK_850).fg(theme::INK_50)
+            } else {
+                Style::new().fg(theme::INK_300)
+            };
+            Row::new(cells).style(style)
         })
         .collect();
 

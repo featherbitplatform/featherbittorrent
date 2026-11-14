@@ -7,8 +7,11 @@
 //! key that does nothing.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use fbtt_core::{Command, RowState, Snapshot, TorrentRow};
+use fbtt_core::{
+    Command, Detail, DetailTab, FilePriority, FileRow, RowState, Snapshot, TorrentRow,
+};
 
+use crate::modal::{self, Modal};
 use crate::model::{Model, visible_rows};
 
 /// Every key the model answers, and what pressing it does. The help screen lists all of
@@ -32,14 +35,24 @@ pub const KEYS: &[(&str, &str)] = &[
     ("a", "add"),
     ("d", "delete"),
     ("S", "settings"),
-    ("y", "confirm quit"),
     ("?", "help"),
+    // These answer inside a dialog or in the file list rather than in the table, and they are in
+    // this one list so that the help screen has to mention them too.
+    ("Enter", "focus the file list"),
+    ("+", "raise the focused file's priority"),
+    ("-", "lower the focused file's priority"),
+    ("Esc", "close a dialog"),
+    ("y", "confirm quit"),
     ("q", "quit"),
 ];
 
 /// The hints the footer has room for, in the order it shows them. Each one is a key of
 /// [`KEYS`].
 pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "?", "q"];
+
+/// The hints the footer gives instead while the cursor is in the detail pane's file list, where
+/// `j` and `k` mean files rather than torrents. Each one is a key of [`KEYS`] too.
+pub const FILE_LIST_KEYS: &[&str] = &["+", "-", "Esc"];
 
 /// How far `PageDown` and `PageUp` move the selection. The model does not know how tall
 /// the terminal is, so this is a page by agreement rather than a screenful.
@@ -57,6 +70,11 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
     // is only accepted where it is the whole of the modifier.
     if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
         return Vec::new();
+    }
+    // A dialog owns the keyboard while it is up. A `q` in a magnet field is a letter, a `j` in
+    // the delete question is an answer, and nothing here moves the table behind it.
+    if model.modal.is_some() {
+        return modal::handle(model, key, snap);
     }
 
     let rows = visible_rows(model, snap);
@@ -83,6 +101,9 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
         code => {
             // Any other key answers the pending confirmation by not confirming it.
             model.cancel_quit();
+            if model.files_focused {
+                return file_list_keys(model, code, snap);
+            }
             match code {
                 KeyCode::Char('j') | KeyCode::Down => model.step_by(1, &rows),
                 KeyCode::Char('k') | KeyCode::Up => model.step_by(-1, &rows),
@@ -99,13 +120,19 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
                 KeyCode::Char('o') => model.cycle_sort(),
                 KeyCode::Char('O') => model.reverse_sort(),
                 KeyCode::Char('m') => model.toggle_view(),
-                // Add, delete, settings, filter and help open dialogs: Task 6 gives them
-                // their keys back. Reserved for later milestones: `c` connects, `s` streams.
-                KeyCode::Char('/')
-                | KeyCode::Char('a')
-                | KeyCode::Char('d')
-                | KeyCode::Char('S')
-                | KeyCode::Char('?') => {}
+                // These five open a dialog, which then answers every key itself. `c` and `s` are
+                // reserved for later milestones: connect, and stream.
+                KeyCode::Char('/') => model.modal = Some(Modal::Filter),
+                KeyCode::Char('a') => model.modal = Some(Modal::add(snap)),
+                KeyCode::Char('S') => model.modal = Some(Modal::settings(snap)),
+                KeyCode::Char('?') => model.modal = Some(Modal::Help),
+                KeyCode::Char('d') => {
+                    // The question names the torrent it is about, so there has to be one.
+                    if let Some(row) = model.selected_row(&rows) {
+                        model.modal = Some(Modal::delete(row));
+                    }
+                }
+                KeyCode::Enter => focus_file_list(model, snap),
                 _ => {}
             }
             Vec::new()
@@ -135,17 +162,130 @@ fn any_downloading(snap: &Snapshot) -> bool {
         .any(|row| matches!(row.state, RowState::Downloading))
 }
 
+/// `Enter` on the Files tab puts the cursor in the file list, where `j` and `k` move it and `+`
+/// and `-` change what is downloaded of the file under it. A list with nothing in it is not worth
+/// moving a cursor into: there would be nothing to change, and no way to tell it was focused.
+fn focus_file_list(model: &mut Model, snap: &Snapshot) {
+    if model.detail_tab != DetailTab::Files {
+        return;
+    }
+    if watched_files(model, snap).is_some_and(|files| !files.is_empty()) {
+        model.set_files_focused(true);
+    }
+}
+
+/// The keys the file list answers while it has the cursor: moving along it, changing the priority
+/// of the file under the cursor, and leaving. Everything else is ignored rather than falling
+/// through to the table, because the person pressing it meant the list. Quit is the exception, and
+/// it was answered before any of this ran.
+fn file_list_keys(model: &mut Model, code: KeyCode, snap: &Snapshot) -> Vec<Command> {
+    match code {
+        KeyCode::Esc => {
+            model.set_files_focused(false);
+            Vec::new()
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            model.step_file_cursor(1, file_count(model, snap));
+            Vec::new()
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            model.step_file_cursor(-1, file_count(model, snap));
+            Vec::new()
+        }
+        // Changing pane is another way of leaving this one, and the key that does it should keep
+        // working while the cursor is here.
+        KeyCode::Tab => {
+            model.set_files_focused(false);
+            model.step_detail_tab(true);
+            Vec::new()
+        }
+        KeyCode::BackTab => {
+            model.set_files_focused(false);
+            model.step_detail_tab(false);
+            Vec::new()
+        }
+        KeyCode::Char('+') | KeyCode::Char('-') => {
+            change_priority(model, snap, code == KeyCode::Char('+'))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `+` and `-` on the file under the cursor. Only the command is sent: the model does not assume
+/// it worked, so the word in the list changes when the next snapshot says it did. A file already
+/// at the top or the bottom of the ladder sends nothing.
+fn change_priority(model: &Model, snap: &Snapshot, raise: bool) -> Vec<Command> {
+    let Some(files) = watched_files(model, snap) else {
+        return Vec::new();
+    };
+    let at = model.file_cursor.min(files.len().saturating_sub(1));
+    let Some(file) = files.get(at) else {
+        return Vec::new();
+    };
+    let next = if raise {
+        higher_priority(file.priority)
+    } else {
+        lower_priority(file.priority)
+    };
+    if next == file.priority {
+        return Vec::new();
+    }
+    let Some(id) = &model.selected else {
+        return Vec::new();
+    };
+    vec![Command::SetFilePriority {
+        id: id.clone(),
+        file: file.index,
+        priority: next,
+    }]
+}
+
+/// The file list the snapshot holds for the selected torrent, `None` when it holds none: while a
+/// torrent's metadata has not arrived there are no files to change.
+fn watched_files<'a>(model: &Model, snap: &'a Snapshot) -> Option<&'a [FileRow]> {
+    let id = model.selected.as_ref()?;
+    match &snap.detail {
+        Some((watched, Detail::Files(files))) if watched == id => Some(files),
+        _ => None,
+    }
+}
+
+/// How many files the focused list holds, which is what stops the cursor at the last one.
+fn file_count(model: &Model, snap: &Snapshot) -> usize {
+    watched_files(model, snap).map_or(0, |files| files.len())
+}
+
+/// The next priority up, or the same one at the top of the ladder.
+const fn higher_priority(priority: FilePriority) -> FilePriority {
+    match priority {
+        FilePriority::Skip => FilePriority::Low,
+        FilePriority::Low => FilePriority::Normal,
+        FilePriority::Normal | FilePriority::High => FilePriority::High,
+    }
+}
+
+/// The next priority down, or the same one at the bottom of it.
+const fn lower_priority(priority: FilePriority) -> FilePriority {
+    match priority {
+        FilePriority::Skip | FilePriority::Low => FilePriority::Skip,
+        FilePriority::Normal => FilePriority::Low,
+        FilePriority::High => FilePriority::Normal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn footer_keys_are_in_the_key_table() {
-        for key in FOOTER_KEYS {
-            assert!(
-                KEYS.iter().any(|(name, _)| name == key),
-                "the footer hints at {key:?}, which the model does not answer"
-            );
+    fn every_hint_the_footer_gives_is_a_key_the_model_answers() {
+        for table in [FOOTER_KEYS, FILE_LIST_KEYS] {
+            for key in table {
+                assert!(
+                    KEYS.iter().any(|(name, _)| name == key),
+                    "the footer hints at {key:?}, which the model does not answer"
+                );
+            }
         }
     }
 

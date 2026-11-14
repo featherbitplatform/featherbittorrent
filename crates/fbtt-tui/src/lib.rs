@@ -9,10 +9,12 @@
 #![forbid(unsafe_code)]
 
 pub mod format;
-mod keys;
+pub mod keys;
+pub mod modal;
 pub mod model;
 pub mod theme;
 pub mod view;
 
-pub use model::{Descending, Modal, Model, SortKey, View, visible_rows};
+pub use modal::{AddForm, Input, Modal, SettingsForm};
+pub use model::{Descending, Model, SortKey, View, visible_rows};
 pub use view::draw;
