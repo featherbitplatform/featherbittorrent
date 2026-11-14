@@ -161,15 +161,17 @@ All file-system access from the API is confined to the configured download roots
   - Large tables render only their visible rows.
 - **Workspace:** one Cargo workspace. Suggested crates are a core with the client interface and config, the TUI, the server, and the binary. This follows the shape of fbt-lib and `fbterm`.
 
-## 8. Engineering standards **[owner: same as the other featherbit repos]**
+## 8. Engineering standards **[owner]**
+
+The same rules as the gateway and fbterm, from the first commit and for every change after it: Gitflow, Conventional Commits, semantic versioning with the same release flow, and the same CI/CD, security and code-quality gates. No release or merge skips them.
 
 - **Repository:**
   - `github.com/featherbitplatform/featherbittorrent`, Apache-2.0. The repo exists, with an initial commit.
   - Its own `CLAUDE.md` is written with the scaffold.
 - **Gitflow:** `main` holds tagged releases only and `develop` is the integration branch, with `feature/*`, `release/X.Y.Z` and `hotfix/*`. Releases follow the same flow as fbt-lib and `fbterm`.
-- **Commits and versions:** Conventional Commits, SemVer, and a `CHANGELOG.md` in Keep a Changelog format with PR links.
+- **Commits and versions:** Conventional Commits, semantic versioning (the version bump happens on the `release/X.Y.Z` branch, the annotated `vX.Y.Z` tag on `main` triggers the release workflow), and a `CHANGELOG.md` in Keep a Changelog format with PR links.
 - **No attribution of any kind** in commits or PRs: no `Co-Authored-By`, no session links, no "Generated with" footer.
-- **CI and security:** fmt, clippy `-D warnings`, and tests on Linux, macOS and Windows; cargo-deny; and the security workflow used in the other repos (semgrep, grype, gitleaks). Releases build every platform in section 4 and attach CycloneDX SBOMs.
+- **CI and security:** fmt, clippy `-D warnings`, and tests on Linux, macOS and Windows; cargo-deny; and the security workflow used in the other repos (semgrep, grype, gitleaks over the full history, also weekly on `main`), with a local `dev/sast.sh` that runs the same scans; every ignore carries a one-line reason. Pull requests merge only when every gate is green. Releases build every platform in section 4 and attach CycloneDX SBOMs.
 - **Tests never contact the public internet.**
 - **Product copy:** no emoji and no em-dashes. Naming other torrent clients is allowed, since interop and migration are part of the domain. **[builder's call]**
 
