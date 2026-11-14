@@ -36,6 +36,7 @@ Non-goals (not built now, on the roadmap):
 - **The web UI, and the Tauri desktop builds** that reuse it. **[owner: later, per the fbt-lib design]** The server's API is designed so the web UI can be built on it. When the web UI exists, it also gets browser streaming.
 - **Autostart.** Packages never install or enable a service. The docs explain how to set up systemd, launchd or a Windows service. **[owner]**
 - **Read-only users or per-user permissions.** Every authenticated client may do everything. **[builder's call]**
+- **A separate "in progress" folder** with automatic moves on completion. **[owner]**
 
 Anti-goals (would make the work a failure even if it works):
 
@@ -77,6 +78,8 @@ The reference low end is a **Raspberry Pi 2 Model B v1.2**: Cortex-A53, 1 GB RAM
 - **Colours.** Ink background, violet accent, green for seeding, amber for stalled, cyan for the connection, red for errors. **[owner agreed]**
 - **Adding torrents.** You paste a magnet link or choose a `.torrent` file from the TUI machine's file system. When connected remotely, the TUI uploads the file to the server. **[owner]**
 - **Destination folder.** Each server has a default download folder. Before a torrent is added, you can browse the server's allowed folders and pick another (section 6.5). **[owner]**
+- **Where files live.** A torrent's files stay where they were downloaded: the default folder or the one chosen when adding. There is no separate "in progress" folder and no automatic move on completion. **[owner]**
+- **Settings screen.** A small screen changes, while running, the global download and upload limits and the number of active torrents (downloads, seeds, total). It works the same on the local engine and on a remote server. Everything else is set in the YAML file only, in the first release. **[owner]**
 
 ### 5.3 Logo **[owner]**
 
