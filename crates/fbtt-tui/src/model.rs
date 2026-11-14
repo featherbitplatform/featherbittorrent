@@ -214,6 +214,10 @@ impl Model {
     /// A torrent hidden by the filter counts as gone: the pane under the table describes the
     /// selection, so it should describe one of the torrents a person can see, and the backend
     /// should not be asked to keep a pane fresh for a row that is not on screen.
+    ///
+    /// A selection that moves or disappears takes the detail pane's file cursor with it: that
+    /// cursor was put into one torrent's list, and once the pane describes another torrent the
+    /// list it points into is not on the screen any more.
     pub fn sync_selection(&mut self, snap: &Snapshot) {
         let rows = visible_rows(self, snap);
         if let Some(at) = self.selected_index(&rows) {
@@ -224,6 +228,7 @@ impl Model {
         let at = self.index_hint.min(rows.len().saturating_sub(1));
         self.index_hint = at;
         self.selected = rows.get(at).map(|row| row.id.clone());
+        self.set_files_focused(false);
     }
 
     /// Selects the visible row at `index`, clamped into the list. Empty means nothing is

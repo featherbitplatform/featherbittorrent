@@ -51,8 +51,15 @@ pub const KEYS: &[(&str, &str)] = &[
 pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "?", "q"];
 
 /// The hints the footer gives instead while the cursor is in the detail pane's file list, where
-/// `j` and `k` mean files rather than torrents. Each one is a key of [`KEYS`] too.
-pub const FILE_LIST_KEYS: &[&str] = &["+", "-", "Esc"];
+/// `j` and `k` mean files rather than torrents, as the key and what it does there. Every key of it
+/// is a key of [`KEYS`] too, which a test keeps true; the words beside them are this list's own,
+/// because they describe where the cursor is: `Esc` in the list leaves the list, it does not close
+/// a dialog.
+pub const FILE_LIST_HINTS: &[(&str, &str)] = &[
+    ("+", "raise the focused file's priority"),
+    ("-", "lower the focused file's priority"),
+    ("Esc", "leave the file list"),
+];
 
 /// How far `PageDown` and `PageUp` move the selection. The model does not know how tall
 /// the terminal is, so this is a page by agreement rather than a screenful.
@@ -279,13 +286,17 @@ mod tests {
 
     #[test]
     fn every_hint_the_footer_gives_is_a_key_the_model_answers() {
-        for table in [FOOTER_KEYS, FILE_LIST_KEYS] {
-            for key in table {
-                assert!(
-                    KEYS.iter().any(|(name, _)| name == key),
-                    "the footer hints at {key:?}, which the model does not answer"
-                );
-            }
+        // The file-list hints carry their own wording, so only the keys are checked against the
+        // table here: what they say is this list's business.
+        let names = FOOTER_KEYS
+            .iter()
+            .copied()
+            .chain(FILE_LIST_HINTS.iter().map(|(key, _)| *key));
+        for key in names {
+            assert!(
+                KEYS.iter().any(|(name, _)| *name == key),
+                "the footer hints at {key:?}, which the model does not answer"
+            );
         }
     }
 

@@ -25,22 +25,34 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, model: &Model) {
     } else if let Some(notice) = model.notice() {
         notice_line(notice)
     } else if model.files_focused {
-        hints_for(keys::FILE_LIST_KEYS)
+        hints_from(keys::FILE_LIST_HINTS)
     } else {
         hints_for(keys::FOOTER_KEYS)
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The hints for one set of keys, in the order they are wanted: each key in the lifted accent, and
-/// what it does beside it. Every word on this line comes from the key table, which a test keeps
-/// true, so a hint cannot promise a key that does nothing.
+/// The hints for one set of keys, in the order they are wanted. Everything on this line comes from
+/// the key table, which a test keeps true, so a hint cannot promise a key that does nothing.
 fn hints_for(wanted: &[&'static str]) -> Line<'static> {
-    let mut spans = Vec::with_capacity(wanted.len() * 2);
-    for key in wanted {
-        let Some((_, action)) = keys::KEYS.iter().find(|(name, _)| name == key) else {
-            continue;
-        };
+    let described: Vec<(&'static str, &'static str)> = wanted
+        .iter()
+        .filter_map(|key| {
+            keys::KEYS
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, action)| (*key, *action))
+        })
+        .collect();
+    hints_from(&described)
+}
+
+/// The hints given as a key and what it does: each key in the lifted accent, and its meaning beside
+/// it. This is the shape for a hint that has to say something other than what the table says, which
+/// is what the file list does with `Esc`: there it leaves the list, it does not close a dialog.
+fn hints_from(described: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(described.len() * 2);
+    for (key, action) in described {
         if !spans.is_empty() {
             spans.push(Span::raw("  "));
         }

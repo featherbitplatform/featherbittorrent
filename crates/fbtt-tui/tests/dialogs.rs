@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::KeyCode;
 use fbtt_core::{
-    AddSource, Command, Detail, DetailTab, FilePriority, LiveLimits, Notice, Snapshot,
+    AddSource, Command, Detail, DetailTab, FilePriority, LiveLimits, Notice, RowState, Snapshot,
 };
 use fbtt_tui::keys::KEYS;
 use fbtt_tui::{AddForm, Modal, Model};
@@ -548,7 +548,7 @@ fn file_priority_keys() {
     );
     let body = screen.text();
     assert!(
-        body.contains("Esc close a dialog"),
+        body.contains("Esc leave the file list"),
         "the footer did not say how to leave the list:\n{body}"
     );
 
@@ -559,6 +559,72 @@ fn file_priority_keys() {
     assert_eq!(
         model.watch().map(|(id, _)| id),
         Some(snap.torrents[1].id.clone())
+    );
+
+    // A gap in the list is the engine's, not something this screen invents: the indices are the ones
+    // the metadata carries, and a command has to name the one it came with. Here index 1 is a pad
+    // file that is not listed at all, so the second row down holds index 2 and `+` on it says 2.
+    let mut padded = snap.clone();
+    if let Some((_, Detail::Files(files))) = &mut padded.detail {
+        files[1].index = 2;
+    }
+    let mut model = model_of(&padded);
+    model.handle_key(key(KeyCode::Enter), &padded);
+    model.handle_key(letter('j'), &padded);
+    assert_eq!(
+        model.file_cursor, 1,
+        "the cursor did not reach the second listed file"
+    );
+    assert_eq!(
+        model.handle_key(letter('+'), &padded),
+        vec![Command::SetFilePriority {
+            id: buck.clone(),
+            file: 2,
+            priority: FilePriority::High,
+        }],
+        "the command named a position in the list instead of the engine's index"
+    );
+}
+
+#[test]
+fn file_list_focus_goes_with_the_torrent_it_was_in() {
+    let snap = library(); // buck selected, its two files listed
+    let mut model = model_of(&snap);
+    model.handle_key(key(KeyCode::Enter), &snap);
+    assert!(model.files_focused, "Enter did not focus the file list");
+    model.handle_key(letter('j'), &snap);
+    assert_eq!(model.file_cursor, 1);
+
+    // A third torrent so that there is somewhere for `j` to go afterwards, and the selected one
+    // taken out of the snapshot: what a delete the backend agreed to looks like from here.
+    let mut next = snap.clone();
+    let mut third = torrent("t3", "Third.Torrent", RowState::Seeding);
+    third.queue_position = 2;
+    next.torrents.push(third);
+    next.torrents.remove(0);
+    next.detail = None; // its files went with it
+
+    model.sync_selection(&next);
+    assert!(
+        !model.files_focused,
+        "the cursor stayed in a list that left with its torrent"
+    );
+    assert_eq!(
+        model.file_cursor, 0,
+        "the cursor was not put back at the top of the list"
+    );
+    // The selection took the row the gone torrent left behind, which is what it always does.
+    assert_eq!(
+        model.watch().map(|(id, _)| id),
+        Some(snap.torrents[1].id.clone())
+    );
+
+    // `j` moves the table again rather than a cursor nobody can see.
+    model.handle_key(letter('j'), &next);
+    assert_eq!(
+        model.watch().map(|(id, _)| id),
+        Some(next.torrents[1].id.clone()),
+        "the key went to a file list that is not there any more"
     );
 }
 

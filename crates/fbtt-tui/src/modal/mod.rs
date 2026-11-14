@@ -24,6 +24,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Fill, Paragraph};
 
+use crate::format;
 use crate::model::Model;
 use crate::theme;
 
@@ -222,6 +223,11 @@ pub(crate) fn field(label: &str, input: &Input, width: usize, invalid: bool) -> 
     });
     let caret = Style::new().fg(theme::INK_950).bg(theme::INK_50);
     let (before, at_cursor) = input.split_at_cursor();
+    // Field text is drawn the way everything else on the screen is drawn, through `format::safe`:
+    // the folder field starts life as a path that came from the snapshot rather than one this
+    // person typed, and text from somewhere else cannot be trusted to stay inside its cells.
+    let before = format::safe(&before);
+    let at_cursor = format::safe(&at_cursor);
 
     let mut spans = vec![
         Span::styled(format!("{label:<width$}"), Style::new().fg(theme::INK_400)),
@@ -327,6 +333,18 @@ mod tests {
             "the cursor was not drawn on a character"
         );
         assert_eq!(line.spans[4].style.fg, Some(theme::RED_500));
+    }
+
+    #[test]
+    fn a_field_draws_text_that_came_from_elsewhere_clean() {
+        // The folder field starts life holding a path from the snapshot, not one this person typed,
+        // so what it holds is remote text: a character that would reorder or escape a row has to be
+        // gone before it is drawn, the same as everywhere else on the screen.
+        let line = field("Save to", &Input::new("/down\u{202e}loads"), 17, false);
+        assert_eq!(
+            text(&line),
+            format!("Save to{}  /downloads ", " ".repeat(10))
+        );
     }
 
     #[test]

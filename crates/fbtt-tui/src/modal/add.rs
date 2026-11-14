@@ -1,5 +1,6 @@
 //! The add dialog: a magnet link or the path of a `.torrent` file, and where its files go.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -16,6 +17,8 @@ const LABELS: [&str; 2] = ["Torrent or magnet", "Save to"];
 /// A `.torrent` file this big is not a torrent file. The cap is what keeps a mistyped path from
 /// reading a whole video into memory on the thread that also has to draw the screen.
 const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
+/// What the dialog says about a file it will not read, in the words the brief specifies.
+const TOO_BIG: &str = "File is larger than 16 MiB";
 
 /// What the person is typing into the add dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,16 +165,29 @@ fn expand_tilde(text: &str) -> PathBuf {
 }
 
 /// The bytes of a `.torrent` file, or the reason it could not be read: the operating system's own
-/// words for a path that is not there, plus one check of our own for a file too big to read. The
-/// size is asked for first so that an over-large file is refused without reading it in.
+/// words for a path that is not there, plus one check of our own for a file too big to read.
+///
+/// The size is asked for first because that is the cheap answer, but it is not the one trusted:
+/// `/dev/zero` reports a length of nothing and answers forever to a read that is not told where to
+/// stop, which would freeze the thread that also has to draw the screen. So the read itself is
+/// capped at one byte past the limit, and a file that reaches that many bytes is refused whether
+/// or not its own length said so.
 fn read_torrent(path: &Path) -> Result<Vec<u8>, String> {
     let size = std::fs::metadata(path)
         .map_err(|error| error.to_string())?
         .len();
     if size > MAX_TORRENT_BYTES {
-        return Err("File is larger than 16 MiB".to_string());
+        return Err(TOO_BIG.to_string());
     }
-    std::fs::read(path).map_err(|error| error.to_string())
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_TORRENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_TORRENT_BYTES {
+        return Err(TOO_BIG.to_string());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -212,5 +228,16 @@ mod tests {
         let error = read_torrent(Path::new("/definitely/not/here.torrent"))
             .expect_err("a path that is not there should not read");
         assert!(!error.is_empty(), "the reason for failing was blank");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_that_would_never_end_is_stopped_by_the_cap() {
+        // `/dev/zero` says it is nothing long and would answer forever to an unbounded read, so
+        // the cap has to be enforced by how much was actually taken rather than by what the path
+        // claims. A read that hung here would hang the thread that draws the screen.
+        let error = read_torrent(Path::new("/dev/zero"))
+            .expect_err("an endless source should not read as a torrent");
+        assert_eq!(error, "File is larger than 16 MiB");
     }
 }
