@@ -19,8 +19,14 @@ missing_debug_implementations = "warn"
 all = "warn"
 
 # Every dependency is declared here and inherited with `dep.workspace = true`;
-# crates never pin their own versions. Later tasks add what they need: fbt (git,
-# tag v0.8.0) plus serde, serde_norway, directories, thiserror, tokio, ratatui
-# and crossterm arrive with the code that uses them.
+# crates never pin their own versions. Later tasks add what they need: tokio,
+# ratatui and crossterm arrive with the code that uses them. fbt (git, tag
+# v0.8.0) arrived with the config, whose settings map onto `fbt::Settings`.
 [workspace.dependencies]
 clap = { version = "4.6", features = ["derive"] }
+directories = "6"
+fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.8.0", features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+# serde_yaml is unmaintained (RUSTSEC-2024-0340); this is its maintained fork.
+serde_norway = "0.9"
+thiserror = "2"

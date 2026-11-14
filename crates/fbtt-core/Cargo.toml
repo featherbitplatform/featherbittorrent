@@ -12,6 +12,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Added by later tasks, always with `dep.workspace = true`: serde, serde_norway,
-# directories and thiserror with the config (Task 2), fbt with the backend
-# (Task 4).
+directories.workspace = true
+fbt.workspace = true
+serde.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+# Added by later tasks, always with `dep.workspace = true`: what the library
+# lock and the backend over `fbt::Session` need (Tasks 3 and 4).
