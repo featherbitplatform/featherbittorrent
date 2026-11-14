@@ -7,6 +7,7 @@
 //! writing the file at all: an empty library saved over bytes nobody read is worse than a
 //! library that has to be re-added by hand.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use fbt::{AddTorrent, SessionState, TorrentSource};
@@ -103,14 +104,16 @@ pub(super) fn read_state(path: &Path) -> Reading {
 
 /// Keeps a copy of `bytes` beside the state file, under `<name>.bak` or the next free name
 /// after it, and leaves the original where it is. Used when some torrents came back and others
-/// did not: the save that follows describes only the ones that did.
+/// did not: the save that follows describes only the ones that did, so these bytes live nowhere
+/// else afterwards - which is why the copy is synced, and why a run that cannot make one stops
+/// writing state at all.
 ///
 /// Returns the name the copy went to, or the reason it did not go anywhere.
 pub(super) fn keep_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let Some(copy) = free_name(path, BACKUP_SUFFIX) else {
         return Err(names_taken(path, BACKUP_SUFFIX));
     };
-    match std::fs::write(&copy, bytes) {
+    match write_synced(&copy, bytes) {
         Ok(()) => Ok(copy),
         Err(source) => Err(format!(
             "{}: {}",
@@ -118,6 +121,16 @@ pub(super) fn keep_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
             map::clean(&source.to_string())
         )),
     }
+}
+
+/// Writes a file and asks the device to have it before returning. `std::fs::write` hands the
+/// bytes to the OS and calls that done; this copy is the only place its bytes exist by the time
+/// the next save lands, so it is not done until [`sync_all`](std::fs::File::sync_all) says the
+/// device has them.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// The line that says both halves of what happened: the library could not be read, and this run

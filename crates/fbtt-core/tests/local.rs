@@ -405,15 +405,16 @@ async fn corrupt_state_is_kept_aside() {
 }
 
 /// A state file this run cannot read at all - here a directory where the file belongs - does
-/// not turn into an empty library: nothing is written over it while the run lasts, and the
-/// notice says both halves of that.
+/// not turn into an empty library: nothing is written over it while the run lasts, the notice
+/// says both halves of that, and the engine still stops with the task rather than being left
+/// running behind the released lock.
 #[tokio::test(flavor = "multi_thread")]
 async fn unreadable_state_is_never_overwritten() {
     let lib = Library::new("local_unreadable_state");
     fs::create_dir_all(&lib.paths.data_dir).expect("the data directory");
     fs::create_dir(lib.paths.state_file()).expect("a state path that is a directory");
 
-    let (mut client, task, _) = lib.start().await;
+    let (mut client, task, engine) = lib.start().await;
     let problem = error_text(notice(&mut client).await);
     assert!(
         problem.contains("could not be read") && problem.contains("will not save torrents"),
@@ -435,6 +436,12 @@ async fn unreadable_state_is_never_overwritten() {
     assert!(
         lib.paths.state_file().is_dir(),
         "what could not be read is still there, not a file this run wrote over it"
+    );
+    // The engine stopped with the task rather than being left running behind a dropped lock:
+    // a session that is only dropped closes its sockets and leaves every torrent task writing.
+    assert!(
+        engine.is_shut_down(),
+        "the run shut the engine down on its way out"
     );
 }
 
@@ -505,6 +512,71 @@ async fn failed_restore_keeps_backup() {
     );
 
     shutdown(client, task).await;
+}
+
+/// A run that cannot keep its copy of what it could not restore writes no state at all: the save
+/// that follows would erase those torrents' only bytes, so they stay under their own name instead.
+/// Unix-only, because making a directory refuse a new file is a permission there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_backup_blocks_state_writes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lib = Library::new("local_backup_blocked");
+    fs::create_dir_all(&lib.paths.data_dir).expect("the data directory");
+    let mut saved = fbt::SessionState::default();
+    saved.torrents.push(b"not resume data".to_vec());
+    let bytes = saved.to_bytes();
+    fs::write(lib.paths.state_file(), &bytes).expect("a state file with one bad entry");
+
+    // The lock first, because from here on nothing may be created in the data directory - and
+    // the copy of the state file is the thing that has to fail. The engine's own files go to the
+    // download directory, which stays writable, and a held flock needs no room in it either.
+    let lock = LibraryLock::acquire(&lib.paths.lock_file()).expect("lock the library");
+    fs::set_permissions(&lib.paths.data_dir, fs::Permissions::from_mode(0o500))
+        .expect("make the data directory read-only");
+
+    let (mut client, task, engine) = within(LocalBackend::start_for_test(
+        loopback(&lib.config),
+        lib.config.clone(),
+        &lib.paths,
+        lock,
+    ))
+    .await
+    .expect("start the backend on a library it cannot copy");
+
+    let problem = error_text(notice(&mut client).await);
+    assert!(
+        problem.contains("could not be kept") && problem.contains("will not save torrents"),
+        "the notice names the copy that failed and says nothing will be saved: {problem}"
+    );
+
+    // Something worth saving, so that a backend which saved anyway would be caught here.
+    let uri = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=no-copy";
+    assert!(client.send(Command::Add {
+        source: AddSource::Magnet(uri.to_string()),
+        dir: None,
+    }));
+    let id = id_of(&fbt::Magnet::parse(uri).expect("a valid magnet").info_hashes);
+    wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+
+    shutdown(client, task).await;
+    fs::set_permissions(&lib.paths.data_dir, fs::Permissions::from_mode(0o700))
+        .expect("let the scratch directory be removed again");
+
+    assert!(
+        !suffixed(&lib.paths.state_file(), ".bak").exists(),
+        "the copy that could not be made left nothing behind"
+    );
+    assert_eq!(
+        fs::read(lib.paths.state_file()).expect("the state file"),
+        bytes,
+        "a run that could not copy did not save over the bytes it could not restore"
+    );
+    assert!(
+        engine.is_shut_down(),
+        "the run shut the engine down on its way out"
+    );
 }
 
 /// A bad magnet, then the same good magnet twice: both are refused with a notice

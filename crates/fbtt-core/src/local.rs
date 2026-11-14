@@ -102,8 +102,9 @@ impl LocalBackend {
 ///
 /// A state file that cannot be read is left where it is and this run stops writing it; one
 /// that does not decode is kept aside under another name. Resume data that will not come back
-/// is copied out from under it before any save happens. All of that arrives as notices. The
-/// engine clone comes back with the client so a caller can drive the same session.
+/// is copied out from under it before any save happens, and a run that cannot make that copy
+/// writes no state either. All of that arrives as notices. The engine clone comes back with the
+/// client so a caller can drive the same session.
 async fn spawn(
     settings: Settings,
     config: Config,
@@ -122,6 +123,10 @@ async fn spawn(
     // that is what a notice always means. A restore reports one per torrent it could
     // not add, which is how many there can be.
     let mut problems = reading.notices;
+    // A run with nothing it is allowed to write about: set by a state file this run could not
+    // read, by one it could not move aside, and by a copy of the bytes it could not restore that
+    // it failed to keep. All three mean the same thing - writing would replace bytes nobody has.
+    let mut writes_blocked = reading.writes_blocked;
     if let Some(loaded) = &reading.state {
         // Torrents that did not come back deserve kept bytes: the save this run makes describes
         // only what it has, so without a copy those torrents would leave the library twice over
@@ -132,9 +137,12 @@ async fn spawn(
             match state::keep_copy(&paths.state_file(), &reading.bytes) {
                 Ok(copy) => Some(copy),
                 Err(problem) => {
+                    // The save that follows would erase the only bytes those torrents have, and
+                    // this run could not keep them: same answer as a state file it could not read.
+                    writes_blocked = true;
                     problems.push(Notice::Error(format!(
-                        "the saved state could not be copied aside ({problem}); what could not \
-                         be restored will not come back"
+                        "the copy of what could not be restored could not be kept ({problem}); \
+                         this run will not save torrents"
                     )));
                     None
                 }
@@ -175,7 +183,7 @@ async fn spawn(
         paths: paths.clone(),
         watching: None,
         stalled,
-        writes_blocked: reading.writes_blocked,
+        writes_blocked,
         published: initial,
         snapshot_tx: channels.snapshot,
         notices: channels.notices,
@@ -243,9 +251,9 @@ struct Backend {
     /// When each torrent's stalled count last started running: while it is downloading and
     /// taking nothing. See [`map::stalled_clock`].
     stalled: HashMap<TorrentId, Instant>,
-    /// Set when this run could not read what was under `session.state`, or could not move an
-    /// unreadable file out of the way: no state write happens at all while it is set, because
-    /// saving would replace bytes this run never read with a library of its own.
+    /// Set when this run must not write `session.state` at all: something is under that name
+    /// this run could not read, or could not move aside, or could not copy out before saving
+    /// over it. Saving would replace bytes this run never read with a library of its own.
     writes_blocked: bool,
     /// The snapshot the screen is looking at, so that only a change publishes.
     published: Arc<Snapshot>,
@@ -500,8 +508,13 @@ impl Backend {
     /// one from before this run - so it goes out as the message the binary prints.
     async fn save_and_stop(&self) -> Result<(), String> {
         if self.writes_blocked {
-            // Nothing to write, so nothing to fail and no reason to stop the torrents for it:
-            // whatever is under `session.state` stays exactly as this run found it.
+            // Nothing to write, but the torrents still have to be stopped: dropping a session
+            // closes its sockets and leaves every torrent task running with its cached writes
+            // unflushed, and this task is where the library lock goes out - the next
+            // featherbittorrent would find one library being written by two. `shutdown` stops
+            // each torrent with its bytes flushed and does not produce resume data this run has
+            // nowhere to put. Whatever is under `session.state` stays exactly as found.
+            self.session.shutdown().await;
             return Ok(());
         }
         let (state, left_out) = self.session.shutdown_and_save().await;
