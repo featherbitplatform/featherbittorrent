@@ -12,5 +12,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Added by later tasks, always with `dep.workspace = true`: ratatui and
-# crossterm with the views (Task 5), fbtt-core with the model's snapshot types.
+# The snapshot types the model speaks, and `fbt::display_safe` for remote text.
+fbtt-core.workspace = true
+fbt.workspace = true
+# crossterm is here for the key events the model takes; it is the same version
+# ratatui's backend uses, so one crossterm serves both.
+crossterm.workspace = true
+ratatui.workspace = true
