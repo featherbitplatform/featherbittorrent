@@ -1,0 +1,392 @@
+//! Who we are to a server: the credential a request carries, and how it is earned.
+//!
+//! A featherbittorrent server takes one of three things as proof of who is asking - nothing, a user name
+//! and password, or a signature from a device key - and answers with a session token that every later
+//! request carries. A gateway standing in front of a server that runs with authentication off takes the
+//! password on every request instead, or a signed OAuth2 assertion it trades for a bearer token. This
+//! module decides which of those a [`RemoteTarget`] describes, gets the credential, and holds it until it
+//! needs replacing; the transport that carries it is [`super::http`].
+//!
+//! The login calls go out on this module's own client rather than through [`super::Api`], because `Api`
+//! holds this: a login that asked `Api` to send its own request would wait forever on the lock that
+//! already belongs to whoever is waiting for the login to finish.
+//!
+//! Nothing here fails in a way a caller has to handle carefully. A bad combination of settings is an error
+//! at construction, which the backend turns into a notice; everything after that - a refused password, an
+//! agent that is not running, a gateway that will not issue a token - is one line for the screen and a
+//! link that says it is down.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use ssh_key::{Algorithm, HashAlg, LineEnding, Signature, SshSig};
+use zeroize::Zeroizing;
+
+use crate::auth::LOGIN_NAMESPACE;
+use crate::remote::Secret;
+use crate::remote::device::Device;
+use crate::remote::gateway::{Gateway, Live, lives};
+use crate::remote::http::{Credential, basic_header, from_json, read_capped};
+use crate::ui_state::{LoginMethod, RemoteTarget};
+
+/// How much of a credential's life is spent before it is replaced: renewal starts this far ahead of the
+/// expiry the server named, so a token that would expire between here and the next request is not sent.
+pub(crate) const RENEW_BEFORE: Duration = Duration::from_secs(30);
+/// How long a login or a token request may take overall. It is one round trip plus a hash, not a download.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// The life of a gateway assertion this client signs for itself: long enough to survive a slow gateway,
+/// short enough that a leaked one stops being useful on its own.
+pub(crate) const ASSERTION_LIFE: u64 = 60;
+/// The OAuth2 grant type and assertion type of a `private_key_jwt` client (RFC 7523).
+pub(crate) const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/// What this client proves to the server, and the credential that proof bought.
+pub(crate) struct Auth {
+    /// The client every login and token request goes out on. Kept here rather than borrowed from
+    /// [`super::Api`] so a login cannot deadlock on the lock around this `Auth` (see the module docs).
+    client: Client,
+    /// The server's address with no trailing slash: `{base}/api/v1/auth/session` is where a session is.
+    base: String,
+    kind: Kind,
+}
+
+/// Which of the four things this client does to get in.
+enum Kind {
+    /// Nothing: this server asks nobody to prove anything.
+    Open,
+    /// A featherbittorrent server: log in, then carry the token it answers.
+    Server(Server),
+    /// A gateway in front of one: trade a signed assertion for a bearer token.
+    Gateway(Gateway),
+    /// A gateway that takes the user name and password on every request instead.
+    Basic {
+        user: String,
+        password: Zeroizing<String>,
+    },
+}
+
+/// A login to a featherbittorrent server, and the session it bought.
+#[derive(Debug)]
+struct Server {
+    /// Which of this server's logins is being used.
+    login: LoginMethod,
+    /// The account a password login names.
+    user: Option<String>,
+    /// The private key a key login signs with, or the one to look for in ssh-agent.
+    key_path: Option<PathBuf>,
+    /// The passphrase or password, kept until it has been spent.
+    secret: Secret,
+    /// The token we hold, and when it stops being good. `None` once it has been given up on.
+    session: Option<Live>,
+}
+
+impl Auth {
+    /// The credential holder for `target`, signed with `secret`.
+    ///
+    /// Errs only about a target and secret that do not go together - a password login with no user name, a
+    /// gateway with no token endpoint - which is a thing to say once rather than on every request.
+    pub(crate) fn new(target: &RemoteTarget, secret: Secret) -> Result<Auth, String> {
+        let client = Client::builder()
+            .connect_timeout(LOGIN_TIMEOUT)
+            .timeout(LOGIN_TIMEOUT)
+            // The same rule the transport follows: a redirect would leave these paths behind.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|problem| problem.to_string())?;
+        let base = target.url.trim_end_matches('/').to_string();
+        let kind = match target.login {
+            LoginMethod::None => {
+                if matches!(secret, Secret::None) {
+                    Kind::Open
+                } else {
+                    return Err(
+                        "this server needs no credential, so none was asked for".to_string()
+                    );
+                }
+            }
+            LoginMethod::Password | LoginMethod::GatewayBasic => {
+                let user = named(&target.user, "a user name")?;
+                let Secret::Password(password) = secret else {
+                    return Err("a password login needs a password".to_string());
+                };
+                match target.login {
+                    LoginMethod::Password => Kind::Server(Server {
+                        login: LoginMethod::Password,
+                        user: Some(user),
+                        key_path: target.key_path.clone(),
+                        secret: Secret::Password(password),
+                        session: None,
+                    }),
+                    _ => Kind::Basic { user, password },
+                }
+            }
+            LoginMethod::KeyFile | LoginMethod::Agent => Kind::Server(Server {
+                login: target.login,
+                user: target.user.clone(),
+                key_path: target.key_path.clone(),
+                secret,
+                session: None,
+            }),
+            LoginMethod::GatewayKey => Kind::Gateway(Gateway {
+                token_url: named(&target.token_url, "a gateway token endpoint")?,
+                client_id: named(&target.client_id, "a gateway client id")?,
+                key_path: target.key_path.clone(),
+                secret,
+                live: None,
+            }),
+        };
+        Ok(Auth { client, base, kind })
+    }
+
+    /// The credential to put on the next request, signing in or fetching a token when there is none, or
+    /// the one there is has run down.
+    pub(crate) async fn credential(&mut self) -> Result<Credential, String> {
+        // Field by field, so the immutable halves and the mutable half do not fight over `self`.
+        let Auth { client, base, kind } = self;
+        match kind {
+            Kind::Open => Ok(Credential::Open),
+            Kind::Basic { user, password } => Ok(Credential::Basic(
+                user.clone(),
+                password.as_str().to_string(),
+            )),
+            Kind::Server(server) => {
+                if let Some(session) = &server.session
+                    && session.still_good()
+                {
+                    return Ok(Credential::Bearer(session.token.clone()));
+                }
+                let session = server.sign_in(client, base).await?;
+                server.session = Some(session.clone());
+                Ok(Credential::Bearer(session.token))
+            }
+            Kind::Gateway(gateway) => {
+                if let Some(live) = &gateway.live
+                    && live.still_good()
+                {
+                    return Ok(Credential::Bearer(live.token.clone()));
+                }
+                let live = gateway.fetch(client).await?;
+                gateway.live = Some(live.clone());
+                Ok(Credential::Bearer(live.token))
+            }
+        }
+    }
+
+    /// Says the credential we hold is no good, so the next request earns a new one. A server that answered
+    /// `401` has ended a session without telling us; this is how we find that out instead of assuming it.
+    pub(crate) fn invalidate(&mut self) {
+        match &mut self.kind {
+            Kind::Server(server) => server.session = None,
+            Kind::Gateway(gateway) => gateway.live = None,
+            _ => {}
+        }
+    }
+
+    /// Whether this target signs to a gateway rather than to the server itself, which changes what a `403`
+    /// means (see [`super::http::Api::refused`]) and what a notice about a refusal should say.
+    pub(crate) fn signs_for_a_gateway(&self) -> bool {
+        matches!(self.kind, Kind::Gateway(_) | Kind::Basic { .. })
+    }
+
+    /// Ends this client's own session with the server, when it has one to end. A gateway token is not ours
+    /// to revoke - it expires on its own - and a server that asks nobody for anything has nothing to end.
+    /// This is the one thing here that does not need an answer: whatever happens, this client is leaving.
+    pub(crate) async fn log_out(&self) {
+        let Kind::Server(server) = &self.kind else {
+            return;
+        };
+        let Some(session) = &server.session else {
+            return;
+        };
+        let _ = self
+            .client
+            .delete(format!("{}/api/v1/auth/session", self.base))
+            .timeout(LOGIN_TIMEOUT)
+            .bearer_auth(&session.token)
+            .send()
+            .await;
+    }
+}
+
+/// `Debug` for the credential holder says which login is in use and nothing else: a token, a password and
+/// a decrypted key are the three things a log line must not repeat.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let method = match &self.kind {
+            Kind::Open => "no login",
+            Kind::Server(server) => match server.login {
+                LoginMethod::Password => "password",
+                LoginMethod::KeyFile => "device key file",
+                LoginMethod::Agent => "ssh-agent",
+                // A gateway method gets its own holder, so this one is always one of the three above.
+                _ => "device key",
+            },
+            Kind::Gateway(_) => "gateway token",
+            Kind::Basic { .. } => "gateway password",
+        };
+        f.debug_struct("Auth")
+            .field("base", &self.base)
+            .field("login", &method)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Server {
+    /// One login to this server, answered with the token it hands out.
+    async fn sign_in(&self, client: &Client, base: &str) -> Result<Live, String> {
+        match self.login {
+            LoginMethod::Password => {
+                let user = named(&self.user, "a user name")?;
+                let Secret::Password(password) = &self.secret else {
+                    return Err("a password login needs a password".to_string());
+                };
+                let response = client
+                    .post(format!("{base}/api/v1/auth/session"))
+                    .headers(basic_header(&user, password))
+                    .send()
+                    .await
+                    .map_err(reached)?;
+                session(response).await
+            }
+            LoginMethod::KeyFile | LoginMethod::Agent => {
+                let device =
+                    Device::load(self.login, self.key_path.as_deref(), &self.secret).await?;
+                let challenge: ChallengeDto = post(
+                    client,
+                    &format!("{base}/api/v1/auth/challenge"),
+                    &ChallengeBody {
+                        public_key: &device.line,
+                    },
+                )
+                .await?;
+                let nonce = BASE64_URL_SAFE_NO_PAD
+                    .decode(&challenge.nonce)
+                    .map_err(|_| "the server's challenge is not base64url".to_string())?;
+                // The same framing `ssh-keygen -Y sign` uses, so the server's own verifier accepts it.
+                let framed = SshSig::signed_data(LOGIN_NAMESPACE, HashAlg::Sha512, &nonce)
+                    .map_err(|problem| problem.to_string())?;
+                let signature = device.sign(&framed).await?;
+                let sshsig = SshSig::new(
+                    device.public.clone(),
+                    LOGIN_NAMESPACE,
+                    HashAlg::Sha512,
+                    Signature::new(Algorithm::Ed25519, signature)
+                        .map_err(|problem| problem.to_string())?,
+                )
+                .map_err(|problem| problem.to_string())?;
+                let body = KeyLoginBody {
+                    public_key: &device.line,
+                    nonce: &challenge.nonce,
+                    signature: &sshsig
+                        .to_pem(LineEnding::LF)
+                        .map_err(|problem| problem.to_string())?,
+                };
+                session(
+                    client
+                        .post(format!("{base}/api/v1/auth/session"))
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(reached)?,
+                )
+                .await
+            }
+            // A gateway method never gets here: it has its own holder.
+            _ => Err("this login method is not a server login".to_string()),
+        }
+    }
+}
+
+/// A `POST` of JSON that answers JSON, with the failures this client cares about turned into lines.
+async fn post<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    body: &impl Serialize,
+) -> Result<T, String> {
+    let response = client.post(url).json(body).send().await.map_err(reached)?;
+    json(response).await
+}
+
+/// One answer to a login: the token and how long it lives.
+async fn session(response: reqwest::Response) -> Result<Live, String> {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default)]
+    struct SessionDto {
+        token: String,
+        expires_in: u64,
+    }
+    let live = json::<SessionDto>(response).await?;
+    if live.token.is_empty() {
+        return Err("the server answered with no session token".to_string());
+    }
+    Ok(Live {
+        token: live.token,
+        expires_at: lives(live.expires_in),
+    })
+}
+
+/// A successful response's JSON, or the reason a failed one gave.
+async fn json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
+    let status = response.status();
+    let body = read_capped(response)
+        .await
+        .map_err(|problem| problem.notice())?;
+    if !status.is_success() {
+        return Err(reason(&body, status));
+    }
+    from_json(body).map_err(|problem| problem.notice())
+}
+
+/// The reason a server or gateway gave for refusing something, or the status when it gave none.
+pub(crate) fn reason(body: &[u8], status: reqwest::StatusCode) -> String {
+    let message = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty());
+    message.unwrap_or_else(|| format!("the server answered {status}"))
+}
+
+/// The body of `POST /api/v1/auth/challenge`.
+#[derive(Serialize)]
+struct ChallengeBody<'a> {
+    public_key: &'a str,
+}
+
+/// The body of a key login: the three fields the server's route names, and no others.
+#[derive(Serialize)]
+struct KeyLoginBody<'a> {
+    public_key: &'a str,
+    nonce: &'a str,
+    signature: &'a str,
+}
+
+/// The challenge a server answers with: the bytes to sign. How long they stay answerable is not read -
+/// this client answers the challenge it was just given, in the same round.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ChallengeDto {
+    nonce: String,
+}
+
+/// A target field one of these logins cannot do without.
+fn named(value: &Option<String>, what: &str) -> Result<String, String> {
+    value
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("this connection needs {what}"))
+}
+
+/// A login request that never got an answer.
+pub(crate) fn reached(problem: reqwest::Error) -> String {
+    format!("the sign-in request did not reach the server: {problem}")
+}

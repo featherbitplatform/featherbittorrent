@@ -26,7 +26,16 @@ version = 2
 # Unmaintained notices only for crates we depend on directly; transitive ones are outside our
 # control. Vulnerabilities still fail at any depth.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # Both come in through `ssh-agent-lib` 0.6, which pins `ssh-key` 0.6 and is the only thing in this
+    # tree that speaks the ssh-agent protocol (`LoginMethod::Agent`). Neither notice describes work this
+    # client asks of them: a device key here is Ed25519, and the agent path signs with and compares an
+    # Ed25519 identity, so no RSA private-key operation and no ECDSA arithmetic ever runs. The fixes are
+    # `rsa` 0.10 and `crypto-bigint` 0.7 - releases that pinned `ssh-key` cannot take - so this records
+    # an upstream release we are waiting on rather than a judgement made here.
+    "RUSTSEC-2023-0071", # `rsa` timing sidechannel (Marvin attack); no RSA key is ever unlocked.
+    "RUSTSEC-2026-0387", # `crypto-bigint` constant-time branches; no ECDSA curve is ever used.
+]
 
 [bans]
 multiple-versions = "warn"

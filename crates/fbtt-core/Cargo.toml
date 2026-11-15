@@ -18,15 +18,37 @@ workspace = true
 test-support = []
 
 [dependencies]
+# The nonce a challenge gives is base64url, and so is a JWT's header and payload.
+base64.workspace = true
 directories.workspace = true
 fbt.workspace = true
+# Only the `Stream` trait, polled by hand in the event stream reader: reqwest's body stream is one,
+# and this adds no version to the lock (see the workspace comment).
+futures-core.workspace = true
+# The JWT assertion's `jti`: a fresh random id per attempt.
+getrandom.workspace = true
+# The remote backend (Task 6): rustls with the `ring` provider, which is what `fbt`'s own `tls`
+# feature builds, so no second crypto provider joins the tree; `json` for the bodies it sends and
+# reads, `stream` for the event stream.
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
 serde.workspace = true
+serde_json.workspace = true
 serde_norway.workspace = true
+# The `Signer` trait ssh-key implements but does not re-export: it is how a device key signs a
+# gateway assertion over the exact bytes that are sent (see the workspace comment).
+signature.workspace = true
+# ...or held by ssh-agent, in which case its bytes are never read. `agent` is the tokio client: the
+# blocking one would stop the backend's task.
+ssh-agent-lib = { workspace = true, features = ["agent"] }
+# The device key a login or a gateway assertion is signed with, from its file.
+ssh-key.workspace = true
 thiserror.workspace = true
+# The password and key passphrase, overwritten when they are dropped.
+zeroize.workspace = true
 # The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
 # it needs `macros`; `spawn_blocking` is `rt`, the state save's cadence is `time`, and
-# the queues are `sync`.
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+# the queues are `sync`. `net` is for the ssh-agent socket the key login talks to (Task 6).
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]`, and a runtime with worker threads: each test runs two live

@@ -78,6 +78,11 @@ ssh-key = { version = "0.7.0-rc.11", default-features = false, features = [
     "std",
     "rand_core",
 ] }
+# The `Signer` trait, so a device key can sign a gateway assertion over raw bytes. ssh-key implements
+# it for `PrivateKey` but re-exports only `Signature` and `SigningKey`, and a supertrait's methods are
+# not in scope just because the trait that names them is - so the trait is depended on directly, at the
+# version ssh-key 0.7 uses, which is what makes it the same trait the impl is written for.
+signature = { version = "3", default-features = false }
 # Only for the `http` types an `AuthRequest` carries (the method and the headers), which fbt-api
 # does not re-export. Depending on axum itself - not on `http` - is what keeps ours one crate with
 # the `HeaderMap` fbt-api hands us. fbt-api turns the serving features on for the tree.
@@ -93,6 +98,13 @@ tracing = "0.1"
 # names rustls with the `ring` provider, which is what `fbt`'s own `tls` feature turns on, so no
 # second crypto provider joins the tree; these tests speak plain http to loopback and ask for none.
 reqwest = { version = "0.12", default-features = false }
+# The remote backend signs logins with a device key held by ssh-agent as well as in a file, so it
+# speaks the agent protocol rather than reimplementing it. Its `agent` feature is what turns on the
+# tokio client; without it only the blocking one exists, and the backend's task must not block.
+ssh-agent-lib = { version = "0.6", default-features = false }
+# What the remote backend holds a password or a key passphrase in while it is in memory: `Zeroizing`
+# overwrites the bytes when they are dropped. Already in the tree through rustls and ssh-key.
+zeroize = "1"
 # The binary's log lines for `serve`, which logs to stderr: `fmt` for the lines themselves,
 # `env-filter` so `RUST_LOG` is honoured. No default features: `ansi` is off because the binary
 # decides itself whether stderr takes colours, and `tracing-log` would bridge a `log` crate that

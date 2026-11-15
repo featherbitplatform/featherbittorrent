@@ -57,10 +57,21 @@ fbtt-core = { workspace = true, features = ["test-support"] }
 # a server on loopback, so no TLS stack and no trust store is asked for - which is also why the workspace
 # default (its native-tls) stays off rather than dragging a system certificate lookup into the tests.
 reqwest = { workspace = true, default-features = false, features = ["json"] }
+# The gateway fake checks a `private_key_jwt` assertion's raw Ed25519 signature against the device's
+# public key. ssh-key implements `signature::Verifier` for its keys but does not re-export the trait, so
+# the test names it here to call that one method.
+signature.workspace = true
 # `#[tokio::test]`, and a runtime with worker threads: each test runs a server, an engine and a
-# blocking-pool Argon2 verify at once.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# blocking-pool Argon2 verify at once. `net` is for the two servers `tests/remote.rs` puts up of its own -
+# a hostile one and a gateway one - beside the real one.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [[test]]
 name = "server"
+required-features = ["test-support"]
+
+# The remote backend (Task 6) drives a `Server` from another process's position: the tests live here
+# rather than in fbtt-core so they can start one.
+[[test]]
+name = "remote"
 required-features = ["test-support"]

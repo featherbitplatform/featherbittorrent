@@ -21,6 +21,7 @@ pub mod fs_list;
 pub mod local;
 pub mod lock;
 pub mod paths;
+pub mod remote;
 pub mod ui_state;
 
 pub use auth::LOGIN_NAMESPACE;
@@ -36,6 +37,7 @@ pub use engine::Engine;
 pub use local::LocalBackend;
 pub use lock::{LibraryLock, LockError};
 pub use paths::Paths;
+pub use remote::{RemoteBackend, Secret};
 pub use ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
 
 /// A directory under the system temp dir, removed when the test that made it is done.
