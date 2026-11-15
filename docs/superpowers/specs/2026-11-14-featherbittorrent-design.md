@@ -141,7 +141,7 @@ On untrusted networks the recommended setup is the featherbit gateway (or anothe
 - both: the gateway authenticates first (for example OpenID Connect through its `openid-connect` plugin for browsers, with `multi-auth` and `key-auth` or `basic-auth` for the TUI), then featherbittorrent's own login;
 - the gateway only: featherbittorrent runs with authentication off, reachable only from the gateway, and accepts only the gateway's host name (`server.allowed_hosts`).
 
-The TUI can send a gateway credential (a key header or basic auth) on every request, so it never needs an OpenID Connect login of its own. The docs ship an example docker compose with an OpenID Connect provider light enough for the reference Raspberry Pi. **[owner, 2026-11-15]**
+Behind a gateway, the TUI authenticates its device with its private key: OAuth2 client credentials with `private_key_jwt` at the OpenID Connect provider, then the access token as a bearer to the gateway, which validates it. Basic auth to the gateway is the simple fallback. **[owner, 2026-11-15]** The docs ship an example docker compose with an OpenID Connect provider light enough for the reference Raspberry Pi. **[owner, 2026-11-15]**
 
 ### 6.5 API
 
