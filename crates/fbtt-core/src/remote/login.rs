@@ -27,17 +27,24 @@ use ssh_key::{Algorithm, HashAlg, LineEnding, Signature, SshSig};
 use zeroize::Zeroizing;
 
 use crate::auth::LOGIN_NAMESPACE;
+use crate::engine::map::clean;
 use crate::remote::Secret;
+use crate::remote::bodies::{from_json, read_capped};
 use crate::remote::device::Device;
-use crate::remote::gateway::{Gateway, Live, lives};
-use crate::remote::http::{Credential, basic_header, from_json, read_capped};
+use crate::remote::gateway::{Gateway, Live};
+use crate::remote::http::{Credential, basic_header};
 use crate::ui_state::{LoginMethod, RemoteTarget};
 
-/// How much of a credential's life is spent before it is replaced: renewal starts this far ahead of the
-/// expiry the server named, so a token that would expire between here and the next request is not sent.
+/// How much of a long credential's life is spent before it is replaced: renewal starts this far ahead of the
+/// expiry the server named, so a token that would expire between here and the next request is not sent. A
+/// credential shorter than twice this renews at half its life instead (see [`Live::bought`]).
 pub(crate) const RENEW_BEFORE: Duration = Duration::from_secs(30);
 /// How long a login or a token request may take overall. It is one round trip plus a hash, not a download.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the revoke that ends our session on the way out may take. A person pressing stop is not waiting
+/// for an answer they will never use, and a server that has gone quiet would make this the longest part of
+/// closing the connection ([`super::http::Api::log_out`]).
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The life of a gateway assertion this client signs for itself: long enough to survive a slow gateway,
 /// short enough that a leaked one stops being useful on its own.
 pub(crate) const ASSERTION_LIFE: u64 = 60;
@@ -149,10 +156,7 @@ impl Auth {
         let Auth { client, base, kind } = self;
         match kind {
             Kind::Open => Ok(Credential::Open),
-            Kind::Basic { user, password } => Ok(Credential::Basic(
-                user.clone(),
-                password.as_str().to_string(),
-            )),
+            Kind::Basic { user, password } => Ok(Credential::Basic(user.clone(), password.clone())),
             Kind::Server(server) => {
                 if let Some(session) = &server.session
                     && session.still_good()
@@ -192,9 +196,34 @@ impl Auth {
         matches!(self.kind, Kind::Gateway(_) | Kind::Basic { .. })
     }
 
+    /// The credential in hand right now, without signing in: what the event stream is allowed to send, and
+    /// `None` when a request would first have to log in or fetch a token. The stream takes this rather than
+    /// [`Self::credential`] so that only the refresh loop ever spends a login (see [`super::sse`]).
+    pub(crate) fn held(&self) -> Option<Credential> {
+        match &self.kind {
+            Kind::Open => Some(Credential::Open),
+            Kind::Basic { user, password } => {
+                Some(Credential::Basic(user.clone(), password.clone()))
+            }
+            // A credential in its renewal window counts as not held: the stream would be sending a token the
+            // refresh loop is about to replace, and waiting costs it nothing.
+            Kind::Server(server) => server
+                .session
+                .as_ref()
+                .filter(|session| session.still_good())
+                .map(|session| Credential::Bearer(session.token.clone())),
+            Kind::Gateway(gateway) => gateway
+                .live
+                .as_ref()
+                .filter(|live| live.still_good())
+                .map(|live| Credential::Bearer(live.token.clone())),
+        }
+    }
+
     /// Ends this client's own session with the server, when it has one to end. A gateway token is not ours
     /// to revoke - it expires on its own - and a server that asks nobody for anything has nothing to end.
-    /// This is the one thing here that does not need an answer: whatever happens, this client is leaving.
+    /// This is the one thing here that does not need an answer: whatever happens, this client is leaving, so
+    /// the revoke gets [`REVOKE_TIMEOUT`] in total rather than the fifteen a login is allowed.
     pub(crate) async fn log_out(&self) {
         let Kind::Server(server) = &self.kind else {
             return;
@@ -202,13 +231,15 @@ impl Auth {
         let Some(session) = &server.session else {
             return;
         };
-        let _ = self
+        let revoke = self
             .client
             .delete(format!("{}/api/v1/auth/session", self.base))
-            .timeout(LOGIN_TIMEOUT)
+            .timeout(REVOKE_TIMEOUT)
             .bearer_auth(&session.token)
-            .send()
-            .await;
+            .send();
+        // The request's own ceiling plus a wall-clock one: a client on its way out should not have to trust
+        // that the timeout machinery is what ends it.
+        let _ = tokio::time::timeout(REVOKE_TIMEOUT, revoke).await;
     }
 }
 
@@ -323,10 +354,7 @@ async fn session(response: reqwest::Response) -> Result<Live, String> {
     if live.token.is_empty() {
         return Err("the server answered with no session token".to_string());
     }
-    Ok(Live {
-        token: live.token,
-        expires_at: lives(live.expires_in),
-    })
+    Ok(Live::bought(live.token, live.expires_in))
 }
 
 /// A successful response's JSON, or the reason a failed one gave.
@@ -341,7 +369,9 @@ async fn json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Re
     from_json(body).map_err(|problem| problem.notice())
 }
 
-/// The reason a server or gateway gave for refusing something, or the status when it gave none.
+/// The reason a server or gateway gave for refusing something, or the status when it gave none. The message
+/// is somebody else's text and this client repeats it on the screen, so it goes through the same cut and
+/// clean every other remote string gets (see [`crate::engine::map::clean`]).
 pub(crate) fn reason(body: &[u8], status: reqwest::StatusCode) -> String {
     let message = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -350,7 +380,7 @@ pub(crate) fn reason(body: &[u8], status: reqwest::StatusCode) -> String {
                 .get("error")
                 .and_then(|error| error.get("message"))
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+                .map(clean)
         })
         .filter(|message| !message.is_empty());
     message.unwrap_or_else(|| format!("the server answered {status}"))

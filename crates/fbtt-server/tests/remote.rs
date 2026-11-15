@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -692,6 +692,110 @@ async fn wrong_password_is_a_notice() {
     within(server.shutdown()).await.expect("the last save ran");
 }
 
+/// A target this client cannot use at all - a password login with no user name to go with it - is reported on
+/// the client rather than thrown at whoever called `start`: one line saying what is missing, and a link that
+/// admits it is down instead of one that keeps "connecting" while nothing can ever fix it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_that_cannot_be_used_says_the_link_is_down() {
+    let mut client = RemoteBackend::start(
+        RemoteTarget {
+            // Nothing is dialled, so this address only has to look like one: what fails is the pairing of
+            // method and secret, before any request is made.
+            url: "http://127.0.0.1:1".to_string(),
+            login: LoginMethod::Password,
+            user: None,
+            key_path: None,
+            token_url: None,
+            client_id: None,
+        },
+        Secret::Password("hunter2".to_string().into()),
+    );
+
+    let lines = notices_until(&mut client, |lines| !lines.is_empty()).await;
+    assert!(
+        lines.iter().any(|line| line.contains("user name")),
+        "the line says what is missing: {lines:?}"
+    );
+    // Nothing was dialled, so the snapshot that `start` published is already final: an address this client
+    // cannot put a request on is not one a later attempt would do better at, and a header that spun forever
+    // would read as a server that is still being reached.
+    let Connection::Remote { state, .. } = &client.snapshot().connection else {
+        panic!("a remote backend says where it came from");
+    };
+    assert!(
+        matches!(state, LinkState::Lost { retry_in_secs: 1 }),
+        "a target nobody can dial says so rather than spinning: {state:?}"
+    );
+
+    // It still answers its screen, including the request to stop.
+    assert!(client.send(Command::ListDirs(None)));
+    shutdown(&mut client).await;
+}
+
+/// Takes back `port` after its server has gone. A listener can linger for a moment after the process that
+/// held it stops, so this tries until it gets the port or the deadline says it never will.
+async fn bind_black_hole(port: u16) -> tokio::net::TcpListener {
+    within(async {
+        loop {
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(problem) if problem.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(problem) => panic!("cannot take port {port}: {problem}"),
+            }
+        }
+    })
+    .await
+}
+
+/// Pressing stop is not held up by a server that has stopped answering. The revoke that ends this client's own
+/// session gets two seconds of its own rather than the fifteen a login is allowed, and a request already in
+/// flight is given up on when the stop arrives rather than waited out: so the task ends within about those two
+/// seconds whatever the server is doing with the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_is_quick_when_server_is_gone() {
+    let lib = Library::new("remote_quick_shutdown", vec![alice()], vec![]);
+    let (server, addr) = lib.serve().await;
+    let port = addr.port();
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    // The server goes away, and something that accepts connections and answers none of them takes its port.
+    // From here every request this client makes waits for an answer that is not coming.
+    within(server.shutdown()).await.expect("the last save ran");
+    let black_hole = bind_black_hole(port).await;
+    tokio::spawn(async move {
+        // Held open and never written to. `forget` is what holds it: dropping the socket would close it, and
+        // a close is an answer - this port is supposed to give none.
+        loop {
+            let (socket, _) = black_hole.accept().await.expect("the black hole accepts");
+            std::mem::forget(socket);
+        }
+    });
+
+    // The stop goes in immediately: whether or not a round of reads happens to be waiting on the black hole
+    // at this moment, it is the same two seconds either way, which is the point of the test.
+    let started = tokio::time::Instant::now();
+    assert!(
+        client.send(Command::Shutdown),
+        "the queue takes the last command"
+    );
+    while let Some(notice) = within(client.notice()).await {
+        eprintln!("notice on the way out: {}", text(notice));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the task ended in {:.1} s: the revoke gets two seconds and nothing else is waited on",
+        elapsed.as_secs_f64()
+    );
+}
+
 // --------------------------------------------------------------------------------------- the fake servers
 
 /// What a fake server accepts as proof of who is asking, and what it remembers about the requests it saw.
@@ -712,21 +816,38 @@ struct Fake {
     client_id: String,
     /// How many times the torrent list was asked for (the hostile server answers it differently each time).
     torrents_calls: AtomicUsize,
+    /// Whether this fake answers its first three torrent lists rudely. `hostile_server_is_bounded` needs that;
+    /// every other test wants the same answer every time so it can count what a client does.
+    rude: bool,
+    /// How many login requests arrived at `/api/v1/auth/session`, right or wrong. Counting these is how the
+    /// backoff tests show a client is not hammering a refused password.
+    logins: AtomicUsize,
+    /// How many event streams were dialled. A client whose link is down should not be dialling any.
+    event_dials: AtomicUsize,
+    /// The session token `Mode::Session` accepts right now: empty until somebody logs in.
+    session: Mutex<String>,
+    /// Set by a test to end every session this fake handed out - which is how a client finds out its token is
+    /// dead the way it does with a real server: by being refused for it.
+    revoked: AtomicBool,
+    /// Set once `burst_events` has written its burst of frames, so a test knows when they are behind it.
+    burst_written: AtomicBool,
 }
 
 /// The credential a fake server insists on.
 enum Mode {
     /// Nothing: every request is somebody.
     Open,
-    /// A bearer token, which must be the one this fake just issued.
+    /// A bearer token this fake issued, any one that has not been overtaken by a newer issue.
     Bearer,
     /// A user name and password on every request.
     Basic(String, String),
+    /// A session token, earned at `/api/v1/auth/session` with `alice` and her password.
+    Session,
 }
 
 impl Fake {
     /// A fake that insists on `mode` and is otherwise default: the temp folder as its one root, no token
-    /// issued yet.
+    /// issued yet, and every route answering the same way every time.
     fn new(mode: Mode) -> Arc<Fake> {
         Arc::new(Fake {
             mode,
@@ -738,11 +859,33 @@ impl Fake {
             public_key: None,
             client_id: "featherbittorrent-test".to_string(),
             torrents_calls: AtomicUsize::new(0),
+            rude: false,
+            logins: AtomicUsize::new(0),
+            event_dials: AtomicUsize::new(0),
+            session: Mutex::new(String::new()),
+            revoked: AtomicBool::new(false),
+            burst_written: AtomicBool::new(false),
         })
     }
 
+    /// The hostile fake: nothing asked for, and a torrent list that is rude on its first three calls.
     fn open() -> Arc<Fake> {
+        let mut fake =
+            Arc::into_inner(Fake::new(Mode::Open)).expect("nobody else holds this test state");
+        fake.rude = true;
+        Arc::new(fake)
+    }
+
+    /// A fake that asks for nothing and answers everything the same way: for counting what a client does
+    /// rather than testing how it copes with what it is handed.
+    fn plain() -> Arc<Fake> {
         Fake::new(Mode::Open)
+    }
+
+    /// The session fake: `POST /api/v1/auth/session` with `alice` and her password earns a token that every
+    /// other route then has to carry, and setting `revoked` ends the one it handed out.
+    fn session() -> Arc<Fake> {
+        Fake::new(Mode::Session)
     }
 
     /// The bearer fake for a device key, with the token's life spelled out. Which credential counts is
@@ -776,11 +919,29 @@ impl Fake {
         match &self.mode {
             Mode::Open => {}
             Mode::Bearer => {
-                let want = self.issued_token();
-                if given != format!("Bearer {want}") {
+                // Any token this gateway issued counts, not only the newest: a renewal leaves the older one
+                // good until its own expiry, and a client with a request of its still in flight is not doing
+                // anything wrong.
+                let number = match given.strip_prefix("Bearer token-") {
+                    Some(number) => number.parse::<usize>().ok(),
+                    None => None,
+                };
+                let issued = self.issued.load(Ordering::SeqCst);
+                if !number.is_some_and(|number| number < issued) {
                     return Err((
                         StatusCode::UNAUTHORIZED,
-                        "the bearer token is not the one this gateway issued".to_string(),
+                        "the bearer token is not one this gateway issued".to_string(),
+                    ));
+                }
+            }
+            // The token is whatever `session_login` last handed out - unless a test has said the session is
+            // over, which is how a client finds its credential is dead: by being refused for it.
+            Mode::Session => {
+                let want = self.session.lock().expect("the test state").clone();
+                if self.revoked.load(Ordering::SeqCst) || given != format!("Bearer {want}") {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "this session is not one this server issued".to_string(),
                     ));
                 }
             }
@@ -810,20 +971,10 @@ impl Fake {
         Ok(())
     }
 
-    /// The token this fake issued last, or an empty string when it has issued none: a request that arrives
-    /// before the client has a token has not earned one.
-    fn issued_token(&self) -> String {
-        self.assertions
-            .lock()
-            .expect("the test state")
-            .last()
-            .map(|_| {
-                format!(
-                    "token-{}",
-                    self.issued.load(Ordering::SeqCst).saturating_sub(1)
-                )
-            })
-            .unwrap_or_default()
+    /// The bearer token a request has to carry for `Mode::Session`: whatever `session_login` handed out, or
+    /// an empty string nobody holds until somebody logs in.
+    fn session_token(&self) -> String {
+        self.session.lock().expect("the test state").clone()
     }
 }
 
@@ -861,18 +1012,19 @@ async fn roots(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
 }
 
 /// The torrent list. The hostile fake answers its first three calls differently, which is how one test
-/// exercises a body that is too big, a body that is not JSON, and a good round between them.
+/// exercises a body that is not JSON, a good round between them, and a body that is too big; every other
+/// fake answers the same way every time, so a test can count the calls instead.
 async fn torrents(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
     if let Err(problem) = fake.check(&headers) {
         return problem.into_response();
     }
     match fake.torrents_calls.fetch_add(1, Ordering::SeqCst) {
-        0 => (
+        0 if fake.rude => (
             [(header::CONTENT_TYPE, "application/json")],
             "{ \"not\": [\"a torrent list\"",
         )
             .into_response(),
-        2 => {
+        2 if fake.rude => {
             let big = vec![b'x'; 17 * 1024 * 1024];
             (
                 [(header::CONTENT_TYPE, "application/json")],
@@ -935,6 +1087,89 @@ async fn endless_events(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Re
         .into_response()
 }
 
+/// `POST /api/v1/auth/session`: the one password login this fake knows, answered with a session token and
+/// how long it lives. It counts every attempt - right or wrong - because counting those is how a test shows
+/// a client is retrying on a ladder rather than hammering a refused password.
+async fn session_login(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    fake.logins.fetch_add(1, Ordering::SeqCst);
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    // Both base64 spellings are accepted, the same way `Fake::check` accepts them for a gateway: this route
+    // is standing in for a server's, and it should not care how a client encoded the pair.
+    let decoded = match given.strip_prefix("Basic ") {
+        Some(rest) => BASE64_URL_SAFE_NO_PAD
+            .decode(rest)
+            .or_else(|_| base64::prelude::BASE64_STANDARD.decode(rest))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if String::from_utf8_lossy(&decoded).as_ref() != "alice:hunter2" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {"code": "unauthorized", "message": "sign-in refused: wrong password"}
+            })),
+        )
+            .into_response();
+    }
+    let number = fake.issued.fetch_add(1, Ordering::SeqCst);
+    let token = format!("session-{number}");
+    *fake.session.lock().expect("the test state") = token.clone();
+    // A login that worked means sessions are being served again, whatever a test revoked before it.
+    fake.revoked.store(false, Ordering::SeqCst);
+    (
+        StatusCode::CREATED,
+        Json(json!({ "token": token, "expires_in": 3_600 })),
+    )
+        .into_response()
+}
+
+/// The event stream for the tests that count: it records the dial - refused ones included, because a client
+/// dialling at all is what those tests are about - then answers one frame and ends.
+async fn counted_events(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    fake.event_dials.fetch_add(1, Ordering::SeqCst);
+    if let Err(problem) = fake.check(&headers) {
+        return problem.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        "event: ready\ndata: {}\n\n",
+    )
+        .into_response()
+}
+
+/// How many frames `burst_events` writes at once: thousands, so that a client which woke once per event
+/// would re-read the torrent list thousands of times if wakes were coalesced into one.
+const EVENT_BURST: usize = 10_000;
+
+/// A stream that answers its first call with [`EVENT_BURST`] frames at once and every later call with
+/// nothing at all - not even headers, which is what a server with nothing to say looks like to this client.
+/// The burst flag says when the frames are behind the server, so a test can measure what happened after them.
+async fn burst_events(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    fake.event_dials.fetch_add(1, Ordering::SeqCst);
+    if let Err(problem) = fake.check(&headers) {
+        return problem.into_response();
+    }
+    // `compare_exchange` rather than read-and-set: a reconnect can overlap the first dial, and only one of
+    // them is the first.
+    if fake
+        .burst_written
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let mut body = String::with_capacity(EVENT_BURST * 32);
+        for n in 0..EVENT_BURST {
+            body.push_str(&format!("event: torrent-changed\ndata: {{\"n\":{n}}}\n\n"));
+        }
+        return ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response();
+    }
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hostile_server_is_bounded() {
     let fake = Fake::open();
@@ -980,6 +1215,154 @@ async fn hostile_server_is_bounded() {
     shutdown(&mut client).await;
 }
 
+/// A refused password is retried on the backoff ladder rather than hammered, and the event stream adds no
+/// logins of its own to that: it waits for the refresh loop to have a session instead of trying to earn one,
+/// so while the link is down it asks this server for nothing at all. An Argon2 verify is the expensive part
+/// of a login attempt, which is why the ladder exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_password_does_not_hammer_login() {
+    let fake = Fake::session();
+    let addr = serve(
+        api_routes(get(counted_events))
+            .route("/api/v1/auth/session", post(session_login))
+            .with_state(Arc::clone(&fake)),
+    )
+    .await;
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("not the password".to_string().into()),
+    );
+    // Counting starts once the first refusal is in: counting from before it would be measuring how long a
+    // login takes rather than how often one is attempted.
+    notices_until(&mut client, |lines| {
+        lines
+            .iter()
+            .any(|line| line.contains("sign-in was refused"))
+    })
+    .await;
+
+    let first = fake.logins.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let attempts = fake.logins.load(Ordering::SeqCst) - first;
+    // The ladder's rungs inside five seconds are one, two and four: three more attempts, with room for a
+    // fourth that was already on its way when the count started. A client that retried once a second would
+    // be at five here, and one that retried twice a second - a login per stream dial as well - over ten.
+    assert!(
+        (1..=4).contains(&attempts),
+        "five seconds of refused logins cost {attempts} attempts; the ladder allows four"
+    );
+    let dials = fake.event_dials.load(Ordering::SeqCst);
+    assert_eq!(
+        dials, 0,
+        "the event stream dialled {dials} times while there was no session to send"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A session that dies between two polls is renewed inside the call that found it dead: one further login,
+/// the same link, and no lost connection. That is what an hour-old token on a server that restarted behind it
+/// looks like to a person watching a download, and it should look like nothing happening.
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_session_401_relogs_once() {
+    let fake = Fake::session();
+    let addr = serve(
+        api_routes(get(counted_events))
+            .route("/api/v1/auth/session", post(session_login))
+            .with_state(Arc::clone(&fake)),
+    )
+    .await;
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+    assert_eq!(
+        fake.logins.load(Ordering::SeqCst),
+        1,
+        "one login got the session"
+    );
+    let first = fake.session_token();
+
+    // The server ends this client's session without telling it: what a restart behind a long-lived token
+    // does, and what signing this device out from another screen does.
+    fake.revoked.store(true, Ordering::SeqCst);
+
+    // The next round finds out and logs in again within itself. Waiting for the second login is also waiting
+    // for the link to have carried on working, since a renewal that worked is not trouble.
+    wait_for(&mut client, |snapshot| {
+        (fake.logins.load(Ordering::SeqCst) == 2
+            && matches!(
+                snapshot.connection,
+                Connection::Remote {
+                    state: LinkState::Connected,
+                    ..
+                }
+            ))
+        .then_some(())
+    })
+    .await;
+
+    // Both tokens were sent, and the second one is what it sends now.
+    let seen = fake.seen.lock().expect("the test state").clone();
+    assert!(
+        seen.contains(&format!("Bearer {first}")),
+        "the dead session was tried: {seen:?}"
+    );
+    let renewed = fake.session_token();
+    assert_ne!(renewed, first, "the second login issued a different token");
+    assert!(
+        seen.contains(&format!("Bearer {renewed}")),
+        "and it is the credential now in use: {seen:?}"
+    );
+
+    // And nothing about this was reported as a link going down and coming back: the line for that is only
+    // ever said after a `Lost`, and there was none.
+    let lines = notices_so_far(&mut client).await;
+    assert!(
+        !lines.iter().any(|line| line.contains("again")),
+        "a renewal is not a reconnect: {lines:?}"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// Ten thousand events arriving while reads are under way become one further round of reads, not ten
+/// thousand: the stream's wake is a permit rather than a message, so it cannot queue up behind itself. What
+/// is measured is the quiet afterwards - the ordinary once-a-second cadence, with no backlog to work off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_events_costs_one_refresh() {
+    let fake = Fake::plain();
+    let addr = serve(api_routes(get(burst_events)).with_state(Arc::clone(&fake))).await;
+
+    let mut client =
+        RemoteBackend::start(target(addr, LoginMethod::None, None, None), Secret::None);
+    wait_for_state(&mut client, true).await;
+
+    // The frames are behind the server, and a moment to let this client have read them: over loopback a few
+    // hundred kilobytes is milliseconds, and the stream reads as it arrives rather than at the end.
+    within(async {
+        while !fake.burst_written.load(Ordering::SeqCst) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let before = fake.torrents_calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let reads = fake.torrents_calls.load(Ordering::SeqCst) - before;
+    assert!(
+        reads <= 8,
+        "four quiet seconds after the burst cost {reads} reads: the cadence is one a second, and wakes that \
+         queued one per event would still be working off thousands here"
+    );
+
+    shutdown(&mut client).await;
+}
+
 /// A `private_key_jwt` assertion is checked the way RFC 7523 says it has to be: the signature against the
 /// device's public key, and the claims a gateway relies on. The token it trades for is then sent on every
 /// request, the event stream included.
@@ -996,11 +1379,10 @@ async fn gateway_key_gets_and_uses_token() {
     .await;
 
     let pem = key.to_openssh(LineEnding::LF).expect("the key file");
-    let key_file = write_file(
-        std::env::temp_dir().as_path(),
-        "gateway-test-key",
-        pem.as_bytes(),
-    );
+    // The key lives in a scratch directory rather than loose in the temp folder: it is a private key, and a
+    // test that fails halfway through should still take it with it.
+    let dir = ScratchDir::new("gateway_key_token");
+    let key_file = write_file(dir.path(), "id_ed25519", pem.as_bytes());
     let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file.clone()));
     remote.token_url = Some(format!("http://{addr}/token"));
     remote.client_id = Some(fake.client_id.clone());
@@ -1023,16 +1405,16 @@ async fn gateway_key_gets_and_uses_token() {
     assert!(seen.len() > 1, "the event stream carried it too: {seen:?}");
 
     shutdown(&mut client).await;
-    let _ = std::fs::remove_file(&key_file);
 }
 
-/// A token is replaced before it expires rather than after: with a 31-second life and a 30-second renewal
-/// window, a client that polls every second gets a second token within seconds.
+/// A credential is replaced before it expires rather than after - and not on every call. An eight-second
+/// token renews at four seconds (half its life: see `fbtt_core`'s gateway module), so within seconds a second
+/// token appears, and the first one carries many requests on the way there.
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_token_refreshed_before_expiry() {
     let key = keypair();
     let public: PublicKey = key.public_key().clone();
-    let fake = Fake::gateway(public, 31);
+    let fake = Fake::gateway(public, 8);
     let addr = serve(
         api_routes(get(events))
             .route("/token", post(token))
@@ -1041,11 +1423,8 @@ async fn gateway_token_refreshed_before_expiry() {
     .await;
 
     let pem = key.to_openssh(LineEnding::LF).expect("the key file");
-    let key_file = write_file(
-        std::env::temp_dir().as_path(),
-        "gateway-ttl-key",
-        pem.as_bytes(),
-    );
+    let dir = ScratchDir::new("gateway_token_ttl");
+    let key_file = write_file(dir.path(), "id_ed25519", pem.as_bytes());
     let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file.clone()));
     remote.token_url = Some(format!("http://{addr}/token"));
     remote.client_id = Some(fake.client_id.clone());
@@ -1066,14 +1445,22 @@ async fn gateway_token_refreshed_before_expiry() {
     })
     .await;
     assert!(second.starts_with("Bearer token-"), "{second}");
+    let issued = fake.issued.load(Ordering::SeqCst);
     assert_eq!(
-        fake.issued.load(Ordering::SeqCst),
-        2,
+        issued, 2,
         "two assertions, two tokens: the first was renewed, not refused"
     );
 
+    // And the renewal is on a clock rather than per request: one token served a run of polls, which is what
+    // a short-lived credential needs or every second of this client's life would be a signature and a POST.
+    let seen = fake.seen.lock().expect("the test state").clone();
+    let shared = seen.iter().filter(|line| **line == seen[0]).count();
+    assert!(
+        shared >= 3,
+        "one token carried {shared} requests before it was replaced: {seen:?}"
+    );
+
     shutdown(&mut client).await;
-    let _ = std::fs::remove_file(&key_file);
 }
 
 /// A gateway that takes the password on every request gets it on every request: no login call, and no

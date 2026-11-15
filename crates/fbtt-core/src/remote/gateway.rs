@@ -14,10 +14,14 @@ use serde::Deserialize;
 use ssh_key::HashAlg;
 
 use crate::remote::Secret;
+use crate::remote::bodies::{from_json, read_capped};
 use crate::remote::device::Device;
-use crate::remote::http::{from_json, read_capped};
 use crate::remote::login::{ASSERTION_LIFE, JWT_BEARER, RENEW_BEFORE, reached, reason};
 use crate::ui_state::LoginMethod;
+
+/// The life to assume for a credential whose issuer named no expiry. Not "forever": something this client
+/// cannot see the end of is something it should plan to replace.
+const DEFAULT_LIFE: u64 = 3_600;
 
 /// A gateway login that trades a signed assertion for a bearer token, and the token it bought.
 #[derive(Debug)]
@@ -32,11 +36,14 @@ pub(crate) struct Gateway {
     pub(crate) live: Option<Live>,
 }
 
-/// A credential with a life: what to send, and until when it is worth sending.
+/// A credential with a life: what to send, until when it is good, and when to start replacing it.
 #[derive(Clone)]
 pub(crate) struct Live {
     pub(crate) token: String,
-    pub(crate) expires_at: Instant,
+    expires_at: Instant,
+    /// When sending this stops being worth it, which is before it expires: a token that dies in the middle of
+    /// a request costs the same as one that was never sent ([`Live::bought`] says how far ahead).
+    renew_at: Instant,
 }
 
 /// `Debug` says how long it lives and not what it is: a session token, a gateway token and a password are
@@ -86,10 +93,7 @@ impl Gateway {
         if token.access_token.is_empty() {
             return Err("the gateway answered with no access token".to_string());
         }
-        Ok(Live {
-            token: token.access_token,
-            expires_at: lives(token.expires_in),
-        })
+        Ok(Live::bought(token.access_token, token.expires_in))
     }
 }
 
@@ -135,20 +139,39 @@ fn assertion(device: &Device, client_id: &str, token_url: &str) -> String {
     )
 }
 
-/// When a credential that lives `seconds` from now stops being good. A server that says nothing lives an
-/// hour; one that says zero is not promising forever, so it is treated as the shortest thing it could mean.
-pub(crate) fn lives(seconds: u64) -> Instant {
-    let seconds = if seconds == 0 { 3_600 } else { seconds };
-    Instant::now()
-        .checked_add(Duration::from_secs(seconds))
-        .unwrap_or_else(|| Instant::now() + RENEW_BEFORE * 2)
-}
-
 impl Live {
-    /// Whether this credential is still worth sending, which it is not once it is within [`RENEW_BEFORE`]
-    /// of expiring: a token that dies during a request costs the same as one that was never sent.
+    /// A credential the issuer says lives `seconds` from now, and when this client starts replacing it.
+    ///
+    /// The renewal point sits [`RENEW_BEFORE`] ahead of the expiry - except for a credential shorter than
+    /// twice that window, which would already be "nearly expired" the moment it was issued and get fetched
+    /// again on every single call. For those, half its life is the honest rule: a token that lives eight
+    /// seconds is replaced at four, not once a second until it dies.
+    pub(crate) fn bought(token: String, seconds: u64) -> Live {
+        // A server that says nothing lives an hour; one that says zero is not promising forever, so it is
+        // treated as the shortest thing it could mean.
+        let life = if seconds == 0 { DEFAULT_LIFE } else { seconds };
+        let before = if life <= RENEW_BEFORE.as_secs() * 2 {
+            Duration::from_secs((life / 2).max(1))
+        } else {
+            RENEW_BEFORE
+        };
+        let now = Instant::now();
+        // A life so long it does not fit in an `Instant` is treated as "not soon", which is what the fallback
+        // says: two renewal windows ahead.
+        let expires_at = now
+            .checked_add(Duration::from_secs(life))
+            .unwrap_or_else(|| now + before * 2);
+        let renew_at = expires_at.checked_sub(before).unwrap_or(now);
+        Live {
+            token,
+            expires_at,
+            renew_at,
+        }
+    }
+
+    /// Whether this credential is still worth sending.
     pub(crate) fn still_good(&self) -> bool {
-        self.expires_at > Instant::now() + RENEW_BEFORE
+        Instant::now() < self.renew_at
     }
 }
 
@@ -158,4 +181,57 @@ impl Live {
 struct TokenDto {
     access_token: String,
     expires_in: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Live;
+    use std::time::{Duration, Instant};
+
+    /// A short-lived credential is replaced at half its life rather than on every call. With the 30-second
+    /// renewal window applied to an eight-second token, it would have been "nearly expired" from the moment
+    /// it was issued - which means a new assertion and a new token for every request.
+    #[test]
+    fn a_short_lived_credential_is_renewed_at_half_its_life() {
+        // The clock is read immediately before each buying, so the bounds below allow for the microseconds a
+        // buying takes and nothing else. Lives are whole seconds, so an odd one splits with the renewal window
+        // rounded down and the renewal point rounded up: half of thirty-one is fifteen, replaced at sixteen.
+        let now = Instant::now();
+        let short = Live::bought("t".to_string(), 8);
+        assert!(short.still_good(), "a token just bought is worth sending");
+        assert!(
+            short.renew_at >= now + Duration::from_secs(4)
+                && short.renew_at <= now + Duration::from_secs(5),
+            "an eight-second credential is replaced at four, not at the end of its life"
+        );
+
+        // Thirty-one seconds is shorter than twice the window, so it gets the same rule rather than being
+        // stale from birth.
+        let now = Instant::now();
+        let edge = Live::bought("t".to_string(), 31);
+        assert!(
+            edge.renew_at >= now + Duration::from_secs(15)
+                && edge.renew_at <= now + Duration::from_secs(17),
+            "half of thirty-one, rounded"
+        );
+
+        // A long life keeps the window it had: nothing about this changes an hour-long session token.
+        let now = Instant::now();
+        let hour = Live::bought("t".to_string(), 3_600);
+        assert!(
+            hour.renew_at >= now + Duration::from_secs(3_570)
+                && hour.renew_at <= now + Duration::from_secs(3_571),
+            "an hour-long credential is replaced half a minute before it expires"
+        );
+
+        // No expiry named is not forever: it gets the default life, and a renewal point inside it.
+        let now = Instant::now();
+        let unstated = Live::bought("t".to_string(), 0);
+        assert!(unstated.still_good());
+        assert!(
+            unstated.renew_at >= now + Duration::from_secs(3_570)
+                && unstated.renew_at <= now + Duration::from_secs(3_571),
+            "an unstated life is an hour, replaced at fifty-nine minutes"
+        );
+    }
 }

@@ -27,6 +27,11 @@ pub(crate) use crate::remote::dto::*;
 /// The units a limit is stated in on each side: the server counts bytes per second, the table KiB/s.
 const KIB: u64 = 1024;
 
+/// The most piece bitmap this client builds a row for. A million pieces is 125 KiB of server bitmap and a
+/// million entries here - more than any torrent in this release's world - and `num_pieces` is a `u32` from
+/// the server, so without a ceiling one hostile answer would ask this process for four gigabytes.
+const MAX_PIECES: usize = 1_048_576;
+
 /// What the table says about one torrent's state.
 ///
 /// `state` and `checking_progress` are what the server said; `down_rate`, `zero_since` and `now` go
@@ -73,9 +78,10 @@ fn row(dto: &TorrentDto, zero_since: Instant, now: Instant) -> TorrentRow {
     TorrentRow {
         id: TorrentId(dto.id.clone()),
         // A magnet whose metadata has not arrived has no name yet; its hash is the only thing to call
-        // it by, and that is what the local backend shows for the same torrent.
+        // it by, and that is what the local backend shows for the same torrent. It came from the server
+        // like everything else here, so it gets cleaned on the way in too.
         name: if name.is_empty() {
-            dto.id.clone()
+            clean(&dto.id)
         } else {
             name
         },
@@ -173,7 +179,9 @@ pub(crate) fn peer_rows(peers: Vec<PeerDto>) -> Vec<PeerRow> {
     peers
         .into_iter()
         .map(|peer| PeerRow {
-            addr: peer.addr,
+            // An address is a peer's own text, and a peer on a hostile network can put anything in the
+            // field this client prints.
+            addr: clean(&peer.addr),
             client: peer.client.map(|client| clean(&client)).unwrap_or_default(),
             down_rate: peer.download_rate,
             up_rate: peer.upload_rate,
@@ -201,21 +209,28 @@ pub(crate) fn tracker_rows(trackers: Vec<TrackerDto>) -> Vec<TrackerRow> {
         .collect()
 }
 
-/// The piece bitmap as one entry per piece. Bits past the last piece are spare bits of the final
-/// byte, which the server leaves zero and this never reads; a hex string too short for the count it
-/// claims has the pieces it did not send as missing rather than as a parse failure.
+/// The piece bitmap as one entry per piece.
+///
+/// `have` is the hex of the server's own packed bitmap: two characters to a byte, eight pieces to a byte,
+/// piece 0 in the top bit of the first byte (BEP 3 order, which is how fbt-api packs it too). The count is
+/// clamped to the bits that were actually sent - `num_pieces` is a `u32` from a server this client does not
+/// trust - and to [`MAX_PIECES`] on top of that, so an answer that claims four billion pieces costs a
+/// bounded vector rather than gigabytes. Bits past the last piece are spare bits of the final byte, which the
+/// server leaves zero and this never reads.
 pub(crate) fn piece_flags(pieces: &PiecesDto) -> Vec<bool> {
-    let count = usize::try_from(pieces.num_pieces).unwrap_or(usize::MAX);
+    let bytes = pieces.have.len() / 2;
+    let claimed = usize::try_from(pieces.num_pieces).unwrap_or(usize::MAX);
+    let count = claimed.min(bytes.saturating_mul(8)).min(MAX_PIECES);
     (0..count)
         .map(|piece| {
-            let high = piece / 4;
-            let Some(byte) = pieces.have.get(high * 2..high * 2 + 2) else {
+            let index = piece / 8;
+            let Some(byte) = pieces.have.get(index * 2..index * 2 + 2) else {
                 return false;
             };
             let Ok(byte) = u8::from_str_radix(byte, 16) else {
                 return false;
             };
-            // Piece 0 is the top bit of the first byte: BEP 3 order, most significant first.
+            // Piece 0 is the top bit of the first byte: most significant first.
             byte & (1 << (7 - piece % 8)) != 0
         })
         .collect()
@@ -293,14 +308,16 @@ pub(crate) fn device_rows(devices: Vec<DeviceDto>) -> Vec<DeviceRow> {
         .into_iter()
         .map(|device| DeviceRow {
             name: clean(&device.name),
-            fingerprint: device.fingerprint,
+            // A fingerprint is a hash rendered in base64, which survives this untouched; it is still the
+            // server's text rather than this client's, so it goes through the same door.
+            fingerprint: clean(&device.fingerprint),
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TorrentDto, piece_flags, row_state_of};
+    use super::{MAX_PIECES, PiecesDto, TorrentDto, piece_flags, row_state_of};
     use crate::client::RowState;
     use std::time::{Duration, Instant};
 
@@ -335,28 +352,66 @@ mod tests {
         );
     }
 
-    /// BEP 3 order: piece 0 in the top bit of the first byte. A bitmap shorter than the count it was
-    /// sent with has what it did not send as missing.
+    /// Eight pieces to a byte, most significant first: a pattern across three bytes reads back as the pieces
+    /// it names, not as nibbles wandering across the wrong bytes.
     #[test]
     fn pieces_read_in_bep_3_order() {
-        let dto = super::PiecesDto {
+        // `81` is 1000_0001: pieces 0 and 7. `42` is 0100_0010: the second byte's bits 6 and 1, which are
+        // pieces 14 and 9. `00` says nothing about pieces 16 through 19.
+        let dto = PiecesDto {
+            num_pieces: 20,
+            have: "814200".to_string(),
+        };
+        let flags = piece_flags(&dto);
+        assert_eq!(flags.len(), 20, "one entry per piece the server named");
+        let had: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(piece, have)| have.then_some(piece))
+            .collect();
+        assert_eq!(had, [0, 7, 9, 14]);
+
+        // A bitmap that covers more pieces than it was sent with reports the ones it covers.
+        let five = PiecesDto {
             num_pieces: 5,
             have: "a0".to_string(),
         };
         assert_eq!(
-            piece_flags(&dto),
+            piece_flags(&five),
             [true, false, true, false, false],
             "`a0` is 1010_0000",
         );
-        let short = super::PiecesDto {
+    }
+
+    /// A `u32` from a hostile server is not a size to trust; the bitmap that arrived is. Even a count the
+    /// bitmap does cover has a ceiling, because a vector this client builds is memory somebody pays for.
+    #[test]
+    fn a_huge_piece_count_is_clamped() {
+        // One byte of bitmap speaks for eight pieces, whatever the count claims.
+        let one_byte = PiecesDto {
+            num_pieces: u32::MAX,
+            have: "c0".to_string(),
+        };
+        assert_eq!(
+            piece_flags(&one_byte),
+            [true, true, false, false, false, false, false, false],
+            "`c0` is 1100_0000, and eight pieces is all one byte can speak for",
+        );
+
+        // A count the bitmap does cover still stops at the ceiling rather than allocating on the server's
+        // say-so: this one claims four billion and sends enough bits for a million and eight.
+        let beyond = PiecesDto {
+            num_pieces: u32::MAX,
+            have: "ff".repeat(MAX_PIECES / 8 + 1),
+        };
+        assert_eq!(piece_flags(&beyond).len(), MAX_PIECES);
+
+        // Nothing sent claims nothing had, rather than a bar for every piece nobody described.
+        let empty = PiecesDto {
             num_pieces: 4,
             have: String::new(),
         };
-        assert_eq!(
-            piece_flags(&short),
-            [false; 4],
-            "nothing sent is nothing had"
-        );
+        assert_eq!(piece_flags(&empty).len(), 0);
     }
 
     /// A torrent with no name yet - a magnet whose metadata has not arrived - is listed by its hash.

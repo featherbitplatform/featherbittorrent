@@ -10,7 +10,8 @@ use crate::client::{
     AddSource, Command, DeviceCommand, DirListing, FilePriority, LiveLimits, Notice, TorrentId,
 };
 use crate::engine::map::{clean, rate_bytes};
-use crate::remote::{Backend, encode, map};
+use crate::remote::routes::{encode, torrent_route};
+use crate::remote::{Backend, map};
 
 impl Backend {
     /// One command, answered. `Shutdown` never reaches here: the loop stops on it before doing any work.
@@ -18,15 +19,15 @@ impl Backend {
         match command {
             Command::Add { source, dir } => self.add(source, dir).await,
             Command::Pause(id) => {
-                let path = format!("/api/v1/torrents/{}/pause", id.0);
+                let path = torrent_route(&id.0, "/pause");
                 self.report(self.api.empty(self.api.post(&path)).await);
             }
             Command::Resume(id) => {
-                let path = format!("/api/v1/torrents/{}/resume", id.0);
+                let path = torrent_route(&id.0, "/resume");
                 self.report(self.api.empty(self.api.post(&path)).await);
             }
             Command::Remove { id, delete_files } => {
-                let path = format!("/api/v1/torrents/{}?delete_files={}", id.0, delete_files);
+                let path = format!("{}?delete_files={}", torrent_route(&id.0, ""), delete_files);
                 self.report(self.api.empty(self.api.delete(&path)).await);
             }
             Command::SetFilePriority { id, file, priority } => {
@@ -69,7 +70,13 @@ impl Backend {
         match self.api.json::<map::TorrentDto>(request).await {
             Ok(dto) => {
                 let name = clean(&dto.name);
-                let shown = if name.is_empty() { dto.id } else { name };
+                // A magnet whose metadata has not arrived is named by its hash, which is server text too and
+                // gets the same cut as everything else this client repeats back.
+                let shown = if name.is_empty() {
+                    clean(&dto.id)
+                } else {
+                    name
+                };
                 self.notify(Notice::Info(format!("Added {shown}")));
             }
             Err(problem) => self.notify(Notice::Error(clean(&problem.notice()))),
@@ -84,7 +91,7 @@ impl Backend {
         file: usize,
         priority: FilePriority,
     ) {
-        let path = format!("/api/v1/torrents/{}/files", id.0);
+        let path = torrent_route(&id.0, "/files");
         let files = match self
             .api
             .json::<Vec<map::FileDto>>(self.api.get(&path))
@@ -101,7 +108,7 @@ impl Backend {
                 return self.notify(Notice::Error(format!("no file with index {file}")));
             }
         };
-        let path = format!("/api/v1/torrents/{}/file-priorities", id.0);
+        let path = torrent_route(&id.0, "/file-priorities");
         self.report(self.api.empty(self.api.put_json(&path, &body)).await);
     }
 
@@ -172,7 +179,9 @@ impl Backend {
             Ok(listing) => DirListing {
                 path: Some(path),
                 roots,
-                dirs: listing.dirs,
+                // Folder names are the server's text about somebody's disk, so they get the same cut and
+                // clean as every other string a screen draws.
+                dirs: listing.dirs.into_iter().map(|dir| clean(&dir)).collect(),
                 error: None,
             },
             Err(problem) => DirListing {

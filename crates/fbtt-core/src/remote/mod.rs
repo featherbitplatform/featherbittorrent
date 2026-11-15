@@ -11,8 +11,18 @@
 //! pause that doubles. Starting a connection therefore never fails: an address that is not one, or a
 //! password login with no user name in it, arrives as [`LinkState::Lost`] and a notice, which is what the
 //! connect screen needs in order to say why nothing appeared.
+//!
+//! Three things about this arrangement are load-bearing and worth saying out loud:
+//!
+//! - Only the refresh loop logs in. The event stream dials with whatever credential that loop already has,
+//!   and only while it says the link is up, so a wrong password costs one refused login per backoff pause
+//!   rather than two per second.
+//! - Wakes coalesce. A burst of events during one refresh is one extra refresh, not one per event.
+//! - `Shutdown` is answered by a task that is never busy (`relay`, below), so it interrupts a request that a
+//!   silent server is still holding open instead of queueing behind it.
 
 mod backend;
+mod bodies;
 mod commands;
 pub(crate) mod device;
 pub(crate) mod dto;
@@ -20,24 +30,27 @@ pub(crate) mod gateway;
 pub(crate) mod http;
 pub(crate) mod login;
 pub(crate) mod map;
+mod routes;
 mod sse;
+mod stopping;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::client::{
-    Client, Command, Connection, Detail, DetailTab, DeviceRow, DirListing, LinkState, LiveLimits,
-    Notice, Snapshot, TorrentId, TorrentRow, Totals,
+    COMMAND_QUEUE, Client, Command, Connection, Detail, DetailTab, DeviceRow, DirListing,
+    LinkState, LiveLimits, Notice, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::engine::map::clean;
 use crate::ui_state::{LoginMethod, RemoteTarget};
 
 use http::Api;
+use stopping::Stopping;
 
 /// How often the table is rebuilt when nothing else wakes it. A second is what the local backend's half
 /// second buys over HTTP: rates that look alive, a stalled column that ticks, and a server that is not
@@ -50,6 +63,7 @@ const SLOW_REFRESH: Duration = Duration::from_secs(10);
 
 /// The ladder of pauses between attempts at a server that is not answering, capped at half a minute so a
 /// server that is down for the evening is asked about once every thirty seconds rather than once a second.
+/// The event stream uses the same ladder for its own reconnects (see [`sse`]).
 const BACKOFF: [Duration; 6] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -85,6 +99,18 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// What the refresh loop tells the event stream about this connection.
+///
+/// It exists so that exactly one task logs in: the stream may not dial, and so may not ask for a
+/// credential, until a refresh has got through to this server with one (see [`sse`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// The link is down, or has never been proved: the stream asks the server for nothing.
+    Down,
+    /// A refresh got through, so a credential is in hand and the stream may use it.
+    Up,
+}
+
 /// Drives the client interface over a server's HTTP API.
 #[derive(Debug)]
 pub struct RemoteBackend;
@@ -96,58 +122,53 @@ impl RemoteBackend {
     /// says so on the client rather than to whoever called. A target and secret that do not go together - a
     /// password login with no user name, a gateway with no token endpoint - is reported the same way.
     pub fn start(target: RemoteTarget, secret: Secret) -> Client {
-        let initial = Arc::new(Snapshot {
-            connection: Connection::Remote {
-                name: server_name(&target.url),
-                secure: target.url.starts_with("https://"),
-                auth: method_name(target.login).to_string(),
-                state: LinkState::Connecting,
-            },
-            torrents: Vec::new(),
-            totals: Totals {
-                down_rate: 0,
-                up_rate: 0,
-                dht_nodes: None,
-            },
-            limits: LiveLimits {
-                download_kib: 0,
-                upload_kib: 0,
-                active_downloads: None,
-                active_seeds: None,
-                active_total: None,
-            },
-            detail: None,
-            default_dir: PathBuf::new(),
-            dirs: None,
-            devices: None,
-        });
+        let name = server_name(&target.url);
+        let secure = target.url.starts_with("https://");
+        let auth = method_name(target.login).to_string();
+        let initial = Arc::new(blank(
+            name.clone(),
+            secure,
+            auth.clone(),
+            LinkState::Connecting,
+        ));
         let (client, channels) = Client::paired(Arc::clone(&initial));
 
-        match Api::try_new(&target, secret) {
+        match Api::try_new(&target, secret, Arc::new(Stopping::default())) {
             Err(problem) => {
-                // Nothing can be asked of this address, so say that once and let the client answer
-                // commands with nothing until it is dropped or asked to stop.
+                // Nothing can be asked of this address, so say it once and let the client answer commands
+                // with nothing until it is dropped or asked to stop. The link goes to `Lost` rather than
+                // staying `Connecting`: there is nothing here that a later attempt could fix, and a header
+                // that spins forever on somebody's typo reads as a server that is still being reached.
                 let _ = channels.notices.try_send(Notice::Error(clean(&problem)));
+                let retry_in_secs = BACKOFF[0].as_secs();
+                let _ = channels.snapshot.send(Arc::new(blank(
+                    name,
+                    secure,
+                    auth,
+                    LinkState::Lost { retry_in_secs },
+                )));
                 tokio::spawn(idle(channels.commands));
                 client
             }
             Ok(api) => {
                 let api = Arc::new(api);
-                let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
-                // The event stream's own end: dropping the sender at the end of `run` is what tells the
-                // stream nobody is left to wake, so it cannot outlive this connection or wait on itself.
-                let (stop_tx, stop_rx) = watch::channel(());
+                // One permit is enough however many events arrive meanwhile: this is the difference between
+                // a stream that keeps a screen fresh and a stream that makes the loop re-read once per event.
+                let wake = Arc::new(Notify::new());
+                // The stream's permission to dial, which only the refresh loop moves. Dropping the sender at
+                // the end of `run` is what ends the stream, so it cannot outlive this connection.
+                let (gate_tx, gate_rx) = watch::channel(Gate::Down);
                 sse::spawn(
                     Arc::clone(&api),
-                    wake_tx.clone(),
+                    Arc::clone(&wake),
                     channels.notices.clone(),
-                    stop_rx,
+                    gate_rx,
                 );
                 let backend = Backend {
                     api,
-                    name: server_name(&target.url),
-                    secure: target.url.starts_with("https://"),
-                    auth: method_name(target.login).to_string(),
+                    name,
+                    secure,
+                    auth,
                     roots: Vec::new(),
                     default_dir: PathBuf::new(),
                     watching: None,
@@ -166,14 +187,69 @@ impl RemoteBackend {
                     published: initial,
                     snapshot_tx: channels.snapshot,
                     notices: channels.notices,
-                    _wake_tx: wake_tx,
-                    _stop: stop_tx,
+                    wake,
+                    gate: gate_tx,
                 };
-                tokio::spawn(backend.run(channels.commands, wake_rx));
+                let (to_backend, commands) = mpsc::channel(COMMAND_QUEUE);
+                tokio::spawn(relay(channels.commands, to_backend, backend.api.stopping()));
+                tokio::spawn(backend.run(commands));
                 client
             }
         }
     }
+}
+
+/// The snapshot a connection shows before it has asked the server anything.
+fn blank(name: String, secure: bool, auth: String, state: LinkState) -> Snapshot {
+    Snapshot {
+        connection: Connection::Remote {
+            name,
+            secure,
+            auth,
+            state,
+        },
+        torrents: Vec::new(),
+        totals: Totals {
+            down_rate: 0,
+            up_rate: 0,
+            dht_nodes: None,
+        },
+        limits: LiveLimits {
+            download_kib: 0,
+            upload_kib: 0,
+            active_downloads: None,
+            active_seeds: None,
+            active_total: None,
+        },
+        detail: None,
+        default_dir: PathBuf::new(),
+        dirs: None,
+        devices: None,
+    }
+}
+
+/// Forwards commands to the loop that answers them, and says "stop waiting on the server" the moment one of
+/// them is `Shutdown` - or the moment the screen has gone away altogether, which means the same thing.
+///
+/// It has to be a task of its own because the loop may be deep inside a request when the command arrives,
+/// and a server that has gone quiet holds a request open for its whole timeout: somebody pressing stop
+/// should not have to wait out that. The command itself still goes through, so the loop is the one that
+/// ends the session and decides what the last snapshot says.
+async fn relay(
+    mut from_screen: mpsc::Receiver<Command>,
+    to_backend: mpsc::Sender<Command>,
+    stopping: Arc<Stopping>,
+) {
+    while let Some(command) = from_screen.recv().await {
+        if matches!(command, Command::Shutdown) {
+            stopping.stop();
+        }
+        // The loop is gone: nobody left to answer.
+        if to_backend.send(command).await.is_err() {
+            return;
+        }
+    }
+    stopping.stop();
 }
 
 /// A client that was never able to reach anywhere: it answers `Shutdown` and drops the rest, so a screen
@@ -230,21 +306,12 @@ struct Backend {
     published: Arc<Snapshot>,
     snapshot_tx: watch::Sender<Arc<Snapshot>>,
     notices: mpsc::Sender<Notice>,
-    /// A handle on the wake channel the event stream uses, held so the channel stays open for it. Never
-    /// read: its only job is to exist until this struct does not.
-    _wake_tx: mpsc::UnboundedSender<()>,
-    /// Dropping this at the end of [`run`](Self::run) is what ends the event stream.
-    _stop: watch::Sender<()>,
-}
-
-/// The pane's tab as the route that answers it is named.
-fn tab_name(tab: DetailTab) -> &'static str {
-    match tab {
-        DetailTab::Files => "files",
-        DetailTab::Peers => "peers",
-        DetailTab::Trackers => "trackers",
-        DetailTab::Pieces => "pieces",
-    }
+    /// Wakes this loop early when an event says something changed. Held by the event stream too, which is
+    /// why it is shared rather than a channel this task owns.
+    wake: Arc<Notify>,
+    /// Tells the event stream whether the link is up (see [`Gate`]). Dropping this at the end of
+    /// [`run`](Self::run) is what ends the stream.
+    gate: watch::Sender<Gate>,
 }
 
 /// What the header calls a server: the host its address names, without the port.
@@ -268,28 +335,9 @@ fn method_name(login: LoginMethod) -> &'static str {
     }
 }
 
-/// Percent-encodes one path or query component, so a device name with a space in it or a folder path with
-/// a slash reaches the route that has to match it exactly. Everything outside the unreserved set becomes a
-/// `%` escape, which is what a server decodes back to the byte it started as.
-fn encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            // Spaces are the common case and every other byte needs no judgement either: this is one table.
-            _ => {
-                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{byte:02X}"));
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Secret, encode};
+    use super::Secret;
     use zeroize::Zeroizing;
 
     /// A secret's `Debug` says which kind of credential it is and never what it is: the target a screen
@@ -315,19 +363,5 @@ mod tests {
         for (secret, expected) in cases {
             assert_eq!(format!("{secret:?}"), expected);
         }
-    }
-
-    /// The unreserved set and nothing more: `:` and `/` in an OAuth2 assertion type become escapes a
-    /// gateway has to undo, which is why the fake one in `tests/remote.rs` decodes percent pairs rather
-    /// than spaces alone.
-    #[test]
-    fn encode_leaves_only_the_unreserved_characters_bare() {
-        assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
-        assert_eq!(encode("a b"), "a%20b");
-        assert_eq!(encode("a/b"), "a%2Fb");
-        assert_eq!(
-            encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
-            "urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer"
-        );
     }
 }

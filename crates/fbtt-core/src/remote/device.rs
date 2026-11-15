@@ -6,6 +6,7 @@
 //! to sign, and matches identities by the blob its own key would produce.
 
 use std::path::Path;
+use std::time::Duration;
 
 use signature::Signer as _;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
@@ -14,6 +15,19 @@ use ssh_key::{PrivateKey, Signature};
 
 use crate::remote::Secret;
 use crate::ui_state::LoginMethod;
+
+/// How long ssh-agent may take to answer. It is a local socket and every call here is one request, so ten
+/// seconds means the agent is wedged - and a login should say that rather than sit on it, because a wedged
+/// agent otherwise looks exactly like a slow server from the screen's side.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The line for an agent that did not answer in time, naming which call it was asked to make.
+fn wedged(what: &str) -> String {
+    format!(
+        "ssh-agent did not {what} within {} seconds",
+        AGENT_TIMEOUT.as_secs()
+    )
+}
 
 /// The device key this client signs with: its public half, spelled both ways a server wants it, and
 /// where the private half is.
@@ -58,10 +72,21 @@ impl Device {
         if from_file {
             let path = key_path.ok_or_else(|| "this login needs a device key file".to_string())?;
             let key = read_key(path, passphrase)?;
-            let public = key.public_key();
+            let asked = key.public_key();
+            let public = asked.key_data().clone();
+            // The key type is settled before anything is asked of a server. Only Ed25519 keys answer a
+            // featherbittorrent challenge (and only they sign a gateway assertion) - so an RSA or ECDSA key
+            // file is worth saying so about now, rather than after a round trip that could not have worked.
+            if !public.is_ed25519() {
+                return Err(format!(
+                    "{} is a {} key; this client signs logins with Ed25519",
+                    path.display(),
+                    public.algorithm()
+                ));
+            }
             return Ok(Device {
-                line: public.to_openssh().map_err(|problem| problem.to_string())?,
-                public: public.key_data().clone(),
+                line: asked.to_openssh().map_err(|problem| problem.to_string())?,
+                public,
                 source: Source::File(key),
             });
         }
@@ -85,7 +110,10 @@ impl Device {
                     flags: 0,
                 };
                 use ssh_agent_lib::agent::Session as _;
-                let signature = client.sign(request).await.map_err(signing)?;
+                let signature = tokio::time::timeout(AGENT_TIMEOUT, client.sign(request))
+                    .await
+                    .map_err(|_| wedged("sign"))?
+                    .map_err(signing)?;
                 // The agent's own `Signature` type is a different crate's version of ours; the bytes are
                 // the same Ed25519 signature, and those are all this client needs.
                 Ok(signature.as_bytes().to_vec())
@@ -136,6 +164,15 @@ async fn agent_device(key_path: Option<&Path>) -> Result<Device, String> {
         PublicCredential::Cert(_) => return Err("ssh-agent's key is a certificate".to_string()),
     };
     let public = ours(credential)?;
+    // The same rule as for a key file, checked before a challenge is asked for: an agent holding nothing but
+    // RSA keys is not this client's device, and finding that out over the network costs a round trip and a
+    // worse line on the screen.
+    if !public.is_ed25519() {
+        return Err(format!(
+            "ssh-agent's key is a {} key; this client signs logins with Ed25519",
+            public.algorithm()
+        ));
+    }
     // The line the challenge and the login name: the one from the `.pub` file when there was one, and
     // otherwise spelled back out of the agent's own key.
     let line = wanted
@@ -193,9 +230,9 @@ fn ours(key: &ssh_agent_lib::ssh_key::public::KeyData) -> Result<ssh_key::public
 async fn identities() -> Result<Vec<Identity>, String> {
     use ssh_agent_lib::agent::Session as _;
     let mut client = connect_agent().await?;
-    client
-        .request_identities()
+    tokio::time::timeout(AGENT_TIMEOUT, client.request_identities())
         .await
+        .map_err(|_| wedged("list its keys"))?
         .map_err(|problem| format!("ssh-agent would not list its keys: {problem}"))
 }
 
@@ -205,8 +242,9 @@ async fn connect_agent() -> Result<ssh_agent_lib::client::Client<AgentStream>, S
     {
         let path = std::env::var("SSH_AUTH_SOCK")
             .map_err(|_| "SSH_AUTH_SOCK is not set: ssh-agent is not running".to_string())?;
-        let stream = tokio::net::UnixStream::connect(&path)
+        let stream = tokio::time::timeout(AGENT_TIMEOUT, tokio::net::UnixStream::connect(&path))
             .await
+            .map_err(|_| wedged("answer the connection"))?
             .map_err(|problem| format!("cannot reach ssh-agent at {path}: {problem}"))?;
         Ok(ssh_agent_lib::client::Client::new(stream))
     }

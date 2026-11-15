@@ -15,17 +15,14 @@ use crate::client::{
     Command, Connection, Detail, DetailTab, LinkState, Notice, Snapshot, TorrentId, Totals,
 };
 use crate::engine::map::clean;
-use crate::remote::http::ApiError;
-use crate::remote::{BACKOFF, Backend, REFRESH, SLOW_REFRESH, map, tab_name};
+use crate::remote::bodies::ApiError;
+use crate::remote::routes::{tab_path, torrent_route};
+use crate::remote::{BACKOFF, Backend, Gate, REFRESH, SLOW_REFRESH, map};
 
 impl Backend {
     /// Answers commands and keeps the snapshot fresh until asked to stop, or until nobody is watching any
     /// more, which are the same thing here as they are for the local backend.
-    pub(crate) async fn run(
-        mut self,
-        mut commands: mpsc::Receiver<Command>,
-        mut wake: mpsc::UnboundedReceiver<()>,
-    ) {
+    pub(crate) async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut tick = tokio::time::interval(REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut slow = tokio::time::interval(SLOW_REFRESH);
@@ -57,18 +54,15 @@ impl Backend {
                         None => Wake::Command(Command::Shutdown),
                     },
                     _ = tick.tick() => Wake::Refresh,
-                    // The event stream: something changed, so ask at once instead of on the next tick.
-                    _ = wake.recv() => Wake::Refresh,
+                    // The event stream: something changed, so ask at once instead of on the next tick. One
+                    // permit covers any number of events that arrived while the last round was running, which
+                    // is what keeps a busy server from turning this loop into a re-read per event.
+                    _ = self.wake.notified() => Wake::Refresh,
                     _ = slow.tick() => Wake::Slow,
                 },
             };
             match wake {
-                Wake::Command(Command::Shutdown) => {
-                    // End this client's own session before going: a device that is not connected any more
-                    // should stop being listed as one.
-                    self.api.log_out().await;
-                    break;
-                }
+                Wake::Command(Command::Shutdown) => break,
                 Wake::Command(command) => self.handle(command).await,
                 Wake::Refresh => self.refresh().await,
                 Wake::Slow => {
@@ -76,8 +70,19 @@ impl Backend {
                     self.refresh().await;
                 }
             }
+            // A round that gave up because somebody pressed stop (see `crate::remote`'s relay) has nothing new
+            // to show and its failure is not trouble worth a line: go straight to ending the session rather
+            // than publishing a snapshot about a server nobody is waiting for any more.
+            if self.api.asked_to_stop() {
+                break;
+            }
             self.publish();
         }
+
+        // End this client's own session before going: a device that is not connected any more should stop
+        // being listed as one. This is the only thing on the way out with a timeout of its own - two seconds,
+        // and then the task ends whatever the server did with it (see `Api::log_out`).
+        self.api.log_out().await;
     }
 
     /// How long to wait before the next attempt at a server that last refused to answer, or `None` when the
@@ -122,6 +127,23 @@ impl Backend {
                     self.notify(Notice::Error(clean(&problem.notice())));
                 }
             }
+        }
+        self.publish_gate();
+    }
+
+    /// Tells the event stream whether it may dial, which follows the link exactly: the stream never logs in
+    /// itself, so it dials only once a round of reads has proved this client can talk to this server with a
+    /// credential it already holds (see [`crate::remote::sse`]).
+    fn publish_gate(&self) {
+        let next = if matches!(self.state, LinkState::Connected) {
+            Gate::Up
+        } else {
+            Gate::Down
+        };
+        // Only on a change. The stream races its own attempt against this channel, so sending once a second
+        // whether it changed or not would look to it like the link went down every second.
+        if *self.gate.borrow() != next {
+            let _ = self.gate.send(next);
         }
     }
 
@@ -177,7 +199,7 @@ impl Backend {
     /// release cannot read what the server answers for that tab. A failure of one pane is not a failure of
     /// the round - the table came through, and the pane comes back on the next tick.
     pub(crate) async fn read_detail(&self, id: &TorrentId, tab: DetailTab) -> Option<Detail> {
-        let path = format!("/api/v1/torrents/{}/{}", id.0, tab_name(tab));
+        let path = torrent_route(&id.0, tab_path(tab));
         match tab {
             DetailTab::Files => self
                 .api
@@ -246,8 +268,12 @@ impl Backend {
     }
 
     /// One line for the screen. It is dropped when the queue is full: a backend must not wait on a screen
-    /// that has stopped reading.
+    /// that has stopped reading. And a round that gave up because somebody pressed stop says nothing at all:
+    /// "the server could not be reached" would be a complaint about a server nobody was waiting for any more.
     pub(crate) fn notify(&self, notice: Notice) {
+        if self.api.asked_to_stop() {
+            return;
+        }
         let _ = self.notices.try_send(notice);
     }
 }
