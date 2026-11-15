@@ -145,7 +145,9 @@ pub struct ServerConfig {
     /// purpose: it says which names count as that address. Empty means `localhost` and addresses only,
     /// which is what a loopback-only server needs and the safe answer for any other bind. Logins being on
     /// makes this list irrelevant: every request then has to carry a token, and no web page gets one by
-    /// accident.
+    /// accident. Spell an entry as a bare name - `bit.local`, not `https://bit.local:8090` - because the
+    /// port is taken off the request before names are compared, and a server says out loud when it starts
+    /// which of the entries it was given could never be matched by anything.
     pub allowed_hosts: Vec<String>,
     /// Whether login is on, and who may use it.
     pub auth: AuthConfig,

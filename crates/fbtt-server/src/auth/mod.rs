@@ -163,6 +163,50 @@ fn origin_is_allowed(origin: &str, allowed: &[String]) -> bool {
     host_is_local_or_allowed(authority, allowed)
 }
 
+/// Why an entry in `server.allowed_hosts` could never be the name a request carries, or `None` when it could
+/// be. What gets compared is the bare name: [`host_part`] takes the port off the request's side and
+/// [`host_is_local_or_allowed`] matches whole names without regard to case, so the entries people type - a
+/// name with the port they mean on it, the URL they copied, a path, `*.local`, the dot DNS appends, a name
+/// with a space in it - are ones no `Host` can ever equal. Saying so at startup ([`crate::Server`]) is the
+/// difference between a person finding out while writing the file and finding out from a `403` about the name
+/// they are sure they listed. An entry that is an address gets said too: those are answered whether they are
+/// listed or not, so one of those in the list only ever hides the name it was written beside.
+pub(crate) fn allowed_host_problem(entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        return Some("it is nothing");
+    }
+    // A `Host` carries no whitespace, and neither does a name in a URL's authority: what has some in it was
+    // typed with something else around it.
+    if entry.chars().any(char::is_whitespace) {
+        return Some("it has whitespace in it, which a host name does not");
+    }
+    if entry.contains("://") {
+        return Some("it spells a whole URL, and only the host part of one is compared");
+    }
+    if entry.contains(['/', '\\']) {
+        return Some("it has a path in it, which a host never carries");
+    }
+    if entry.contains('*') {
+        return Some("it uses `*`, and names here are matched whole rather than by prefix");
+    }
+    // `bit.local.` is the same host to DNS as `bit.local` and a different name to this server, which is the
+    // safe direction for a rule whose job is refusing: what it refuses is somebody else's guess.
+    if entry.ends_with('.') {
+        return Some("it ends in a dot, which is what DNS appends rather than part of the name");
+    }
+    if entry.contains(':') {
+        let bare = entry.strip_prefix('[').unwrap_or(entry);
+        let bare = bare.strip_suffix(']').unwrap_or(bare);
+        // A colon means either an address - which this server answers without being told - or a port, which
+        // is taken off the request before anything is compared. Either way the entry as written matches
+        // nothing.
+        if bare.parse::<Ipv6Addr>().is_ok() {
+            return Some("it is an address, and those are answered whether they are listed or not");
+        }
+        return Some("it carries a port, which is taken off before names are compared");
+    }
+    None
+}
 /// Who may use this server: fbt-api's authenticator over the session, challenge and limiter stores.
 ///
 /// With auth off no token is asked for, but every request still has to name this server - `localhost`, an
@@ -349,8 +393,8 @@ impl TestClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthRejection, Authenticator, FbttAuth, LOGIN_NAMESPACE, TestClock, bearer,
-        host_is_local_or_allowed, host_part, origin_is_allowed,
+        AuthRejection, Authenticator, FbttAuth, LOCAL_HOST, LOGIN_NAMESPACE, TestClock,
+        allowed_host_problem, bearer, host_is_local_or_allowed, host_part, origin_is_allowed,
     };
     use axum::http::{HeaderMap, Method, header};
     use fbtt_core::{AuthConfig, ServerConfig};
@@ -746,6 +790,49 @@ mod tests {
             ("http:///path", false),
         ] {
             assert_eq!(origin_is_allowed(origin, &listed), allowed, "{origin:?}");
+        }
+    }
+
+    /// What `server.allowed_hosts` is compared against is a bare name with its port already taken off, so most
+    /// of the ways people spell a host are entries no request could ever satisfy. Each one gets said out loud
+    /// when the server starts ([`crate::Server`]) rather than left as a `403` about a name the config appears
+    /// to have been told to answer - and the reason has to be the one thing the person reading it can act on.
+    #[test]
+    fn allowed_host_entries_that_cannot_match_are_named() {
+        for usable in [
+            "bit.local",
+            "BIT.LOCAL",
+            "server-1.lan",
+            "xn--bcher-kva.local",
+            LOCAL_HOST,
+        ] {
+            assert_eq!(allowed_host_problem(usable), None, "{usable:?} is a name");
+        }
+
+        // The second half of each pair is the word the startup line would have to contain, because "it cannot
+        // match" on its own tells nobody what to type instead.
+        for (entry, expected) in [
+            ("bit.local:8090", "port"),
+            ("http://bit.local", "URL"),
+            ("https://bit.local:8443/app", "URL"),
+            ("/srv/bit.local", "path"),
+            ("bit.local\\share", "path"),
+            ("*.local", "`*`"),
+            ("*", "`*`"),
+            ("bit.local.", "dot"),
+            (" bit.local", "whitespace"),
+            ("bit local", "whitespace"),
+            ("\tbit.local", "whitespace"),
+            ("", "nothing"),
+            // An address in this list is not wrong so much as pointless: one is answered whether it is listed
+            // or not, so the entry only hides the name written beside it.
+            ("[::1]", "address"),
+            ("fe80::1", "address"),
+        ] {
+            let problem = allowed_host_problem(entry).unwrap_or_else(|| {
+                panic!("{entry:?} looks like a name to answer, so nothing should warn about it")
+            });
+            assert!(problem.contains(expected), "{entry:?}: {problem}");
         }
     }
 

@@ -18,10 +18,13 @@ pub(crate) mod fs;
 mod login;
 
 use std::collections::BTreeMap;
-// Only the test-support counters need these; the fields they update exist only with that feature too.
+// Only the test-support counters and the hold they update need these; the fields they belong to exist only
+// with that feature too.
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "test-support")]
+use std::sync::{Condvar, OnceLock};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -32,6 +35,8 @@ use axum::routing::{delete, get, post};
 use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
 use serde::Serialize;
 use ssh_key::PublicKey;
+#[cfg(feature = "test-support")]
+use tokio::sync::watch;
 
 use crate::auth::{FbttAuth, keys, locked};
 
@@ -100,8 +105,9 @@ pub(crate) struct Shared {
     /// runs on the blocking pool, which will happily start several hundred threads if nothing tells it to
     /// stop. The login limiter bounds how many attempts an *address* gets; this bounds what all of them
     /// together can make the machine do, which is what a distributed guess - one attempt per address, and
-    /// no address over its budget - would otherwise find.
-    verify_permits: tokio::sync::Semaphore,
+    /// no address over its budget - would otherwise find. An `Arc` because the permit has to be able to
+    /// outlive the request that asked for it ([`login::password_login`]).
+    verify_permits: Arc<tokio::sync::Semaphore>,
     /// How many Argon2 verifications this server has run. Nothing in a run reads it; the test that
     /// proves an unknown user name still costs a verify does.
     #[cfg(feature = "test-support")]
@@ -113,6 +119,11 @@ pub(crate) struct Shared {
     verifying: AtomicU64,
     #[cfg(feature = "test-support")]
     most_verifying: AtomicU64,
+    /// The place inside the verify that a test can put there to hold a check in it ([`VerifyHold`]), so
+    /// that the test counting permits does not have to guess how long a hash takes. Set by
+    /// [`Server::park_verifies`]; absent in every run that is not one.
+    #[cfg(feature = "test-support")]
+    verify_hold: OnceLock<VerifyHold>,
 }
 
 impl Shared {
@@ -137,13 +148,15 @@ impl Shared {
             paths,
             roots: roots.into(),
             dummy_password_hash,
-            verify_permits: tokio::sync::Semaphore::new(parallel_verifies()),
+            verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             #[cfg(feature = "test-support")]
             verifies: AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             verifying: AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             most_verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            verify_hold: OnceLock::new(),
         }
     }
 
@@ -240,6 +253,95 @@ impl Shared {
     #[cfg(feature = "test-support")]
     pub(crate) fn max_concurrent_verifies(&self) -> u64 {
         self.most_verifying.load(Ordering::Relaxed)
+    }
+
+    /// Stops this check inside the verify until a test lets it go, if a test armed a hold ([`Server::park_verifies`],
+    /// under `test-support`). Called from inside the blocking job, after [`verify_started`](Self::verify_started)
+    /// and before any hashing, so what is parked there is a check that is holding one of this server's permits.
+    /// In a run nothing has armed a hold, so there is nowhere to stop and this does nothing - which is the only
+    /// cost it ever has.
+    pub(crate) fn park_inside_verify(&self) {
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(hold) = self.verify_hold.get() {
+                hold.arrive_and_wait();
+            }
+        }
+    }
+
+    /// Arms [`park_inside_verify`](Self::park_inside_verify) and returns the count it moves: how many checks
+    /// are sitting inside the verify right now, with a change to wait for. Under `test-support` only, and
+    /// arming it twice changes nothing about the checks - both watchers see the same count. See
+    /// [`Server::park_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
+        let hold = self.verify_hold.get_or_init(VerifyHold::new);
+        hold.counts.subscribe()
+    }
+
+    /// Lets every parked check finish, and stops holding the ones that come after ([`park_verifies`](Self::park_verifies)).
+    /// Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn release_parked_verifies(&self) {
+        if let Some(hold) = self.verify_hold.get() {
+            hold.release();
+        }
+    }
+}
+
+/// A place inside the Argon2 check that only a test can put there: a check that reaches it says how many are
+/// sitting there and then waits until somebody opens it. The waiting is a condvar because it happens on the
+/// blocking pool, where nothing may await; the count is a `watch` because whoever reads it is an async task
+/// sharing this runtime's only worker with the server, so it can afford to be told rather than to sit and
+/// poll. Without `test-support` none of this exists: no test arms a hold, and `Shared` carries neither the
+/// field nor the wait.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct VerifyHold {
+    /// How many checks are parked here right now. Every arrival bumps it and sends the new number, so a
+    /// watcher reads a count and waits for the next change instead of polling - which is how a test counts
+    /// what is holding the permits without guessing at how long a hash takes on somebody else's machine.
+    parked: AtomicU64,
+    counts: watch::Sender<u64>,
+    /// `false` while checks are being held; [`VerifyHold::release`] makes it `true` for good, so the checks
+    /// that arrive afterwards run through without stopping. A condvar rather than a channel because the
+    /// people waiting here are not on a runtime: they are on the blocking pool, where nothing may await.
+    open: Mutex<bool>,
+    waiting: Condvar,
+}
+
+#[cfg(feature = "test-support")]
+impl VerifyHold {
+    /// A hold nobody has opened yet: everything that arrives waits here until a test says otherwise.
+    fn new() -> Self {
+        let (counts, _) = watch::channel(0);
+        VerifyHold {
+            parked: AtomicU64::new(0),
+            counts,
+            open: Mutex::new(false),
+            waiting: Condvar::new(),
+        }
+    }
+
+    /// Says this check has reached the inside of the verify, then waits there for the test to stop looking.
+    fn arrive_and_wait(&self) {
+        let parked = self.parked.fetch_add(1, Ordering::Relaxed) + 1;
+        // The number is what a watcher reads; whether anybody is still watching to be told is not its job.
+        let _ = self.counts.send(parked);
+        let mut open = locked(&self.open);
+        while !*open {
+            open = self
+                .waiting
+                .wait(open)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Opens the hold for good: everyone waiting here goes on, and so does anything that arrives later.
+    fn release(&self) {
+        let mut open = locked(&self.open);
+        *open = true;
+        self.waiting.notify_all();
     }
 }
 

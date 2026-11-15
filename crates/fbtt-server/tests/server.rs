@@ -1610,28 +1610,70 @@ fn verify_permit_cap() -> usize {
     cores.clamp(1, 4)
 }
 
-/// The other half of the same problem: an Argon2 check wants about 19 MiB and a core's worth of time, and the
-/// blocking pool will run as many as arrive if nothing tells it otherwise. Eight wrong passwords at once from
-/// one address is inside that address's budget - so every one of them gets checked - and more than this
-/// machine is allowed to hash together, so what the server has to show afterwards is that it never had more
-/// than its cap running at once. That is the case an address-per-address guesser is built for: each address
-/// inside its own budget, and nothing between all of them and the machine's memory.
+/// Releases the checks a test parked inside the Argon2 verify when it goes out of scope - including on the
+/// way out of a failed assertion, which is what makes the difference between a failure that says what was
+/// measured and one that hangs: tokio waits for every blocking job when a runtime is dropped, and a parked
+/// check only stops waiting when somebody opens the hold. Releasing twice costs nothing.
+struct ReleaseParked<'a>(&'a Server);
+
+impl Drop for ReleaseParked<'_> {
+    fn drop(&mut self) {
+        self.0.release_parked_verifies();
+    }
+}
+
+/// How long the burst test waits for a check that must not start. Nothing has to travel further than this
+/// process: the attempts that are waiting are already queued at the permit, and all that would have to happen
+/// is a permit coming back and a blocking thread picking the next job up - so what this settles is whether a
+/// permit was returned at all, not how fast argon2 runs on the machine next door.
+const SETTLE: Duration = Duration::from_secs(3);
+
+/// Waits until `want` Argon2 checks are sitting inside the check (see `Server::park_verifies`) and returns
+/// how many are. The count moves when a check arrives, so this waits on that change instead of polling a
+/// counter - and it leaves the count marked as read, which is what lets the caller then wait for the next one.
+async fn wait_until_parked(parked: &mut tokio::sync::watch::Receiver<u64>, want: u64) -> u64 {
+    while *parked.borrow_and_update() < want {
+        within(parked.changed()).await.expect("a check parked");
+    }
+    *parked.borrow_and_update()
+}
+
+/// The bound on the slow part of logging in, measured rather than inferred: an Argon2 check wants about 19
+/// MiB and a core's worth of time, and the blocking pool runs as many as arrive if nothing tells it not to.
+/// Every permit is taken by a check that is holding it - not by the request that asked for it, which is the
+/// part that matters, because whoever connected is free to hang up halfway through. So: park exactly a cap's
+/// worth of checks inside their checks, add more attempts than there are permits, hang up on the ones that
+/// are running, and see whether anything else gets a turn while they are still hashing. A permit that went
+/// back with its handler would come free here, and one of the queued attempts would take it - which is what
+/// this test fails on if the permit is not held by the work itself.
 #[tokio::test]
 async fn verify_concurrency_is_bounded() {
     let served = Served::start("verify-burst", |scratch| {
         base_config(scratch, vec![alice()], Vec::new(), Some(true))
     })
     .await;
-    let url = served.url("/api/v1/auth/session");
-    // Inside the ten attempts one address gets in a window, and above the four verifies any server is
-    // allowed to run at once on any machine.
-    const ASKERS: usize = 8;
+    let cap = verify_permit_cap();
+    // More attempts than there are permits, and still inside the ten one address gets in a window - so what
+    // they are waiting for is this bound, not their own budget.
+    const EXTRA: usize = 3;
+    assert!(
+        cap + EXTRA <= LOGIN_BUDGET,
+        "the attempts this test sends have to be inside one address's budget",
+    );
 
-    let mut asks = Vec::new();
-    for _ in 0..ASKERS {
+    // Armed before the first request: from here every check stops inside the check with its permit in hand,
+    // until this test lets it go. That is what makes the measurement not a race against hashing speed - and
+    // the guard is what makes a failure report itself instead of hanging, because tokio waits for a parked
+    // check when the runtime this test runs on is dropped.
+    let mut parked = served.server.park_verifies();
+    let release = ReleaseParked(&served.server);
+    let url = served.url("/api/v1/auth/session");
+
+    let mut running = Vec::new();
+    for _ in 0..cap {
         let client = http();
         let url = url.clone();
-        asks.push(tokio::spawn(async move {
+        running.push(tokio::spawn(async move {
             within(
                 client
                     .post(url.as_str())
@@ -1643,20 +1685,81 @@ async fn verify_concurrency_is_bounded() {
             .status()
         }));
     }
-    for ask in asks {
-        let status = within(ask).await.expect("the check was answered");
-        assert!(
-            status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
-            "a wrong password inside the budget is checked, or queued while others are checked: {status}",
-        );
+    let want = u64::try_from(cap).expect("a count of permits");
+    assert_eq!(
+        wait_until_parked(&mut parked, want).await,
+        want,
+        "every permit this server has is held by a check that has not finished",
+    );
+    assert_eq!(
+        usize::try_from(served.server.max_concurrent_verifies()).expect("a count of checks"),
+        cap,
+        "the checks that are running are the whole bound, not more than it",
+    );
+
+    let mut queued = Vec::new();
+    for _ in 0..EXTRA {
+        let client = http();
+        let url = url.clone();
+        queued.push(tokio::spawn(async move {
+            within(
+                client
+                    .post(url.as_str())
+                    .basic_auth("alice", Some("wrong"))
+                    .send(),
+            )
+            .await
+            .expect("the server answered")
+            .status()
+        }));
     }
 
-    let most = served.server.max_concurrent_verifies();
-    let cap = verify_permit_cap();
-    assert!(most > 0, "the checks ran");
-    assert!(
-        usize::try_from(most).expect("a count of checks") <= cap,
-        "{most} Argon2 checks at once on a machine allowed {cap}",
+    // Hang up on the attempts that are being worked on: cancelling a task stops it where it waits, which is
+    // the client closing the connection mid-check, and hyper drops the handler with it (the red run of this
+    // test showed the queued attempts getting their turn the moment that happened). The hashing does not
+    // stop - a blocking job cannot be cancelled - so all that can change here is who is holding the permit.
+    for attempt in running {
+        attempt.abort();
+    }
+    // Measured first and asserted after the hold is opened, because a check that stayed parked would keep
+    // tokio waiting for it when this test's runtime is dropped: a failure has to report what it measured
+    // rather than hang.
+    let started_after_hangup = match tokio::time::timeout(SETTLE, parked.changed()).await {
+        // Nothing arrived: the checks that are still hashing hold every permit there is, and a queued
+        // attempt cannot start until one of them finishes.
+        Err(_silent) => 0,
+        Ok(Ok(())) => usize::try_from(*parked.borrow_and_update()).expect("a count of checks"),
+        Ok(Err(disconnected)) => panic!("the parked-check count stopped ({disconnected})"),
+    };
+    let most_while_held = served.server.max_concurrent_verifies();
+    // Let them finish, for good: the queued attempts take the turns as they come back, so what hung up did
+    // not cost anybody their answer.
+    drop(release);
+
+    assert_eq!(
+        started_after_hangup, 0,
+        "Argon2 checks started after every client that asked for them had hung up: a check handed its turn \
+         back with the request while it was still hashing",
+    );
+    assert_eq!(
+        usize::try_from(most_while_held).expect("a count of checks"),
+        cap,
+        "nothing started while every permit was held by a check that had already taken it",
+    );
+
+    for attempt in queued {
+        let status = within(attempt)
+            .await
+            .expect("the queued attempt was answered");
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
+            "an attempt inside the budget is checked, or told to come back once: {status}",
+        );
+    }
+    assert_eq!(
+        usize::try_from(served.server.max_concurrent_verifies()).expect("a count of checks"),
+        cap,
+        "at no point did this server run more checks together than the machine is allowed",
     );
 
     served.stop().await;

@@ -137,6 +137,7 @@ impl Server {
         // Said before any of the slow work, because it is about how this server will be reached: if
         // someone is going to type a password over this address, they should know now.
         warn_if_passwords_are_exposed(bind, auth_on, passwords_in_use);
+        warn_on_hosts_that_cannot_match(&config.server.allowed_hosts);
 
         let roots = prepare_roots(&config.server.allowed_roots).await?;
         // Both spellings of every root go to fbt-api too: it enforces the same containment on the paths
@@ -240,6 +241,24 @@ impl Server {
         self.shared.max_concurrent_verifies()
     }
 
+    /// Stops every Argon2 password check this server starts inside the check, and returns how many are
+    /// stopped there right now - a count a test waits on rather than polls, and releases with
+    /// [`release_parked_verifies`](Self::release_parked_verifies). Only a test does this, and it is how that
+    /// test says the bound is real without timing somebody else's hashing: hold the checks that are holding
+    /// every permit, hang up on their connections, and see whether anything else gets a turn. A check stays
+    /// parked until released even after its client has gone, which is the point of the exercise.
+    #[cfg(feature = "test-support")]
+    pub fn park_verifies(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.park_verifies()
+    }
+
+    /// Lets every check stopped by [`park_verifies`](Self::park_verifies) finish, and stops stopping the
+    /// ones that come after. Only a test calls this; without `test-support` there is nothing to stop.
+    #[cfg(feature = "test-support")]
+    pub fn release_parked_verifies(&self) {
+        self.shared.release_parked_verifies();
+    }
+
     /// Stops serving, saves, and releases the library. Returns once every connection is closed, the last
     /// save has been written or failed to be, and the lock has gone with it - so another
     /// featherbittorrent may start on this library as soon as this returns.
@@ -319,6 +338,25 @@ fn warn_if_passwords_are_exposed(bind: SocketAddr, auth_on: bool, passwords_in_u
             "passwords are sent unencrypted to this address; put a TLS reverse proxy in front of it, \
              or use device keys"
         );
+    }
+}
+
+/// One line for each name in `server.allowed_hosts` that no request could ever carry. What is compared is a
+/// bare name with its port already taken off, whole and without regard to case (see [`crate::auth`]), so an
+/// entry spelled like a URL, or with a port on it, a path, a wildcard, the dot DNS appends, or a space in it
+/// is one nobody can satisfy - and the person who wrote it would otherwise see only a `403` for the name they
+/// are sure they listed. It is said here, once, rather than per request because this is when they are still
+/// looking at the file, and because nothing changes the list while the server runs. Whether anyone has to
+/// sign in does not change the answer: an entry nobody can type is wrong whether or not it is being consulted.
+fn warn_on_hosts_that_cannot_match(allowed: &[String]) {
+    for host in allowed {
+        if let Some(problem) = crate::auth::allowed_host_problem(host) {
+            tracing::warn!(
+                host = %routes::clean(host),
+                problem,
+                "this name in server.allowed_hosts can never be the name a request carries",
+            );
+        }
     }
 }
 

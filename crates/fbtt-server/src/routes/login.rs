@@ -223,7 +223,9 @@ const MAX_VERIFY_WAIT: Duration = Duration::from_secs(10);
 /// verify wants about 19 MiB and a core's worth of time, and the blocking pool will run as many of them as
 /// arrive if nothing tells it otherwise. The permit is for the whole server, so it bounds what every
 /// address together can do - which is the case an address-per-address guesser is built for, each one inside
-/// its own budget and none of them limited by anybody else's.
+/// its own budget and none of them limited by anybody else's. It travels down to the verify rather than
+/// staying here, because a handler is not what makes the memory: whoever connected may hang up halfway,
+/// and this server is still going to finish the hash it started.
 async fn password_login(
     shared: &Arc<Shared>,
     peer: IpAddr,
@@ -236,20 +238,29 @@ async fn password_login(
     };
     // A turn at the check, or a `503` saying to come back in a second: waiting for room is bounded, so a
     // queued login neither hangs nor holds this connection open while somebody else's list gets worked
-    // through. The permit is held across the verify below and returned when this returns.
-    let permit = tokio::time::timeout(MAX_VERIFY_WAIT, shared.verify_permits.acquire())
+    // through. The permit owns its reference to the semaphore - that is what lets it outlive this handler -
+    // so the `Arc` is cloned rather than borrowed, and the clone goes down to the verify with the closure.
+    let permits = Arc::clone(&shared.verify_permits);
+    let permit = tokio::time::timeout(MAX_VERIFY_WAIT, permits.acquire_owned())
         .await
         .map_err(|_| {
             RouteError::busy("too many password checks are running, try again in a second")
         })?
         .map_err(|_| RouteError::internal("the password check queue is closed"))?;
     // Off the connection's task: this is the slow part of logging in, and it must not hold up anything
-    // else that shares the connection or the worker. The hash and the password move in with it; the permit
-    // does not, because it has to be back on the semaphore before this handler continues.
+    // else that shares the connection or the worker. The hash, the password and the permit all move in
+    // with it, and the permit coming back is what finishing the verify means: a client that hangs up
+    // halfway makes hyper drop this handler, and a permit still held out here would be handed back while
+    // its 19 MiB of hashing was still running - which is the very hole the permit exists to close. A
+    // blocking job cannot be cancelled, so the only thing that can end it is the verify itself.
     let counting = Arc::clone(shared);
     let password = password.to_string();
     let matched = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         counting.verify_started();
+        // A test that armed a hold stops here, with the permit in hand, so it can count what is holding
+        // this server's permits and hang up on them without anything else getting a turn.
+        counting.park_inside_verify();
         let matched = password::verify(&phc, &password);
         counting.verify_finished();
         matched
@@ -258,7 +269,6 @@ async fn password_login(
     .map_err(|problem| {
         RouteError::internal(format!("the password check did not finish ({problem})"))
     })?;
-    drop(permit);
     if !matched {
         return Err(refusal(peer, "password", "wrong password"));
     }
