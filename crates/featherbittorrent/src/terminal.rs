@@ -17,7 +17,16 @@ impl Terminal {
     /// A terminal that cannot be entered - no tty, a closed stdout - is an error here
     /// rather than a panic, because every caller prints its own one-line answer.
     pub fn setup() -> Result<Terminal, std::io::Error> {
-        ratatui::try_init().map(Terminal)
+        // A failure partway in - raw mode in, alternate screen refused - leaves the tty
+        // half changed: put back what did go in before handing the error out, because
+        // every caller answers with a line printed to that tty.
+        match ratatui::try_init() {
+            Ok(terminal) => Ok(Terminal(terminal)),
+            Err(error) => {
+                ratatui::restore();
+                Err(error)
+            }
+        }
     }
 
     /// The terminal to draw into.

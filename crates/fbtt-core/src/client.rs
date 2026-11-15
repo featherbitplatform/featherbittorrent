@@ -340,6 +340,39 @@ pub(crate) struct Channels {
     pub(crate) notices: mpsc::Sender<Notice>,
 }
 
+/// The sending half of the command queue, so a runtime can hold it beside the two
+/// receivers without holding a whole [`Client`]. Cloning it is cloning the queue's
+/// handle: every clone must go before the backend sees an empty queue.
+#[derive(Clone, Debug)]
+pub struct Commands {
+    commands: mpsc::Sender<Command>,
+}
+
+impl Commands {
+    /// Hands `command` to the backend without waiting, with exactly
+    /// [`Client::send`](Client::send)'s contract: false means the queue was full or
+    /// the backend has gone.
+    pub fn send(&self, command: Command) -> bool {
+        self.commands.try_send(command).is_ok()
+    }
+}
+
+/// A [`Client`] taken apart by [`split`](Client::split): the fields a runtime waits on
+/// and sends through, so each lives on its own and no borrow of one fights another in
+/// the same `tokio::select!`.
+#[derive(Debug)]
+pub struct ClientParts {
+    /// Commands out to the backend. Clonable, and every clone has to go - with the
+    /// two receivers below - before the backend notices nobody is listening.
+    pub commands: Commands,
+    /// The snapshots, newest first: `changed()` wakes on a publish and
+    /// `borrow_and_update()` takes the value that woke it.
+    pub snapshots: watch::Receiver<Arc<Snapshot>>,
+    /// The notices, oldest first. Dropping this one does not stop the backend; its
+    /// queue is separate from the commands that keep it alive.
+    pub notices: mpsc::Receiver<Notice>,
+}
+
 /// The screen's side of a backend: commands out, snapshots and notices in.
 ///
 /// None of its methods waits on the engine, so the thread that draws with them can
@@ -416,14 +449,24 @@ impl Client {
         &mut self.snapshot
     }
 
-    /// The change-wait of [`changed`](Self::changed) handed over by value: the binary's
-    /// loop selects on snapshots beside keys, notices and its frame clock at once, and
-    /// a borrow of `self` cannot sit in one `select!` branch while another branch sends
-    /// or receives on the same client. Taken, not cloned: a watch receiver has no
-    /// public clone, and two handles would only disagree about what has been seen.
-    pub fn take_changed(&mut self) -> watch::Receiver<Arc<Snapshot>> {
-        let current = self.snapshot.borrow().clone();
-        std::mem::replace(&mut self.snapshot, watch::channel(current).1)
+    /// Takes the client's three channels apart. A runtime that selects on snapshots
+    /// beside keys and notices needs the receivers as fields it owns: a method on
+    /// `self` borrows the whole client, and one `select!` branch cannot hold that
+    /// borrow while another sends on the same client. The client is consumed; letting
+    /// every part go is what tells the backend nobody is listening, exactly as
+    /// dropping the client did.
+    pub fn split(self) -> ClientParts {
+        let Client {
+            commands,
+            snapshot,
+            notices,
+            ..
+        } = self;
+        ClientParts {
+            commands: Commands { commands },
+            snapshots: snapshot,
+            notices,
+        }
     }
 
     /// The next notice, if there is one waiting. A screen that draws every frame

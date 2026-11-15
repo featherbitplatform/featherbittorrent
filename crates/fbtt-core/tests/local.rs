@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{
-    AddSource, Client, Command, Config, ConfigLoad, Connection, Detail, DetailTab, FilePriority,
-    FileRow, LibraryLock, LiveLimits, LocalBackend, Notice, Paths, RowState, Snapshot, TorrentId,
-    TorrentRow,
+    AddSource, Client, ClientParts, Command, Config, ConfigLoad, Connection, Detail, DetailTab,
+    FilePriority, FileRow, LibraryLock, LiveLimits, LocalBackend, Notice, Paths, RowState,
+    Snapshot, TorrentId, TorrentRow,
 };
 use tokio::task::JoinHandle;
 
@@ -346,6 +346,62 @@ async fn downloads_from_local_seed() {
 
     shutdown(client, task).await;
     seed.shutdown().await;
+}
+
+/// What `Client::split` is for: every part sees every publish. The binary's loop holds
+/// exactly these parts, and its screen once read snapshots from a channel the backend no
+/// longer wrote to - the first snapshot shown forever. This is what would have caught it.
+#[tokio::test(flavor = "multi_thread")]
+async fn split_parts_see_live_snapshots() {
+    let lib = Library::new("local_split");
+    let (client, task, _) = lib.start().await;
+    let ClientParts {
+        commands,
+        mut snapshots,
+        mut notices,
+    } = client.split();
+
+    let uri = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=live-parts";
+    let id = id_of(
+        &fbt::Magnet::parse(uri)
+            .expect("a magnet with a made-up hash")
+            .info_hashes,
+    );
+    assert!(
+        commands.send(Command::Add {
+            source: AddSource::Magnet(uri.to_string()),
+            dir: None,
+        }),
+        "the queue takes the magnet"
+    );
+
+    // The row is not there yet and arrives on a later wake: each `changed()` is followed
+    // by taking *that* publish's value through `borrow_and_update`, so a receiver that
+    // kept answering with its seed value would sit here until the deadline.
+    assert!(row_of(&snapshots.borrow_and_update().clone(), &id).is_none());
+    within(async {
+        loop {
+            if snapshots.changed().await.is_err() {
+                panic!("the backend stopped before the row appeared");
+            }
+            if row_of(&snapshots.borrow_and_update().clone(), &id).is_some() {
+                break;
+            }
+        }
+    })
+    .await;
+
+    // The notice queue is live too, and it is a separate handle: dropping it does not
+    // stop the backend, whose life follows the command queue.
+    let added = within(notices.recv()).await.expect("a notice for the add");
+    assert_eq!(info_text(added), "Added live-parts");
+
+    // Shutdown goes through `commands`, and the join answers the way the binary reads it.
+    assert!(commands.send(Command::Shutdown), "the queue takes Shutdown");
+    drop(notices);
+    drop(snapshots);
+    let outcome = within(task).await.expect("the backend stopped cleanly");
+    assert_eq!(outcome, Ok(()), "the last save reported no problem");
 }
 
 /// What one run added, the next run knows: the state file is the library's memory.

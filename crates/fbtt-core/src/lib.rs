@@ -14,8 +14,9 @@ pub mod lock;
 pub mod paths;
 
 pub use client::{
-    AddSource, Client, Command, Connection, Detail, DetailTab, FilePriority, FileRow, LiveLimits,
-    Notice, PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals, TrackerRow,
+    AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab, FilePriority,
+    FileRow, LiveLimits, Notice, PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals,
+    TrackerRow,
 };
 pub use config::{Config, ConfigError, ConfigLoad};
 pub use local::LocalBackend;

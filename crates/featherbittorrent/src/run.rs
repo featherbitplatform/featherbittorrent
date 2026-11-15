@@ -22,11 +22,12 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::{Fill, Paragraph};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use fbtt_core::{
-    Client, Command, Config, ConfigLoad, LibraryLock, LocalBackend, LockError, Notice, Paths,
-    Snapshot,
+    ClientParts, Command, Commands, Config, ConfigLoad, LibraryLock, LocalBackend, LockError,
+    Notice, Paths, Snapshot,
 };
 use fbtt_tui::{Model, format, theme, view};
 
@@ -84,7 +85,12 @@ pub async fn run() -> ExitCode {
         }
     };
 
-    let (mut client, task) = match LocalBackend::start(config, &paths, lock).await {
+    // Listened for before anything else can go wrong from here on: a listener made once
+    // buffers a signal that lands between two turns of the loop, where one made per turn
+    // would miss it entirely.
+    let mut signal = ShutdownSignal::install();
+
+    let (client, task) = match LocalBackend::start(config, &paths, lock).await {
         Ok(started) => started,
         Err(error) => return fail(&error),
     };
@@ -93,78 +99,101 @@ pub async fn run() -> ExitCode {
         Ok(terminal) => terminal,
         Err(error) => {
             eprintln!("Could not set up the terminal: {error}");
-            // Dropping `client` closes the queue, which the backend answers with its
-            // save; waiting for it keeps a second start off a half-written file.
-            let (code, problem) = await_backend(task).await;
+            // Tell it, let every queue handle go, and only then wait. Awaiting with the
+            // client still alive would wait forever: the backend ends when its command
+            // queue closes, and the client is what keeps that queue open. Waiting at all
+            // keeps a second start off a half-written file.
+            client.send(Command::Shutdown);
+            drop(client);
+            let (_, problem) = await_backend(task).await;
             if let Some(problem) = problem {
                 eprintln!("{problem}");
             }
-            return code;
+            // The library is saved and the lock is free, but this run never showed
+            // anything: that is a failure, whatever the save did.
+            return ExitCode::FAILURE;
         }
     };
 
+    // The channels come apart so the loop can hold each one on its own: a method on the
+    // whole client borrows it, and one `select!` branch cannot hold that borrow while
+    // another sends on the same client (see `Client::split`).
+    let ClientParts {
+        commands,
+        mut snapshots,
+        mut notices,
+    } = client.split();
+
     let mut model = Model::new();
-    let mut snap = client.snapshot();
+    // The value the watch already holds. The backend builds a snapshot before it
+    // publishes one, so taking it is a clone of an `Arc`, never a wait.
+    let mut snap = snapshots.borrow().clone();
     model.sync_selection(&snap);
     if let Some(notice) = first_notice {
         model.push_notice(notice, Instant::now());
     }
 
     let quit = {
-        // The change-wait leaves `client` by value (see `Client::take_changed`): a
-        // borrow of it could not sit in the loop beside the sends and the notice read.
-        let mut watch_rx = client.take_changed();
         let mut stream = EventStream::new();
-        // Both drop at the end of this block: the event reader lets go of stdin before
+        // The stream drops at the end of this block: its reader lets go of stdin before
         // the last save.
         run_loop(
             terminal.get_mut(),
             &mut model,
             &mut snap,
-            &mut client,
+            &commands,
+            &mut snapshots,
+            &mut notices,
             &mut stream,
-            &mut watch_rx,
+            &mut signal,
         )
         .await
     };
 
-    // The backend is told once: by this command or, if the queue was full, by the
-    // client going out of scope below. No timeout - resume data is worth the wait.
-    client.send(Command::Shutdown);
+    // The backend is told once: by this command or, if the queue was full, by `commands`
+    // going out of scope below. No timeout - resume data is worth the wait.
+    commands.send(Command::Shutdown);
     draw_saving(terminal.get_mut(), &model);
-    drain_notices(&mut model, &mut client, |model| {
+    drain_notices(&mut model, &mut notices, |model| {
         draw_saving(terminal.get_mut(), model)
     });
-    drop(client);
+    drop(commands);
 
     let (code, problem) = await_backend(task).await;
     drop(terminal); // The terminal goes back before anything is printed to it.
     if let Some(problem) = problem {
         eprintln!("{problem}");
     }
-    if quit == Quit::Failed {
+    if let Quit::Failed(problem) = quit {
+        eprintln!("{problem}");
         return ExitCode::FAILURE;
     }
     code
 }
 
-/// Why the loop ended. `Failed` is a failure of this process (a draw that could not be
-/// written); a backend that could not save reports itself through the join instead.
-#[derive(PartialEq, Eq)]
+/// Why the loop ended. `Failed` is a failure of this process - its line travels with it,
+/// to be printed after the terminal is back, because stderr on the alternate screen is
+/// not readable anywhere the person can look. A backend that could not save reports
+/// itself through the join instead.
 enum Quit {
     Ok,
-    Failed,
+    Failed(String),
 }
 
 /// Keys, snapshots, notices and the frame clock, waited on all at once. Nothing here
-/// awaits a backend reply: each branch takes what has arrived and returns.
+/// awaits a backend reply: each branch takes what has arrived and returns. The client's
+/// channels arrive as separate parts so that no borrow of one can fight a use of another
+/// in the same `select!`.
+#[allow(clippy::too_many_arguments)] // four channels, the screen, the model and the signal
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     model: &mut Model,
     snap: &mut Arc<Snapshot>,
-    client: &mut Client,
+    commands: &Commands,
+    snapshots: &mut watch::Receiver<Arc<Snapshot>>,
+    notices: &mut mpsc::Receiver<Notice>,
     stream: &mut EventStream,
-    watch_rx: &mut tokio::sync::watch::Receiver<Arc<Snapshot>>,
+    signal: &mut ShutdownSignal,
 ) -> Quit {
     // Nothing has been drawn yet, so the first tick draws.
     let mut dirty = true;
@@ -181,7 +210,7 @@ async fn run_loop(
             event = once_stream(&mut *stream) => match event {
                 Some(Ok(Event::Key(key))) => {
                     for command in model.handle_key(key, snap) {
-                        client.send(command);
+                        commands.send(command);
                     }
                     dirty = true;
                 }
@@ -190,24 +219,25 @@ async fn run_loop(
                 Some(Err(_)) | None => return Quit::Ok,
                 Some(Ok(_)) => {}
             },
-            // The change-wait taken from `client` before the loop: it resolves when the
-            // backend publishes, and taking the snapshot after it is a clone of an
-            // `Arc`, never a wait. (`select!` polls a watch receiver directly; a borrow
-            // of `client` in this branch would fight the sends in the other handlers.)
-            wake = watch_rx.changed() => match wake {
+            // `changed()` is a method on the receiver this loop owns, and its body reads
+            // that same receiver - no branch here borrows anything another uses. The value
+            // comes from `borrow_and_update`, which takes the snapshot that woke this wait;
+            // reading through the client instead was the old bug: it answered from a
+            // channel the backend no longer writes to.
+            wake = snapshots.changed() => match wake {
                 Ok(()) => {
-                    *snap = client.snapshot();
+                    *snap = snapshots.borrow_and_update().clone();
                     model.sync_selection(snap);
                     dirty = true;
                 }
                 // The backend is gone; nothing more will change on this screen.
                 Err(_) => return Quit::Ok,
             },
-            notice = once(client.notice()) => match notice {
+            notice = once(notices.recv()) => match notice {
                 Some(notice) => {
                     model.push_notice(notice, Instant::now());
                     dirty = true;
-                    drain_notices(model, client, |_| {});
+                    drain_notices(model, notices, |_| {});
                 }
                 // The backend stopped and the queue is read out: the screen has all it gets.
                 None => return Quit::Ok,
@@ -224,15 +254,16 @@ async fn run_loop(
                 dirty = false;
                 let watch = model.watch();
                 if watch != last_watch {
-                    client.send(Command::Watch(watch.clone()));
+                    commands.send(Command::Watch(watch.clone()));
                     last_watch = watch;
                 }
                 if let Err(error) = terminal.draw(|frame| view::draw(frame, model, snap)) {
-                    eprintln!("the terminal failed: {error}");
-                    return Quit::Failed;
+                    // The screen is the thing that failed: carry the line out of here and
+                    // print it once the terminal is back.
+                    return Quit::Failed(format!("the terminal failed: {error}"));
                 }
             },
-            _ = once(signal()) => return Quit::Ok,
+            _ = once(signal.wait.as_mut()) => return Quit::Ok,
         }
         if model.quit_requested() {
             return Quit::Ok;
@@ -240,22 +271,32 @@ async fn run_loop(
     }
 }
 
-/// The one shutdown signal this build listens for that is not a key: SIGTERM on Unix,
-/// Ctrl-C elsewhere, where raw mode does not swallow it. Both quit without asking -
-/// a signal is not a person who can answer a confirmation. On Unix Ctrl-C arrives as a
-/// key press instead, and the model's own map answers it.
-async fn signal() {
-    #[cfg(unix)]
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(mut term) => {
-            term.recv().await;
-        }
-        // A system that will not hand us a SIGTERM listener runs without that signal.
-        Err(_) => std::future::pending::<()>().await,
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+/// SIGTERM on Unix, Ctrl-C elsewhere (where raw mode does not swallow it), listened for
+/// once at startup: tokio keeps the signal's own queue between polls, so a listener made
+/// once cannot lose a signal that lands mid-loop, while a fresh listener per iteration
+/// can. A system that will not hand over a listener runs without that signal; on Unix
+/// Ctrl-C arrives as a key press instead, and the model's map answers it. Both quit
+/// without asking - a signal is not a person who can answer a confirmation.
+struct ShutdownSignal {
+    wait: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl ShutdownSignal {
+    fn install() -> ShutdownSignal {
+        #[cfg(unix)]
+        let wait: Pin<Box<dyn Future<Output = ()> + Send>> =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => Box::pin(async move {
+                    term.recv().await;
+                }),
+                Err(_) => Box::pin(std::future::pending::<()>()),
+            };
+        #[cfg(not(unix))]
+        let wait: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {
+            // Registered once, like the Unix listener; Ctrl-C is not a key here.
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        ShutdownSignal { wait }
     }
 }
 
@@ -285,8 +326,12 @@ fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
 
 /// Every notice already queued, taken without waiting: these are the answers a quitting
 /// person should still see, and past their room in the queue they mean nothing new.
-fn drain_notices(model: &mut Model, client: &mut Client, mut show: impl FnMut(&mut Model)) {
-    while let Some(notice) = client.try_notice() {
+fn drain_notices(
+    model: &mut Model,
+    notices: &mut mpsc::Receiver<Notice>,
+    mut show: impl FnMut(&mut Model),
+) {
+    while let Ok(notice) = notices.try_recv() {
         model.push_notice(notice, Instant::now());
         show(model);
     }
