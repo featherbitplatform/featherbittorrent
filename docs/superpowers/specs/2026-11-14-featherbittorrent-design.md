@@ -136,7 +136,12 @@ Detecting the terminal's capability must never stall startup. A query that gets 
 
 The local TUI and `featherbittorrent serve` on the same machine share one torrent library (config, resume data, session state, download folder). A lock file guarantees only one engine runs on it at a time: if a server already runs on the machine, the TUI offers to connect to it instead of starting its own engine. Plain `featherbittorrent` reopens the way it was last used (the local engine, or the last server it connected to); the connect screen (`c`) switches.
 
-The reverse proxy in front of a remote server is assumed to terminate TLS only, without a login of its own, so stream URLs and the event stream pass through unchanged; the gateway setup guide says so. A proxy that adds its own authentication is not supported in the first release.
+On untrusted networks the recommended setup is the featherbit gateway (or another API gateway) in front of the server, for TLS, throttling and further authentication. **[owner, 2026-11-15]** Three setups are supported:
+- featherbittorrent's own login only, the gateway terminating TLS and rate-limiting;
+- both: the gateway authenticates first (for example OpenID Connect through its `openid-connect` plugin for browsers, with `multi-auth` and `key-auth` or `basic-auth` for the TUI), then featherbittorrent's own login;
+- the gateway only: featherbittorrent runs with authentication off, reachable only from the gateway, and accepts only the gateway's host name (`server.allowed_hosts`).
+
+The TUI can send a gateway credential (a key header or basic auth) on every request, so it never needs an OpenID Connect login of its own. The docs ship an example docker compose with an OpenID Connect provider light enough for the reference Raspberry Pi. **[owner, 2026-11-15]**
 
 ### 6.5 API
 
