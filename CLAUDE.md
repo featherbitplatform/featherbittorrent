@@ -37,7 +37,8 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 Run `source "$HOME/.cargo/env"` first if cargo is not on PATH.
 
 ```
-# The client (the TUI arrives later in this milestone; today it prints its version)
+# The client: no subcommand runs the local TUI (it needs a real terminal; a second
+# instance on a locked library prints one line and exits 3 without touching the tty)
 cargo run -p featherbittorrent
 
 # Full gate, as CI runs it (fmt is Linux-only in CI; deny runs as cargo-deny-action)

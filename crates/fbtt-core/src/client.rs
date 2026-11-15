@@ -416,6 +416,16 @@ impl Client {
         &mut self.snapshot
     }
 
+    /// The change-wait of [`changed`](Self::changed) handed over by value: the binary's
+    /// loop selects on snapshots beside keys, notices and its frame clock at once, and
+    /// a borrow of `self` cannot sit in one `select!` branch while another branch sends
+    /// or receives on the same client. Taken, not cloned: a watch receiver has no
+    /// public clone, and two handles would only disagree about what has been seen.
+    pub fn take_changed(&mut self) -> watch::Receiver<Arc<Snapshot>> {
+        let current = self.snapshot.borrow().clone();
+        std::mem::replace(&mut self.snapshot, watch::channel(current).1)
+    }
+
     /// The next notice, if there is one waiting. A screen that draws every frame
     /// takes notices this way so it never waits on the engine.
     pub fn try_notice(&mut self) -> Option<Notice> {

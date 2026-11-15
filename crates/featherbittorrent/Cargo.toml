@@ -12,6 +12,20 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# fbtt-core and fbtt-tui join here when main.rs starts using them (Task 7); an
-# unused dependency is a warning under `cargo clippy -D warnings`.
 clap.workspace = true
+# The library this binary wires terminal, runtime and backend together with.
+fbtt-core.workspace = true
+fbtt-tui.workspace = true
+# The TUI stack. `event-stream` is what the loop selects over; ratatui's own backend
+# uses the same crossterm version, so one crate drives the terminal.
+crossterm.workspace = true
+ratatui.workspace = true
+# The `Stream` trait for polling that event stream inside `tokio::select!`.
+futures-core.workspace = true
+# The runtime: `rt-multi-thread` because the backend task runs long engine steps that
+# must not stall the event read; `signal` for SIGTERM and Ctrl-C off Unix.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+# The test process holds `LibraryLock` to make the binary's second acquire lose.
+fbtt-core.workspace = true

@@ -319,6 +319,42 @@ fn quit_asks_twice_when_something_downloads() {
 }
 
 #[test]
+fn ctrl_c_quits_the_way_q_does() {
+    // Ctrl-C is a modified press the map would otherwise drop; it has to mean quit, with
+    // the same confirmation `q` asks for while bytes are still coming down.
+    let snap = library();
+    let mut model = model_of(&snap);
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    let commands = model.handle_key(ctrl_c, &snap);
+    assert!(commands.is_empty(), "the first Ctrl-C quit without asking");
+    assert!(!model.quit_requested());
+    let commands = model.handle_key(ctrl_c, &snap);
+    assert_eq!(commands, vec![Command::Shutdown]);
+    assert!(model.quit_requested());
+
+    // With nothing downloading it quits at once, and `q` confirms an armed Ctrl-C too.
+    let idle = Snapshot {
+        torrents: vec![torrent("a", "quiet.torrent", RowState::Paused)],
+        ..library()
+    };
+    let mut model = model_of(&idle);
+    assert_eq!(
+        model.handle_key(ctrl_c, &idle),
+        vec![Command::Shutdown],
+        "Ctrl-C did not quit an idle library"
+    );
+
+    let mut model = model_of(&snap);
+    model.handle_key(ctrl_c, &snap);
+    assert_eq!(
+        model.handle_key(letter('y'), &snap),
+        vec![Command::Shutdown],
+        "y did not confirm the Ctrl-C ask"
+    );
+}
+
+#[test]
 fn tab_moves_through_the_detail_panes() {
     let snap = library();
     let mut model = model_of(&snap);

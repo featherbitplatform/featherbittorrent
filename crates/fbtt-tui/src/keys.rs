@@ -72,9 +72,14 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
     if key.kind != KeyEventKind::Press {
         return Vec::new();
     }
-    // Ctrl, Alt and the window key mean something else, and M1 has no binding for them.
-    // Terminals report an upper case letter as the character they typed, so a shift press
-    // is only accepted where it is the whole of the modifier.
+    // Ctrl-C is the terminal's word for "stop", so it means what `q` means - confirmation
+    // included - and it is answered even behind a dialog, where a typed `q` is only a
+    // letter. Ctrl, Alt and the window key mean something else otherwise, and M1 has no
+    // binding for them; terminals report an upper case letter as the character they typed,
+    // so a shift press is only accepted where it is the whole of the modifier.
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        return quit_press(model, snap);
+    }
     if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
         return Vec::new();
     }
@@ -88,16 +93,7 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
     match key.code {
         // Quitting is the one action that may need a second press, so it comes first and
         // answers before any of the rest of the map runs.
-        KeyCode::Char('q') => {
-            if model.quit_armed() {
-                model.quit_now()
-            } else if any_downloading(snap) {
-                model.arm_quit();
-                Vec::new()
-            } else {
-                model.quit_now()
-            }
-        }
+        KeyCode::Char('q') => quit_press(model, snap),
         KeyCode::Char('y') => {
             if model.quit_armed() {
                 model.quit_now()
@@ -160,6 +156,20 @@ fn pause_or_resume(row: Option<&TorrentRow>) -> Vec<Command> {
         _ => Command::Pause(row.id.clone()),
     };
     vec![command]
+}
+
+/// The press that means "leave": `q`, or Ctrl-C wearing the same meaning. With bytes still
+/// coming down it asks first - a second press, or `y`, confirms; anything else cancels.
+/// With nothing downloading one press is enough.
+fn quit_press(model: &mut Model, snap: &Snapshot) -> Vec<Command> {
+    if model.quit_armed() {
+        model.quit_now()
+    } else if any_downloading(snap) {
+        model.arm_quit();
+        Vec::new()
+    } else {
+        model.quit_now()
+    }
 }
 
 /// Whether something is still pulling bytes, which is what makes quitting worth asking about.

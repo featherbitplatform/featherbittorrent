@@ -28,6 +28,7 @@ all = "warn"
 # anything else. A crate joins this table when another one starts using it: `fbtt-tui`
 # arrives with the binary (Task 7), which is what makes it a dependency of something.
 fbtt-core = { path = "crates/fbtt-core" }
+fbtt-tui = { path = "crates/fbtt-tui" }
 clap = { version = "4.6", features = ["derive"] }
 # The TUI stack. crossterm is the version ratatui's own backend uses (its default),
 # so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
@@ -42,6 +43,10 @@ ratatui = { version = "0.30", default-features = false, features = [
 ] }
 directories = "6"
 fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.8.0", features = ["serde"] }
+# The `Stream` trait only: `std::stream::Stream` is still unstable, and this is the
+# same futures tree crossterm's `EventStream` implements it from. Already in the tree
+# through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # serde_yaml is unmaintained (RUSTSEC-2024-0340); this is its maintained fork.
 serde_norway = "0.9"
