@@ -5,10 +5,13 @@
 //! because that is how people state them: 0 means unlimited, and a queue count
 //! left out stays whatever the engine's own default is. A download folder may be
 //! named relative to the library (`download_dir: dl`), which is where it lands;
-//! see [`Config::resolve`]. A file that cannot be parsed does not stop the app. It
-//! runs on this library's defaults, and the file it could not read is kept aside as
-//! `config.yaml.bad` so the next save cannot overwrite what we never understood.
+//! see [`Config::resolve`]. The `server` section says where `featherbittorrent serve`
+//! listens, which folders its API may name, and whether anyone has to sign in. A file
+//! that cannot be parsed does not stop the app. It runs on this library's defaults, and
+//! the file it could not read is kept aside as `config.yaml.bad` so the next save cannot
+//! overwrite what we never understood.
 
+use std::fmt;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -21,6 +24,8 @@ use crate::paths::Paths;
 
 /// The port to listen on when the user does not pick one: BitTorrent's own.
 const DEFAULT_LISTEN_PORT: u16 = 6881;
+/// The port the API listens on when the config does not name an address at all.
+const DEFAULT_SERVER_PORT: u16 = 8090;
 /// The engine's write cache, in MiB.
 const DEFAULT_CACHE_SIZE_MIB: u64 = 32;
 /// Where downloads go on a host with no Downloads directory of its own and no
@@ -111,6 +116,97 @@ impl Default for Limits {
     }
 }
 
+/// Where `featherbittorrent serve` listens, which folders its API may name, and who has to sign
+/// in to use it.
+///
+/// The address decides the login rule ([`auth_on`](Self::auth_on)): a port on loopback is already
+/// reachable only by someone sitting at this machine, who owns the library anyway; a port on any
+/// other address is reachable by everyone on the network, and without logins they would all read
+/// and control the same torrents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// The address and port to serve on.
+    pub bind: SocketAddr,
+    /// The directories the API may name in a request: save paths, move targets, folders to
+    /// browse. An empty list means the download folder alone. [`Config::resolve`] fills that in
+    /// and makes every entry absolute, so what the server enforces is what the run works on - and
+    /// [`Config::save`] writes it back unnamed when it is only that folder, so the default keeps
+    /// following `download_dir` wherever the person moves it.
+    pub allowed_roots: Vec<PathBuf>,
+    /// Whether login is on, and who may use it.
+    pub auth: AuthConfig,
+}
+
+impl Default for ServerConfig {
+    /// Loopback on port 8090, the download folder as the only root (filled in by
+    /// [`Config::resolve`]), and login left to [`ServerConfig::auth_on`] to decide.
+    fn default() -> Self {
+        ServerConfig {
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_SERVER_PORT)),
+            allowed_roots: Vec::new(),
+            auth: AuthConfig::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Whether this server signs people in.
+    ///
+    /// `auth.enabled` spells the answer when the config sets it; left out, authentication is on
+    /// for anything but a loopback address. Turning it off on a public bind is therefore an
+    /// explicit `enabled: false`, not something a missing field does by accident.
+    pub fn auth_on(&self) -> bool {
+        self.auth.enabled.unwrap_or(!self.bind.ip().is_loopback())
+    }
+}
+
+/// Login for the server: whether it is on, and who is let in.
+///
+/// Neither list holds a secret beyond `UserEntry`'s hash, which its `Debug` hides. A device key
+/// is a public key and may be printed freely.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// `None`: on unless [`ServerConfig::bind`] is loopback, which is what
+    /// [`ServerConfig::auth_on`] answers with. `Some(true)` and `Some(false)` mean exactly that.
+    pub enabled: Option<bool>,
+    /// The accounts a password logs in to. Empty means no password logins at all.
+    pub users: Vec<UserEntry>,
+    /// The device keys that may log in without a password. Empty means none.
+    pub devices: Vec<DeviceEntry>,
+}
+
+/// One account a password logs in to.
+///
+/// The hash is a secret, so this is the one type in the config whose `Debug` hides a field: a
+/// config printed in a log line or a panic message must not carry a password hash out of it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserEntry {
+    /// The name typed at the login prompt.
+    pub name: String,
+    /// The Argon2id hash (a PHC string) of the password, never the password itself.
+    pub password_hash: String,
+}
+
+impl fmt::Debug for UserEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserEntry")
+            .field("name", &self.name)
+            .field("password_hash", &"<hash>")
+            .finish()
+    }
+}
+
+/// One device key that may log in by signing a challenge, with no password involved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    /// What the person named this device, for the devices list.
+    pub name: String,
+    /// The public key in the one-line OpenSSH format (`ssh-ed25519 AAAA... comment`).
+    pub public_key: String,
+}
+
 /// The settings one library runs on.
 ///
 /// Every field has a default, so a config that names one setting keeps the rest
@@ -127,6 +223,9 @@ pub struct Config {
     pub limits: Limits,
     /// The engine's write cache, in MiB.
     pub cache_size_mib: u64,
+    /// The headless server: where it listens, what its API may name, and who signs in. A run of
+    /// the TUI reads none of this; `featherbittorrent serve` is what acts on it.
+    pub server: ServerConfig,
 }
 
 impl Default for Config {
@@ -164,8 +263,15 @@ impl Config {
     /// Every config a run works on goes through here (see the binary's setup), so
     /// what the backend holds, what a snapshot offers the add dialog, and what a
     /// save writes back are all rooted in the library.
+    ///
+    /// `server.allowed_roots` is put through the same rule, and an empty list becomes
+    /// the download folder alone: the folders the API may name have to be absolute
+    /// directories for the server to confine requests to them, and a config that names
+    /// no root means "downloads only", not "everything on this machine".
     pub fn resolve(mut self, paths: &Paths) -> Config {
-        self.download_dir = absolute_download_dir(&self.download_dir, paths);
+        self.download_dir = absolute_dir(&self.download_dir, paths);
+        self.server.allowed_roots =
+            resolved_roots(&self.server.allowed_roots, &self.download_dir, paths);
         self
     }
 
@@ -177,6 +283,7 @@ impl Config {
             listen_port: DEFAULT_LISTEN_PORT,
             limits: Limits::default(),
             cache_size_mib: DEFAULT_CACHE_SIZE_MIB,
+            server: ServerConfig::default(),
         }
     }
 
@@ -228,12 +335,19 @@ impl Config {
     /// target: a crash leaves either the old config or the new one, never half
     /// of each. A failure before the rename removes the temp file; a failed
     /// rename leaves it holding what we tried to save.
+    ///
+    /// What goes in is this config with `server.allowed_roots` unnamed when it is only the download
+    /// folder [`resolve`] filled in: a run saves the config it resolved, and pinning the roots to
+    /// that directory would leave the server's root behind the day the person moves `download_dir`.
+    /// An empty list means "the download folder" on disk, which is what keeps following it.
+    ///
+    /// [`resolve`]: Self::resolve
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let cannot_write = |source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
         };
-        let text = serde_norway::to_string(self)
+        let text = serde_norway::to_string(&self.for_the_file())
             .map_err(|error| {
                 std::io::Error::other(format!("the config cannot be written as YAML: {error}"))
             })
@@ -246,6 +360,18 @@ impl Config {
         }
         write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, text.as_bytes())
             .map_err(cannot_write)
+    }
+
+    /// This config as it belongs in a file: the roots unnamed when they are the one directory
+    /// [`resolve`](Self::resolve) would fill in anyway. See [`save`](Self::save).
+    fn for_the_file(&self) -> Config {
+        let mut out = self.clone();
+        let pins_only_downloads =
+            out.server.allowed_roots.len() == 1 && out.server.allowed_roots[0] == out.download_dir;
+        if pins_only_downloads {
+            out.server.allowed_roots.clear();
+        }
+        out
     }
 
     /// The engine settings these values describe.
@@ -281,17 +407,29 @@ fn user_download_dir() -> Option<PathBuf> {
     UserDirs::new().and_then(|dirs| dirs.download_dir().map(PathBuf::from))
 }
 
-/// `download_dir` as a directory the run can use: absolute stays, relative hangs
-/// below the library's data directory, and nothing at all means the library's own
-/// `downloads`. See [`Config::resolve`].
-fn absolute_download_dir(download_dir: &Path, paths: &Paths) -> PathBuf {
-    if download_dir.as_os_str().is_empty() {
+/// A directory the config named, as a path this run can use: absolute stays, relative hangs
+/// below the library's data directory, and nothing at all means the library's own `downloads`.
+/// See [`Config::resolve`], which puts `download_dir` and each `server.allowed_roots` entry
+/// through here.
+fn absolute_dir(dir: &Path, paths: &Paths) -> PathBuf {
+    if dir.as_os_str().is_empty() {
         return paths.data_dir.join(DOWNLOADS_DIR_NAME);
     }
-    if download_dir.is_absolute() {
-        return download_dir.to_path_buf();
+    if dir.is_absolute() {
+        return dir.to_path_buf();
     }
-    paths.data_dir.join(download_dir)
+    paths.data_dir.join(dir)
+}
+
+/// The directories the API may name, as absolute paths: what the config named, rooted in the
+/// library like `download_dir` is, or the download folder alone when it named none. An empty
+/// list cannot mean "no folders" to a server that has to answer requests about somewhere. See
+/// [`Config::resolve`].
+fn resolved_roots(roots: &[PathBuf], download_dir: &Path, paths: &Paths) -> Vec<PathBuf> {
+    if roots.is_empty() {
+        return vec![download_dir.to_path_buf()];
+    }
+    roots.iter().map(|root| absolute_dir(root, paths)).collect()
 }
 
 /// `path` with `suffix` added to its file name: `config.yaml` becomes
@@ -350,7 +488,10 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, user_download_dir};
+    use super::{
+        AuthConfig, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, ServerConfig, UserEntry,
+        user_download_dir,
+    };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
     use std::fs;
@@ -619,5 +760,185 @@ mod tests {
             leftovers.is_empty(),
             "a temp file survived the save: {leftovers:?}"
         );
+    }
+
+    /// The server section's defaults, and the one rule that decides whether anyone has to sign
+    /// in: a server on loopback does not, a server anyone can reach does, and only an explicit
+    /// `enabled: false` turns that off. A config file that names part of the section keeps the
+    /// rest at these defaults, like every other part of it.
+    #[test]
+    fn server_config_defaults() {
+        let dir = ScratchDir::new("config_server");
+        let paths = library(&dir);
+
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.server.bind,
+            "127.0.0.1:8090".parse().expect("the default bind"),
+            "the API listens on loopback unless the config says otherwise"
+        );
+        assert!(
+            defaults.server.allowed_roots.is_empty(),
+            "no roots are named until the run resolves the config: {:?}",
+            defaults.server.allowed_roots
+        );
+        assert_eq!(defaults.server.auth.enabled, None);
+        assert!(defaults.server.auth.users.is_empty());
+        assert!(defaults.server.auth.devices.is_empty());
+
+        assert!(
+            !defaults.server.auth_on(),
+            "a server on loopback does not need a login"
+        );
+        let mut localhost = Config::default();
+        localhost.server.bind = "[::1]:8090".parse().expect("the IPv6 loopback");
+        assert!(!localhost.server.auth_on(), "::1 is loopback too");
+
+        let mut public = Config::default();
+        public.server.bind = "0.0.0.0:8090".parse().expect("a bind on every address");
+        assert!(
+            public.server.auth_on(),
+            "a server anyone can reach signs people in"
+        );
+
+        let mut turned_off = public.clone();
+        turned_off.server.auth.enabled = Some(false);
+        assert!(
+            !turned_off.server.auth_on(),
+            "only an explicit `enabled: false` turns authentication off"
+        );
+
+        let let_in = Config {
+            server: ServerConfig {
+                auth: AuthConfig {
+                    enabled: Some(true),
+                    ..AuthConfig::default()
+                },
+                ..ServerConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            let_in.server.auth_on(),
+            "and `enabled: true` keeps it on even on loopback"
+        );
+
+        // A file naming one server setting keeps the rest at the defaults above.
+        fs::write(
+            paths.config_file(),
+            "server:\n  bind: 0.0.0.0:8090\n  auth:\n    enabled: false\n",
+        )
+        .expect("write a config naming the server");
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read it back") else {
+            panic!("a config naming the server is still a config");
+        };
+        assert_eq!(config.server.bind, public.server.bind);
+        assert!(!config.server.auth_on());
+        assert_eq!(
+            config.server.allowed_roots, defaults.server.allowed_roots,
+            "the part the file leaves out is default too"
+        );
+
+        // And what a save writes is what the next run reads.
+        let with_users = Config {
+            server: ServerConfig {
+                bind: public.server.bind,
+                allowed_roots: vec![paths.data_dir.join("share")],
+                auth: AuthConfig {
+                    enabled: Some(true),
+                    users: vec![UserEntry {
+                        name: "alice".to_string(),
+                        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_string(),
+                    }],
+                    devices: Vec::new(),
+                },
+            },
+            ..Config::default()
+        };
+        with_users
+            .save(&paths.config_file())
+            .expect("save the server section");
+        match Config::load(&paths).expect("read it back") {
+            ConfigLoad::Loaded(loaded) => assert_eq!(loaded, with_users),
+            other => panic!("expected the saved server back, got {other:?}"),
+        }
+    }
+
+    /// The folders the API may touch: none named means the download folder alone, and a named
+    /// one follows `download_dir`'s rule - relative to the library, absolute left alone.
+    #[test]
+    fn allowed_roots_default_to_the_download_dir() {
+        let dir = ScratchDir::new("config_allowed_roots");
+        let paths = library(&dir);
+
+        let nothing_named = Config::default().resolve(&paths);
+        let downloads = nothing_named.download_dir.clone();
+        assert_eq!(
+            nothing_named.server.allowed_roots,
+            [downloads],
+            "with no roots in the config the download folder is the one root"
+        );
+
+        let named = Config {
+            server: ServerConfig {
+                allowed_roots: vec![PathBuf::from("share"), paths.data_dir.join("elsewhere")],
+                ..ServerConfig::default()
+            },
+            ..Config::default()
+        }
+        .resolve(&paths);
+        assert_eq!(
+            named.server.allowed_roots,
+            [
+                paths.data_dir.join("share"),
+                paths.data_dir.join("elsewhere")
+            ],
+            "a relative root hangs below the library and an absolute one stays as written"
+        );
+
+        // Resolving twice changes nothing, as it does for `download_dir`.
+        let roots = named.server.allowed_roots.clone();
+        assert_eq!(named.resolve(&paths).server.allowed_roots, roots);
+    }
+
+    /// A password hash is a secret: nothing that prints a config may show it. `Debug` names the
+    /// field and hides its value, so a log line or a panic message carries the name only.
+    #[test]
+    fn user_debug_hides_hash() {
+        let user = UserEntry {
+            name: "alice".to_string(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaGFnb3JpdGht".to_string(),
+        };
+        let shown = format!("{user:?}");
+        assert!(
+            shown.contains("<hash>"),
+            "the field is still named, with its value replaced: {shown}"
+        );
+        assert!(
+            !shown.contains("argon2") && !shown.contains("c2FsdA"),
+            "neither the hash nor its salt is printed: {shown}"
+        );
+        assert!(shown.contains("alice"), "the name is shown: {shown}");
+
+        // The same through a config, and through a list of users.
+        let config = Config {
+            server: ServerConfig {
+                auth: AuthConfig {
+                    enabled: Some(true),
+                    users: vec![user.clone()],
+                    ..AuthConfig::default()
+                },
+                ..ServerConfig::default()
+            },
+            ..Config::default()
+        };
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("argon2"),
+            "a config's Debug hides the hash too: {shown}"
+        );
+        assert!(shown.contains("<hash>"), "and says so: {shown}");
+        let shown = format!("{:?}", vec![user]);
+        assert!(!shown.contains("argon2"), "so does a list of them: {shown}");
     }
 }

@@ -760,6 +760,68 @@ async fn set_limits_applies_and_persists() {
     shutdown(client, task).await;
 }
 
+/// The limits save writes the config this run resolved, and the roots default has to survive that:
+/// `allowed_roots` stays unnamed in the file, because "no roots named" *is* the download folder. A
+/// file that pinned it would leave the server's root behind the day the person moves `download_dir`.
+#[tokio::test(flavor = "multi_thread")]
+async fn limits_save_keeps_allowed_roots_default() {
+    let lib = Library::new("local_limits_roots");
+    let (mut client, task, _) = lib.start().await;
+
+    let mut limits = LiveLimits::from(lib.config.limits);
+    limits.download_kib = 250;
+    assert!(client.send(Command::SetLimits(limits)));
+    wait_for(&mut client, |snapshot| snapshot.limits.download_kib == 250).await;
+
+    let ConfigLoad::Loaded(written) =
+        Config::load(&lib.paths).expect("the limits save wrote a file")
+    else {
+        panic!("the config the limits save wrote is readable");
+    };
+    assert_eq!(written.limits.download_kib, 250, "the limit is in the file");
+    assert_eq!(
+        written.download_dir, lib.config.download_dir,
+        "so is the folder this run works on"
+    );
+    assert!(
+        written.server.allowed_roots.is_empty(),
+        "the roots default is not pinned to a directory: {:?}",
+        written.server.allowed_roots
+    );
+
+    // The text says the same thing: no `allowed_roots` line, or an empty list.
+    let text = fs::read_to_string(lib.paths.config_file()).expect("read the file as text");
+    let roots_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("allowed_roots:"));
+    assert!(
+        roots_line.is_none_or(|line| line.trim() == "allowed_roots: []"),
+        "the file leaves the roots unnamed: {text}"
+    );
+
+    // And resolving what was written still means the download folder - and moves with it, which is
+    // the point of leaving the roots unnamed.
+    let downloads = lib.config.download_dir.clone();
+    let resolved = written.clone().resolve(&lib.paths);
+    assert_eq!(
+        resolved.server.allowed_roots,
+        [downloads],
+        "unnamed roots mean the download folder"
+    );
+
+    let elsewhere = lib.dir.path().join("elsewhere");
+    let mut moved = written;
+    moved.download_dir = elsewhere.clone();
+    let moved = moved.resolve(&lib.paths);
+    assert_eq!(
+        moved.server.allowed_roots,
+        [elsewhere],
+        "and the root follows a folder the person moves"
+    );
+
+    shutdown(client, task).await;
+}
+
 /// Skipping one file of a two-file torrent shows up in the watched file list:
 /// pad files are not listed, and only the named file changes.
 #[tokio::test(flavor = "multi_thread")]

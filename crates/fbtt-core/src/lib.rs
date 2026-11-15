@@ -1,27 +1,38 @@
-//! fbtt-core: config, platform paths, the library lock and the client interface:
+//! fbtt-core: config, platform paths, the library lock, the engine and the client interface:
 //! everything featherbittorrent needs that is not a screen.
 //!
 //! The UI talks to one client interface: commands go in, immutable snapshots come
 //! out, so a screen never awaits anything. [`LocalBackend`] implements it over the
 //! embedded engine; the remote implementation over HTTP arrives with milestone 2.
+//!
+//! The engine itself ([`Engine`]) is separate from either role on purpose: the terminal and the
+//! headless server drive the same session by the same rules about the same files, so those rules -
+//! and the library lock - are written once, here. Which role a run starts on is what
+//! [`ui_state`] remembers.
 
 #![forbid(unsafe_code)]
 
 pub mod client;
 pub mod config;
+pub mod engine;
 pub mod local;
 pub mod lock;
 pub mod paths;
+pub mod ui_state;
 
 pub use client::{
     AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab, FilePriority,
     FileRow, LiveLimits, Notice, PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals,
     TrackerRow,
 };
-pub use config::{Config, ConfigError, ConfigLoad};
+pub use config::{
+    AuthConfig, Config, ConfigError, ConfigLoad, DeviceEntry, ServerConfig, UserEntry,
+};
+pub use engine::Engine;
 pub use local::LocalBackend;
 pub use lock::{LibraryLock, LockError};
 pub use paths::Paths;
+pub use ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
 
 /// A directory under the system temp dir, removed when the test that made it is done.
 /// The workspace takes no `tempfile` dependency, so tests make their own scratch space.
