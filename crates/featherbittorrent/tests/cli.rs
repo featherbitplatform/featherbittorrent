@@ -2,9 +2,8 @@ use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fbtt_core::LibraryLock;
 
@@ -97,23 +96,26 @@ fn terminal_setup_failure_exits() {
         .spawn()
         .expect("the binary starts even with no terminal to show");
 
-    // `wait` blocks, so the deadline lives in a second thread and the main one times out
-    // on a channel instead.
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || tx.send(child.wait()));
-    let status = match rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => panic!("waiting for the binary failed: {error}"),
-        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the waiter thread died"),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // std cannot signal a child it has moved away: ask by number, then reap.
-            let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
-            let _ = rx.recv();
-            panic!(
-                "the binary is still running after 20 seconds - it waited on a backend \
-                 it never told to stop"
-            );
+    // `try_wait` does not block, so the deadline can live right here: a run that will not
+    // end is killed and failed, not left hanging CI on a blocking `wait`.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // SIGKILL on Unix, TerminateProcess on Windows; then reap the child so
+                    // it is gone before the scratch directories are removed.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the binary is still running after 20 seconds - it waited on a \
+                         backend it never told to stop"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("waiting for the binary failed: {error}"),
         }
     };
 
