@@ -1,0 +1,28 @@
+[package]
+name = "fbtt-server"
+description = "featherbittorrent server: logins, device keys and sessions, plus the routes on top of fbt-api."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The password hashes.
+argon2.workspace = true
+# Only the `http` types an `AuthRequest` carries: fbt-api does not re-export them.
+axum.workspace = true
+# Session tokens and challenge nonces, spelled in base64.
+base64.workspace = true
+fbt-api.workspace = true
+fbtt-core.workspace = true
+# The bytes session tokens and challenge nonces are made of.
+getrandom.workspace = true
+# What a session token is stored as: its SHA-256.
+sha2.workspace = true
+ssh-key.workspace = true
+thiserror.workspace = true

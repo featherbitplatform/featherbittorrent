@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod client;
 pub mod config;
 pub mod engine;
@@ -20,6 +21,7 @@ pub mod lock;
 pub mod paths;
 pub mod ui_state;
 
+pub use auth::LOGIN_NAMESPACE;
 pub use client::{
     AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab, FilePriority,
     FileRow, LiveLimits, Notice, PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals,
