@@ -16,6 +16,27 @@ clap.workspace = true
 # The library this binary wires terminal, runtime and backend together with.
 fbtt-core.workspace = true
 fbtt-tui.workspace = true
+# `featherbittorrent serve`, and the password hashes and device-key checks the admin commands write
+# into config.yaml. `test-support` is on because the debug-only `--offline` knob needs the constructor
+# that takes the engine settings rather than deriving them from the config; it is asked for in every
+# build so that this crate has one start path, and what it adds - two counters a test reads - costs an
+# atomic increment per password check. Cargo cannot select a dependency by `debug_assertions`, so the
+# profile cannot be part of this decision.
+fbtt-server = { workspace = true, features = ["test-support"] }
+# The engine's own settings type, which the debug-only `--offline` knob edits before handing them to
+# the server: it is the only way to keep a test run's sockets on loopback without pretending the
+# config said so.
+fbt.workspace = true
+# Reading whether a config file names a `server` section at all, which the parsed `Config` cannot
+# answer: every field of it has a default, so a file that never mentioned one still reads back as a
+# full server section. See `serve.rs`.
+serde_norway.workspace = true
+# The wizard's and `user set`'s password prompt.
+rpassword.workspace = true
+# Where `serve`'s log lines go: stderr, with `RUST_LOG` honoured.
+tracing-subscriber.workspace = true
+# The log lines themselves (`listening on <addr>`, the stop reason).
+tracing.workspace = true
 # The TUI stack. `event-stream` is what the loop selects over; ratatui's own backend
 # uses the same crossterm version, so one crate drives the terminal.
 crossterm.workspace = true

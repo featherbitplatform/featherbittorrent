@@ -29,6 +29,8 @@ all = "warn"
 # arrives with the binary (Task 7), which is what makes it a dependency of something.
 fbtt-core = { path = "crates/fbtt-core" }
 fbtt-tui = { path = "crates/fbtt-tui" }
+# Joins the table now that the binary depends on it for `serve`.
+fbtt-server = { path = "crates/fbtt-server" }
 clap = { version = "4.6", features = ["derive"] }
 # The TUI stack. crossterm is the version ratatui's own backend uses (its default),
 # so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
@@ -91,3 +93,11 @@ tracing = "0.1"
 # names rustls with the `ring` provider, which is what `fbt`'s own `tls` feature turns on, so no
 # second crypto provider joins the tree; these tests speak plain http to loopback and ask for none.
 reqwest = { version = "0.12", default-features = false }
+# The binary's log lines for `serve`, which logs to stderr: `fmt` for the lines themselves,
+# `env-filter` so `RUST_LOG` is honoured. No default features: `ansi` is off because the binary
+# decides itself whether stderr takes colours, and `tracing-log` would bridge a `log` crate that
+# nothing in this workspace logs through.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+# The wizard's and `user set`'s password prompt: one line read with echo off, so a password typed at
+# a terminal never lands in the shell's history or in what the run prints. It has no features to name.
+rpassword = "7"
