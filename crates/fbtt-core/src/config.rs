@@ -116,8 +116,8 @@ impl Default for Limits {
     }
 }
 
-/// Where `featherbittorrent serve` listens, which folders its API may name, and who has to sign
-/// in to use it.
+/// Where `featherbittorrent serve` listens, which folders its API may name, which host names it answers
+/// when nobody signs in, and who has to sign in to use it.
 ///
 /// The address decides the login rule ([`auth_on`](Self::auth_on)): a port on loopback is already
 /// reachable only by someone sitting at this machine, who owns the library anyway; a port on any
@@ -134,17 +134,32 @@ pub struct ServerConfig {
     /// [`Config::save`] writes it back unnamed when it is only that folder, so the default keeps
     /// following `download_dir` wherever the person moves it.
     pub allowed_roots: Vec<PathBuf>,
+    /// The names this server answers when nobody signs in, beside `localhost` and an address.
+    ///
+    /// With logins off the server has no credential to say who a request came from, so all that stands
+    /// between a hostile web page and this library is the name the browser thinks it is talking to: a
+    /// request whose `Host` is some other domain is refused, because that is how a DNS-rebinding attack
+    /// arrives. An address (an IPv4 one, or an IPv6 one in brackets) is always accepted - someone using
+    /// this on their own network types an address, and a rebound page cannot name one. This list is for
+    /// the person who runs the server behind a name of their own (`bit.local`) and turned logins off on
+    /// purpose: it says which names count as that address. Empty means `localhost` and addresses only,
+    /// which is what a loopback-only server needs and the safe answer for any other bind. Logins being on
+    /// makes this list irrelevant: every request then has to carry a token, and no web page gets one by
+    /// accident.
+    pub allowed_hosts: Vec<String>,
     /// Whether login is on, and who may use it.
     pub auth: AuthConfig,
 }
 
 impl Default for ServerConfig {
     /// Loopback on port 8090, the download folder as the only root (filled in by
-    /// [`Config::resolve`]), and login left to [`ServerConfig::auth_on`] to decide.
+    /// [`Config::resolve`]), no host names beside `localhost` and an address (logins are on off-loopback
+    /// anyway), and login left to [`ServerConfig::auth_on`] to decide.
     fn default() -> Self {
         ServerConfig {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_SERVER_PORT)),
             allowed_roots: Vec::new(),
+            allowed_hosts: Vec::new(),
             auth: AuthConfig::default(),
         }
     }
@@ -299,21 +314,11 @@ impl Config {
     /// reason: the defaults have to be rooted in it.
     pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
         let path = paths.config_file();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ConfigLoad::Missing);
-            }
-            Err(source) => {
-                return Err(ConfigError::Io {
-                    path: path.clone(),
-                    source,
-                });
-            }
-        };
-        match serde_norway::from_slice::<Config>(&bytes) {
-            Ok(config) => Ok(ConfigLoad::Loaded(config)),
-            Err(error) => {
+        match read_and_parse(&path)? {
+            Reading::Absent => Ok(ConfigLoad::Missing),
+            Reading::Parsed(config) => Ok(ConfigLoad::Loaded(*config)),
+            Reading::Unparsable(error) => {
+                // The file moves out of the way before anything can take its place.
                 let aside = suffixed(&path, BAD_FILE_SUFFIX);
                 std::fs::rename(&path, &aside).map_err(|source| ConfigError::Write {
                     path: path.clone(),
@@ -324,6 +329,28 @@ impl Config {
                     problem: problem_line(&path, &error),
                 })
             }
+        }
+    }
+
+    /// Reads one config file for a caller that is about to change it, leaving the file alone.
+    ///
+    /// `Ok(None)` when there is no file yet; `Ok(Some(config))` when the bytes read as a config; `Err`
+    /// with one line saying what is wrong when the file cannot be opened or cannot be read as YAML.
+    /// Nothing is renamed and nothing is written, which is the whole difference from
+    /// [`load`](Self::load): a run has to start on *something*, so `load` keeps an unreadable file aside
+    /// under another name and goes on with defaults. Something that edits the file has no basis for
+    /// deciding what the file should have said, and writing its own defaults over bytes it never read
+    /// would quietly drop everything else that was in them. `path` rather than [`Paths`] for the same
+    /// reason - no library defaults are wanted here, and having them on hand is how a caller gets tempted
+    /// to use them.
+    pub fn load_for_edit(path: &Path) -> Result<Option<Config>, String> {
+        match read_and_parse(path) {
+            Ok(Reading::Absent) => Ok(None),
+            Ok(Reading::Parsed(config)) => Ok(Some(*config)),
+            Ok(Reading::Unparsable(error)) => Err(problem_line(path, &error)),
+            // A file that cannot be opened at all: the same reason `load` calls it an error, put in one
+            // line instead of carrying an enum a caller only formats anyway.
+            Err(problem) => Err(problem.to_string()),
         }
     }
 
@@ -399,6 +426,40 @@ impl Config {
         settings.queue = queue;
         settings.cache_size = self.cache_size_mib.saturating_mul(MIB);
         settings
+    }
+}
+
+/// What reading one config file gave, before anybody decides what to do about a bad one. A config is a few
+/// hundred bytes of everything the run works on, and the box keeps the two "there are bytes" cases the same
+/// size instead of making the empty one pay for both.
+enum Reading {
+    /// Nothing at that path.
+    Absent,
+    /// Bytes that read as this config.
+    Parsed(Box<Config>),
+    /// Bytes that are there and are not this config, with the parse failure that says so.
+    Unparsable(serde_norway::Error),
+}
+
+/// Reads `path` and parses it: [`Reading::Absent`] for no file, [`Reading::Unparsable`] for bytes that
+/// are not this config, and [`ConfigError`] only for a file that cannot be opened at all (no permission,
+/// a directory in the way), where there is no way to tell "empty" from "unavailable". This is the one
+/// place a config file is read; [`Config::load`] and [`Config::load_for_edit`] differ in what they do
+/// with an unparsable file, not in how they find out about it.
+fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Reading::Absent),
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    match serde_norway::from_slice::<Config>(&bytes) {
+        Ok(config) => Ok(Reading::Parsed(Box::new(config))),
+        Err(error) => Ok(Reading::Unparsable(error)),
     }
 }
 
@@ -670,6 +731,54 @@ mod tests {
         assert!(dir.path().join("config.yaml.bad").exists());
     }
 
+    /// A caller that is about to *edit* the file gets the unreadable one as an error with the bytes left
+    /// where they are: nothing is renamed and nothing is written, so a failed request cannot move the
+    /// person's own config out from under them, and it has no defaults to overwrite it with either.
+    #[test]
+    fn load_for_edit_does_not_touch_the_file() {
+        let dir = ScratchDir::new("config_load_for_edit");
+        let path = dir.path().join("config.yaml");
+
+        // No file yet: there is nothing to read, and `None` says that rather than inventing a config.
+        assert_eq!(
+            Config::load_for_edit(&path).expect("no file is not an error"),
+            None,
+        );
+
+        fs::write(&path, "listen_port: 51413\n").expect("write a config");
+        let loaded = Config::load_for_edit(&path)
+            .expect("read a whole config")
+            .expect("the file is there");
+        assert_eq!(loaded.listen_port, 51413);
+
+        fs::write(&path, "listen_port: [nope\n").expect("write a malformed config");
+        let problem = Config::load_for_edit(&path).expect_err(
+            "something that cannot guess a file's contents must not pretend to have read it",
+        );
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+        assert!(problem.contains("config.yaml"), "{problem}");
+
+        // The bytes are still there under the name they had, and nothing appeared beside them.
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file is where it was"),
+            "listen_port: [nope\n",
+        );
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["config.yaml"],
+            "nothing was moved aside and nothing was written: {names:?}"
+        );
+    }
+
     /// KiB/s and MiB in the file become bytes per second and bytes for the
     /// engine, and `None` counts stay unlimited. The fields the config does not
     /// name keep the engine's own values.
@@ -782,6 +891,11 @@ mod tests {
             "no roots are named until the run resolves the config: {:?}",
             defaults.server.allowed_roots
         );
+        assert!(
+            defaults.server.allowed_hosts.is_empty(),
+            "nothing but localhost and an address is answered until the config names a host: {:?}",
+            defaults.server.allowed_hosts
+        );
         assert_eq!(defaults.server.auth.enabled, None);
         assert!(defaults.server.auth.users.is_empty());
         assert!(defaults.server.auth.devices.is_empty());
@@ -839,11 +953,43 @@ mod tests {
             "the part the file leaves out is default too"
         );
 
+        // Host names come back exactly as the file wrote them, and resolving - the step that makes every
+        // root absolute - leaves them alone: they are names a server answers, not folders to root in the
+        // library. Nothing about them depends on where the library is.
+        fs::write(
+            paths.config_file(),
+            "server:\n  allowed_hosts:\n    - bit.local\n    - LAN-Server\n",
+        )
+        .expect("write a config naming hosts");
+        let ConfigLoad::Loaded(named) = Config::load(&paths).expect("read the host names back")
+        else {
+            panic!("a config naming hosts is still a config");
+        };
+        assert_eq!(
+            named.server.allowed_hosts,
+            ["bit.local", "LAN-Server"],
+            "spelling is kept: the comparison that uses these is the case-insensitive one"
+        );
+        assert_eq!(
+            named.server.bind, defaults.server.bind,
+            "a file naming only hosts leaves the rest alone"
+        );
+        let resolved = named.clone().resolve(&paths);
+        assert_eq!(
+            resolved.server.allowed_hosts, named.server.allowed_hosts,
+            "resolving roots says nothing about names"
+        );
+        assert!(
+            !resolved.server.allowed_hosts.is_empty(),
+            "and it does not clear them either"
+        );
+
         // And what a save writes is what the next run reads.
         let with_users = Config {
             server: ServerConfig {
                 bind: public.server.bind,
                 allowed_roots: vec![paths.data_dir.join("share")],
+                allowed_hosts: vec!["bit.local".to_string()],
                 auth: AuthConfig {
                     enabled: Some(true),
                     users: vec![UserEntry {

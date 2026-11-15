@@ -232,6 +232,14 @@ impl Server {
         self.shared.password_verifies()
     }
 
+    /// The most Argon2 password checks this server has run at the same time. Only a test reads this: the
+    /// one that says the bound on how many verifies run together - one per core, at most four - is what
+    /// actually limits the work, however many logins arrive at once.
+    #[cfg(feature = "test-support")]
+    pub fn max_concurrent_verifies(&self) -> u64 {
+        self.shared.max_concurrent_verifies()
+    }
+
     /// Stops serving, saves, and releases the library. Returns once every connection is closed, the last
     /// save has been written or failed to be, and the lock has gone with it - so another
     /// featherbittorrent may start on this library as soon as this returns.
@@ -352,10 +360,13 @@ async fn save_loop(
             // Some(()) is the shutdown signal, None is the server being dropped. Both mean stop.
             _ = stop.recv() => break,
             _ = tick.tick() => {
-                read_reports(&mut reports);
                 if let Some(problem) = engine.save_periodic().await {
                     warn_notice(&problem);
                 }
+                // After the save, not before: what this save queued - a torrent whose resume data would
+                // not come back, one it left out - is the news worth having, and reading it here means it
+                // is said as soon as it exists instead of one interval later.
+                read_reports(&mut reports);
             }
         }
     }

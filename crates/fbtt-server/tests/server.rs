@@ -253,6 +253,38 @@ async fn delete(client: &reqwest::Client, url: &str, token: Option<&str>) -> Res
     within(request.send()).await.expect("the server answered")
 }
 
+/// A `GET` that says which name it came to, and where it came from. reqwest takes the `Host` from the URL -
+/// an address, since every test here connects to one - so overriding it is how a test sends the name a
+/// browser would send for it, which is what the server reads when nobody has to sign in.
+async fn get_from(
+    client: &reqwest::Client,
+    url: &str,
+    host: &str,
+    origin: Option<&str>,
+) -> Response {
+    let mut request = client.get(url).header(reqwest::header::HOST, host);
+    if let Some(origin) = origin {
+        request = request.header(reqwest::header::ORIGIN, origin);
+    }
+    within(request.send()).await.expect("the server answered")
+}
+
+/// The `{error: {code, message}}` of a response, with the message as well as the code - for the errors
+/// whose point is in the words.
+async fn problem_of(response: Response) -> (StatusCode, String, String) {
+    let status = response.status();
+    let body = body(response).await;
+    let code = body["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an error without a code in it: {body}"))
+        .to_string();
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an error without a message in it: {body}"))
+        .to_string();
+    (status, code, message)
+}
+
 /// The JSON a response carries, which every route here answers in - errors included.
 async fn body(response: Response) -> Value {
     within(response.json::<Value>()).await.expect("a JSON body")
@@ -967,6 +999,54 @@ async fn devices_add_list_remove_persist() {
     served.stop().await;
 }
 
+/// A name this server's own route added cannot need cleaning - adding one refuses anything a display cannot
+/// show - so the only way an invisible character gets into a device list is through `config.yaml`, which most
+/// people still edit by hand. Repeating it to a client as it was written is how a list lies: `phone\u{202e}`
+/// draws as `enohp`, and the row that looks like a phone is not one. What the API answers is the name as a
+/// display would draw it, which is also what fbt does with every other remote string a user reads.
+#[tokio::test]
+async fn device_names_reach_the_api_cleaned() {
+    let odd = "phone\u{202e}".to_string();
+    let key = keypair();
+    let served = Served::start("device-names", |scratch| {
+        base_config(scratch, vec![alice()], vec![device(&odd, &key)], Some(true))
+    })
+    .await;
+    let client = http();
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let url = served.url("/api/v1/auth/devices");
+
+    let listed = body(get(&client, &url, Some(&token)).await).await;
+    let rows = listed.as_array().expect("a list of devices");
+    assert_eq!(rows.len(), 1, "the device in the config is listed");
+    assert_eq!(
+        rows[0]["name"].as_str().expect("a name"),
+        "phone",
+        "what a client reads is what a display shows",
+    );
+
+    // And the same name cannot be put in at all, which is the rule that keeps this from being about tidiness:
+    // what would need cleaning on the way out is refused on the way in.
+    let (status, code, message) = problem_of(
+        post_json(
+            &client,
+            &url,
+            serde_json::json!({ "name": odd, "public_key": public_line(&keypair()) }),
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{odd:?} is not a name");
+    assert_eq!(code, "invalid_request");
+    assert!(
+        message.contains("a display can show"),
+        "the answer says what a name has to be: {message}"
+    );
+
+    served.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Folder browsing
 // ---------------------------------------------------------------------------
@@ -1052,12 +1132,50 @@ async fn fs_list_stays_in_roots() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "not a folder");
     assert_eq!(code, "invalid_request");
 
+    // A NUL byte - which `%00` in a query string hands over as an ordinary character - is where a path
+    // stops, so one in the middle is not a path anything could resolve. It used to arrive as a `500`,
+    // blaming this server for a name somebody else invented.
+    let (status, code, message) = problem_of(
+        get_with_query(
+            &client,
+            &list,
+            "path",
+            &root.join(format!("a{}b", char::from(0u8))),
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "not a path at all");
+    assert_eq!(code, "invalid_request");
+    assert!(
+        message.contains("invalid path"),
+        "the answer says what is wrong with it: {message}"
+    );
+
     // A link inside the root that points out of it: spelled like it belongs, and refused once it is
-    // resolved. This is the check a lexical rule cannot make on its own, so it happens after canonicalising
-    // - and it is why the listing of a linked folder would need the same rule another day.
+    // resolved. This is the check a lexical rule cannot make on its own, so it happens after canonicalising.
+    // And it is not offered by the listing of the folder it sits in either - a picker that could step
+    // through it would leave the library one directory at a time, with every answer still spelling itself
+    // as part of the root. A link to a folder inside the same root stays in the list: it is somewhere a
+    // torrent can go.
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink("../outside", root.join("link-out")).expect("make a symlink");
+        std::os::unix::fs::symlink("../outside", root.join("link-out"))
+            .expect("make a link out of the root");
+        std::os::unix::fs::symlink("alpha", root.join("link-in"))
+            .expect("make a link inside the root");
+        let listing = body(get_with_query(&client, &list, "path", &root, Some(&token)).await).await;
+        assert_eq!(
+            listing["dirs"].as_array().expect("a list").as_slice(),
+            [
+                Value::String("alpha".to_string()),
+                Value::String("beta".to_string()),
+                Value::String("link-in".to_string()),
+            ],
+            "the link out of the root is not offered; the link inside it is",
+        );
+
         let (status, code) = error_of(
             get_with_query(&client, &list, "path", &root.join("link-out"), Some(&token)).await,
         )
@@ -1076,7 +1194,10 @@ async fn fs_list_stays_in_roots() {
 /// With auth off - which is what a loopback-only server means by default, and what an explicit
 /// `enabled: false` says about any address - every request is served without a token, including the calls
 /// that would otherwise be how you got one. There is nothing to log out of here, and logging out anyway
-/// still answers correctly that you are logged out.
+/// still answers correctly that you are logged out. What is *not* open this way is the device list, and what
+/// decides whether a request is served at all is the name it carries: see
+/// [`auth_off_refuses_device_routes`] and the host tests beside this one. Every request here arrives with an
+/// address in `Host`, because every test connects to one, which is a name this server answers.
 #[tokio::test]
 async fn auth_off_allows_all() {
     let served = Served::start("auth-off", |scratch| {
@@ -1090,9 +1211,6 @@ async fn auth_off_allows_all() {
 
     let roots = get(&client, &served.url("/api/v1/fs/roots"), None).await;
     assert_eq!(roots.status(), StatusCode::OK);
-
-    let devices = get(&client, &served.url("/api/v1/auth/devices"), None).await;
-    assert_eq!(devices.status(), StatusCode::OK);
 
     let logged_out = delete(&client, &served.url("/api/v1/auth/session"), None).await;
     assert_eq!(
@@ -1145,6 +1263,465 @@ async fn auth_off_allows_all() {
         served.server.password_verifies(),
         before + 1,
         "nothing was hashed to find that out: with auth off there is no name worth hiding",
+    );
+
+    served.stop().await;
+}
+
+/// A rebinding attack connects to 127.0.0.1 and still names the attacker's domain, so with nobody signing
+/// in the name a request says it came to is what stands between a hostile page and this library. Every name
+/// that is not this server's own is refused before any route sees the request - including fbt-api's own
+/// routes, because this server hands fbt-api its authenticator - and the answer is the one for "you may not
+/// have this", not a `401` inviting the page to guess at a token.
+#[tokio::test]
+async fn auth_off_refuses_foreign_host() {
+    let served = Served::start("host-rebind", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+
+    for elsewhere in [
+        "evil.example",
+        "evil.example:8090",
+        "localhost.evil.example",
+        "127.0.0.1.nip.io",
+    ] {
+        for path in ["/api/v1/torrents", "/api/v1/fs/roots"] {
+            let (status, code) =
+                error_of(get_from(&client, &served.url(path), elsewhere, None).await).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{elsewhere} is not a name this server was given, and {path} is the route it reached",
+            );
+            assert_eq!(code, "forbidden");
+        }
+    }
+
+    // Including the call a page would use to get a token of its own: refusing the name is what makes the
+    // login routes unreachable to it, since with logins off those are open to whoever asks.
+    let (status, code) = error_of(
+        within(
+            client
+                .post(served.url("/api/v1/auth/session"))
+                .header(reqwest::header::HOST, "evil.example")
+                .send(),
+        )
+        .await
+        .expect("the server answered"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no token for a rebound page");
+    assert_eq!(code, "forbidden");
+
+    served.stop().await;
+}
+
+/// A browser sends `Origin` on exactly the cross-site requests a rebinding page is allowed to make, so an
+/// origin this server would not answer as a `Host` is refused as an origin too - even when the `Host` itself
+/// is one of its own names, which is what the page gets by connecting to the address it was told about.
+#[tokio::test]
+async fn auth_off_refuses_foreign_origin() {
+    let served = Served::start("origin-rebind", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+    let address = served.server.local_addr();
+    let own = format!("127.0.0.1:{}", address.port());
+
+    // The same-origin request of someone who really is using this server: the name and the place it came
+    // from are both its own.
+    assert_eq!(
+        get_from(
+            &client,
+            &served.url("/api/v1/torrents"),
+            &own,
+            Some(&format!("http://{address}")),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
+
+    for origin in [
+        "http://evil.example",
+        "https://evil.example:8443",
+        "http://localhost.evil.example",
+        "null",
+        "ftp://127.0.0.1",
+        "http://",
+    ] {
+        let (status, code) =
+            error_of(get_from(&client, &served.url("/api/v1/torrents"), &own, Some(origin)).await)
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{origin} is not a place this server answers",
+        );
+        assert_eq!(code, "forbidden");
+    }
+
+    served.stop().await;
+}
+
+/// What a person reaches this server by, with nobody signing in: `localhost`, or an address - IPv4, or IPv6
+/// in the brackets a host must use. A browser cannot be rebound into naming an address (the name comes from
+/// the URL it was handed and only a domain is resolved), so addresses are how a trusted network uses a server
+/// with no logins, and any port on one of them is the same place.
+#[tokio::test]
+async fn auth_off_allows_ip_literal_host() {
+    let served = Served::start("host-address", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+    let port = served.server.local_addr().port();
+
+    for own in [
+        "localhost".to_string(),
+        format!("LocalHost:{port}"),
+        "127.0.0.1".to_string(),
+        format!("127.0.0.1:{port}"),
+        "[::1]".to_string(),
+        "[::1]:8090".to_string(),
+        "192.168.1.5:8090".to_string(),
+    ] {
+        assert_eq!(
+            get_from(&client, &served.url("/api/v1/torrents"), &own, None)
+                .await
+                .status(),
+            StatusCode::OK,
+            "{own} is this server's own name",
+        );
+    }
+
+    // An unbracketed IPv6 address is not a host a browser sends, and a port that is not digits means the
+    // value is not a host either: both are refused rather than guessed at.
+    for unusable in ["::1", "[::1]:80x", "evil.example:notaport"] {
+        let (status, _) =
+            error_of(get_from(&client, &served.url("/api/v1/torrents"), unusable, None).await)
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{unusable} is not a host");
+    }
+
+    served.stop().await;
+}
+
+/// The list for someone who runs this behind a name of their own and turned logins off on purpose: the name
+/// answers in any case with any port, and only that name - a suffix trick is somebody else's domain, and a
+/// prefix is somebody else's host. With logins on the list would be pointless, because every request would
+/// need a token instead.
+#[tokio::test]
+async fn auth_off_allows_listed_host() {
+    let served = Served::start("host-listed", |scratch| {
+        let mut config = base_config(scratch, vec![alice()], Vec::new(), Some(false));
+        config.server.allowed_hosts = vec!["bit.local".to_string()];
+        config
+    })
+    .await;
+    let client = http();
+
+    for own in ["bit.local", "BIT.LOCAL:8090"] {
+        assert_eq!(
+            get_from(&client, &served.url("/api/v1/torrents"), own, None)
+                .await
+                .status(),
+            StatusCode::OK,
+            "{own} is what the config named",
+        );
+    }
+
+    // A name that only looks like the one the config named: a domain that ends with it, a host that starts
+    // with it, and the same name with a trailing dot - which DNS treats as the same host and this server
+    // does not, the safe direction for something whose whole job is refusing names.
+    for elsewhere in [
+        "bit.local.evil.example",
+        "mybit.local",
+        "evil.example",
+        "bit.local.:8090",
+    ] {
+        let (status, code) =
+            error_of(get_from(&client, &served.url("/api/v1/torrents"), elsewhere, None).await)
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{elsewhere} is not listed");
+        assert_eq!(code, "forbidden");
+    }
+
+    // An origin spells the same name and gets the same answer, and a login attempt still arrives: what this
+    // list decides is which names are served, not whether anyone has to sign in.
+    assert_eq!(
+        get_from(
+            &client,
+            &served.url("/api/v1/torrents"),
+            "bit.local:8090",
+            Some("http://BIT.LOCAL:8090"),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
+
+    served.stop().await;
+}
+
+/// A device is a way of proving who you are, and a server that asks nobody to prove anything has nothing for
+/// one to be proof against - so with logins off the three device routes answer `403` and say what to do
+/// instead. That closes the worst thing an unauthenticated server could do to itself: let a request it cannot
+/// authenticate add a key that every later run would log in, and keep it in `config.yaml` after the page
+/// that added it was closed. Everything else about an open server stays open.
+#[tokio::test]
+async fn auth_off_refuses_device_routes() {
+    let served = Served::start("auth-off-devices", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+
+    let (_, _, message) =
+        problem_of(get(&client, &served.url("/api/v1/auth/devices"), None).await).await;
+    assert!(
+        message.contains("devices need authentication on"),
+        "the answer says why: {message}"
+    );
+
+    let (status, code, message) = problem_of(
+        post_json(
+            &client,
+            &served.url("/api/v1/auth/devices"),
+            serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "adding one is refused too");
+    assert_eq!(code, "forbidden");
+    assert!(
+        message.contains("devices need authentication on"),
+        "{message}"
+    );
+
+    let (status, _) =
+        error_of(delete(&client, &served.url("/api/v1/auth/devices/phone"), None).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "and so is removing one");
+
+    // A password login still works here, and its token still opens everything else - but not the device
+    // list: what that route describes is what a key login checks against, and with logins off there is no
+    // such thing to describe, token or not.
+    let (token, _) = session_of(
+        post_basic(
+            &client,
+            &served.url("/api/v1/auth/session"),
+            "alice",
+            "hunter2",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        get(&client, &served.url("/api/v1/fs/roots"), Some(&token))
+            .await
+            .status(),
+        StatusCode::OK,
+        "nothing else about this server got stricter on the way",
+    );
+    let (status, code) =
+        error_of(get(&client, &served.url("/api/v1/auth/devices"), Some(&token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a token from a password does not make there be devices",
+    );
+    assert_eq!(code, "forbidden");
+
+    served.stop().await;
+}
+
+/// What the login limit is really for: not a person typing a wrong password ten times, but thirty guesses
+/// from one address arriving together, which is what something with a list of passwords does. Counting an
+/// attempt when it arrives - before a hash is chosen or a verify starts - means at most one window's worth
+/// of them is ever worked on; a limit that asked permission first and counted afterwards would have said yes
+/// to all thirty and then run thirty Argon2 checks.
+#[tokio::test]
+async fn parallel_password_guesses_are_capped() {
+    let served = Served::start("guess-burst", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let url = served.url("/api/v1/auth/session");
+    const GUESSERS: usize = 30;
+
+    let mut guesses = Vec::new();
+    for _ in 0..GUESSERS {
+        let client = http();
+        let url = url.clone();
+        guesses.push(tokio::spawn(async move {
+            within(
+                client
+                    .post(url.as_str())
+                    .basic_auth("alice", Some("wrong"))
+                    .send(),
+            )
+            .await
+            .expect("the server answered")
+            .status()
+        }));
+    }
+
+    let mut checked = 0;
+    let mut refused = 0;
+    let mut busy = 0;
+    for guess in guesses {
+        match within(guess).await.expect("the guess was answered") {
+            StatusCode::UNAUTHORIZED => checked += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            StatusCode::SERVICE_UNAVAILABLE => busy += 1,
+            other => panic!("a password guess got {other}"),
+        }
+    }
+
+    assert_eq!(
+        checked + refused + busy,
+        GUESSERS,
+        "all thirty were answered"
+    );
+    assert!(
+        checked <= LOGIN_BUDGET,
+        "{checked} guesses were worked on, and one address has {LOGIN_BUDGET} attempts in a window",
+    );
+    assert!(
+        refused >= GUESSERS - LOGIN_BUDGET,
+        "the rest were refused before any of that work started: {refused}",
+    );
+
+    served.stop().await;
+}
+
+/// How many Argon2 checks one server may run at once, restated here rather than read back from the server:
+/// one per core as the OS reports them, never more than four and never fewer than one. A test that trusts
+/// the number the server itself would give could not tell a cap from a wish.
+fn verify_permit_cap() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1);
+    cores.clamp(1, 4)
+}
+
+/// The other half of the same problem: an Argon2 check wants about 19 MiB and a core's worth of time, and the
+/// blocking pool will run as many as arrive if nothing tells it otherwise. Eight wrong passwords at once from
+/// one address is inside that address's budget - so every one of them gets checked - and more than this
+/// machine is allowed to hash together, so what the server has to show afterwards is that it never had more
+/// than its cap running at once. That is the case an address-per-address guesser is built for: each address
+/// inside its own budget, and nothing between all of them and the machine's memory.
+#[tokio::test]
+async fn verify_concurrency_is_bounded() {
+    let served = Served::start("verify-burst", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let url = served.url("/api/v1/auth/session");
+    // Inside the ten attempts one address gets in a window, and above the four verifies any server is
+    // allowed to run at once on any machine.
+    const ASKERS: usize = 8;
+
+    let mut asks = Vec::new();
+    for _ in 0..ASKERS {
+        let client = http();
+        let url = url.clone();
+        asks.push(tokio::spawn(async move {
+            within(
+                client
+                    .post(url.as_str())
+                    .basic_auth("alice", Some("wrong"))
+                    .send(),
+            )
+            .await
+            .expect("the server answered")
+            .status()
+        }));
+    }
+    for ask in asks {
+        let status = within(ask).await.expect("the check was answered");
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
+            "a wrong password inside the budget is checked, or queued while others are checked: {status}",
+        );
+    }
+
+    let most = served.server.max_concurrent_verifies();
+    let cap = verify_permit_cap();
+    assert!(most > 0, "the checks ran");
+    assert!(
+        usize::try_from(most).expect("a count of checks") <= cap,
+        "{most} Argon2 checks at once on a machine allowed {cap}",
+    );
+
+    served.stop().await;
+}
+
+/// A `config.yaml` this server cannot read is somebody's hand-edited file, and a request that cannot parse it
+/// has no business rearranging it: adding a device answers that it cannot be read and says to fix it by hand,
+/// writes nothing, and leaves the bytes under the name they had. It used to move them aside as
+/// `config.yaml.bad` and write a config of its own in their place - from inside a `POST`, on the strength of
+/// YAML it could not understand.
+#[tokio::test]
+async fn an_unreadable_config_is_left_for_its_owner() {
+    let served = Served::start("bad-config", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let file = served.paths.config_file();
+    const BROKEN: &str = "server:\n  allowed_hosts: [bit.local\n";
+
+    // Nothing was there when this server started - the tests hand their config over in memory, and serving a
+    // library does not write a config file - so this is the state a person leaves behind by editing the file
+    // and getting the YAML wrong before fixing it: bytes on disk that disagree with what the run is using.
+    fs::create_dir_all(file.parent().expect("the config directory"))
+        .expect("make the config directory");
+    fs::write(&file, BROKEN).expect("write an unreadable config");
+
+    let (status, code, message) = problem_of(
+        post_json(
+            &client,
+            &served.url("/api/v1/auth/devices"),
+            serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a file this server cannot read is not its to repair",
+    );
+    assert_eq!(code, "internal");
+    assert!(
+        message.starts_with("config.yaml cannot be read; fix it by hand"),
+        "the answer says what to do: {message}"
+    );
+
+    // The bytes are where they were, under the name they had, with nothing beside them: no `.bad` left behind
+    // by a request, and no half-config with the new device in it.
+    assert_eq!(
+        fs::read_to_string(&file).expect("the file is still where it was"),
+        BROKEN,
+    );
+    let mut names: Vec<String> = fs::read_dir(file.parent().expect("the config directory"))
+        .expect("read the config directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["config.yaml"],
+        "nothing was renamed and nothing was written: {names:?}"
     );
 
     served.stop().await;

@@ -15,6 +15,14 @@
 //! a minute per address - rather than by the failure budget a wrong password spends. It is what stops
 //! the challenge route, which answers strangers too, from being used to fill the challenge store.
 //!
+//! Both limiters take the attempt *before* the request is answered, not after: `reserve` counts it and
+//! says no to anything that arrives once the window is full. A limiter that only asked "may I try?" and
+//! counted afterwards would tell every request in a burst yes at once - five hundred parallel guesses all
+//! pass that question, and each then spends a slow Argon2 verify's memory on its way to being refused,
+//! which is the exhaustion this ordering exists to prevent. Being refused is not itself counted: a client
+//! hammering a closed door waits out the window it is told about instead of pushing it outward, and only
+//! a login that actually worked ([`LoginLimiter::success`]) gives the address its attempts back.
+//!
 //! "One address" is deliberately a block rather than a socket: an IPv4-mapped IPv6 counts as its IPv4
 //! address and other IPv6 addresses share a window per `/64`, so a client cannot get a fresh ten tries
 //! by changing the low half of its address. Both limiters count a client by the same address bucket, so
@@ -186,12 +194,44 @@ impl Tracked {
         }
     }
 
+    /// Takes one event's worth of room for `address` up front: counted now, before whatever the request
+    /// goes on to do has happened. The `Err` is how many whole seconds it must wait first, and a refused
+    /// attempt is left uncounted - so someone hammering a closed door waits out the window they were told
+    /// about instead of pushing it further out with every try.
+    fn reserve(
+        &mut self,
+        address: IpAddr,
+        now: Instant,
+        cap: usize,
+        span: Duration,
+    ) -> Result<(), u64> {
+        if let Some(until) = self.blocked_until(address, now, cap, span) {
+            return Err(seconds_until(until, now));
+        }
+        self.add(address, now, cap, span);
+        Ok(())
+    }
+
     /// `address` starts from clean again.
     fn clear(&mut self, address: IpAddr) {
         if let Some(events) = self.by_address.remove(&address) {
             self.quietest_first.remove(&events.place);
         }
     }
+}
+
+/// One attempt a limiter has already counted, taken before the request started work.
+///
+/// It carries nothing, because there is nothing left to do with it: what it stands for is that this
+/// address's window now holds one more event no matter how the request turns out. A login that worked
+/// clears the window ([`LoginLimiter::success`]); every other answer leaves this one counted, which is
+/// what makes a refusal that arrived after half a second of hashing cost the address exactly what a
+/// refusal that arrived at once would have cost it.
+#[derive(Debug)]
+pub struct Reservation {
+    /// Nothing to hold: taking the reservation is the whole of it. The field keeps the type from being a
+    /// unit struct somebody could construct without counting anything.
+    _counted: (),
 }
 
 /// Who may keep trying to log in, and who has to wait.
@@ -218,25 +258,22 @@ impl LoginLimiter {
         }
     }
 
-    /// Whether `address` may try to log in now, or how many whole seconds it should wait first. The
-    /// peer address as the connection reports it is fine: an IPv4-mapped IPv6 and a client rotating
-    /// within its `/64` are counted where the failures they caused were counted.
-    pub fn check(&self, address: IpAddr) -> Result<(), u64> {
-        let now = (self.clock)();
-        let address = bucket(address);
-        let tracked = locked(&self.tracked);
-        match tracked.blocked_until(address, now, MAX_FAILURES, WINDOW) {
-            Some(until) => Err(seconds_until(until, now)),
-            None => Ok(()),
-        }
-    }
-
-    /// One more failure for `address`.
-    pub fn failure(&self, address: IpAddr) {
+    /// Takes one of `address`'s ten attempts now - before its credential has been looked at, before any
+    /// hashing starts - or says how many whole seconds it should wait first. The peer address as the
+    /// connection reports it is fine: an IPv4-mapped IPv6 and a client rotating within its `/64` are
+    /// counted where the attempts they made were counted.
+    ///
+    /// Taking one is what makes ten mean ten. A `check`-then-answer order would let every request in a
+    /// burst through the same question at once and count the failures afterwards, so an address could have
+    /// as many Argon2 verifies running as it had connections; reserving first bounds the work to the budget
+    /// without anyone having to be unlucky about timing.
+    pub fn reserve(&self, address: IpAddr) -> Result<Reservation, u64> {
         let now = (self.clock)();
         let address = bucket(address);
         let tracked = &mut *locked(&self.tracked);
-        tracked.add(address, now, MAX_FAILURES, WINDOW);
+        tracked
+            .reserve(address, now, MAX_FAILURES, WINDOW)
+            .map(|()| Reservation { _counted: () })
     }
 
     /// A login worked: the address starts from clean again.
@@ -294,25 +331,21 @@ impl ChallengeLimiter {
         }
     }
 
-    /// Whether `address` may ask for another challenge now, or how many whole seconds it should wait
-    /// first - the oldest of the nonces in its minute is answerable for that long again.
-    pub fn check(&self, address: IpAddr) -> Result<(), u64> {
-        let now = (self.clock)();
-        let address = bucket(address);
-        let tracked = locked(&self.tracked);
-        match tracked.blocked_until(address, now, MAX_ISSUES, ISSUE_WINDOW) {
-            Some(until) => Err(seconds_until(until, now)),
-            None => Ok(()),
-        }
-    }
-
-    /// One more nonce handed to `address`. Only an address that was answered is counted: a request
-    /// refused before it got a nonce asked for nothing.
-    pub fn record(&self, address: IpAddr) {
+    /// Takes one of `address`'s thirty asks for a nonce now - before its key line has been parsed and
+    /// before any nonce is made - or says how many whole seconds it should wait first.
+    ///
+    /// The ask is counted rather than the answer because the ask is where this route's cost is: reading
+    /// the body, parsing a public key and getting random bytes all happen whatever the answer turns out to
+    /// be, so an address that spends its minute on malformed asks has spent it, exactly as one that spends
+    /// it on nonces. Refusals are not counted, so a blocked address cannot extend its own minute by
+    /// knocking.
+    pub fn reserve(&self, address: IpAddr) -> Result<Reservation, u64> {
         let now = (self.clock)();
         let address = bucket(address);
         let tracked = &mut *locked(&self.tracked);
-        tracked.add(address, now, MAX_ISSUES, ISSUE_WINDOW);
+        tracked
+            .reserve(address, now, MAX_ISSUES, ISSUE_WINDOW)
+            .map(|()| Reservation { _counted: () })
     }
 }
 
@@ -338,56 +371,64 @@ mod tests {
     use std::net::IpAddr;
     use std::time::{Duration, Instant};
 
-    /// Ten failures in the window lock an address out until the window clears; a success wipes it.
+    /// Ten attempts in the window lock an address out until it clears; a login that worked wipes the count,
+    /// and a refusal costs nothing, so it cannot push the block outward.
     #[test]
-    fn limiter_blocks_after_10_failures() {
+    fn limiter_blocks_after_10_attempts() {
         let (clock, handle) = TestClock::starting_at(Instant::now());
         let limiter = LoginLimiter::with_clock(handle);
         let address: IpAddr = "203.0.113.7".parse().expect("an address");
 
-        assert_eq!(limiter.check(address), Ok(()));
-        for _ in 0..MAX_FAILURES - 1 {
-            limiter.failure(address);
+        // The tenth attempt is allowed - and it is counted the moment it is taken, before anything about the
+        // credential it carries is known, which is what makes ten mean ten however they arrive.
+        for attempt in 1..=MAX_FAILURES {
+            assert!(
+                limiter.reserve(address).is_ok(),
+                "attempt {attempt} of the budget",
+            );
         }
-        assert_eq!(
-            limiter.check(address),
-            Ok(()),
-            "nine failures leave one try",
-        );
-        limiter.failure(address);
-
-        let Err(retry_after) = limiter.check(address) else {
-            panic!("ten failures should block the address");
-        };
+        let retry_after = limiter
+            .reserve(address)
+            .expect_err("ten should fill the window");
         assert_eq!(retry_after, 300, "blocked until the window clears");
-        clock.advance(Duration::from_secs(299));
+
+        // A refused attempt is not counted, so hammering a closed door does not move it: the wait keeps
+        // counting down to when the tenth attempt was taken, not to the last knock.
+        clock.advance(Duration::from_secs(60));
+        let retry_after = limiter.reserve(address).expect_err("still blocked");
+        assert_eq!(
+            retry_after, 240,
+            "the block ends one window after the attempts that caused it",
+        );
+
+        // And it ends by itself.
+        clock.advance(Duration::from_secs(239));
         assert!(
-            limiter.check(address).is_err(),
-            "still inside the window of the oldest failure"
+            limiter.reserve(address).is_err(),
+            "one second of the oldest attempt's window left",
         );
         clock.advance(Duration::from_secs(2));
-        assert_eq!(limiter.check(address), Ok(()), "the window has cleared");
+        assert!(limiter.reserve(address).is_ok(), "the window has cleared");
 
-        // Failing while blocked only pushes the block forward, it does not wear it down.
-        for _ in 0..MAX_FAILURES {
-            limiter.failure(address);
-        }
-        let Err(retry_after) = limiter.check(address) else {
-            panic!("ten fresh failures block again");
-        };
-        assert_eq!(retry_after, 300);
-
-        // A login that worked clears the count: nine failures do not carry over to the next attempt.
+        // A login that worked clears the count: nine attempts do not carry over to the next one.
         let other: IpAddr = "203.0.113.8".parse().expect("an address");
         for _ in 0..MAX_FAILURES - 1 {
-            limiter.failure(other);
+            assert!(limiter.reserve(other).is_ok(), "inside the budget");
         }
-        assert_eq!(limiter.check(other), Ok(()));
         limiter.success(other);
-        assert_eq!(limiter.check(other), Ok(()));
+        for attempt in 1..=MAX_FAILURES {
+            assert!(
+                limiter.reserve(other).is_ok(),
+                "a cleared address has the whole budget again ({attempt})",
+            );
+        }
+        assert!(
+            limiter.reserve(other).is_err(),
+            "and it is a budget, not a suggestion",
+        );
     }
 
-    /// A failure follows the client, not the spelling its address arrived in: `::ffff:a.b.c.d` is that
+    /// An attempt follows the client, not the spelling its address arrived in: `::ffff:a.b.c.d` is that
     /// IPv4 address, and every address inside one `/64` shares one window.
     #[test]
     fn limiter_groups_v6_by_64_and_maps_v4() {
@@ -400,25 +441,23 @@ mod tests {
             .expect("a v6 spelling of a v4 address");
         let plain: IpAddr = "203.0.113.9".parse().expect("an address");
         for _ in 0..MAX_FAILURES - 1 {
-            limiter.failure(mapped);
+            assert!(limiter.reserve(mapped).is_ok(), "inside the budget");
         }
-        assert_eq!(limiter.check(plain), Ok(()), "nine failures leave one try");
-        limiter.failure(plain);
+        assert!(limiter.reserve(plain).is_ok(), "nine attempts leave one",);
         assert!(
-            limiter.check(mapped).is_err(),
-            "the tenth failure came in as the other spelling",
+            limiter.reserve(mapped).is_err(),
+            "the tenth attempt came in as the other spelling and filled the same window",
         );
         limiter.success(plain);
-        assert_eq!(
-            limiter.check(mapped),
-            Ok(()),
+        assert!(
+            limiter.reserve(mapped).is_ok(),
             "clearing one spelling clears the other",
         );
 
         // Many addresses, one customer: a `/64` is what a network hands out.
         let first: IpAddr = "2001:db8:1:2::5".parse().expect("an address");
         for _ in 0..MAX_FAILURES {
-            limiter.failure(first);
+            assert!(limiter.reserve(first).is_ok(), "inside the budget");
         }
         for sibling in [
             "2001:db8:1:2::ffff:1",
@@ -427,66 +466,63 @@ mod tests {
         ] {
             let address: IpAddr = sibling.parse().expect("an address");
             assert!(
-                limiter.check(address).is_err(),
+                limiter.reserve(address).is_err(),
                 "{sibling} is the same /64 as 2001:db8:1:2::5",
             );
         }
 
         // The next /64 over is somebody else.
         let neighbour: IpAddr = "2001:db8:1:3::5".parse().expect("an address");
-        assert_eq!(
-            limiter.check(neighbour),
-            Ok(()),
+        assert!(
+            limiter.reserve(neighbour).is_ok(),
             "a different /64 keeps its own window",
         );
     }
 
-    /// Thirty nonces a minute per address, the block moving with a client that keeps asking. Asking
-    /// spends nothing from the failure budget, and one address's minute is nobody else's.
+    /// Thirty asks a minute per address, the block moving with a client that keeps asking. Asking spends
+    /// nothing from the failure budget, and one address's minute is nobody else's.
     #[test]
     fn challenge_issuance_is_capped_per_minute() {
         let (clock, handle) = TestClock::starting_at(Instant::now());
         let limiter = ChallengeLimiter::with_clock(handle);
         let address: IpAddr = "203.0.113.21".parse().expect("an address");
 
-        for _ in 0..MAX_ISSUES {
-            assert_eq!(limiter.check(address), Ok(()));
-            limiter.record(address);
+        for ask in 1..=MAX_ISSUES {
+            assert!(limiter.reserve(address).is_ok(), "ask {ask} of the minute",);
         }
-        let Err(retry_after) = limiter.check(address) else {
-            panic!("{MAX_ISSUES} nonces should fill the minute");
-        };
+        let retry_after = limiter
+            .reserve(address)
+            .expect_err("thirty should fill the minute");
         assert_eq!(retry_after, 60, "blocked until the oldest nonce ages out");
 
         clock.advance(Duration::from_secs(59));
         assert!(
-            limiter.check(address).is_err(),
-            "still inside the minute of the oldest one"
+            limiter.reserve(address).is_err(),
+            "still inside the minute of the oldest one",
         );
         clock.advance(Duration::from_secs(2));
-        assert_eq!(
-            limiter.check(address),
-            Ok(()),
+        assert!(
+            limiter.reserve(address).is_ok(),
             "the oldest nonce has aged out, so room is left again",
         );
 
-        // The other spelling of the same address is the same address here too.
+        // The other spelling of the same address is the same address here too, so the one ask taken above
+        // left twenty-nine in this minute for it.
         let mapped: IpAddr = "::ffff:203.0.113.21"
             .parse()
             .expect("a v6 spelling of a v4 address");
-        for _ in 0..MAX_ISSUES {
-            limiter.record(mapped);
+        for _ in 0..MAX_ISSUES - 1 {
+            assert!(limiter.reserve(mapped).is_ok(), "inside the minute");
         }
         assert!(
-            limiter.check(address).is_err(),
+            limiter.reserve(address).is_err(),
             "the minute was filled in the other spelling",
         );
 
         // Nobody else pays for it.
         let neighbour: IpAddr = "203.0.113.22".parse().expect("an address");
-        assert_eq!(
-            limiter.check(neighbour),
-            Ok(()),
+        assert!(
+            limiter.reserve(neighbour).is_ok(),
             "a different address keeps its own minute",
         );
     }

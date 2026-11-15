@@ -18,9 +18,9 @@ pub(crate) mod fs;
 mod login;
 
 use std::collections::BTreeMap;
-// Only the test-support counter needs this; the field it updates exists only with that feature too.
+// Only the test-support counters need these; the fields they update exist only with that feature too.
 #[cfg(feature = "test-support")]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -41,6 +41,26 @@ use crate::auth::{FbttAuth, keys, locked};
 /// reaches something a person will read.
 pub(crate) fn clean(text: &str) -> String {
     fbt::display_safe(text, fbt::MAX_DISPLAY_CHARS)
+}
+
+/// At most this many Argon2 verifies run at once on one server.
+///
+/// A verify is expensive on purpose - about 19 MiB and a core's worth of time here - and it runs on the
+/// blocking pool, which will start several hundred threads if nothing tells it not to. The login limiter
+/// bounds how many attempts one *address* gets; this bounds what every address together can do to the
+/// machine, which is what a distributed guess needs: one attempt per address, each inside its own budget,
+/// and no cap at all in between them and memory. Four of them is under 80 MiB and a quarter of a busy
+/// machine - enough to keep logins prompt while everything else on this box keeps running.
+const MAX_PARALLEL_VERIFIES: usize = 4;
+
+/// How many verifies to let run at once on this machine: one per core as the OS reports them, and never
+/// more than [`MAX_PARALLEL_VERIFIES`] or fewer than one. A machine that cannot say gets one - the
+/// pessimistic end, and the right one for something whose whole job is to slow a guesser down.
+fn parallel_verifies() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1);
+    cores.clamp(1, MAX_PARALLEL_VERIFIES)
 }
 
 /// Who may log in, which devices the login route recognises, which folders the file routes may name,
@@ -75,10 +95,24 @@ pub(crate) struct Shared {
     /// what answering "wrong password" costs. `None` when no account could have been found anyway -
     /// with no users, or with nobody signing in, there is no name worth hiding. See [`login`].
     dummy_password_hash: Option<String>,
+    /// How many Argon2 verifies may run at once, for the whole server: one per core, and never more than a
+    /// handful ([`MAX_PARALLEL_VERIFIES`]). A verify is deliberately expensive - about 19 MiB here - and it
+    /// runs on the blocking pool, which will happily start several hundred threads if nothing tells it to
+    /// stop. The login limiter bounds how many attempts an *address* gets; this bounds what all of them
+    /// together can make the machine do, which is what a distributed guess - one attempt per address, and
+    /// no address over its budget - would otherwise find.
+    verify_permits: tokio::sync::Semaphore,
     /// How many Argon2 verifications this server has run. Nothing in a run reads it; the test that
     /// proves an unknown user name still costs a verify does.
     #[cfg(feature = "test-support")]
     verifies: AtomicU64,
+    /// How many verifies are running right now, and the most there have been at once: the pair of counters
+    /// a test reads to show that [`parallel_verifies`] is what actually bounds the work rather than just
+    /// what it asks for. Nothing in a run reads either.
+    #[cfg(feature = "test-support")]
+    verifying: AtomicU64,
+    #[cfg(feature = "test-support")]
+    most_verifying: AtomicU64,
 }
 
 impl Shared {
@@ -103,8 +137,13 @@ impl Shared {
             paths,
             roots: roots.into(),
             dummy_password_hash,
+            verify_permits: tokio::sync::Semaphore::new(parallel_verifies()),
             #[cfg(feature = "test-support")]
             verifies: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            most_verifying: AtomicU64::new(0),
         }
     }
 
@@ -133,10 +172,23 @@ impl Shared {
         devices.by_fingerprint.contains_key(fingerprint)
     }
 
-    /// The devices to show, in the order the config has them.
+    /// The devices to show, in the order the config has them, with every name cleaned for display.
+    ///
+    /// A name this server's own route added is already display-safe - adding one refuses anything that is
+    /// not - so cleaning changes nothing for it. What it covers is a name someone put into `config.yaml` by
+    /// hand: by the time an API response repeats it, it is remote text, and a bidi override in a device
+    /// name is how a list lies about what is in it. Such a name shows as a display would draw it; removing
+    /// it means naming it as the file spells it, which is what the person who wrote that file has.
     pub(crate) fn device_rows(&self) -> Vec<DeviceRow> {
         let devices = locked(&self.devices);
-        devices.entries.clone()
+        devices
+            .entries
+            .iter()
+            .map(|row| DeviceRow {
+                name: clean(&row.name),
+                fingerprint: row.fingerprint.clone(),
+            })
+            .collect()
     }
 
     /// The hash a password for `name` is checked against: the account's, or this server's fixed dummy
@@ -151,13 +203,18 @@ impl Shared {
         known.or_else(|| self.dummy_password_hash.clone())
     }
 
-    /// Counts one Argon2 verification as having run. Under `test-support` that is what lets a test
-    /// prove an unknown user name still costs a verify; in a run nothing reads the count, so this
-    /// records nothing and the field it would update is not even there.
-    pub(crate) fn count_verify(&self) {
+    /// Counts one Argon2 verification as having run, and records how many are running now against the most
+    /// this server has had at once. Under `test-support` that is what lets a test prove an unknown user name
+    /// still costs a verify, and that the bound in [`parallel_verifies`] is real rather than asked for; in a
+    /// run nothing reads any of these counts, so this records nothing and the fields it would update are not
+    /// even there. See [`crate::Server::password_verifies`] and [`crate::Server::max_concurrent_verifies`].
+    pub(crate) fn verify_started(&self) {
         #[cfg(feature = "test-support")]
-        self.verifies
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            self.verifies.fetch_add(1, Ordering::Relaxed);
+            let running = self.verifying.fetch_add(1, Ordering::Relaxed) + 1;
+            self.most_verifying.fetch_max(running, Ordering::Relaxed);
+        }
     }
 
     /// How many Argon2 verifications this server has run since it started. Under `test-support` this is
@@ -165,7 +222,24 @@ impl Shared {
     /// counts and so there is nothing to read. See [`crate::Server::password_verifies`].
     #[cfg(feature = "test-support")]
     pub(crate) fn password_verifies(&self) -> u64 {
-        self.verifies.load(std::sync::atomic::Ordering::Relaxed)
+        self.verifies.load(Ordering::Relaxed)
+    }
+
+    /// Says the verify [`verify_started`](Self::verify_started) counted has finished. A verify that panicked
+    /// would leave the count one too high: argon2's verify does not panic, nothing in a run reads the
+    /// number, and the permit itself is returned by a `Drop` whichever way this ends.
+    pub(crate) fn verify_finished(&self) {
+        #[cfg(feature = "test-support")]
+        self.verifying.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The most Argon2 verifies this server has had running at once. Under `test-support` this is how a test
+    /// checks that [`parallel_verifies`] bounds the work when logins arrive in a burst instead of merely
+    /// asking it to; in a run nothing counts, so there is nothing to read. See
+    /// [`crate::Server::max_concurrent_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn max_concurrent_verifies(&self) -> u64 {
+        self.most_verifying.load(Ordering::Relaxed)
     }
 }
 
@@ -241,7 +315,7 @@ impl DeviceTable {
 
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
-/// `forbidden`, `not_found`, `already_exists`, `too_many_requests`, `internal`) and a message.
+/// `forbidden`, `not_found`, `already_exists`, `too_many_requests`, `busy`, `internal`) and a message.
 #[derive(Debug)]
 pub(crate) struct RouteError {
     status: StatusCode,
@@ -308,6 +382,16 @@ impl RouteError {
             "too many requests, retry later",
         );
         error.retry_after_secs = Some(retry_after_secs);
+        error
+    }
+
+    /// `503 busy`, with `Retry-After: 1`: this server could answer, but it is in the middle of too many of
+    /// something right now. It is fbt-api's own spelling for that answer - too many open streams, too many
+    /// torrents being added at once - so a client that already knows to try again on `busy` needs nothing
+    /// new to learn here.
+    fn busy(message: impl Into<String>) -> Self {
+        let mut error = Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message);
+        error.retry_after_secs = Some(1);
         error
     }
 
