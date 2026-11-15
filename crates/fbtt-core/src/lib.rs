@@ -8,7 +8,8 @@
 //! The engine itself ([`Engine`]) is separate from either role on purpose: the terminal and the
 //! headless server drive the same session by the same rules about the same files, so those rules -
 //! and the library lock - are written once, here. Which role a run starts on is what
-//! [`ui_state`] remembers.
+//! [`ui_state`] remembers. The one question both roles answer the same way - which folders may a
+//! torrent go into ([`fs_list`]) - is written once for the same reason.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +17,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod engine;
+pub mod fs_list;
 pub mod local;
 pub mod lock;
 pub mod paths;
@@ -23,9 +25,9 @@ pub mod ui_state;
 
 pub use auth::LOGIN_NAMESPACE;
 pub use client::{
-    AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab, FilePriority,
-    FileRow, LiveLimits, Notice, PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals,
-    TrackerRow,
+    AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab,
+    DeviceCommand, DeviceRow, DirListing, FilePriority, FileRow, LinkState, LiveLimits, Notice,
+    PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals, TrackerRow,
 };
 pub use config::{
     AuthConfig, Config, ConfigError, ConfigLoad, DeviceEntry, ServerConfig, UserEntry,

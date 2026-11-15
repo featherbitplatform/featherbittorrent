@@ -4,7 +4,8 @@
 //! or one server. It is a convenience - starting on the local engine when the file is missing,
 //! broken or unreadable is always a usable answer - so nothing here is fatal and no secret lives
 //! here either: a password belongs in the system keychain, a private key stays in its own file, and
-//! what this file holds is an address, a method, a user name and a path.
+//! what this file holds is an address, a method, a user name, a path, and for a gateway login its token
+//! endpoint and client id.
 //!
 //! The file names its backend the way serde writes an enum: `last_used: Local`, or `last_used:`
 //! followed by a YAML tag and the target's fields under it - `last_used: !Remote` with `url`,
@@ -53,6 +54,13 @@ pub struct RemoteTarget {
     pub user: Option<String>,
     /// The device key to sign with, or to look for in ssh-agent, when the method needs one.
     pub key_path: Option<PathBuf>,
+    /// Where a gateway login gets its bearer token (`token_url`): the endpoint a `private_key_jwt`
+    /// assertion is posted to, and the audience that assertion names. Only `GatewayKey` uses it, and a
+    /// target written before this field existed has none.
+    pub token_url: Option<String>,
+    /// The client id this installation is known to a gateway by, which is what a `GatewayKey` assertion
+    /// says `iss` and `sub` are. Only `GatewayKey` uses it.
+    pub client_id: Option<String>,
 }
 
 /// How a target signs in.
@@ -67,6 +75,12 @@ pub enum LoginMethod {
     KeyFile,
     /// The same key signed by ssh-agent, so its bytes are never read.
     Agent,
+    /// A bearer token from a gateway standing in front of a server that runs with auth off: the device
+    /// key signs an OAuth2 client-credentials assertion at `token_url`, so the key's bytes stay on this
+    /// machine and the gateway decides who is in.
+    GatewayKey,
+    /// A user name and password given to a gateway rather than to the server, which runs with auth off.
+    GatewayBasic,
 }
 
 impl UiState {
@@ -170,6 +184,8 @@ mod tests {
                 login: LoginMethod::KeyFile,
                 user: Some("alice".to_string()),
                 key_path: Some(PathBuf::from("/home/alice/.ssh/id_ed25519")),
+                token_url: None,
+                client_id: None,
             }),
         };
         remote.save(&paths).expect("save the last connection");
@@ -202,10 +218,83 @@ mod tests {
                 login: LoginMethod::None,
                 user: None,
                 key_path: None,
+                token_url: None,
+                client_id: None,
             }),
         };
         open_server.save(&paths).expect("save the open server");
         assert_eq!(UiState::load(&paths), open_server);
+    }
+
+    /// A gateway target keeps what a gateway needs (its token endpoint and this installation's client id)
+    /// through a save, and a `ui.yaml` written before those fields existed still loads as the target it
+    /// always was, with nothing invented for what it does not name.
+    #[test]
+    fn gateway_target_round_trips() {
+        let dir = ScratchDir::new("ui_state_gateway");
+        let paths = library(&dir);
+
+        let gateway = UiState {
+            last_used: LastUsed::Remote(RemoteTarget {
+                url: "https://bit.example".to_string(),
+                login: LoginMethod::GatewayKey,
+                user: None,
+                key_path: Some(PathBuf::from("/home/alice/.ssh/id_ed25519")),
+                token_url: Some("https://auth.example/oauth/token".to_string()),
+                client_id: Some("featherbittorrent-alice".to_string()),
+            }),
+        };
+        gateway
+            .save(&paths)
+            .expect("save the private-key gateway target");
+        assert_eq!(
+            UiState::load(&paths),
+            gateway,
+            "the token endpoint and the client id survive a save"
+        );
+
+        // The other gateway method needs neither of them: it hands a user name and password to whatever
+        // stands in front of the server, which runs with auth off.
+        let basic = UiState {
+            last_used: LastUsed::Remote(RemoteTarget {
+                url: "https://bit.example".to_string(),
+                login: LoginMethod::GatewayBasic,
+                user: Some("alice".to_string()),
+                key_path: None,
+                token_url: None,
+                client_id: None,
+            }),
+        };
+        basic
+            .save(&paths)
+            .expect("save the gateway password target");
+        assert_eq!(UiState::load(&paths), basic);
+
+        // A file from before these two fields existed - the shape every `ui.yaml` on disk has today - is
+        // still a connection this run can make, and it is not treated as something unreadable.
+        fs::write(
+            paths.ui_file(),
+            "last_used: !Remote\n  url: \"https://bit.example\"\n  login: Password\n  user: alice\n",
+        )
+        .expect("write a target from before the gateway fields");
+        assert_eq!(
+            UiState::load(&paths),
+            UiState {
+                last_used: LastUsed::Remote(RemoteTarget {
+                    url: "https://bit.example".to_string(),
+                    login: LoginMethod::Password,
+                    user: Some("alice".to_string()),
+                    key_path: None,
+                    token_url: None,
+                    client_id: None,
+                }),
+            },
+            "an older file loads with nothing filled in"
+        );
+        assert!(
+            !paths.config_dir.join("ui.yaml.bad").exists(),
+            "and it stays where it was rather than moving aside as unreadable"
+        );
     }
 
     /// A `ui.yaml` this run cannot read as YAML does not stop anything: the last connection is a

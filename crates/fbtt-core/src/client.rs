@@ -249,7 +249,73 @@ pub enum Connection {
         secure: bool,
         /// How we are signed in, fit to draw.
         auth: String,
+        /// Whether the link holds, right now.
+        state: LinkState,
     },
+}
+
+/// How a link to a server stands, as the header shows it.
+///
+/// A server that goes away does not stop the screen: the last snapshot stays on it and this says why, so
+/// a person knows whether the numbers they are looking at are current or remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    /// Nothing has come back from that address yet.
+    Connecting,
+    /// The last exchange worked.
+    Connected,
+    /// The server went away and this client is dialling again: the snapshot on the screen is whatever
+    /// was last good.
+    Lost {
+        /// Seconds until the next attempt, which doubles from 1 while it keeps failing.
+        retry_in_secs: u64,
+    },
+}
+
+/// The folders a destination may be picked from, as one answer to [`Command::ListDirs`].
+///
+/// With `path` `None` this is only the list of places to start from; naming a folder asks what is directly
+/// inside it. A failure belongs in `error` rather than in a notice: a picker shows the reason beside the
+/// folder it failed on, and it needs `roots` to fall back on while it does - one line about the failure
+/// alone would say the same thing twice and take the folders out of view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirListing {
+    /// The folder that was asked for; `None` for the list of places to start from.
+    pub path: Option<PathBuf>,
+    /// The folders this backend may name at all, spelled as they were configured: what a picker starts
+    /// from, and where it goes back to.
+    pub roots: Vec<PathBuf>,
+    /// The directories directly inside `path`: sorted, nothing hidden, names fit to draw, at most two
+    /// thousand of them, and no file among them. Empty when `path` is `None`, where `roots` is the list
+    /// to show.
+    pub dirs: Vec<String>,
+    /// Why that folder could not be listed, fit to draw; `None` when it could.
+    pub error: Option<String>,
+}
+
+/// What the screen asks about the devices a server lets sign in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceCommand {
+    /// The devices this server knows, as [`Snapshot::devices`].
+    List,
+    /// Let `name` sign in with `public_key`, spelled as an OpenSSH public key line.
+    Add {
+        /// What to call this device.
+        name: String,
+        /// The key it signs logins with.
+        public_key: String,
+    },
+    /// Stop the device called `name` from signing in.
+    Remove(String),
+}
+
+/// One device a server lets sign in: what it was named, and the short form of the key behind that name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    /// The name this server's person gave it.
+    pub name: String,
+    /// Its key's fingerprint, `SHA256:<base64>`: what a person checks before trusting the name.
+    pub fingerprint: String,
 }
 
 /// Everything one screen draws, as one value.
@@ -272,6 +338,12 @@ pub struct Snapshot {
     pub detail: Option<(TorrentId, Detail)>,
     /// The directory new torrents go to unless the dialog names another.
     pub default_dir: PathBuf,
+    /// The last folder listing that was asked for with [`Command::ListDirs`], and the answer to it;
+    /// `None` until one is asked for. See [`DirListing`].
+    pub dirs: Option<DirListing>,
+    /// The devices a server lets sign in, from the last [`Command::Devices`]; `None` until one is asked
+    /// for, which is also what a library with no server to manage them keeps showing.
+    pub devices: Option<Vec<DeviceRow>>,
 }
 
 /// What a torrent is being added from.
@@ -317,6 +389,12 @@ pub enum Command {
     SetLimits(LiveLimits),
     /// Which pane to keep fresh, or nothing.
     Watch(Option<(TorrentId, DetailTab)>),
+    /// What folders may be named as a destination: the places to start from when `None`, otherwise the
+    /// directories directly inside that folder. The answer is [`Snapshot::dirs`].
+    ListDirs(Option<PathBuf>),
+    /// The devices a server lets sign in, and what to do with them. The answer is
+    /// [`Snapshot::devices`]; a library running its own engine has no device list to give and says so.
+    Devices(DeviceCommand),
     /// Save everything and stop. Dropping every [`Client`] is the same as this.
     Shutdown,
 }

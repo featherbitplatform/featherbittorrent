@@ -387,6 +387,8 @@ mod tests {
             },
             detail: None,
             default_dir: std::path::PathBuf::from("/downloads"),
+            dirs: None,
+            devices: None,
         };
 
         let mut model = Model::new();

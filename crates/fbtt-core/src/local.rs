@@ -12,10 +12,11 @@
 //! new one, never between them.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use directories::UserDirs;
 use fbt::{
     AddTorrent, InfoHashV1, InfoHashes, Magnet, Metainfo, Priority, RateLimit, RemoveMode, Session,
     SessionError, Settings, TorrentHandle,
@@ -24,11 +25,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::client::{
-    AddSource, Client, Command, Connection, Detail, DetailTab, FilePriority, LiveLimits, Notice,
-    Snapshot, TorrentId, TorrentRow, Totals,
+    AddSource, Client, Command, Connection, Detail, DetailTab, DirListing, FilePriority,
+    LiveLimits, Notice, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::config::{Config, ConfigLoad, Limits};
 use crate::engine::{Engine, SAVE_EVERY, map};
+use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
 
@@ -39,6 +41,10 @@ const TICK: Duration = Duration::from_millis(500);
 /// the screen (and, from milestone 2, from a server), so a stale or malformed one is an
 /// ordinary answer rather than a failure.
 const NO_TORRENT: &str = "the torrent is not in this library";
+/// What the screen is told when it asks about devices: which keys may sign in to a featherbittorrent
+/// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
+/// them - not an empty one, none at all.
+const DEVICES_ON_A_SERVER: &str = "Devices are managed on a server";
 
 /// The backend that runs the torrents in this process.
 ///
@@ -125,6 +131,8 @@ async fn spawn(
         limits: map::limits(engine.session()),
         detail: None,
         default_dir: config.download_dir.clone(),
+        dirs: None,
+        devices: None,
     });
     let (client, channels) = Client::paired(Arc::clone(&initial));
     // The screen may not be reading yet, so these wait in the queue, and past its room they are
@@ -146,6 +154,7 @@ async fn spawn(
         config,
         paths: paths.clone(),
         watching: None,
+        dirs: None,
         stalled,
         published: initial,
         snapshot_tx: channels.snapshot,
@@ -199,6 +208,58 @@ fn rows(
     (torrents, totals)
 }
 
+/// The folders a listing on this machine may name: the download folder this run saves to, and the
+/// person's own home directory when their host has one.
+///
+/// Home is in the list because that is where everything else they own already is, and it is also the
+/// bound that keeps a picker inside the two places a torrent plausibly goes rather than anywhere on the
+/// file system. This costs no directory reads - which is why the backend's own thread may call it, while
+/// everything that does read a directory happens in the blocking task ([`Backend::list_dirs"]). A host
+/// with no home directory gets the download folder alone, which is the one thing a listing can say here.
+fn browse_paths(download_dir: &Path) -> Vec<PathBuf> {
+    let mut given = vec![download_dir.to_path_buf()];
+    if let Some(dirs) = UserDirs::new() {
+        let home = dirs.home_dir().to_path_buf();
+        // The same folder named twice would show up twice in the list someone picks from.
+        if !given.contains(&home) {
+            given.push(home);
+        }
+    }
+    given
+}
+
+/// One browse of this machine's folders, answered: the folders to start from when none was named, and
+/// otherwise the directories inside the one that was, under the rules every featherbittorrent listing
+/// uses ([`fs_list`]) - sorted, nothing hidden, names fit to draw, at most [`fs_list::MAX_DIRS`] of them,
+/// a link only where it stays inside a root, and no file among them.
+///
+/// A folder that cannot be listed says so inside the listing rather than as a notice: the picker shows
+/// that line beside the folder it failed on and can go back to `roots`, which a notice alone would not
+/// have told it. Runs on a blocking thread, because this is where the directory reads happen.
+fn listing_of(given: Vec<PathBuf>, path: Option<PathBuf>) -> DirListing {
+    let Some(path) = path else {
+        // Nothing named means nothing to read: the folders to start from were decided before anyone
+        // asked, and there are no directories to report below them until someone names one.
+        return DirListing {
+            path: None,
+            roots: given,
+            dirs: Vec::new(),
+            error: None,
+        };
+    };
+    let allowed = fs_list::browse_roots(&given);
+    let (dirs, error) = match fs_list::list_dirs(&allowed, &path) {
+        Ok(dirs) => (dirs, None),
+        Err(problem) => (Vec::new(), Some(problem.to_string())),
+    };
+    DirListing {
+        path: Some(path),
+        roots: given,
+        dirs,
+        error,
+    }
+}
+
 /// The task's side of the library: the engine it drives, and what a screen wants built on top of
 /// it - the snapshot, the watched pane, the config file the limits are saved to.
 struct Backend {
@@ -213,6 +274,10 @@ struct Backend {
     paths: Paths,
     /// The pane to keep fresh, and for which torrent.
     watching: Option<(TorrentId, DetailTab)>,
+    /// The last folder listing that was asked for, kept so that every snapshot after it still carries
+    /// an answer the picker is drawn from: a screen reads snapshots, not replies to its own commands.
+    /// `None` until one is asked for.
+    dirs: Option<DirListing>,
     /// When each torrent's stalled count last started running: while it is downloading and
     /// taking nothing. See [`map::stalled_clock`].
     stalled: HashMap<TorrentId, Instant>,
@@ -292,6 +357,10 @@ impl Backend {
             limits: map::limits(self.engine.session()),
             detail,
             default_dir: self.config.download_dir.clone(),
+            // The last listing stays with the snapshot until another one replaces it, and a library that
+            // runs its own engine has no device list to publish: `Devices` answers that with a notice.
+            dirs: self.dirs.clone(),
+            devices: None,
         });
         if next == self.published {
             return;
@@ -331,6 +400,12 @@ impl Backend {
             Command::SetLimits(limits) => self.set_limits(limits).await,
             // The next publish brings this pane, so the answer is already on its way.
             Command::Watch(target) => self.watching = target,
+            // The listing is the answer, and it goes where a picker reads it: see [`Self::list_dirs`].
+            Command::ListDirs(path) => self.list_dirs(path).await,
+            // Which keys may sign in to a server is that server's `config.yaml` to hold. A library
+            // running its own engine has no device list to change, and says so rather than pretending
+            // to have an empty one.
+            Command::Devices(_) => self.notify(Notice::Error(DEVICES_ON_A_SERVER.to_owned())),
             Command::Shutdown => {}
         }
     }
@@ -445,6 +520,35 @@ impl Backend {
                 "the config could not be written: {joined}"
             ))),
         }
+    }
+
+    /// One [`Command::ListDirs`] answered, on the blocking pool where reading directories belongs: this
+    /// task answers commands and does not wait on a disk for any of them (see [`save_config`](Self::save_config)
+    /// for the same arrangement). The answer is kept in `self.dirs` so the publish that follows this
+    /// command carries it, and every publish after that keeps carrying it until another listing replaces
+    /// it - a screen draws snapshots rather than replies.
+    ///
+    /// A folder that could not be listed is still an answer: its reason goes in the listing and nothing
+    /// is sent to the notice queue, because a picker shows that reason beside the folder it failed on.
+    async fn list_dirs(&mut self, path: Option<PathBuf>) {
+        let asked = path.clone();
+        // Which folders may be named at all is this backend's own rule, and reading it costs no directory
+        // reads (see `browse_paths`); the task below does all of those.
+        let browsable = browse_paths(&self.config.download_dir);
+        let roots = browsable.clone();
+        let outcome = tokio::task::spawn_blocking(move || listing_of(browsable, path)).await;
+        self.dirs = Some(match outcome {
+            Ok(listing) => listing,
+            // A blocking task that was dropped takes its answer with it, which is the only way this
+            // command fails outright. The reason goes where a picker reads reasons, and the root list
+            // comes from the same rule the answer would have used.
+            Err(joined) => DirListing {
+                path: asked,
+                roots,
+                dirs: Vec::new(),
+                error: Some(format!("the folder could not be listed: {joined}")),
+            },
+        });
     }
 
     /// The watched pane, or `None` when there is nothing to show for it: the torrent went

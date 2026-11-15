@@ -42,7 +42,11 @@ fn connection_line(snap: &Snapshot) -> Line<'static> {
     let mut spans = vec![Span::styled("connected to ", muted)];
     match &snap.connection {
         Connection::Local => spans.push(Span::styled("Local", Style::new().fg(theme::CYAN_400))),
-        Connection::Remote { name, secure, auth } => {
+        Connection::Remote {
+            name, secure, auth, ..
+        } => {
+            // The link's own state (`LinkState`) belongs on this line too; until the connect screen exists
+            // to produce one, a remote header says what it always said.
             spans.push(Span::styled(
                 format::safe(name),
                 Style::new().fg(theme::CYAN_400),

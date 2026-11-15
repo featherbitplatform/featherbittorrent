@@ -110,6 +110,8 @@ pub fn library() -> Snapshot {
             ]),
         )),
         default_dir: PathBuf::from("/downloads"),
+        dirs: None,
+        devices: None,
     }
 }
 
