@@ -8,10 +8,14 @@
 //!
 //! A success clears the address's count, so one mistyped password on the way to a working login does
 //! not leave someone half-blocked.
+//!
+//! "One address" is deliberately a block rather than a socket: an IPv4-mapped IPv6 counts as its IPv4
+//! address and other IPv6 addresses share a window per `/64`, so a client cannot get a fresh ten tries
+//! by changing the low half of its address.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,6 +33,25 @@ const MAX_ADDRESSES: usize = 4_096;
 /// Whether a failure at `then` still counts when the clock reads `now`.
 fn inside(then: Instant, now: Instant) -> bool {
     then.checked_add(WINDOW).is_some_and(|until| until > now)
+}
+
+/// The address a failure is counted against, so that two spellings of one client do not get two
+/// windows and one client does not get a thousand.
+///
+/// `::ffff:203.0.113.7` is how the IPv4 client of an IPv6-listening server arrives, so it counts as
+/// its IPv4 address ([`IpAddr::to_canonical`]). Everything else in IPv6 is keyed by its `/64`, which
+/// is the block a customer is handed: someone rotating through addresses inside one prefix - what a
+/// machine or a home connection does - shares one window instead of getting ten fresh tries per
+/// address. Two prefixes two customers share would share a window, and that errs on the side of
+/// refusing too much, which is the safe way for a limiter to be wrong.
+fn bucket(address: IpAddr) -> IpAddr {
+    match address.to_canonical() {
+        address @ IpAddr::V4(_) => address,
+        IpAddr::V6(v6) => {
+            let [first, second, third, fourth, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(first, second, third, fourth, 0, 0, 0, 0))
+        }
+    }
 }
 
 /// Whole seconds between `now` and `until`, rounded up. A client told to wait zero seconds would be
@@ -76,10 +99,11 @@ impl Failures {
     }
 }
 
-/// The addresses with failures on their record, and the same addresses ordered by when they stop
-/// mattering.
+/// The addresses with failures on their record, keyed by [`bucket`], and the same addresses ordered by
+/// when they stop mattering.
 #[derive(Debug)]
 struct Tracked {
+    /// Bucket to its failures.
     by_address: HashMap<IpAddr, Failures>,
     /// `(newest failure, sequence)` to address: the entry a full table forgets first.
     quietest_first: BTreeMap<(Instant, u64), IpAddr>,
@@ -133,9 +157,12 @@ impl LoginLimiter {
         }
     }
 
-    /// Whether `address` may try to log in now, or how many whole seconds it should wait first.
+    /// Whether `address` may try to log in now, or how many whole seconds it should wait first. The
+    /// peer address as the connection reports it is fine: an IPv4-mapped IPv6 and a client rotating
+    /// within its `/64` are counted where the failures they caused were counted.
     pub fn check(&self, address: IpAddr) -> Result<(), u64> {
         let now = (self.clock)();
+        let address = bucket(address);
         let tracked = locked(&self.tracked);
         match tracked
             .by_address
@@ -150,6 +177,7 @@ impl LoginLimiter {
     /// One more failure for `address`.
     pub fn failure(&self, address: IpAddr) {
         let now = (self.clock)();
+        let address = bucket(address);
         let tracked = &mut *locked(&self.tracked);
         if !tracked.by_address.contains_key(&address) {
             tracked.make_room();
@@ -177,6 +205,7 @@ impl LoginLimiter {
 
     /// A login worked: the address starts from clean again.
     pub fn success(&self, address: IpAddr) {
+        let address = bucket(address);
         let tracked = &mut *locked(&self.tracked);
         if let Some(failures) = tracked.by_address.remove(&address) {
             tracked.quietest_first.remove(&failures.place);
@@ -253,5 +282,59 @@ mod tests {
         assert_eq!(limiter.check(other), Ok(()));
         limiter.success(other);
         assert_eq!(limiter.check(other), Ok(()));
+    }
+
+    /// A failure follows the client, not the spelling its address arrived in: `::ffff:a.b.c.d` is that
+    /// IPv4 address, and every address inside one `/64` shares one window.
+    #[test]
+    fn limiter_groups_v6_by_64_and_maps_v4() {
+        let (_clock, handle) = TestClock::starting_at(Instant::now());
+        let limiter = LoginLimiter::with_clock(handle);
+
+        // One IPv4 address, arrived two ways.
+        let mapped: IpAddr = "::ffff:203.0.113.9"
+            .parse()
+            .expect("a v6 spelling of a v4 address");
+        let plain: IpAddr = "203.0.113.9".parse().expect("an address");
+        for _ in 0..MAX_FAILURES - 1 {
+            limiter.failure(mapped);
+        }
+        assert_eq!(limiter.check(plain), Ok(()), "nine failures leave one try");
+        limiter.failure(plain);
+        assert!(
+            limiter.check(mapped).is_err(),
+            "the tenth failure came in as the other spelling",
+        );
+        limiter.success(plain);
+        assert_eq!(
+            limiter.check(mapped),
+            Ok(()),
+            "clearing one spelling clears the other",
+        );
+
+        // Many addresses, one customer: a `/64` is what a network hands out.
+        let first: IpAddr = "2001:db8:1:2::5".parse().expect("an address");
+        for _ in 0..MAX_FAILURES {
+            limiter.failure(first);
+        }
+        for sibling in [
+            "2001:db8:1:2::ffff:1",
+            "2001:db8:1:2:dead:beef:cafe:f00d",
+            "2001:db8:1:2:0:0:0:0",
+        ] {
+            let address: IpAddr = sibling.parse().expect("an address");
+            assert!(
+                limiter.check(address).is_err(),
+                "{sibling} is the same /64 as 2001:db8:1:2::5",
+            );
+        }
+
+        // The next /64 over is somebody else.
+        let neighbour: IpAddr = "2001:db8:1:3::5".parse().expect("an address");
+        assert_eq!(
+            limiter.check(neighbour),
+            Ok(()),
+            "a different /64 keeps its own window",
+        );
     }
 }

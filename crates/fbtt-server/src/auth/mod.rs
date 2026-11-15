@@ -57,22 +57,23 @@ const LOGIN_ROUTES: [(Method, &str); 2] = [
     (Method::POST, "/api/v1/auth/session"),
 ];
 
-/// Whether `(method, matched_path)` names one of the login routes, matched by path suffix the way
-/// fbt-api matches its own exempt list: a server that nests these routes under a prefix keeps the
-/// rule. A request that matched no route at all is not a login route either.
+/// Whether `(method, matched_path)` names one of the login routes, by exact equality with the paths
+/// these are mounted at. A suffix match - the way fbt-api matches its own exempt list - fails open:
+/// a route that merely ends in `/api/v1/auth/session` (an admin's session list under a prefix) would
+/// be handed the exemption too. A request that matched no route at all is not a login route either.
 fn login_route(method: &Method, matched_path: Option<&str>) -> bool {
-    matched_path.is_some_and(|path| {
-        LOGIN_ROUTES
-            .iter()
-            .any(|(route, suffix)| route == method && path.ends_with(suffix))
-    })
+    LOGIN_ROUTES
+        .iter()
+        .any(|(route, path)| route == method && matched_path == Some(path))
 }
 
 /// The authorization scheme a session token is presented in, matched without regard to case.
 const BEARER_SCHEME: &str = "Bearer";
 
 /// The token of `Authorization: Bearer <token>`: the scheme in any case, then exactly one space, as
-/// fbt-api's own bearer parsing spells it. A header we cannot read as text is as good as absent.
+/// fbt-api's own bearer parsing spells it. `None` when the header is absent, cannot be read as text,
+/// or is in another form - which is why [`FbttAuth`] asks whether a header is there before it decides
+/// that no credential came in at all.
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_at_checked(BEARER_SCHEME.len())?;
@@ -161,8 +162,13 @@ impl Authenticator for FbttAuth {
         }
         // The header, or the query parameter on the routes fbt-api says take one (the file streams and
         // the event stream, which a browser cannot send headers on): everywhere else it hands us
-        // `None`, so this does not have to know which routes those are.
-        let token = bearer(request.headers).or(request.query_token);
+        // `None`, so this does not have to know which routes those are. Only when there is no header
+        // at all: a header that is here but is not a bearer token is a wrong credential, not a missing
+        // one, and letting the query token answer it would let a request pick which credential loses.
+        let token = match request.headers.get(header::AUTHORIZATION) {
+            Some(_) => bearer(request.headers),
+            None => request.query_token,
+        };
         if token.is_some_and(|token| self.sessions.check(token).is_some()) {
             Ok(())
         } else {
@@ -305,6 +311,28 @@ mod tests {
         );
         assert!(auth.authorize(&streamed).is_ok());
 
+        // A header that is here but is not a bearer token is a wrong credential, not a missing one:
+        // the query token does not get to answer behind it.
+        let mut other_scheme = HeaderMap::new();
+        other_scheme.insert(
+            header::AUTHORIZATION,
+            "Basic YWxpY2U6aHVudGVyNDI=".parse().expect("a header"),
+        );
+        let overshadowed = fbt_api::AuthRequest::new(
+            &Method::GET,
+            Some("/api/v1/events"),
+            &other_scheme,
+            Some(&token),
+            None,
+        );
+        assert!(
+            matches!(
+                auth.authorize(&overshadowed),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a good query token behind a header we do not read is still refused",
+        );
+
         // An hour after the last request that used it, the token stops working on its own: a stolen
         // one dies eventually without anyone revoking it.
         clock.advance(Duration::from_secs(60 * 60 + 1));
@@ -320,6 +348,39 @@ mod tests {
         let printed = format!("{auth:?}");
         assert!(!printed.contains("alice"), "{printed}");
         assert!(printed.contains("sessions"), "{printed}");
+    }
+
+    /// The login exemption is exact, not a suffix match: our routes are mounted at the root, so a
+    /// path that merely ends in one of them - an admin's session list under a prefix - is an ordinary
+    /// request and needs a token.
+    #[test]
+    fn prefixed_login_path_needs_token() {
+        let (_clock, handle) = TestClock::starting_at(Instant::now());
+        let auth = FbttAuth::with_clock(&server(true), handle);
+        let none = HeaderMap::new();
+
+        for path in [
+            "/admin/api/v1/auth/session",
+            "/v2/api/v1/auth/challenge",
+            "/api/v1/auth/session/",
+        ] {
+            assert!(
+                matches!(
+                    auth.authorize(&request(&Method::POST, Some(path), &none)),
+                    Err(AuthRejection::Unauthorized),
+                ),
+                "{path} only looks like a login route",
+            );
+        }
+
+        // The two paths themselves stay open.
+        for path in ["/api/v1/auth/challenge", "/api/v1/auth/session"] {
+            assert!(
+                auth.authorize(&request(&Method::POST, Some(path), &none))
+                    .is_ok(),
+                "{path} is how you get a token",
+            );
+        }
     }
 
     /// The header form a bearer token arrives in, matched the way fbt-api matches it.
