@@ -4,7 +4,7 @@
 //! that a terminal four rows tall gets a header and some torrents instead of five
 //! overlapping panels nobody can read. A tall terminal gets the layout the design draws:
 //! three header lines, the table, a rule, the detail pane, a rule and the key hints. What is
-//! given up first as the terminal shrinks is written down in [`full_areas`], and it is always
+//! given up first as the terminal shrinks is written down in `full_areas`, and it is always
 //! something other than a row of torrents until there is nothing else left to give.
 
 use ratatui::Frame;

@@ -21,7 +21,7 @@ const RATE_FIELDS: usize = 2;
 /// What the person is typing into the settings dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsForm {
-    /// The five numbers, in [`LABELS`]'s order.
+    /// The five numbers, in the order `LABELS` lists them.
     pub fields: [Input; LABELS.len()],
     /// Which field was refused last and is drawn red, `None` when nothing has been refused.
     /// Editing a field clears its mark, so the warning goes away as soon as it is wrong no more.

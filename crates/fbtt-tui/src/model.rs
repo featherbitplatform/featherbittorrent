@@ -196,7 +196,7 @@ impl Model {
         self.notice = Some((notice, now));
     }
 
-    /// Drops a notice that has been on the footer for [`NOTICE_TTL`]. The binary calls this with
+    /// Drops a notice that has been on the footer for `NOTICE_TTL`. The binary calls this with
     /// each frame's clock reading so a line about something goes away without a key press; a
     /// `now` earlier than the notice arrived counts as no time passed.
     pub fn tick(&mut self, now: Instant) {
