@@ -21,6 +21,11 @@ fn main() -> std::process::ExitCode {
         .enable_all()
         .build()
         .expect("a tokio runtime");
+    // A panic on the UI side unwinds out of `run` before its ordered quit, so no last save
+    // runs: what the next start finds is whatever was written last, and the tick that
+    // writes `session.state` every five minutes is what bounds that loss to re-checking a
+    // few minutes of progress. The terminal still comes back, through the panic hook
+    // `ratatui::try_init` installs (see `terminal.rs`).
     let code = runtime.block_on(run::run());
     drop(runtime); // Engine threads finish before the process does.
     code

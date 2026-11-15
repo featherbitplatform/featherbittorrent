@@ -84,6 +84,19 @@ fn applied(snap: &Snapshot, file: usize, priority: FilePriority) -> Snapshot {
     next
 }
 
+/// A magnet link that parses, used by the tests that follow an add through to its answer.
+const MAGNET_LINK: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo";
+
+/// Opens the add dialog, types `text` into it and presses Enter, which is what every test
+/// that follows an add starts from.
+fn submit(snap: &Snapshot, text: &str) -> (Model, Vec<Command>) {
+    let mut model = model_of(snap);
+    model.handle_key(letter('a'), snap);
+    type_text(&mut model, snap, text);
+    let commands = model.handle_key(key(KeyCode::Enter), snap);
+    (model, commands)
+}
+
 #[test]
 fn add_magnet_sends_command() {
     let snap = library();
@@ -112,9 +125,18 @@ fn add_magnet_sends_command() {
         }],
         "the magnet was not sent as it was typed"
     );
+    // An add is not finished when Enter was pressed. The dialog stays up for the backend's
+    // answer, and says what it is waiting for; `duplicate_error_shows_in_dialog` and
+    // `success_closes_dialog` follow that answer.
     assert!(
-        model.modal.is_none(),
-        "the dialog stayed open once submitted"
+        matches!(model.modal, Some(Modal::Add(_))),
+        "the dialog came down before its answer"
+    );
+    assert!(
+        Screen::new(&model, &snap, 100, 30)
+            .text()
+            .contains("Adding..."),
+        "a dialog waiting for its add said nothing about it"
     );
 
     // A folder the person changed is sent; the default one is not, because nothing is moving.
@@ -248,6 +270,188 @@ fn add_dialog_expands_a_leading_tilde() {
         .expect_err("the scratch name should not exist")
         .to_string();
     assert_eq!(add_form(&model).error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn malformed_magnet_stays_in_dialog() {
+    let snap = library();
+    // A `btih` that is neither 40 hex digits nor 32 base32 characters: the engine's own parser
+    // refuses it, and so does this screen before anything is sent.
+    let broken = "magnet:?xt=urn:btih:notavalidhash";
+
+    let (mut model, commands) = submit(&snap, broken);
+    assert!(
+        commands.is_empty(),
+        "a link that is not a magnet was sent to the backend"
+    );
+    let form = add_form(&model);
+    assert_eq!(form.source.text, broken, "the typed link was not kept");
+    let error = form.error.clone().expect("a refused link gave no reason");
+    assert!(
+        !error.is_empty(),
+        "the reason for refusing the link was blank"
+    );
+
+    // It is on the screen too, in the error colour, where the person can read it and fix it.
+    let screen = Screen::new(&model, &snap, 100, 30);
+    let (x, y) = screen
+        .find(&error)
+        .expect("the reason for refusing the link was not drawn");
+    assert_eq!(screen.fg(x, y), Color::Rgb(0xed, 0x4a, 0x49));
+
+    // Correcting the hash and pressing Enter again sends it, and the dialog waits for its answer.
+    repeat(
+        &mut model,
+        &snap,
+        KeyCode::Backspace,
+        broken.chars().count(),
+    );
+    type_text(&mut model, &snap, MAGNET_LINK);
+    let commands = model.handle_key(key(KeyCode::Enter), &snap);
+    assert_eq!(
+        commands,
+        vec![Command::Add {
+            source: AddSource::Magnet(MAGNET_LINK.to_string()),
+            dir: None,
+        }],
+        "the corrected link was not sent"
+    );
+    assert_eq!(
+        add_form(&model).error,
+        None,
+        "the old reason stayed on screen"
+    );
+}
+
+#[test]
+fn uppercase_magnet_is_a_magnet() {
+    let snap = library();
+    // Links arrive from browsers and shell history spelled every which way. The scheme is read
+    // ignoring case, so this goes to the backend as a magnet instead of being looked for on disk
+    // as a file named `MAGNET:?...`.
+    let upper = "MAGNET:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo";
+
+    let (model, commands) = submit(&snap, upper);
+    assert_eq!(
+        commands,
+        vec![Command::Add {
+            source: AddSource::Magnet(upper.to_string()),
+            dir: None,
+        }],
+        "an upper-case scheme was not sent as the magnet it is"
+    );
+    let form = add_form(&model);
+    assert_eq!(
+        form.error, None,
+        "a magnet was refused as if it were a path"
+    );
+    assert!(
+        Screen::new(&model, &snap, 100, 30)
+            .text()
+            .contains("Adding..."),
+        "the upper-case link did not go as an add that is waiting for its answer"
+    );
+}
+
+#[test]
+fn unrelated_error_does_not_enter_add_dialog() {
+    let snap = library();
+    let at = Instant::now();
+    let elsewhere = "the session state could not be written";
+
+    // The dialog is open with nothing sent in it: a line about something else in the app has to
+    // read as itself, on the footer, not as a refusal of what is being typed.
+    let mut model = model_of(&snap);
+    model.handle_key(letter('a'), &snap);
+    model.push_notice(Notice::Error(elsewhere.to_string()), at);
+    assert_eq!(
+        add_form(&model).error,
+        None,
+        "an error that was not about this dialog went inside it"
+    );
+    assert_eq!(model.notice(), Some(&Notice::Error(elsewhere.to_string())));
+
+    // Once a dialog has had its own answer, the next error is somebody else's news too.
+    let (mut model, _) = submit(&snap, MAGNET_LINK);
+    model.push_notice(
+        Notice::Error("torrent already in this library".to_string()),
+        at,
+    );
+    assert_eq!(
+        add_form(&model).error.as_deref(),
+        Some("torrent already in this library"),
+        "the answer to this dialog did not reach it"
+    );
+    model.push_notice(
+        Notice::Error(elsewhere.to_string()),
+        at + Duration::from_secs(1),
+    );
+    assert_eq!(
+        add_form(&model).error.as_deref(),
+        Some("torrent already in this library"),
+        "an unrelated error overwrote what this dialog was told"
+    );
+    assert_eq!(model.notice(), Some(&Notice::Error(elsewhere.to_string())));
+}
+
+#[test]
+fn duplicate_error_shows_in_dialog() {
+    let snap = library();
+    let at = Instant::now();
+
+    let (mut model, commands) = submit(&snap, MAGNET_LINK);
+    assert_eq!(commands.len(), 1, "the add was not sent");
+    assert!(
+        matches!(model.modal, Some(Modal::Add(_))),
+        "the dialog came down before its answer"
+    );
+
+    model.push_notice(
+        Notice::Error("torrent already in this library".to_string()),
+        at,
+    );
+    let form = add_form(&model);
+    assert_eq!(
+        form.error.as_deref(),
+        Some("torrent already in this library"),
+        "the refusal did not reach the dialog it belongs to"
+    );
+    assert!(model.notice().is_none(), "the same line was shown twice");
+
+    // On the screen, inside the box, in the error colour.
+    let screen = Screen::new(&model, &snap, 100, 30);
+    let (x, y) = screen
+        .find("torrent already in this library")
+        .expect("the refusal was not drawn");
+    assert_eq!(screen.fg(x, y), Color::Rgb(0xed, 0x4a, 0x49));
+
+    // Esc still closes it, whatever it is waiting for.
+    assert!(model.handle_key(key(KeyCode::Esc), &snap).is_empty());
+    assert!(model.modal.is_none(), "escape left the dialog up");
+}
+
+#[test]
+fn success_closes_dialog() {
+    let snap = library();
+    let at = Instant::now();
+
+    let (mut model, commands) = submit(&snap, MAGNET_LINK);
+    assert_eq!(commands.len(), 1, "the add was not sent");
+    assert!(
+        matches!(model.modal, Some(Modal::Add(_))),
+        "the dialog came down before its answer"
+    );
+
+    model.push_notice(Notice::Info("Added demo".to_string()), at);
+    assert!(
+        model.modal.is_none(),
+        "the dialog stayed open after the add worked"
+    );
+    assert_eq!(
+        model.notice(),
+        Some(&Notice::Info("Added demo".to_string())),
+        "what worked did not reach the footer"
+    );
 }
 
 #[test]
@@ -682,12 +886,23 @@ fn notice_expires_after_5s() {
         "an expired notice was still on the screen"
     );
 
-    // An error that answers the add dialog goes in the dialog rather than under it.
+    // An error while the add dialog is open, with nothing in it waiting for an answer, is
+    // somebody else's news: it stays on the footer rather than reading as a refused magnet.
     let mut model = model_of(&snap);
     model.handle_key(letter('a'), &snap);
-    model.push_notice(Notice::Error("duplicate torrent".to_string()), at);
-    assert_eq!(add_form(&model).error.as_deref(), Some("duplicate torrent"));
-    assert!(model.notice().is_none(), "the same error was shown twice");
+    model.push_notice(
+        Notice::Error("the session state could not be written".to_string()),
+        at,
+    );
+    assert_eq!(
+        add_form(&model).error,
+        None,
+        "an error that was not about the dialog went inside it"
+    );
+    assert!(
+        model.notice().is_some(),
+        "an unrelated error never reached the footer"
+    );
 
     // Something that worked still goes on the footer even with the dialog up.
     model.push_notice(Notice::Info("added".to_string()), at);

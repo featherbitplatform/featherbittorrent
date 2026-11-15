@@ -170,16 +170,28 @@ impl Model {
 
     /// Records one line of feedback from the backend for the footer to show until it expires.
     ///
-    /// An error that arrives while the add dialog is open goes into the dialog instead: it is the
-    /// answer to what was just typed there, and a line under the box would read as something else
-    /// having gone wrong. `now` is a parameter rather than a clock reading so that a test can say
-    /// when a notice arrived instead of waiting for one.
+    /// The add dialog is the one notice that goes somewhere else, and only while it waits for
+    /// the answer to the add it sent itself: success closes the dialog, failure shows the reason
+    /// inside it. That flag is what keeps an unrelated line - a torrent that went away, a state
+    /// file that would not write, a limit the engine refused - from reading as a refused magnet
+    /// while somebody has the box open. `now` is a parameter rather than a clock reading so that
+    /// a test can say when a notice arrived instead of waiting for one.
     pub fn push_notice(&mut self, notice: Notice, now: Instant) {
-        if let Some(Modal::Add(form)) = &mut self.modal
-            && let Notice::Error(text) = &notice
-        {
-            form.error = Some(text.clone());
-            return;
+        match self.modal.take() {
+            // This dialog asked the question this notice answers.
+            Some(Modal::Add(mut form)) if form.awaiting_answer => match &notice {
+                Notice::Error(text) => {
+                    form.error = Some(text.clone());
+                    // The answer arrived, whatever it was: a later notice is about something else.
+                    form.awaiting_answer = false;
+                    self.modal = Some(Modal::Add(form));
+                    return;
+                }
+                // Success: the dialog has done its job and comes down. The line still goes on
+                // the footer, where the rest of the screen's news lands.
+                Notice::Info(_) => {}
+            },
+            other => self.modal = other,
         }
         self.notice = Some((notice, now));
     }

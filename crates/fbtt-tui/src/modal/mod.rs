@@ -91,20 +91,28 @@ pub(crate) enum Answer {
     /// The dialog comes down, with whatever it had to say. Closing without answering sends
     /// nothing, which is what its `Vec` holds then.
     Close(Vec<Command>),
+    /// The commands go out and the dialog stays up for the answer: it is waiting for the
+    /// backend to say whether what it sent worked, so it comes down on a notice rather than
+    /// on a key press. See [`Model::push_notice`](crate::model::Model::push_notice).
+    Await(Vec<Command>),
 }
 
 /// Applies one press to the open dialog, which owns the keyboard while it is up: none of it
-/// reaches the table, a sort, or a quit that is waiting to be confirmed.
+/// reaches the table, a sort, or a quit that is waiting to be confirmed. A dialog that sent
+/// something and is waiting for its answer stays up too.
 pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<Command> {
     let Some(mut modal) = model.modal.take() else {
         return Vec::new();
     };
-    let answer = modal.on_key(key, model, snap);
-    if matches!(answer, Answer::Stay) {
-        model.modal = Some(modal);
-    }
-    match answer {
-        Answer::Stay => Vec::new(),
+    match modal.on_key(key, model, snap) {
+        Answer::Stay => {
+            model.modal = Some(modal);
+            Vec::new()
+        }
+        Answer::Await(commands) => {
+            model.modal = Some(modal);
+            commands
+        }
         Answer::Close(commands) => commands,
     }
 }

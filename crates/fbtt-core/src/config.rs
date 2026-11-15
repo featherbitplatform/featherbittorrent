@@ -3,10 +3,11 @@
 //! `config.yaml` is plain YAML in [`Paths::config_file`](crate::Paths::config_file),
 //! small enough to edit by hand. Rates are whole KiB/s and the cache whole MiB,
 //! because that is how people state them: 0 means unlimited, and a queue count
-//! left out stays whatever the engine's own default is. A file that cannot be
-//! parsed does not stop the app. It runs on the defaults, and the file it could
-//! not read is kept aside as `config.yaml.bad` so the next save cannot overwrite
-//! what we never understood.
+//! left out stays whatever the engine's own default is. A download folder may be
+//! named relative to the library (`download_dir: dl`), which is where it lands;
+//! see [`Config::resolve`]. A file that cannot be parsed does not stop the app. It
+//! runs on this library's defaults, and the file it could not read is kept aside as
+//! `config.yaml.bad` so the next save cannot overwrite what we never understood.
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -66,7 +67,8 @@ pub enum ConfigLoad {
     Missing,
     /// The file is there but cannot be read as YAML.
     Bad {
-        /// What to run on instead: every default.
+        /// What to run on instead: this library's defaults, its download folder
+        /// rooted in the data directory (see [`Config::resolve`]).
         config: Config,
         /// One line naming the file and saying what is wrong, fit to show the
         /// user and to log.
@@ -116,7 +118,8 @@ impl Default for Limits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Where torrent contents go.
+    /// Where torrent contents go. A relative one says "below the library" and is
+    /// made absolute by [`Config::resolve`] before a run uses it.
     pub download_dir: PathBuf,
     /// The port both address families listen on.
     pub listen_port: u16,
@@ -129,9 +132,9 @@ pub struct Config {
 impl Default for Config {
     /// The settings a library starts from: BitTorrent's port, no rate limits,
     /// the engine's own queue counts, a 32 MiB cache and downloads in the host's
-    /// Downloads directory. A host with none gets `downloads` relative to the
-    /// working directory; [`Config::default_for`] roots them in the library
-    /// instead.
+    /// Downloads directory. A host with none gets `downloads`, which is relative:
+    /// [`Config::default_for`] roots it in the library, and
+    /// [`Config::resolve`] roots whatever came out of a config file.
     fn default() -> Self {
         Config::with_download_dir(
             user_download_dir().unwrap_or_else(|| PathBuf::from(DOWNLOADS_DIR_NAME)),
@@ -149,6 +152,23 @@ impl Config {
         )
     }
 
+    /// Makes this config's `download_dir` a directory the run can actually use:
+    /// relative to `paths.data_dir`, and an empty one becomes
+    /// `<data_dir>/downloads`.
+    ///
+    /// A config file is hand-edited, so it may name its folder as `dl` or leave the
+    /// field out entirely, and a bare `Default::default()` names `downloads`. None
+    /// of those may mean "wherever this process happened to be started": downloads
+    /// would land there and move whenever the app was launched from somewhere else.
+    /// An absolute folder is the person's own choice and stays exactly as written.
+    /// Every config a run works on goes through here (see the binary's setup), so
+    /// what the backend holds, what a snapshot offers the add dialog, and what a
+    /// save writes back are all rooted in the library.
+    pub fn resolve(mut self, paths: &Paths) -> Config {
+        self.download_dir = absolute_download_dir(&self.download_dir, paths);
+        self
+    }
+
     /// The settings a first run starts from, with downloads in `download_dir`
     /// and everything else at its default.
     fn with_download_dir(download_dir: PathBuf) -> Config {
@@ -160,23 +180,26 @@ impl Config {
         }
     }
 
-    /// Reads the config file at `path`.
+    /// Reads this library's config file, [`Paths::config_file`].
     ///
     /// A file that is not there is [`ConfigLoad::Missing`], not an error. A file
-    /// that is not valid YAML becomes [`ConfigLoad::Bad`] with the defaults, and
+    /// that is not valid YAML becomes [`ConfigLoad::Bad`] with this library's own
+    /// defaults ([`Config::default_for`], with its download folder resolved), and
     /// it is renamed to `<file>.bad`: a run must not overwrite what it could not
     /// read. A file that cannot be opened at all (no permission, a directory in
     /// the way) is an error, because there is no way to tell "empty" from
-    /// "unavailable".
-    pub fn load(path: &Path) -> Result<ConfigLoad, ConfigError> {
-        let bytes = match std::fs::read(path) {
+    /// "unavailable". The library comes in rather than the file for exactly this
+    /// reason: the defaults have to be rooted in it.
+    pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
+        let path = paths.config_file();
+        let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ConfigLoad::Missing);
             }
             Err(source) => {
                 return Err(ConfigError::Io {
-                    path: path.to_path_buf(),
+                    path: path.clone(),
                     source,
                 });
             }
@@ -184,14 +207,14 @@ impl Config {
         match serde_norway::from_slice::<Config>(&bytes) {
             Ok(config) => Ok(ConfigLoad::Loaded(config)),
             Err(error) => {
-                let aside = suffixed(path, BAD_FILE_SUFFIX);
-                std::fs::rename(path, &aside).map_err(|source| ConfigError::Write {
-                    path: path.to_path_buf(),
+                let aside = suffixed(&path, BAD_FILE_SUFFIX);
+                std::fs::rename(&path, &aside).map_err(|source| ConfigError::Write {
+                    path: path.clone(),
                     source,
                 })?;
                 Ok(ConfigLoad::Bad {
-                    config: Config::default(),
-                    problem: problem_line(path, &error),
+                    config: Config::default_for(paths).resolve(paths),
+                    problem: problem_line(&path, &error),
                 })
             }
         }
@@ -258,6 +281,19 @@ fn user_download_dir() -> Option<PathBuf> {
     UserDirs::new().and_then(|dirs| dirs.download_dir().map(PathBuf::from))
 }
 
+/// `download_dir` as a directory the run can use: absolute stays, relative hangs
+/// below the library's data directory, and nothing at all means the library's own
+/// `downloads`. See [`Config::resolve`].
+fn absolute_download_dir(download_dir: &Path, paths: &Paths) -> PathBuf {
+    if download_dir.as_os_str().is_empty() {
+        return paths.data_dir.join(DOWNLOADS_DIR_NAME);
+    }
+    if download_dir.is_absolute() {
+        return download_dir.to_path_buf();
+    }
+    paths.data_dir.join(download_dir)
+}
+
 /// `path` with `suffix` added to its file name: `config.yaml` becomes
 /// `config.yaml.bad`. The session state save uses the same convention for
 /// `session.state` ([`crate::LocalBackend`]).
@@ -314,19 +350,31 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigLoad, Limits};
+    use super::{Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, user_download_dir};
+    use crate::paths::Paths;
     use crate::scratch::ScratchDir;
     use std::fs;
+    use std::path::PathBuf;
+
+    /// The scratch directory stands in for a whole library: config side and data
+    /// side in the same place, which is all `Config::load` needs to know.
+    fn library(dir: &ScratchDir) -> Paths {
+        Paths {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        }
+    }
 
     /// What a first run saves is what the next run reads back.
     #[test]
     fn defaults_round_trip() {
         let dir = ScratchDir::new("config_round_trip");
-        let path = dir.path().join("config.yaml");
+        let paths = library(&dir);
+        let path = paths.config_file();
         let config = Config::default();
 
         config.save(&path).expect("save the defaults");
-        match Config::load(&path).expect("read them back") {
+        match Config::load(&paths).expect("read them back") {
             ConfigLoad::Loaded(loaded) => assert_eq!(loaded, config),
             other => panic!("expected the saved config back, got {other:?}"),
         }
@@ -337,7 +385,7 @@ mod tests {
         unlimited.limits.active_seeds = None;
         unlimited.limits.active_total = None;
         unlimited.save(&path).expect("save the unlimited counts");
-        match Config::load(&path).expect("read them back") {
+        match Config::load(&paths).expect("read them back") {
             ConfigLoad::Loaded(loaded) => assert_eq!(loaded, unlimited),
             other => panic!("expected the saved config back, got {other:?}"),
         }
@@ -347,18 +395,21 @@ mod tests {
     #[test]
     fn missing_file_is_missing() {
         let dir = ScratchDir::new("config_missing");
-        let path = dir.path().join("config.yaml");
-        assert!(matches!(Config::load(&path), Ok(ConfigLoad::Missing)));
+        assert!(matches!(
+            Config::load(&library(&dir)),
+            Ok(ConfigLoad::Missing)
+        ));
     }
 
     /// A config that names one setting keeps every other one at its default.
     #[test]
     fn partial_yaml_keeps_defaults() {
         let dir = ScratchDir::new("config_partial");
-        let path = dir.path().join("config.yaml");
-        fs::write(&path, "listen_port: 51413\n").expect("write a partial config");
+        let paths = library(&dir);
+        fs::write(paths.config_file(), "listen_port: 51413\n").expect("write a partial config");
 
-        let ConfigLoad::Loaded(config) = Config::load(&path).expect("read a partial config") else {
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read a partial config")
+        else {
             panic!("a partial config is still a config");
         };
         let defaults = Config::default();
@@ -368,16 +419,95 @@ mod tests {
         assert_eq!(config.cache_size_mib, defaults.cache_size_mib);
     }
 
-    /// A malformed config does not stop the app: it runs on the defaults and
-    /// the unreadable file is kept aside instead of being overwritten.
+    /// A config that names only a port still has somewhere to download to once the
+    /// run resolves it: an absolute directory, and the library's own when the host
+    /// has no Downloads directory of its own. That is [`Config::default_for`]'s
+    /// answer, so a half-written file and no file at all go to the same place.
+    #[test]
+    fn partial_yaml_download_dir_is_absolute() {
+        let dir = ScratchDir::new("config_partial_download_dir");
+        let paths = library(&dir);
+        fs::write(paths.config_file(), "listen_port: 51413\n").expect("write a partial config");
+
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read a partial config")
+        else {
+            panic!("a partial config is still a config");
+        };
+        let resolved = config.resolve(&paths);
+        assert_eq!(resolved.listen_port, 51413);
+        assert_eq!(
+            resolved.download_dir,
+            Config::default_for(&paths).download_dir,
+            "a partial config downloads somewhere other than a missing one"
+        );
+        assert!(
+            resolved.download_dir.is_absolute(),
+            "the download folder depends on where the process was started: {}",
+            resolved.download_dir.display()
+        );
+        if user_download_dir().is_none() {
+            assert_eq!(
+                resolved.download_dir,
+                paths.data_dir.join(DOWNLOADS_DIR_NAME),
+                "a host with no Downloads directory should download under its library"
+            );
+        }
+    }
+
+    /// A relative `download_dir` is a folder below the library, not below whatever
+    /// directory the app happened to be started in. An absolute one is the person's
+    /// own choice and stays as written.
+    #[test]
+    fn relative_download_dir_resolves_against_data_dir() {
+        let dir = ScratchDir::new("config_relative_download_dir");
+        let paths = library(&dir);
+        fs::write(paths.config_file(), "download_dir: dl\n").expect("write a relative folder");
+
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read the file as written")
+        else {
+            panic!("a relative folder is still a config");
+        };
+        assert_eq!(
+            config.download_dir,
+            PathBuf::from("dl"),
+            "the file should be read as it was written and resolved afterwards"
+        );
+        assert_eq!(
+            config.resolve(&paths).download_dir,
+            paths.data_dir.join("dl")
+        );
+
+        // Nothing named means the library's own downloads folder.
+        let empty = Config {
+            download_dir: PathBuf::new(),
+            ..Config::default()
+        };
+        assert_eq!(
+            empty.resolve(&paths).download_dir,
+            paths.data_dir.join(DOWNLOADS_DIR_NAME)
+        );
+
+        // An absolute folder is left alone, and resolving twice changes nothing.
+        let chosen = paths.data_dir.join("elsewhere");
+        let once = Config {
+            download_dir: chosen.clone(),
+            ..Config::default()
+        }
+        .resolve(&paths);
+        assert_eq!(once.download_dir, chosen);
+        assert_eq!(once.resolve(&paths).download_dir, chosen);
+    }
+
+    /// A malformed config does not stop the app: it runs on this library's defaults
+    /// and the unreadable file is kept aside instead of being overwritten.
     #[test]
     fn bad_config_is_reported() {
         let dir = ScratchDir::new("config_bad");
-        let path = dir.path().join("config.yaml");
-        fs::write(&path, "listen_port: [nope").expect("write a malformed config");
+        let paths = library(&dir);
+        fs::write(paths.config_file(), "listen_port: [nope").expect("write a malformed config");
 
         let ConfigLoad::Bad { config, problem } =
-            Config::load(&path).expect("a bad file is still read")
+            Config::load(&paths).expect("a bad file is still read")
         else {
             panic!("a malformed config is reported, not swallowed");
         };
@@ -387,8 +517,15 @@ mod tests {
             1,
             "the problem is one line: {problem}"
         );
-        assert_eq!(config, Config::default());
-        assert!(!path.exists(), "the bad file moves out of the way");
+        assert_eq!(config, Config::default_for(&paths).resolve(&paths));
+        assert!(
+            config.download_dir.is_absolute(),
+            "defaults a run starts on should not depend on the working directory"
+        );
+        assert!(
+            !paths.config_file().exists(),
+            "the bad file moves out of the way"
+        );
         assert!(dir.path().join("config.yaml.bad").exists());
     }
 
@@ -456,7 +593,8 @@ mod tests {
     #[test]
     fn save_replaces_the_file_without_leftovers() {
         let dir = ScratchDir::new("config_save");
-        let path = dir.path().join("config.yaml");
+        let paths = library(&dir);
+        let path = paths.config_file();
 
         Config::default().save(&path).expect("save once");
         let changed = Config {
@@ -467,7 +605,7 @@ mod tests {
             .save(&path)
             .expect("save twice, over a shorter file");
 
-        let ConfigLoad::Loaded(config) = Config::load(&path).expect("read it back") else {
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read it back") else {
             panic!("the second save replaced the first");
         };
         assert_eq!(config.listen_port, 51000);

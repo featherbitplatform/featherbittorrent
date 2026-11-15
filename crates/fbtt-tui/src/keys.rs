@@ -150,17 +150,25 @@ fn pause_or_resume(row: Option<&TorrentRow>) -> Vec<Command> {
         return Vec::new();
     };
     let command = match row.state {
-        RowState::Paused | RowState::Queued => Command::Resume(row.id.clone()),
-        // Running, waiting for metadata, or stopped by a failure: the screen offers the key
-        // and the backend decides what stopping an errored torrent means.
-        _ => Command::Pause(row.id.clone()),
+        // Stopped by the person, or stopped by a storage failure: `resume` starts either
+        // again, and the engine clears the error that stopped it as it does.
+        RowState::Paused | RowState::Error => Command::Resume(row.id.clone()),
+        // Waiting for a place in the queue, waiting for metadata, checking, or running: every
+        // one of them is going somewhere, and `p` stops what is in progress. A queued torrent
+        // has nothing running to lose, and stopping it hands its place to another one.
+        RowState::Queued
+        | RowState::Metadata
+        | RowState::Checking(_)
+        | RowState::Downloading
+        | RowState::Stalled
+        | RowState::Seeding => Command::Pause(row.id.clone()),
     };
     vec![command]
 }
 
-/// The press that means "leave": `q`, or Ctrl-C wearing the same meaning. With bytes still
-/// coming down it asks first - a second press, or `y`, confirms; anything else cancels.
-/// With nothing downloading one press is enough.
+/// The press that means "leave": `q`, or Ctrl-C wearing the same meaning. With work still in
+/// progress it asks first - a second press, or `y`, confirms; anything else cancels.
+/// With nothing running one press is enough.
 fn quit_press(model: &mut Model, snap: &Snapshot) -> Vec<Command> {
     if model.quit_armed() {
         model.quit_now()
@@ -172,11 +180,17 @@ fn quit_press(model: &mut Model, snap: &Snapshot) -> Vec<Command> {
     }
 }
 
-/// Whether something is still pulling bytes, which is what makes quitting worth asking about.
+/// Whether the library has work this run would leave half-finished, which is what makes quitting
+/// worth asking about: bytes coming down, running with nothing arriving, metadata still on its
+/// way, or bytes on disk still being hash-checked. Paused, queued, seeding and errored torrents
+/// have nothing in progress - an errored one stopped itself, and `p` is what starts it again.
 fn any_downloading(snap: &Snapshot) -> bool {
-    snap.torrents
-        .iter()
-        .any(|row| matches!(row.state, RowState::Downloading))
+    snap.torrents.iter().any(|row| {
+        matches!(
+            row.state,
+            RowState::Downloading | RowState::Stalled | RowState::Metadata | RowState::Checking(_)
+        )
+    })
 }
 
 /// `Enter` on the Files tab puts the cursor in the file list, where `j` and `k` move it and `+`

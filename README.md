@@ -106,8 +106,8 @@ Every change runs the same gates locally and in CI:
 
 ```
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cargo deny check
 bash dev/sast.sh
 ```

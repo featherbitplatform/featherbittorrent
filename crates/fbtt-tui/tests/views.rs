@@ -275,6 +275,58 @@ fn p_sends_pause_or_resume() {
 }
 
 #[test]
+fn p_on_queued_pauses_and_on_error_resumes() {
+    let mut snap = library();
+    // A torrent waiting for its place in the session's queue, and one a storage failure stopped.
+    let mut queued = torrent(
+        &TorrentId::from_wire_hash([0x33; 20]).0,
+        "archlinux-2026.11.iso",
+        RowState::Queued,
+    );
+    queued.queue_position = 2;
+    let mut errored = torrent(
+        &TorrentId::from_wire_hash([0x44; 20]).0,
+        "broken.partition.iso",
+        RowState::Error,
+    );
+    errored.queue_position = 3;
+    errored.error = Some("no space left on device".to_string());
+    snap.torrents.push(queued);
+    snap.torrents.push(errored);
+
+    let mut model = model_of(&snap);
+
+    // Two rows down is the queued one. It has nothing running to lose, and stopping it hands its
+    // place in the queue to another torrent, so `p` stops rather than starts.
+    model.handle_key(letter('j'), &snap);
+    model.handle_key(letter('j'), &snap);
+    assert_eq!(
+        model.watch().map(|(id, _)| id),
+        Some(snap.torrents[2].id.clone()),
+        "the cursor did not reach the queued torrent"
+    );
+    assert_eq!(
+        model.handle_key(letter('p'), &snap),
+        vec![Command::Pause(snap.torrents[2].id.clone())],
+        "p on a queued torrent did not stop it"
+    );
+
+    // One more row down is the errored one. `resume` is what retries it: the engine clears the
+    // storage error that stopped it as it starts the torrent again.
+    model.handle_key(letter('j'), &snap);
+    assert_eq!(
+        model.watch().map(|(id, _)| id),
+        Some(snap.torrents[3].id.clone()),
+        "the cursor did not reach the errored torrent"
+    );
+    assert_eq!(
+        model.handle_key(letter('p'), &snap),
+        vec![Command::Resume(snap.torrents[3].id.clone())],
+        "p on an errored torrent did not try it again"
+    );
+}
+
+#[test]
 fn quit_asks_twice_when_something_downloads() {
     let snap = library();
     let mut model = model_of(&snap);
@@ -307,15 +359,48 @@ fn quit_asks_twice_when_something_downloads() {
     model.handle_key(letter('y'), &snap);
     assert!(model.quit_requested());
 
-    // With nothing downloading, one `q` is enough.
-    let idle = Snapshot {
-        torrents: vec![torrent("a", "quiet.torrent", RowState::Paused)],
-        ..library()
-    };
-    let mut model = model_of(&idle);
-    let commands = model.handle_key(letter('q'), &idle);
-    assert_eq!(commands, vec![Command::Shutdown]);
-    assert!(model.quit_requested());
+    // Work that has not become bytes on disk yet is still work in progress: waiting for metadata,
+    // checking what is on disk, and running with nothing arriving are all worth asking about.
+    for state in [
+        RowState::Metadata,
+        RowState::Checking(0.4),
+        RowState::Stalled,
+    ] {
+        let busy = Snapshot {
+            torrents: vec![torrent("a", "work.in.progress.iso", state)],
+            ..library()
+        };
+        let mut model = model_of(&busy);
+        assert!(
+            model.handle_key(letter('q'), &busy).is_empty(),
+            "the first q quit over {state:?} without asking"
+        );
+        assert_eq!(
+            model.handle_key(letter('q'), &busy),
+            vec![Command::Shutdown],
+            "the second q did not confirm over {state:?}"
+        );
+    }
+
+    // With nothing in progress, one `q` is enough: stopped, waiting for a place in the queue,
+    // finished, and stopped by a failure each have nothing this run would leave half-done.
+    for state in [
+        RowState::Paused,
+        RowState::Queued,
+        RowState::Seeding,
+        RowState::Error,
+    ] {
+        let idle = Snapshot {
+            torrents: vec![torrent("a", "quiet.torrent", state)],
+            ..library()
+        };
+        let mut model = model_of(&idle);
+        assert_eq!(
+            model.handle_key(letter('q'), &idle),
+            vec![Command::Shutdown],
+            "one q did not quit a library whose only torrent was {state:?}"
+        );
+    }
 }
 
 #[test]
@@ -332,6 +417,17 @@ fn ctrl_c_quits_the_way_q_does() {
     let commands = model.handle_key(ctrl_c, &snap);
     assert_eq!(commands, vec![Command::Shutdown]);
     assert!(model.quit_requested());
+
+    // Running with nothing arriving asks too: it is still a download in progress.
+    let stalled = Snapshot {
+        torrents: vec![torrent("a", "nothing.arriving.iso", RowState::Stalled)],
+        ..library()
+    };
+    let mut model = model_of(&stalled);
+    assert!(
+        model.handle_key(ctrl_c, &stalled).is_empty(),
+        "Ctrl-C quit a stalled download without asking"
+    );
 
     // With nothing downloading it quits at once, and `q` confirms an armed Ctrl-C too.
     let idle = Snapshot {

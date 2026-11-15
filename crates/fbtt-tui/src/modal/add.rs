@@ -1,4 +1,11 @@
 //! The add dialog: a magnet link or the path of a `.torrent` file, and where its files go.
+//!
+//! It stays up after Enter until the backend answers what it sent: an add is not finished when
+//! the keys are pressed, and the answer - `Added ...`, or the reason a torrent was refused -
+//! belongs in the box it was about rather than in the footer under it. See [`Model::push_notice`]
+//! for where that routing happens.
+//!
+//! [`Model::push_notice`]: crate::model::Model::push_notice
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,6 +21,12 @@ use ratatui::text::{Line, Span};
 
 /// The two fields' labels, in the order `Tab` walks them.
 const LABELS: [&str; 2] = ["Torrent or magnet", "Save to"];
+/// What a magnet link starts with, matched ignoring case because links reach the terminal from
+/// browsers and shell history spelled every which way. Whether the rest of it is a magnet is
+/// `fbt::Magnet::parse`'s answer, and the dialog asks it before sending.
+const MAGNET_PREFIX: &str = "magnet:";
+/// What the dialog says while the add it sent waits for an answer.
+const ADDING: &str = "Adding...";
 /// A `.torrent` file this big is not a torrent file. The cap is what keeps a mistyped path from
 /// reading a whole video into memory on the thread that also has to draw the screen.
 const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -29,6 +42,10 @@ pub struct AddForm {
     pub dir: Input,
     /// Why the last try did not work, shown in red under the fields.
     pub error: Option<String>,
+    /// Whether this dialog has sent an add and is waiting for its answer. While it is true
+    /// the dialog shows `Adding...`, and the next notice belongs to it: an `Info` closes it,
+    /// an `Error` shows inside it. See [`Model::push_notice`](crate::model::Model::push_notice).
+    pub(crate) awaiting_answer: bool,
     /// Which field takes what is typed: 0 is [`source`](Self::source), 1 is [`dir`](Self::dir).
     focused: usize,
 }
@@ -41,6 +58,7 @@ impl AddForm {
             source: Input::new(String::new()),
             dir: Input::new(default_dir.display().to_string()),
             error: None,
+            awaiting_answer: false,
             focused: 0,
         }
     }
@@ -69,21 +87,27 @@ impl AddForm {
         }
     }
 
-    /// Enter: a magnet goes straight to the backend, and a path is read here. It is read on the
-    /// thread that draws because it is a file the person has just named on the machine this
-    /// screen runs on, and it cannot be bigger than [`MAX_TORRENT_BYTES`] (spec 5.2). A failure
-    /// keeps the dialog open with the reason in it, so the path can be corrected.
+    /// Enter: a magnet is checked here and then sent, and a path is read here. The magnet is
+    /// parsed before it goes because a link that is not one has a reason to say, and that
+    /// reason belongs under the field it was typed in rather than coming back from the backend
+    /// as a line somewhere else on the screen. A `.torrent` is read on the thread that draws
+    /// because it is a file the person has just named on the machine this screen runs on, and
+    /// it cannot be bigger than [`MAX_TORRENT_BYTES`] (spec 5.2). Whatever stopped it - a link
+    /// that does not parse, a path that is not there - the dialog stays open with the text kept
+    /// and the reason in it. What did go is sent and waited on.
     fn submit(&mut self, default_dir: &Path) -> Answer {
         let source = self.source.text.trim();
         if source.is_empty() {
             return Answer::Stay;
         }
         let dir = chosen_dir(&self.dir, default_dir);
-        let command = if source.starts_with("magnet:") {
-            Ok(Command::Add {
-                source: AddSource::Magnet(source.to_string()),
-                dir,
-            })
+        let command = if is_magnet(source) {
+            fbt::Magnet::parse(source)
+                .map(|_| Command::Add {
+                    source: AddSource::Magnet(source.to_string()),
+                    dir,
+                })
+                .map_err(|error| error.to_string())
         } else {
             read_torrent(&expand_tilde(source)).map(|bytes| Command::Add {
                 source: AddSource::File(bytes),
@@ -92,7 +116,13 @@ impl AddForm {
         };
 
         match command {
-            Ok(command) => Answer::Close(vec![command]),
+            // The add is on its way and its answer has not arrived. The dialog stays up
+            // saying so; Esc still closes it, and the notice brings it down when it lands.
+            Ok(command) => {
+                self.error = None;
+                self.awaiting_answer = true;
+                Answer::Await(vec![command])
+            }
             Err(error) => {
                 self.error = Some(error);
                 Answer::Stay
@@ -110,8 +140,8 @@ impl AddForm {
     }
 }
 
-/// The dialog's lines: the two fields, why the last try failed when it did, and what each key
-/// does here.
+/// The dialog's lines: the two fields, why the last try failed when it did, that an add is
+/// waiting for its answer when one is, and what each key does here.
 pub(crate) fn lines(form: &AddForm) -> Vec<Line<'static>> {
     let width = LABELS
         .iter()
@@ -129,12 +159,26 @@ pub(crate) fn lines(form: &AddForm) -> Vec<Line<'static>> {
             Style::new().fg(theme::RED_500),
         )));
     }
+    if form.awaiting_answer {
+        lines.push(Line::from(Span::styled(
+            ADDING,
+            Style::new().fg(theme::INK_400),
+        )));
+    }
     lines.push(keys_hint(&[
         ("Tab", "switch field"),
         ("Enter", "add"),
         ("Esc", "cancel"),
     ]));
     lines
+}
+
+/// Whether what was typed is meant as a magnet link rather than as a path. The scheme only:
+/// `fbt::Magnet::parse` is the one that says whether what follows it is a magnet, and the
+/// dialog asks it before sending so a bad link stays here with its reason.
+fn is_magnet(text: &str) -> bool {
+    text.get(..MAGNET_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(MAGNET_PREFIX))
 }
 
 /// The directory to send: nothing when the field still holds the default folder or is empty, so

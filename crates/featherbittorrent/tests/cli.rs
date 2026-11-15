@@ -52,13 +52,13 @@ fn lock_held_message() {
     );
 }
 
-/// When the terminal cannot be set up, the binary must say so and leave - not wait on a
-/// backend it never told to stop, which is the bug this test exists for. A run with no
-/// tty on any stream is how that happens in CI. `listen_port: 0` goes in the config
-/// first so the engine takes a port the OS hands out rather than one another test run
-/// is holding. Where this process has a controlling terminal, crossterm reaches it
-/// through `/dev/tty` whatever our stdios are and setup cannot fail at all; there the
-/// test says that plainly instead of pretending to have tested the failure.
+/// When the terminal cannot be set up, the binary must say so and leave - without ever starting
+/// the engine, which is the bug this test exists for. A run with no tty on any stream is how that
+/// happens in CI. `listen_port: 0` goes in the config first so that an engine which did start
+/// would take a port the OS hands out rather than one another test run is holding. Where this
+/// process has a controlling terminal, crossterm reaches it through `/dev/tty` whatever our
+/// stdios are and setup cannot fail at all; there the test says that plainly instead of pretending
+/// to have tested the failure.
 #[test]
 fn terminal_setup_failure_exits() {
     // Same session, so what this process finds is what the child will find.
@@ -127,6 +127,21 @@ fn terminal_setup_failure_exits() {
     assert!(
         stderr.contains("Could not set up the terminal"),
         "the binary says what stopped it: {stderr}"
+    );
+
+    // The engine never ran, which `session.state` proves. The data directory exists - taking the
+    // lock makes it, and that comes before the terminal - but only a run that drove a session
+    // writes that file into it, and this one had no screen to run an engine for.
+    let left_behind: Vec<_> = fs::read_dir(&scratch.data_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !left_behind.iter().any(|name| name == "session.state"),
+        "a run with no terminal started the engine anyway: {left_behind:?}"
     );
 }
 

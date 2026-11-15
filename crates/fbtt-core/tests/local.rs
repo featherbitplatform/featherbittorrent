@@ -744,7 +744,7 @@ async fn set_limits_applies_and_persists() {
     assert_eq!(snapshot.limits.upload_kib, lib.config.limits.upload_kib);
     drop(snapshot);
 
-    match Config::load(&lib.paths.config_file()).expect("read the config back") {
+    match Config::load(&lib.paths).expect("read the config back") {
         ConfigLoad::Loaded(config) => {
             assert_eq!(config.limits.download_kib, 100);
             assert_eq!(config.limits.upload_kib, lib.config.limits.upload_kib);

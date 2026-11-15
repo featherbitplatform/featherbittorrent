@@ -1,8 +1,10 @@
 //! The binary's own work: bring one library up, run its screen, put everything back.
 //!
-//! Setup happens in order - paths, config, lock, backend - because every step answers
-//! with its own line before the terminal is touched, and a second instance should hear
-//! "close the other one" rather than see a blank screen blink. The loop then waits on
+//! Setup happens in order - paths, config, lock, terminal, backend - because every step
+//! answers with its own line before the terminal is touched, and a second instance should
+//! hear "close the other one" rather than see a blank screen blink. The screen goes up
+//! before the engine does: a run that cannot show anything has no reason to start an
+//! engine, and no resume data to write for a library nobody showed. The loop then waits on
 //! four things at once (keys, snapshots, notices, the frame clock), never on a backend
 //! reply: it draws the newest snapshot when something changed, at most thirty frames a
 //! second, and quitting is a command out and a join, not a conversation.
@@ -38,6 +40,9 @@ const FRAME_TICK: Duration = Duration::from_millis(33);
 /// What the screen says while the last save runs. A run that was told it will not save
 /// shows its notice here instead, so a quit never promises more than the engine kept.
 const SAVING: &str = "Saving...";
+/// What the footer says when a key press produced a command the backend would not take:
+/// its queue was full, so that press did nothing and the person should press it again.
+const BUSY: &str = "Busy, try again";
 
 /// One library's whole run: setup, the loop, the quit. The exit code is the answer.
 pub async fn run() -> ExitCode {
@@ -47,13 +52,16 @@ pub async fn run() -> ExitCode {
     };
 
     // A missing config is written with this library's defaults; a broken one came back
-    // from `Config::load` as the defaults plus the line saying what was wrong (the file
-    // itself is kept aside under `.bad`), and that line becomes the first notice.
+    // from `Config::load` as those defaults plus the line saying what was wrong (the file
+    // itself is kept aside under `.bad`), and that line becomes the first notice. Every
+    // branch is resolved: a config file names its download folder by hand, so it may say
+    // `dl`, and downloads then belong below this library, not below whatever directory
+    // the process happened to be started in.
     let mut first_notice = None;
-    let config = match Config::load(&paths.config_file()) {
-        Ok(ConfigLoad::Loaded(config)) => config,
+    let config = match Config::load(&paths) {
+        Ok(ConfigLoad::Loaded(config)) => config.resolve(&paths),
         Ok(ConfigLoad::Missing) => {
-            let config = Config::default_for(&paths);
+            let config = Config::default_for(&paths).resolve(&paths);
             if let Err(error) = config.save(&paths.config_file()) {
                 return fail(&error);
             }
@@ -61,7 +69,7 @@ pub async fn run() -> ExitCode {
         }
         Ok(ConfigLoad::Bad { config, problem }) => {
             first_notice = Some(Notice::Error(problem));
-            config
+            config.resolve(&paths)
         }
         Err(error) => return fail(&error),
     };
@@ -85,6 +93,17 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    // The screen comes up before the engine does. A run with no terminal to draw on has
+    // nothing to show and no reason to start a session: it says its line and leaves, with
+    // the library as it found it - no `session.state`, and the lock released on the way out.
+    let mut terminal = match Terminal::setup() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            eprintln!("Could not set up the terminal: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Listened for before anything else can go wrong from here on: a listener made once
     // buffers a signal that lands between two turns of the loop, where one made per turn
     // would miss it entirely.
@@ -92,26 +111,12 @@ pub async fn run() -> ExitCode {
 
     let (client, task) = match LocalBackend::start(config, &paths, lock).await {
         Ok(started) => started,
-        Err(error) => return fail(&error),
-    };
-
-    let mut terminal = match Terminal::setup() {
-        Ok(terminal) => terminal,
         Err(error) => {
-            eprintln!("Could not set up the terminal: {error}");
-            // Tell it, let every queue handle go, and only then wait. Awaiting with the
-            // client still alive would wait forever: the backend ends when its command
-            // queue closes, and the client is what keeps that queue open. Waiting at all
-            // keeps a second start off a half-written file.
-            client.send(Command::Shutdown);
-            drop(client);
-            let (_, problem) = await_backend(task).await;
-            if let Some(problem) = problem {
-                eprintln!("{problem}");
-            }
-            // The library is saved and the lock is free, but this run never showed
-            // anything: that is a failure, whatever the save did.
-            return ExitCode::FAILURE;
+            // The terminal goes back first: a line printed onto the alternate screen is
+            // not readable anywhere the person can look. Nothing was written to the
+            // library, so there is no save to wait for; the lock leaves with `lock`.
+            drop(terminal);
+            return fail(&error);
         }
     };
 
@@ -210,7 +215,14 @@ async fn run_loop(
             event = once_stream(&mut *stream) => match event {
                 Some(Ok(Event::Key(key))) => {
                     for command in model.handle_key(key, snap) {
-                        commands.send(command);
+                        // A full queue drops this command: the backend handles one at a
+                        // time and every one is short, so 64 deep is more than a person can
+                        // type, and what is dropped is a keystroke they will press again. Say
+                        // so rather than let the screen look like it ignored them - unless
+                        // this was the quit itself, which the `Saving...` screen answers.
+                        if !commands.send(command) && !model.quit_requested() {
+                            model.push_notice(Notice::Error(BUSY.to_string()), Instant::now());
+                        }
                     }
                     dirty = true;
                 }

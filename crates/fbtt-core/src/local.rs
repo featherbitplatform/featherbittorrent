@@ -55,7 +55,9 @@ pub struct LocalBackend;
 
 impl LocalBackend {
     /// Starts the engine on `paths`, restoring whatever `session.state` holds, on the
-    /// settings [`Config::session_settings`] describes.
+    /// settings [`Config::session_settings`] describes. A `config` whose download folder
+    /// is relative gets it rooted in `paths` first ([`Config::resolve`]), which is what
+    /// a run that read a hand-written config file hands in.
     ///
     /// `lock` is this library's, taken with [`LibraryLock::acquire`]: the backend holds
     /// it until its state is written. The returned handle resolves once `Shutdown` has
@@ -111,6 +113,10 @@ async fn spawn(
     paths: &Paths,
     lock: LibraryLock,
 ) -> Result<(Client, JoinHandle<Result<(), String>>, Session), SessionError> {
+    // Whatever the config file named for downloads, this run works on an absolute
+    // directory (`Config::resolve`), so a snapshot's default folder, an add with no
+    // folder typed in, and the fallback a save writes are all the same place.
+    let config = config.resolve(paths);
     let reading = state::read_state(&paths.state_file());
     let (session, failed) = match &reading.state {
         Some(loaded) => Session::restore(settings, loaded).await?,
@@ -241,7 +247,8 @@ fn rows(
 struct Backend {
     /// The only session in this process, and only this task touches it.
     session: Session,
-    /// What the run started with, kept current so a missing config file has something
+    /// What the run started with, its download folder already rooted in the library
+    /// (see [`Config::resolve`]), kept current so a missing config file has something
     /// sensible to fall back to.
     config: Config,
     /// Where `config.yaml` and `session.state` are.
@@ -462,13 +469,14 @@ impl Backend {
         let limits = self.config.limits;
         let outcome = tokio::task::spawn_blocking(move || {
             let file = paths.config_file();
-            let mut config = match Config::load(&file) {
+            let mut config = match Config::load(&paths) {
                 Ok(ConfigLoad::Loaded(config)) => config,
-                // A file we could not parse is already kept aside as `.bad`; the defaults
-                // it came with are what to write on.
+                // A file we could not parse is already kept aside as `.bad`; the
+                // library's own defaults it came with are what to write on.
                 Ok(ConfigLoad::Bad { config, .. }) => config,
                 // No file yet, or one that could not be opened at all: keep what this run
-                // started with, which is what the file would have said.
+                // started with, which is what the file would have said - its download
+                // folder included, already rooted in the library.
                 Ok(ConfigLoad::Missing) | Err(_) => fallback,
             };
             config.limits = limits;
