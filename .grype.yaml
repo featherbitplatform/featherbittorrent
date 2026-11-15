@@ -1,0 +1,15 @@
+# grype configuration: dependency/CVE scanning over the repo filesystem
+# (Cargo.lock and the GitHub Actions the workflows use). High/critical
+# findings fail the scan; lower severities are reported.
+
+fail-on-severity: high
+
+# Directory scans: skip build outputs and scanner output.
+exclude:
+  - ./target/**
+  - ./sast-out/**
+  - ./.superpowers/**
+
+# Accepted findings, each with a one-line reason for accepting it. None yet: add
+# an entry here only when a finding is real but not worth failing the gate over.
+ignore: []

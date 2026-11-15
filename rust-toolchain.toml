@@ -1,0 +1,4 @@
+[toolchain]
+# stable always: no nightly-only feature is used anywhere in the workspace.
+channel = "stable"
+components = ["rustfmt", "clippy"]

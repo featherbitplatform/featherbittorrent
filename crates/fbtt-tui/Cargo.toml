@@ -1,0 +1,24 @@
+[package]
+name = "fbtt-tui"
+description = "featherbittorrent TUI: the model (keys in, actions out) and its ratatui rendering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The snapshot types the model speaks, and `fbt::display_safe` for remote text.
+fbtt-core.workspace = true
+fbt.workspace = true
+# crossterm is here for the key events the model takes; it is the same version
+# ratatui's backend uses, so one crossterm serves both.
+crossterm.workspace = true
+ratatui.workspace = true
+# The add dialog expands a leading `~/` in a path someone typed, which is the home
+# directory this platform says it has.
+directories.workspace = true

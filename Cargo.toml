@@ -1,0 +1,58 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+# Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/featherbitplatform/featherbittorrent"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Every dependency is declared here and inherited with `dep.workspace = true`;
+# crates never pin their own versions, and each crate names the features it
+# uses. Later tasks add what they need: ratatui and crossterm arrive with the
+# views (Task 5). fbt (git, tag v0.8.0) arrived with the config, whose settings
+# map onto `fbt::Settings`; tokio with the backend task (Task 4).
+[workspace.dependencies]
+# The workspace's own crates, so a member depends on another the same way it depends on
+# anything else. A crate joins this table when another one starts using it: `fbtt-tui`
+# arrives with the binary (Task 7), which is what makes it a dependency of something.
+fbtt-core = { path = "crates/fbtt-core" }
+fbtt-tui = { path = "crates/fbtt-tui" }
+clap = { version = "4.6", features = ["derive"] }
+# The TUI stack. crossterm is the version ratatui's own backend uses (its default),
+# so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
+# one tree means a `KeyEvent` that does not match the terminal driving it.
+# `event-stream` is for the binary's async event loop (Task 7).
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "std",
+    # A layout cache so a table redraw does not re-solve the same column widths.
+    "layout-cache",
+] }
+directories = "6"
+fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.8.0", features = ["serde"] }
+# The `Stream` trait only: `std::stream::Stream` is still unstable, and this is the
+# same futures tree crossterm's `EventStream` implements it from. Already in the tree
+# through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+# serde_yaml is unmaintained (RUSTSEC-2024-0340); this is its maintained fork.
+serde_norway = "0.9"
+thiserror = "2"
+# No default features: every crate names the parts it needs, so nothing pulls a
+# runtime flavour nobody asked for. `macros` is for the macros a crate's own code uses
+# (`select!` in the backend task) and for `#[tokio::test]`, which arrives in
+# dev-dependencies too.
+tokio = { version = "1", default-features = false }

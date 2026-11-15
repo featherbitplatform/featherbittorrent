@@ -1,0 +1,38 @@
+[package]
+name = "fbtt-core"
+description = "featherbittorrent core: config, platform paths, the library lock and the client interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The hooks `tests/local.rs` needs: `LocalBackend::start_for_test`, which hands
+# back a clone of the session it drives, and the scratch directory helper. The
+# `local` test target below requires it, so the gate runs with `--all-features`.
+test-support = []
+
+[dependencies]
+directories.workspace = true
+fbt.workspace = true
+serde.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+# The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
+# it needs `macros`; `spawn_blocking` is `rt`, the state save's cadence is `time`, and
+# the queues are `sync`.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# `#[tokio::test]`, and a runtime with worker threads: each test runs two live
+# sessions, and a blocking call in one should not stall the other's timers.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "local"
+required-features = ["test-support"]

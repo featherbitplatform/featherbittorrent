@@ -1,0 +1,46 @@
+[licenses]
+# The list below is the featherbit allow list, shared with fbt-lib and the
+# gateway. Entries whose crates arrive with a later task (fbt's rustls chain,
+# clipboard and error-code crates) stay in place instead of being re-added then.
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "OFL-1.1",
+    # Permitted for general-purpose transitive dependencies (error-code, clipboard-style crates)
+    "BSL-1.0",
+    # Public-domain dedications used by small utility crates
+    "CC0-1.0",
+    # webpki-roots (Mozilla's root certificates as data, for HTTPS over rustls)
+    "CDLA-Permissive-2.0",
+]
+
+[advisories]
+version = 2
+# Unmaintained notices only for crates we depend on directly; transitive ones are outside our
+# control. Vulnerabilities still fail at any depth.
+unmaintained = "workspace"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# fbt and fbt-api come from fbt-lib as git dependencies pinned by tag, so a branch or an
+# unpinned rev is refused.
+required-git-spec = "tag"
+# The org allowance below is written before the dependency that uses it arrives, so an
+# unused entry is expected, not a problem.
+unused-allowed-org = "allow"
+
+# The only git host we take code from: our own org.
+[sources.allow-org]
+github = ["featherbitplatform"]
