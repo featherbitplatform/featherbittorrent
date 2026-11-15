@@ -214,19 +214,86 @@ fn wizard_answers_become_config() {
         "the comment on the key names the device"
     );
 
-    // A port that is not a number is a problem to fix, not a config to write.
+    // A password keeps the spaces typed around it: they are part of what was typed,
+    // and a client that sends them back has to be able to log in.
+    let mut input = Cursor::new("\n\n\n\nalice\n hunter2 \n hunter2 \nno\n".to_string());
+    let mut out: Vec<u8> = Vec::new();
+    let config = answered(&base, &mut input, &mut out);
+    let hash = &config.server.auth.users[0].password_hash;
+    assert!(
+        fbtt_server::auth::password::verify(hash, " hunter2 "),
+        "the spaces that were typed are in the password that was hashed"
+    );
+    assert!(
+        !fbtt_server::auth::password::verify(hash, "hunter2"),
+        "so trimming them would have made a login nobody typed"
+    );
+
+    // A comment on the key names the device, unless it is not a name this product can
+    // show and match - then the reason is said and the name asked for.
+    let (key_body, _) = ED25519_KEY
+        .split_once(" alice@laptop")
+        .expect("the test key ends with its comment");
+    let long_comment = format!("{key_body} {}", "workstation".repeat(7));
+    let mut input = Cursor::new(format!(
+        "\n\n\n\nbob\npw\npw\nyes\n{long_comment}\nwork laptop\n"
+    ));
+    let mut out: Vec<u8> = Vec::new();
+    let config = answered(&base, &mut input, &mut out);
+    let said = String::from_utf8(out).expect("the prompts are text");
+    assert!(
+        said.contains("not a usable name"),
+        "a comment too long to be a name says why it was not used: {said}"
+    );
+    assert_eq!(
+        config.server.auth.devices[0].name, "work laptop",
+        "and the name given instead is what goes in the file"
+    );
+
+    // A bad answer is asked again, and a good one after it is taken.
     let base = fbtt_core::Config::default();
-    let mut input = Cursor::new("/home/alice/Downloads\nanything\n".to_string());
+    let mut input = Cursor::new("/home/alice/Downloads\nnope\n7000\n\n\nno\n".to_string());
+    let mut out: Vec<u8> = Vec::new();
+    let config = answered(&base, &mut input, &mut out);
+    let said = String::from_utf8(out).expect("the prompts are text");
+    assert_eq!(
+        config.listen_port, 7000,
+        "the second answer is the one used"
+    );
+    assert_eq!(
+        times(&said, "BitTorrent port"),
+        2,
+        "asked once, complained, asked again: {said}"
+    );
+
+    // Three bad answers to one question end the run rather than asking forever.
+    let mut input = Cursor::new("/home/alice/Downloads\nnope\nnope\nnope\n".to_string());
     let mut out: Vec<u8> = Vec::new();
     let Err(problem) = wizard::run(&base, &mut input, &mut out, false) else {
-        panic!("a word is not a port number");
+        panic!("three answers that are not port numbers cannot make a config");
     };
+    let said = String::from_utf8(out).expect("the prompts are text");
     assert_eq!(problem.code, 1);
     assert!(
-        problem.message.contains("port number"),
+        problem.message.contains("Gave up after 3 answers"),
         "{}",
         problem.message
     );
+    assert!(
+        problem.message.contains("port number"),
+        "the complaint it gives up on is the last one it heard: {}",
+        problem.message
+    );
+    assert_eq!(
+        times(&said, "BitTorrent port"),
+        3,
+        "asked three times and no more: {said}"
+    );
+}
+
+/// How many times `needle` appears in `haystack`: how many times a question was asked.
+fn times(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
 }
 
 /// Answers the wizard from `input` and says the run must have succeeded, so each
@@ -293,6 +360,21 @@ fn user_set_and_list() {
     assert!(
         !stdout.contains("bob"),
         "the name that failed to get a password was not saved: {stdout}"
+    );
+
+    // Three pairs typed differently end the run: a person who cannot get the two to
+    // agree is told to start again rather than asked forever.
+    let run = Run::start(
+        &scratch,
+        &["user", "set", "carol"],
+        "a\nb\nc\nd\ne\nf\n",
+        "three_pairs",
+    );
+    let (code, _, stderr) = run.wait(1);
+    assert_eq!(code, 1, "three mismatched pairs is a problem");
+    assert!(
+        stderr.contains("Gave up after 3 answers"),
+        "the giving-up line is the problem it reports: {stderr}"
     );
 
     // `user remove` takes the login out again.
@@ -460,6 +542,29 @@ fn admin_refuses_while_locked() {
         "a list reads nothing, so a held library does not stop it"
     );
     assert_eq!(stdout.trim(), "No users.", "{stdout}");
+}
+
+/// `serve` refuses a library something else is using *before* it asks anything: the wizard writes
+/// `config.yaml`, and writing it while a TUI works from that file would replace what that run is
+/// working from for nobody. Nothing is asked, nothing is written, and the answer is exit 3.
+#[test]
+fn serve_refuses_before_asking() {
+    let scratch = Scratch::new("serve_before_asking");
+    // No config file at all: this is the case where the wizard would have run.
+    let _held = LibraryLock::acquire(&scratch.lock_file()).expect("this test takes the lock first");
+
+    let run = Run::start(&scratch, &["serve"], "hunter2\n", "before_asking");
+    let (code, stdout, stderr) = run.wait(3);
+    assert_eq!(code, 3, "a held library is exit code 3: {stderr}");
+    assert!(stderr.contains("already using this library"), "{stderr}");
+    assert!(
+        !stdout.contains("Download folder"),
+        "no question was asked: {stdout}"
+    );
+    assert!(
+        !scratch.config_file().exists(),
+        "and no config file was written over the running library's"
+    );
 }
 
 /// A server run starts on the config file, answers over HTTP, and stops on its own

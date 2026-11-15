@@ -17,12 +17,12 @@ clap.workspace = true
 fbtt-core.workspace = true
 fbtt-tui.workspace = true
 # `featherbittorrent serve`, and the password hashes and device-key checks the admin commands write
-# into config.yaml. `test-support` is on because the debug-only `--offline` knob needs the constructor
-# that takes the engine settings rather than deriving them from the config; it is asked for in every
-# build so that this crate has one start path, and what it adds - two counters a test reads - costs an
-# atomic increment per password check. Cargo cannot select a dependency by `debug_assertions`, so the
-# profile cannot be part of this decision.
-fbtt-server = { workspace = true, features = ["test-support"] }
+# into config.yaml. No features are asked for: `test-support` adds counters only a test reads, and a
+# release binary must not link them. What this crate needs from the server is public in every build -
+# including `Server::start_with_settings`, which takes the engine settings as an argument because the
+# debug-only `--offline` knob changes them (see `serve.rs`). fbtt-server's own tests get their feature
+# from its `[[test]] required-features`, not from anything here.
+fbtt-server.workspace = true
 # The engine's own settings type, which the debug-only `--offline` knob edits before handing them to
 # the server: it is the only way to keep a test run's sockets on loopback without pretending the
 # config said so.

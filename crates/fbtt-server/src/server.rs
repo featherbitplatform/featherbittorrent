@@ -16,7 +16,8 @@
 //!   the [`Server`] is dropped, so a run that forgets to shut down still ends with the state written.
 //!
 //! The engine settings come from [`Config::session_settings`]; [`Server::start_with_settings`] takes
-//! them as an argument instead, which is how a test keeps every socket on loopback.
+//! them as an argument instead, which is how a test - or the binary's debug-only offline mode - keeps
+//! every socket where the caller put it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -107,14 +108,18 @@ impl Server {
         Self::build(config.session_settings(), config, paths, lock).await
     }
 
-    /// [`start`](Self::start) with the engine's settings given rather than taken from the config. A test
-    /// uses this to keep every socket on loopback - no DHT, no multicast, nothing that could leave the
-    /// machine - while still running the same server over the same config file.
+    /// [`start`](Self::start) with the engine's settings given rather than taken from the config.
+    ///
+    /// This is not a test hook: the settings and the config answer different questions, and something that
+    /// runs the library somewhere other than where its config points needs to say so. `featherbittorrent
+    /// serve` uses it for its debug-only offline mode - every socket on loopback, no DHT, no multicast -
+    /// and a test uses it for the same reason on a bigger scale, keeping one run's traffic inside the
+    /// machine while still serving the same config file. [`start`](Self::start) is this call with
+    /// [`Config::session_settings`] handed to it, which is what a normal run wants.
     ///
     /// # Errors
     ///
     /// The same as [`start`](Self::start).
-    #[cfg(feature = "test-support")]
     pub async fn start_with_settings(
         settings: Settings,
         config: Config,
@@ -323,21 +328,37 @@ async fn prepare_roots(configured: &[PathBuf]) -> Result<Vec<fs::Root>, ServerEr
         .map_err(ServerError::Root)
 }
 
-/// The warning about passwords on a bind address anyone can reach.
+/// The warning about passwords on a bind address anyone can reach, or `None` when there is nothing to
+/// warn about.
 ///
 /// This server speaks plain HTTP: there is no certificate in it and TLS termination is somebody else's
 /// job (see the design's reverse-proxy rule). A `Basic` credential over an address that is not loopback
 /// therefore crosses the network in the clear, and the person who chose that address may have chosen it
 /// precisely so others could reach it. Nothing here can tell whether a proxy is doing the encrypting, so
 /// the answer is to say what is unencrypted and let them decide - which is why this is a warning at
-/// startup rather than a refusal to start.
+/// startup rather than a refusal to start. The name it points at is the featherbit gateway, with any API
+/// gateway or reverse proxy equally an answer, because throttling and further authentication come with it
+/// and not just TLS; device keys are the alternative that needs no third party at all.
+fn passwords_are_exposed_warning(
+    bind: SocketAddr,
+    auth_on: bool,
+    passwords_in_use: bool,
+) -> Option<String> {
+    if !auth_on || !passwords_in_use || bind.ip().is_loopback() {
+        return None;
+    }
+    Some(format!(
+        "passwords cross the network unencrypted on {bind}: on untrusted networks put the featherbit \
+         gateway (or another API gateway or reverse proxy) in front for TLS, throttling and further \
+         authentication, or use device keys"
+    ))
+}
+
+/// Says [`passwords_are_exposed_warning`], when there is one to say. The address is in the sentence
+/// rather than only in a log field, because the line a person reads is the sentence.
 fn warn_if_passwords_are_exposed(bind: SocketAddr, auth_on: bool, passwords_in_use: bool) {
-    if auth_on && passwords_in_use && !bind.ip().is_loopback() {
-        tracing::warn!(
-            address = %bind,
-            "passwords are sent unencrypted to this address; put a TLS reverse proxy in front of it, \
-             or use device keys"
-        );
+    if let Some(problem) = passwords_are_exposed_warning(bind, auth_on, passwords_in_use) {
+        tracing::warn!("{problem}");
     }
 }
 
@@ -419,5 +440,44 @@ async fn save_loop(
 fn read_reports(reports: &mut mpsc::Receiver<Notice>) {
     while let Ok(notice) = reports.try_recv() {
         warn_notice(&notice);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::passwords_are_exposed_warning;
+    use std::net::SocketAddr;
+
+    /// What the warning says, and when it is said at all. Checked as text rather than by catching a log
+    /// line: the sentence is the product here - it is the one thing a person who bound this server onto a
+    /// public address gets to read before they decide what to put in front of it - and no log subscriber
+    /// runs in this harness to catch the line itself.
+    #[test]
+    fn the_password_warning_names_the_gateway_and_the_alternative() {
+        let reachable: SocketAddr = ([0, 0, 0, 0], 8090).into();
+        let warning = passwords_are_exposed_warning(reachable, true, true)
+            .expect("logins on, accounts in the file, an address anyone can reach: warn");
+        assert_eq!(
+            warning,
+            "passwords cross the network unencrypted on 0.0.0.0:8090: on untrusted networks put the \
+             featherbit gateway (or another API gateway or reverse proxy) in front for TLS, throttling \
+             and further authentication, or use device keys"
+        );
+
+        // The three answers that mean there is nothing to say: nobody can reach this address, nobody has
+        // to give a password, and there is no account a password could be for.
+        let loopback: SocketAddr = ([127, 0, 0, 1], 8090).into();
+        assert!(
+            passwords_are_exposed_warning(loopback, true, true).is_none(),
+            "loopback is already reachable only from this machine"
+        );
+        assert!(
+            passwords_are_exposed_warning(reachable, false, true).is_none(),
+            "with logins off no password crosses anything"
+        );
+        assert!(
+            passwords_are_exposed_warning(reachable, true, false).is_none(),
+            "with no accounts there is no password to cross"
+        );
     }
 }

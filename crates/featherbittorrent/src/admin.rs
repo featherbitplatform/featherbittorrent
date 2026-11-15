@@ -11,7 +11,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use crate::exit::Failure;
-use crate::wizard::{ask, ask_password, name_problem};
+use crate::wizard::{ask_new_password, ask_user_name, name_problem};
 use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
 use fbtt_server::auth::keys::{fingerprint, parse_device_key};
 use fbtt_server::auth::password::hash;
@@ -36,28 +36,12 @@ pub fn set_user(
             None => given.trim().to_string(),
             Some(problem) => return Err(Failure::problem(problem)),
         },
-        None => loop {
-            let candidate = ask(input, out, "User name [alice]: ", "alice")?;
-            match name_problem(&candidate) {
-                None => break candidate,
-                Some(problem) => writeln!(out, "{problem}")?,
-            }
-        },
+        // The same question, the same rules and the same number of goes-wrong as the
+        // wizard's, so one product asks for a name in one way.
+        None => ask_user_name(input, out)?,
     };
 
-    let password = loop {
-        let first = ask_password(input, out, secret_input, "Password [hidden]: ")?;
-        if first.is_empty() {
-            writeln!(out, "The password must not be empty.")?;
-            continue;
-        }
-        let again = ask_password(input, out, secret_input, "Repeat password [hidden]: ")?;
-        if first != again {
-            writeln!(out, "The passwords did not match, try again.")?;
-            continue;
-        }
-        break first;
-    };
+    let password = ask_new_password(input, out, secret_input)?;
 
     edit_config(paths, |config| {
         let entry = UserEntry {

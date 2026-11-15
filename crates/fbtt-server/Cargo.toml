@@ -12,10 +12,11 @@ publish.workspace = true
 workspace = true
 
 [features]
-# What `tests/server.rs` needs: `Server::start_with_settings`, which takes the engine settings as an
-# argument so a test keeps every session on loopback, and the counter that lets a test prove a
-# password attempt ran an Argon2 verify. The `server` test target below requires it, which is what
-# makes the gate's `--all-features` run execute that file at all.
+# What `tests/server.rs` needs beyond what is public anyway: the counters that let a test prove a password
+# attempt ran an Argon2 verify, and that no more than the clamp of them ran at once. Taking the engine's
+# settings as an argument (`Server::start_with_settings`) is not part of this - something that runs the
+# library away from where its config points needs it in a release build too. The `server` test target below
+# requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
 test-support = []
 
 [dependencies]

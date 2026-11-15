@@ -72,11 +72,10 @@ impl ServeDebug {
 /// that leaves the library whole. The problem it returns is what `main` prints and
 /// exits with.
 pub async fn run(paths: &Paths, debug: &ServeDebug) -> Result<(), Failure> {
-    // The wizard asks before any log line exists: a person answering questions has
-    // nowhere to read a warning, and prompts belong on stdout anyway.
-    let (config, startup_problem) = config_for_serve(paths)?;
-
-    // Before the listener: a held lock is a sentence to read, not a server to wait for.
+    // The lock comes before the questions, not after them. A wizard that writes
+    // `config.yaml` while a TUI is running on it would replace what that run is
+    // working from and only then find out it was never allowed to start; refused up
+    // front, this command neither asks anything nor changes anything.
     let lock = match LibraryLock::acquire(&paths.lock_file()) {
         Ok(lock) => lock,
         Err(LockError::Held) => {
@@ -92,6 +91,10 @@ pub async fn run(paths: &Paths, debug: &ServeDebug) -> Result<(), Failure> {
             )));
         }
     };
+
+    // The wizard asks before any log line exists: a person answering questions has
+    // nowhere to read a warning, and prompts belong on stdout anyway.
+    let (config, startup_problem) = config_for_serve(paths)?;
 
     // Logs start here, held back until the address is known: the contract is that
     // the first line a script sees is `listening on <addr>`, and the engine's own
@@ -125,8 +128,10 @@ pub async fn run(paths: &Paths, debug: &ServeDebug) -> Result<(), Failure> {
     }
 }
 
-/// Starts the server: with the debug switches in a debug build (where the tests
-/// run), and straight from the config in a release build.
+/// Starts the server on the engine's settings: what the config says, with `--offline` applied in a build
+/// that has that switch. There is one start path in every build, because taking the settings as an
+/// argument is not a test hook - see [`Server::start_with_settings`] - so no feature that only tests ask
+/// for is linked into a release binary here.
 async fn open(
     config: Config,
     paths: &Paths,
@@ -134,15 +139,14 @@ async fn open(
     debug: &ServeDebug,
 ) -> Result<Server, ServerError> {
     #[cfg(debug_assertions)]
-    {
-        let settings = offline_settings(&config, debug.offline());
-        Server::start_with_settings(settings, config, paths, lock).await
-    }
+    let settings = offline_settings(&config, debug.offline());
     #[cfg(not(debug_assertions))]
-    {
+    let settings = {
+        // A release build has no switches to read, so the config's own settings are the answer.
         let _ = debug;
-        Server::start(config, paths, lock).await
-    }
+        config.session_settings()
+    };
+    Server::start_with_settings(settings, config, paths, lock).await
 }
 
 /// The engine's settings, with `--offline` applied: every socket on loopback and
@@ -165,7 +169,9 @@ fn offline_settings(config: &Config, offline: bool) -> fbt::Settings {
 }
 
 /// The config to serve on: what the file says, or the wizard's answers when there
-/// is no file, no server section in it, or bytes this run could not read.
+/// is no file, no server section in it, or bytes this run could not read. Called
+/// with the library lock already held, so a wizard run cannot replace a file some
+/// other featherbittorrent is working from (see [`run`]).
 ///
 /// A server address and a login rule are two decisions nobody should have to look
 /// up in a YAML file, and a config written by the TUI has never been asked them.
@@ -281,7 +287,10 @@ async fn wait_for_stop_file(path: PathBuf) {
     }
 }
 
-/// The same, for a build that has no stop file: a future nothing ever wakes.
+/// There is no `--stop-file` in a release build, so [`ServeDebug::stop_file`] always answers `None`, this
+/// future is never polled to completion, and nothing here polls for anything: it exists only so that
+/// `wait_for_stop` selects over the same three futures in every build. A file named by a flag that does
+/// not exist would have nothing to watch it, which is why this arm is a future that never wakes.
 #[cfg(not(debug_assertions))]
 async fn wait_for_stop_file(_path: PathBuf) {}
 
