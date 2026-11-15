@@ -74,7 +74,7 @@ pub fn draw(frame: &mut Frame, model: &Model, snap: &Snapshot) {
 
     // The dialog is drawn last so that it covers what it is meant to cover, and over either
     // view: the box a person gets for `a` in minimal mode is the same one they get anywhere.
-    crate::modal::draw(frame, model);
+    crate::modal::draw(frame, model, snap);
 }
 
 fn draw_full(frame: &mut Frame, area: Rect, model: &Model, snap: &Snapshot) {

@@ -1,9 +1,10 @@
 //! The screen's own state: what is selected, how the table is ordered, which pane is up.
 //!
 //! A model never talks to the engine and never waits for anything. A key press goes in
-//! with the newest snapshot beside it, and either nothing changes or a list of commands
-//! comes out for the binary to pass on. Reading a snapshot is what tells the model what
-//! `p` means for the torrent under the cursor; deciding that the engine did it is not its
+//! with the newest snapshot beside it, and either nothing changes or a list of [`Action`]s
+//! comes out for the binary to act on - mostly commands for whatever backend is running, but
+//! also "run on a different backend" and "finished". Reading a snapshot is what tells the model
+//! what `p` means for the torrent under the cursor; deciding that the engine did it is not its
 //! business, so a command that a peer keeps waiting for cannot freeze the screen.
 
 use std::time::{Duration, Instant};
@@ -12,7 +13,8 @@ use crossterm::event::KeyEvent;
 use fbtt_core::{Command, DetailTab, Notice, RowState, Snapshot, TorrentId, TorrentRow};
 
 use crate::keys;
-use crate::modal::Modal;
+use crate::modal::{ConnectRequest, ConnectTarget, Modal};
+use fbtt_core::ui_state::RemoteTarget;
 
 /// Which of the two screens is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,21 @@ const TABS: [DetailTab; 4] = [
     DetailTab::Pieces,
 ];
 
+/// What one key press asks of the program. A command is the common answer and goes to whatever backend
+/// is running; the other two are about the run itself, which is why they are not commands: a screen cannot
+/// ask a backend to start a different backend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// Something for the current backend to do.
+    Command(Command),
+    /// Stop this backend and run on another one: the connect screen's answer. The binary shuts the current
+    /// backend down (which is how a local engine saves and frees its lock), starts the new one, and
+    /// remembers the choice for the next run.
+    Connect(ConnectRequest),
+    /// The person is finished: save, restore the terminal, leave.
+    Quit,
+}
+
 /// What a person is doing in the app, as one value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
@@ -122,6 +139,10 @@ pub struct Model {
     /// The last notice from the backend and when it arrived. The footer shows it until
     /// [`NOTICE_TTL`] has passed, which [`tick`](Self::tick) is what drops.
     notice: Option<(Notice, Instant)>,
+    /// The target this run last connected to, which is what `c` prefills the connect screen with so that
+    /// changing one thing about a server does not mean typing all of it again. The address and the method
+    /// only: what a person typed into a password field stays in that field.
+    last_target: Option<RemoteTarget>,
 }
 
 impl Model {
@@ -141,23 +162,44 @@ impl Model {
             quit_armed: false,
             index_hint: 0,
             notice: None,
+            last_target: None,
         }
     }
 
-    /// Applies one key press and says what the backend should do about it.
+    /// Applies one key press and says what the program should do about it.
     ///
     /// The snapshot comes along because the answer depends on what is on screen: `p` sends
-    /// [`Command::Pause`] or [`Command::Resume`] depending on the state of the torrent
-    /// under the selection. A key that only changes this model returns nothing. Quitting
-    /// returns [`Command::Shutdown`] and also sets [`quit_requested`](Self::quit_requested),
-    /// so a runtime that is watching for other things can stop as well.
-    pub fn handle_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Vec<Command> {
+    /// [`Command::Pause`] or [`Command::Resume`] depending on the state of the torrent under the
+    /// selection. A key that only changes this model returns nothing. Quitting returns
+    /// [`Action::Quit`] and also sets [`quit_requested`](Self::quit_requested), so a runtime that is
+    /// watching for other things can stop as well; connecting returns [`Action::Connect`] with what the
+    /// connect screen chose, which the binary acts on by changing backends.
+    pub fn handle_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Vec<Action> {
         self.sync_selection(snap);
-        keys::handle(self, key, snap)
+        let actions = keys::handle(self, key, snap);
+        // A connect answer is also the prefill for the next time the screen opens. What a person just
+        // chose is the best guess at what they will want to change, and choosing this library's own
+        // engine means there is no server address to bring back.
+        if let Some(request) = actions.iter().find_map(|action| match action {
+            Action::Connect(request) => Some(request),
+            Action::Command(_) | Action::Quit => None,
+        }) {
+            self.last_target = match &request.target {
+                ConnectTarget::Remote(target) => Some(target.clone()),
+                ConnectTarget::Local => None,
+            };
+        }
+        actions
     }
 
-    /// Whether the person has finished: the binary should send [`Command::Shutdown`] and
-    /// restore the terminal.
+    /// What to prefill the connect screen with: what this run connected to last, or `None` when it has
+    /// only ever run on its own engine. A password is never part of it.
+    pub fn last_target(&self) -> Option<&RemoteTarget> {
+        self.last_target.as_ref()
+    }
+
+    /// Whether the person has finished: the binary should send [`Command::Shutdown`] and restore the
+    /// terminal.
     pub const fn quit_requested(&self) -> bool {
         self.quit
     }
@@ -350,10 +392,10 @@ impl Model {
     }
 
     /// Stops now: the model says it is finished and the backend is told to save and stop.
-    pub(crate) fn quit_now(&mut self) -> Vec<Command> {
+    pub(crate) fn quit_now(&mut self) -> Vec<Action> {
         self.quit = true;
         self.quit_armed = false;
-        vec![Command::Shutdown]
+        vec![Action::Quit]
     }
 }
 

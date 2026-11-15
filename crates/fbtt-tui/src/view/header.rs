@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use fbtt_core::{Connection, Snapshot};
+use fbtt_core::{Connection, LinkState, Snapshot};
 
 use crate::format;
 use crate::theme;
@@ -35,30 +35,53 @@ fn title_span() -> Span<'static> {
     )
 }
 
-/// What is running the torrents: the engine in this process, or a server reached over the
-/// network with milestone 2. The name came from that server, so it goes through `safe`.
+/// What is running the torrents: the engine in this process, or a server reached over the network with
+/// milestone 2. The name came from that server, so it goes through `safe`.
+///
+/// A server's line also says which of the three things its link is doing, because the numbers under it are
+/// worth different amounts depending on the answer: a table behind a held link is current, one behind a
+/// link still dialling may not have arrived yet, and one behind a lost link is whatever was last good
+/// while the client keeps trying. A person who cannot tell those apart reads a frozen figure as a slow one.
 fn connection_line(snap: &Snapshot) -> Line<'static> {
     let muted = Style::new().fg(theme::INK_400);
-    let mut spans = vec![Span::styled("connected to ", muted)];
-    match &snap.connection {
-        Connection::Local => spans.push(Span::styled("Local", Style::new().fg(theme::CYAN_400))),
+    match snap.connection {
+        Connection::Local => Line::from(vec![
+            Span::styled("connected to ", muted),
+            Span::styled("Local", Style::new().fg(theme::CYAN_400)),
+        ]),
         Connection::Remote {
-            name, secure, auth, ..
+            ref name,
+            secure,
+            ref auth,
+            state,
         } => {
-            // The link's own state (`LinkState`) belongs on this line too; until the connect screen exists
-            // to produce one, a remote header says what it always said.
-            spans.push(Span::styled(
-                format::safe(name),
-                Style::new().fg(theme::CYAN_400),
-            ));
-            let scheme = if *secure { "https" } else { "http" };
-            spans.push(Span::styled(
-                format!(" (remote · {scheme} · {})", format::safe(auth)),
-                muted,
-            ));
+            let scheme = if secure { "https" } else { "http" };
+            // The method is the server's own word for how this client signs in, already fit to draw.
+            let identity = format!(" ({scheme} · {})", format::safe(auth));
+            let name = format::safe(name);
+            match state {
+                LinkState::Connecting => Line::from(vec![
+                    Span::styled("connecting to ", muted),
+                    Span::styled(name, Style::new().fg(theme::CYAN_400)),
+                    Span::styled(format!("{identity}..."), muted),
+                ]),
+                LinkState::Connected => Line::from(vec![
+                    Span::styled("connected to ", muted),
+                    Span::styled(name, Style::new().fg(theme::CYAN_400)),
+                    Span::styled(identity, muted),
+                ]),
+                // The amber is the only colour on the screen that means "this is not working", so it goes
+                // on the fact rather than on the name: what changed is the link, not the server.
+                LinkState::Lost { retry_in_secs } => Line::from(vec![
+                    Span::styled(
+                        format!("connection lost, retrying in {retry_in_secs}s"),
+                        Style::new().fg(theme::AMBER_500),
+                    ),
+                    Span::styled(format!(" · {name}{identity}"), muted),
+                ]),
+            }
         }
     }
-    Line::from(spans)
 }
 
 /// The total rates: the arrow and its unit muted, the number itself strong, so the eye

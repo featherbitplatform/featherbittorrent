@@ -5,19 +5,29 @@
 //! filter draws as a box in the middle of the screen, on the surface colour inside a border of the
 //! rule colour. The filter is one line along the bottom, where the design puts the key hints, and
 //! it changes the table while it is typed rather than when Enter is pressed.
+//!
+//! A dialog that shows something the backend reported - the folders to pick from, the devices a
+//! server lets sign in - is drawn with the newest snapshot beside it, because that listing is not
+//! the dialog's to hold: the backend replaces it whenever it answers again.
 
 mod add;
+mod connect;
 mod delete;
+mod devices;
+mod folders;
 mod help;
 mod input;
 mod settings;
 
 pub use add::AddForm;
-pub use input::Input;
+pub use connect::{ConnectForm, ConnectRequest, ConnectTarget, SecretInput};
+pub use devices::DevicesForm;
+pub use folders::FolderPicker;
+pub use input::{Input, Masked};
 pub use settings::SettingsForm;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use fbtt_core::{Command, Snapshot, TorrentId, TorrentRow};
+use fbtt_core::{Snapshot, TorrentId, TorrentRow};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Style, Stylize};
@@ -25,7 +35,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Fill, Paragraph};
 
 use crate::format;
-use crate::model::Model;
+use crate::model::{Action, Model};
 use crate::theme;
 
 /// Cells between a field's label and what has been typed in it.
@@ -36,6 +46,10 @@ const LABEL_GAP: usize = 2;
 pub enum Modal {
     /// A magnet link or a `.torrent` file, and where its files go.
     Add(AddForm),
+    /// Which backend to run on, and how to sign in to it.
+    Connect(ConnectForm),
+    /// The devices a server lets sign in, and what to do with them.
+    Devices(DevicesForm),
     /// Whether to forget a torrent with its files or without them.
     Delete {
         /// The torrent the question is about.
@@ -57,6 +71,18 @@ impl Modal {
         Modal::Add(AddForm::new(&snap.default_dir))
     }
 
+    /// The connect screen, prefilled with `last` - the connection this library was last used on, or
+    /// the server running on its own library - and pointed at a server so that there is something to
+    /// change with Left and Right.
+    pub fn connect(last: Option<&fbtt_core::ui_state::RemoteTarget>) -> Modal {
+        Modal::Connect(ConnectForm::new(last))
+    }
+
+    /// The device list, empty until the server answers the `Devices(List)` that opening it sends.
+    pub fn devices() -> Modal {
+        Modal::Devices(DevicesForm::new())
+    }
+
     /// The settings dialog, prefilled with the limits this snapshot says are running.
     pub fn settings(snap: &Snapshot) -> Modal {
         Modal::Settings(SettingsForm::new(&snap.limits))
@@ -74,7 +100,9 @@ impl Modal {
     /// model's filter so that the table changes while it is typed; the rest answer themselves.
     fn on_key(&mut self, key: KeyEvent, model: &mut Model, snap: &Snapshot) -> Answer {
         match self {
-            Modal::Add(form) => form.on_key(key, &snap.default_dir),
+            Modal::Add(form) => form.on_key(key, snap),
+            Modal::Connect(form) => form.on_key(key),
+            Modal::Devices(form) => form.on_key(key, snap),
             Modal::Settings(form) => form.on_key(key),
             Modal::Delete { id, .. } => delete::on_key(key, id),
             Modal::Help => help::on_key(key),
@@ -84,23 +112,23 @@ impl Modal {
 }
 
 /// What one press did to a dialog.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Answer {
-    /// The dialog stays up and nothing goes to the backend.
+    /// The dialog stays up and nothing goes out.
     Stay,
-    /// The dialog comes down, with whatever it had to say. Closing without answering sends
-    /// nothing, which is what its `Vec` holds then.
-    Close(Vec<Command>),
-    /// The commands go out and the dialog stays up for the answer: it is waiting for the
-    /// backend to say whether what it sent worked, so it comes down on a notice rather than
-    /// on a key press. See [`Model::push_notice`](crate::model::Model::push_notice).
-    Await(Vec<Command>),
+    /// The actions go out and the dialog stays up for their answer: what happens next comes back from
+    /// the backend - as a notice that closes an add, or as a snapshot that redraws a list - rather than
+    /// from this press. See [`Model::push_notice`](crate::model::Model::push_notice).
+    Keep(Vec<Action>),
+    /// The dialog comes down, with whatever it had to say. Closing without answering sends nothing,
+    /// which is what its `Vec` holds then.
+    Close(Vec<Action>),
 }
 
-/// Applies one press to the open dialog, which owns the keyboard while it is up: none of it
-/// reaches the table, a sort, or a quit that is waiting to be confirmed. A dialog that sent
-/// something and is waiting for its answer stays up too.
-pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<Command> {
+/// Applies one press to the open dialog, which owns the keyboard while it is up: none of it reaches
+/// the table, a sort, or a quit that is waiting to be confirmed. A dialog that sent something and is
+/// waiting for its answer stays up too.
+pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<Action> {
     let Some(mut modal) = model.modal.take() else {
         return Vec::new();
     };
@@ -109,11 +137,11 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
             model.modal = Some(modal);
             Vec::new()
         }
-        Answer::Await(commands) => {
+        Answer::Keep(actions) => {
             model.modal = Some(modal);
-            commands
+            actions
         }
-        Answer::Close(commands) => commands,
+        Answer::Close(actions) => actions,
     }
 }
 
@@ -143,11 +171,14 @@ fn filter_on_key(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Answer {
 }
 
 /// Draws the open dialog over a view that has already been drawn. Only the box it adds is blanked,
-/// so the table behind it stays exactly as it was.
-pub(crate) fn draw(frame: &mut Frame, model: &Model) {
+/// so the table behind it stays exactly as it was. `snap` is the newest snapshot: a dialog that lists
+/// something the backend reported draws from it rather than keeping its own copy.
+pub(crate) fn draw(frame: &mut Frame, model: &Model, snap: &Snapshot) {
     let area = frame.area();
     match &model.modal {
-        Some(Modal::Add(form)) => draw_box(frame, area, "Add torrent", add::lines(form)),
+        Some(Modal::Add(form)) => draw_box(frame, area, "Add torrent", add::lines(form, snap)),
+        Some(Modal::Connect(form)) => draw_box(frame, area, "Connect", connect::lines(form)),
+        Some(Modal::Devices(form)) => draw_box(frame, area, "Devices", devices::lines(form, snap)),
         Some(Modal::Delete { name, .. }) => {
             draw_box(frame, area, "Delete torrent", delete::lines(name));
         }
@@ -254,6 +285,62 @@ pub(crate) fn field(label: &str, input: &Input, width: usize, invalid: bool) -> 
     Line::from(spans)
 }
 
+/// A secret's field: its label, then one `*` for every character typed, with the cursor drawn as one
+/// inverted cell in the same place [`field`] draws it. The counts are all that leave the field, so a
+/// password is never copied on its way to the screen; what shows is how long it is, which a person
+/// typing it already knows.
+pub(crate) fn masked_field(label: &str, secret: &Masked, width: usize) -> Line<'static> {
+    let text = Style::new().fg(theme::INK_300);
+    let caret = Style::new().fg(theme::INK_950).bg(theme::INK_50);
+    let (before, at_cursor) = secret.split_at_cursor();
+
+    let mut spans = vec![
+        Span::styled(format!("{label:<width$}"), Style::new().fg(theme::INK_400)),
+        Span::raw(" ".repeat(LABEL_GAP)),
+        Span::styled("*".repeat(before), text),
+    ];
+    if at_cursor > 0 {
+        // The character under the cursor is a star like the others, only inverted: the field says where
+        // the next keystroke lands without saying which letter is there.
+        spans.push(Span::styled("*", caret));
+        spans.push(Span::styled("*".repeat(at_cursor - 1), text));
+    } else {
+        spans.push(Span::styled(" ", caret));
+    }
+    Line::from(spans)
+}
+
+/// A row whose value is chosen rather than typed - the target, the login method - drawn like a field,
+/// with the whole value inverted while the cursor is on it. The inversion is what tells a person that
+/// Left and Right do something here: a caret inside a word they cannot edit would say nothing.
+pub(crate) fn choice(label: &str, value: &str, width: usize, focused: bool) -> Line<'static> {
+    let style = if focused {
+        Style::new().fg(theme::INK_950).bg(theme::INK_50)
+    } else {
+        Style::new().fg(theme::INK_300)
+    };
+    Line::from(vec![
+        Span::styled(format!("{label:<width$}"), Style::new().fg(theme::INK_400)),
+        Span::raw(" ".repeat(LABEL_GAP)),
+        Span::styled(value.to_string(), style),
+    ])
+}
+
+/// A row that is a yes or a no: the box, and the tick inside it drawn as the cursor cell when this row
+/// has the cursor. The label follows the box rather than sitting in the field column beside it, because
+/// these labels are longer than any field's and would push every field on the screen to the right.
+pub(crate) fn toggle(label: &str, on: bool, focused: bool) -> Line<'static> {
+    let caret = Style::new().fg(theme::INK_950).bg(theme::INK_50);
+    let box_style = Style::new().fg(theme::INK_400);
+    let tick = if on { "x" } else { " " };
+    Line::from(vec![
+        Span::styled("[", box_style),
+        Span::styled(tick, if focused { caret } else { box_style }),
+        Span::styled("] ", box_style),
+        Span::styled(label.to_string(), Style::new().fg(theme::INK_300)),
+    ])
+}
+
 /// The line at the bottom of a dialog that says what its keys do here, in the footer's shape: each
 /// key in the accent, and its meaning beside it.
 pub(crate) fn keys_hint(items: &[(&'static str, &'static str)]) -> Line<'static> {
@@ -269,9 +356,80 @@ pub(crate) fn keys_hint(items: &[(&'static str, &'static str)]) -> Line<'static>
     Line::from(spans)
 }
 
+/// A line of muted advice under a dialog's fields: what the keys do not make obvious, in the colour of
+/// text meant to be read second.
+pub(crate) fn advice(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::new().fg(theme::INK_400),
+    ))
+}
+
+/// A line saying what went wrong, in the error colour, fit to draw however it was worded.
+pub(crate) fn problem(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format::safe(text),
+        Style::new().fg(theme::RED_500),
+    ))
+}
+
+/// A line saying something the person should know before going ahead, in the warning colour: not a
+/// failure, and not something to skim past either.
+pub(crate) fn caution(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::new().fg(theme::AMBER_500),
+    ))
+}
+
 /// The keys every text field answers: typing, deleting and moving the cursor. False means the key
-/// belongs to the dialog itself, which is what has to say what Enter and Tab and Esc do.
+/// belongs to the dialog itself, which is what has to say what Enter and Tab and Esc do. A key with a
+/// modifier on it is not typing either: `Ctrl+O` means the folder picker wherever a field is up, and a
+/// field that swallowed it would type its letter as well.
 pub(crate) fn type_into(field: &mut Input, key: KeyEvent) -> bool {
+    if !matches!(
+        key.modifiers,
+        crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT
+    ) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char(c) => {
+            field.insert(c);
+            true
+        }
+        KeyCode::Backspace => {
+            field.backspace();
+            true
+        }
+        KeyCode::Left => {
+            field.move_left();
+            true
+        }
+        KeyCode::Right => {
+            field.move_right();
+            true
+        }
+        KeyCode::Home => {
+            field.home();
+            true
+        }
+        KeyCode::End => {
+            field.end();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The same keys for a masked field.
+pub(crate) fn type_into_masked(field: &mut Masked, key: KeyEvent) -> bool {
+    if !matches!(
+        key.modifiers,
+        crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT
+    ) {
+        return false;
+    }
     match key.code {
         KeyCode::Char(c) => {
             field.insert(c);
@@ -353,6 +511,29 @@ mod tests {
             text(&line),
             format!("Save to{}  /downloads ", " ".repeat(10))
         );
+    }
+
+    #[test]
+    fn a_masked_field_draws_stars_and_never_the_password() {
+        let mut secret = Masked::new();
+        for c in "hunter2".chars() {
+            secret.insert(c);
+        }
+        // Seven characters, so seven stars, and nothing of what was typed among them. The cursor is past
+        // the last one, so it marks the next cell - the same mark a typed-into field draws there.
+        let line = masked_field("Password", &secret, 8);
+        assert_eq!(text(&line), "Password  ******* ");
+        assert_eq!(line.spans[3].style.bg, Some(theme::INK_50));
+
+        // The cursor moved; the stars did not.
+        secret.home();
+        let line = masked_field("Password", &secret, 8);
+        assert_eq!(text(&line), "Password  *******");
+        assert_eq!(line.spans[3].style.bg, Some(theme::INK_50));
+
+        // Nothing typed is one inverted cell and nothing else.
+        secret.clear();
+        assert_eq!(text(&masked_field("Password", &secret, 8)), "Password   ");
     }
 
     #[test]

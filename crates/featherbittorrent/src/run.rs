@@ -31,7 +31,7 @@ use fbtt_core::{
     ClientParts, Command, Commands, Config, ConfigLoad, LibraryLock, LocalBackend, LockError,
     Notice, Paths, Snapshot,
 };
-use fbtt_tui::{Model, format, theme, view};
+use fbtt_tui::{Action, Model, format, theme, view};
 
 use crate::terminal::Terminal;
 
@@ -43,6 +43,9 @@ const SAVING: &str = "Saving...";
 /// What the footer says when a key press produced a command the backend would not take:
 /// its queue was full, so that press did nothing and the person should press it again.
 const BUSY: &str = "Busy, try again";
+/// What the footer says about a connect answer this build cannot act on yet: the screen collects it and
+/// the run keeps going where it was, so the press needs to be acknowledged rather than left in silence.
+const STILL_ON_THIS_LIBRARY: &str = "This build does not switch libraries yet";
 
 /// One library's whole run: setup, the loop, the quit. The exit code is the answer.
 pub async fn run() -> ExitCode {
@@ -214,14 +217,31 @@ async fn run_loop(
             // which is what a branch that re-arms itself every iteration should be.
             event = once_stream(&mut *stream) => match event {
                 Some(Ok(Event::Key(key))) => {
-                    for command in model.handle_key(key, snap) {
-                        // A full queue drops this command: the backend handles one at a
-                        // time and every one is short, so 64 deep is more than a person can
-                        // type, and what is dropped is a keystroke they will press again. Say
-                        // so rather than let the screen look like it ignored them - unless
-                        // this was the quit itself, which the `Saving...` screen answers.
-                        if !commands.send(command) && !model.quit_requested() {
-                            model.push_notice(Notice::Error(BUSY.to_string()), Instant::now());
+                    for action in model.handle_key(key, snap) {
+                        match action {
+                            // A full queue drops this command: the backend handles one at a
+                            // time and every one is short, so 64 deep is more than a person can
+                            // type, and what is dropped is a keystroke they will press again. Say
+                            // so rather than let the screen look like it ignored them - unless
+                            // this was the quit itself, which the `Saving...` screen answers.
+                            Action::Command(command) => {
+                                if !commands.send(command) && !model.quit_requested() {
+                                    model.push_notice(Notice::Error(BUSY.to_string()), Instant::now());
+                                }
+                            }
+                            // Quitting is not a command to this backend: the `Saving...` screen
+                            // below stops it on the way out, which is how an engine gets the
+                            // chance to save and free its lock.
+                            Action::Quit => {}
+                            // The connect screen's answer means "run on that instead", and acting
+                            // on it - shutting this backend down, starting the one that was named,
+                            // saving the choice - is the change that follows this one. Until then
+                            // the press is reported rather than dropped without a word, so nobody
+                            // wonders whether it registered.
+                            Action::Connect(_) => model.push_notice(
+                                Notice::Info(STILL_ON_THIS_LIBRARY.to_string()),
+                                Instant::now(),
+                            ),
                         }
                     }
                     dirty = true;

@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use fbtt_core::{Command, TorrentId};
 
 use crate::format;
-use crate::modal::Answer;
+use crate::modal::{Action, Answer};
 use crate::theme;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -35,10 +35,10 @@ pub(crate) fn on_key(key: KeyEvent, id: &TorrentId) -> Answer {
         KeyCode::Esc => return Answer::Close(Vec::new()),
         _ => return Answer::Stay,
     };
-    Answer::Close(vec![Command::Remove {
+    Answer::Close(vec![Action::Command(Command::Remove {
         id: id.clone(),
         delete_files,
-    }])
+    })])
 }
 
 #[cfg(test)]
@@ -72,10 +72,10 @@ mod tests {
         };
         assert_eq!(
             commands,
-            vec![Command::Remove {
+            vec![Action::Command(Command::Remove {
                 id: id.clone(),
                 delete_files: false
-            }]
+            })]
         );
 
         let Answer::Close(commands) = on_key(press(KeyCode::Char('D')), &id) else {
@@ -83,10 +83,10 @@ mod tests {
         };
         assert_eq!(
             commands,
-            vec![Command::Remove {
+            vec![Action::Command(Command::Remove {
                 id: id.clone(),
                 delete_files: true
-            }]
+            })]
         );
 
         assert!(

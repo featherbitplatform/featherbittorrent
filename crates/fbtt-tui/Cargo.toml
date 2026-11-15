@@ -22,3 +22,9 @@ ratatui.workspace = true
 # The add dialog expands a leading `~/` in a path someone typed, which is the home
 # directory this platform says it has.
 directories.workspace = true
+# What the connect screen holds a password or a key passphrase in: `Zeroizing`, so the bytes are
+# overwritten when the screen lets go of them and no copy of them outlives the field.
+zeroize.workspace = true
+# The connect screen asks a device key file whether it is encrypted before it asks for a passphrase,
+# which is `ssh-key`'s question to answer (its own features are named in the workspace table).
+ssh-key.workspace = true

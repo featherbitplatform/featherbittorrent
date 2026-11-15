@@ -1,9 +1,9 @@
 //! The main screens and the model's keys, tested the way the binary uses them: keys in,
-//! commands out, and a buffer to read what a person would have seen.
+//! actions out, and a buffer to read what a person would have seen.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use fbtt_core::{Command, DetailTab, RowState, Snapshot, TorrentId};
-use fbtt_tui::{Descending, SortKey, visible_rows};
+use fbtt_core::{Command, DetailTab, LinkState, RowState, Snapshot, TorrentId};
+use fbtt_tui::{Action, Descending, SortKey, theme, visible_rows};
 use ratatui::style::Color;
 
 mod support;
@@ -256,14 +256,22 @@ fn p_sends_pause_or_resume() {
 
     let mut model = model_of(&snap);
     // The downloading torrent is selected first: `p` stops it.
-    let commands = model.handle_key(letter('p'), &snap);
-    assert_eq!(commands, vec![Command::Pause(snap.torrents[0].id.clone())]);
+    let actions = model.handle_key(letter('p'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Pause(snap.torrents[0].id.clone()))]
+    );
 
     // Two steps down reaches the paused one, where `p` starts it again.
     model.handle_key(letter('j'), &snap);
     model.handle_key(letter('j'), &snap);
-    let commands = model.handle_key(letter('p'), &snap);
-    assert_eq!(commands, vec![Command::Resume(snap.torrents[2].id.clone())]);
+    let actions = model.handle_key(letter('p'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Resume(
+            snap.torrents[2].id.clone()
+        ))]
+    );
 
     // Nothing selected means nothing to stop.
     let empty = Snapshot {
@@ -307,7 +315,7 @@ fn p_on_queued_pauses_and_on_error_resumes() {
     );
     assert_eq!(
         model.handle_key(letter('p'), &snap),
-        vec![Command::Pause(snap.torrents[2].id.clone())],
+        vec![Action::Command(Command::Pause(snap.torrents[2].id.clone()))],
         "p on a queued torrent did not stop it"
     );
 
@@ -321,7 +329,9 @@ fn p_on_queued_pauses_and_on_error_resumes() {
     );
     assert_eq!(
         model.handle_key(letter('p'), &snap),
-        vec![Command::Resume(snap.torrents[3].id.clone())],
+        vec![Action::Command(Command::Resume(
+            snap.torrents[3].id.clone()
+        ))],
         "p on an errored torrent did not try it again"
     );
 }
@@ -332,8 +342,8 @@ fn quit_asks_twice_when_something_downloads() {
     let mut model = model_of(&snap);
 
     // A torrent is downloading: the first `q` only asks.
-    let commands = model.handle_key(letter('q'), &snap);
-    assert!(commands.is_empty(), "the first q quit without asking");
+    let actions = model.handle_key(letter('q'), &snap);
+    assert!(actions.is_empty(), "the first q quit without asking");
     assert!(!model.quit_requested());
     assert!(
         Screen::new(&model, &snap, 100, 30)
@@ -343,8 +353,8 @@ fn quit_asks_twice_when_something_downloads() {
     );
 
     // A second `q` confirms.
-    let commands = model.handle_key(letter('q'), &snap);
-    assert_eq!(commands, vec![Command::Shutdown]);
+    let actions = model.handle_key(letter('q'), &snap);
+    assert_eq!(actions, vec![Action::Quit]);
     assert!(model.quit_requested());
 
     // Any other key cancels the ask instead.
@@ -352,8 +362,8 @@ fn quit_asks_twice_when_something_downloads() {
     model.handle_key(letter('q'), &snap);
     model.handle_key(letter('j'), &snap);
     assert!(!model.quit_requested());
-    let commands = model.handle_key(letter('q'), &snap);
-    assert!(commands.is_empty(), "a cancelled q quit at once");
+    let actions = model.handle_key(letter('q'), &snap);
+    assert!(actions.is_empty(), "a cancelled q quit at once");
 
     // `y` confirms too.
     model.handle_key(letter('y'), &snap);
@@ -377,7 +387,7 @@ fn quit_asks_twice_when_something_downloads() {
         );
         assert_eq!(
             model.handle_key(letter('q'), &busy),
-            vec![Command::Shutdown],
+            vec![Action::Quit],
             "the second q did not confirm over {state:?}"
         );
     }
@@ -397,7 +407,7 @@ fn quit_asks_twice_when_something_downloads() {
         let mut model = model_of(&idle);
         assert_eq!(
             model.handle_key(letter('q'), &idle),
-            vec![Command::Shutdown],
+            vec![Action::Quit],
             "one q did not quit a library whose only torrent was {state:?}"
         );
     }
@@ -411,11 +421,11 @@ fn ctrl_c_quits_the_way_q_does() {
     let mut model = model_of(&snap);
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
-    let commands = model.handle_key(ctrl_c, &snap);
-    assert!(commands.is_empty(), "the first Ctrl-C quit without asking");
+    let actions = model.handle_key(ctrl_c, &snap);
+    assert!(actions.is_empty(), "the first Ctrl-C quit without asking");
     assert!(!model.quit_requested());
-    let commands = model.handle_key(ctrl_c, &snap);
-    assert_eq!(commands, vec![Command::Shutdown]);
+    let actions = model.handle_key(ctrl_c, &snap);
+    assert_eq!(actions, vec![Action::Quit]);
     assert!(model.quit_requested());
 
     // Running with nothing arriving asks too: it is still a download in progress.
@@ -437,7 +447,7 @@ fn ctrl_c_quits_the_way_q_does() {
     let mut model = model_of(&idle);
     assert_eq!(
         model.handle_key(ctrl_c, &idle),
-        vec![Command::Shutdown],
+        vec![Action::Quit],
         "Ctrl-C did not quit an idle library"
     );
 
@@ -445,7 +455,7 @@ fn ctrl_c_quits_the_way_q_does() {
     model.handle_key(ctrl_c, &snap);
     assert_eq!(
         model.handle_key(letter('y'), &snap),
-        vec![Command::Shutdown],
+        vec![Action::Quit],
         "y did not confirm the Ctrl-C ask"
     );
 }
@@ -644,5 +654,61 @@ fn renders_only_visible_rows_with_10k_torrents() {
     assert!(
         !body.contains("torrent-09999"),
         "the last of ten thousand rows was drawn:\n{body}"
+    );
+}
+
+#[test]
+fn header_shows_lost_link() {
+    // A server that goes away does not stop the screen: the last snapshot stays on it and the header says
+    // why. A person who cannot tell a lost link from a slow one reads frozen numbers as a stalled torrent.
+    let lost = server(LinkState::Lost { retry_in_secs: 4 });
+    let model = model_of(&lost);
+    let screen = Screen::new(&model, &lost, 100, 30);
+    let text = screen.text();
+    assert!(
+        text.contains("connection lost, retrying in 4s"),
+        "a server that went away was reported as nothing: {text:?}"
+    );
+    assert!(
+        text.contains("bit.example"),
+        "the line did not say which server went away: {text:?}"
+    );
+
+    // Amber is the one colour on this screen that means "this is not working", so it goes on the fact
+    // rather than on the name: what changed is the link, not the server.
+    let (column, row) = screen
+        .find("connection lost")
+        .expect("the header said nothing about the link");
+    assert_eq!(
+        screen.fg(column, row),
+        theme::AMBER_500,
+        "a lost link was not drawn as the failure it is"
+    );
+
+    // A link still dialling says that, so a table with nothing in it yet reads as waiting rather than as
+    // empty.
+    let connecting = server(LinkState::Connecting);
+    let text = Screen::new(&model_of(&connecting), &connecting, 100, 30).text();
+    assert!(
+        text.contains("connecting to bit.example"),
+        "a link that has not answered yet said nothing about itself: {text:?}"
+    );
+
+    // A held link says what it is signed in with, which is the thing a person checks when the numbers on
+    // the screen are not the ones they expected to see.
+    let held = server(LinkState::Connected);
+    let text = Screen::new(&model_of(&held), &held, 100, 30).text();
+    assert!(
+        text.contains("connected to bit.example (http · password)"),
+        "a remote connection did not say how it is signed in: {text:?}"
+    );
+
+    // And this library's own engine still reads as itself: milestone 2 added a second kind of connection
+    // without changing the words for the first.
+    let local = library();
+    let text = Screen::new(&model_of(&local), &local, 100, 30).text();
+    assert!(
+        text.contains("connected to Local"),
+        "the local engine's header changed: {text:?}"
     );
 }
