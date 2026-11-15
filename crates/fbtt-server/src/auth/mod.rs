@@ -73,8 +73,9 @@ const BEARER_SCHEME: &str = "Bearer";
 /// The token of `Authorization: Bearer <token>`: the scheme in any case, then exactly one space, as
 /// fbt-api's own bearer parsing spells it. `None` when the header is absent, cannot be read as text,
 /// or is in another form - which is why [`FbttAuth`] asks whether a header is there before it decides
-/// that no credential came in at all.
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+/// that no credential came in at all, and why logging out has to treat "no token" as an answer rather
+/// than an error.
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_at_checked(BEARER_SCHEME.len())?;
     let token = token.strip_prefix(' ')?;
@@ -94,6 +95,9 @@ pub struct FbttAuth {
     sessions: sessions::Sessions,
     challenges: sessions::Challenges,
     limiter: limiter::LoginLimiter,
+    /// The separate cap on how often one address may ask for a nonce: asking is not an attempt at a
+    /// login, so it does not spend the failure budget above.
+    challenge_limiter: limiter::ChallengeLimiter,
 }
 
 impl FbttAuth {
@@ -109,7 +113,8 @@ impl FbttAuth {
             on: server.auth_on(),
             sessions: sessions::Sessions::with_clock(clock.clone()),
             challenges: sessions::Challenges::with_clock(clock.clone()),
-            limiter: limiter::LoginLimiter::with_clock(clock),
+            limiter: limiter::LoginLimiter::with_clock(clock.clone()),
+            challenge_limiter: limiter::ChallengeLimiter::with_clock(clock),
         }
     }
 
@@ -134,6 +139,12 @@ impl FbttAuth {
     pub fn limiter(&self) -> &limiter::LoginLimiter {
         &self.limiter
     }
+
+    /// The per-address cap on asking for a challenge, which the challenge route spends and the login
+    /// route does not.
+    pub fn challenge_limiter(&self) -> &limiter::ChallengeLimiter {
+        &self.challenge_limiter
+    }
 }
 
 impl fmt::Debug for FbttAuth {
@@ -145,6 +156,7 @@ impl fmt::Debug for FbttAuth {
             .field("sessions", &self.sessions)
             .field("challenges", &self.challenges)
             .field("limiter", &self.limiter)
+            .field("challenge_limiter", &self.challenge_limiter)
             .finish()
     }
 }

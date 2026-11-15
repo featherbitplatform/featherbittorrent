@@ -21,12 +21,14 @@ use sha2::{Digest as _, Sha256};
 
 use crate::auth::{Clock, locked, wall_clock};
 
-/// How long a session token stays good for after the last request that used it.
-const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a session token stays good for after the last request that used it. The login route
+/// reports this same span to the client as `expires_in`.
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 /// How many sessions may be live at once.
 const MAX_SESSIONS: usize = 5_000;
-/// How long a challenge nonce stays answerable.
-const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+/// How long a challenge nonce stays answerable, and what the challenge route reports as
+/// `expires_in`.
+pub(crate) const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// How many challenges may be pending at once.
 const MAX_CHALLENGES: usize = 1_000;
 /// How many of them one key may have outstanding, so that asking again cannot cancel an answer that
@@ -40,11 +42,12 @@ fn token_hash(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
-/// `N` random bytes from the operating system's random source.
+/// `N` random bytes from the operating system's random source: what tokens, challenge nonces and
+/// the nonce a stranger is answered with are all made of.
 ///
 /// # Panics
 /// If that source fails, which on every platform this project runs on it does not.
-fn random_bytes<const N: usize>() -> [u8; N] {
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("the operating system's random source");
     bytes
