@@ -73,6 +73,15 @@ const BACKOFF: [Duration; 6] = [
     Duration::from_secs(30),
 ];
 
+/// The words every sign-in refusal this client puts on a screen start with.
+///
+/// Public because the binary reads it back out of a notice: a run that started with a password it read out
+/// of the system keychain needs to know when a server said no to *that* password, so it can take the entry
+/// out and ask the person again - which is a different answer from "this server could not be reached", and
+/// cannot be told apart from one by anything else in the two things a screen gets. The notice itself is made
+/// in `bodies`, above, and only cleaned for drawing, so this prefix survives it.
+pub const SIGN_IN_REFUSED: &str = "sign-in was refused";
+
 /// What a connection uses to prove who is asking.
 ///
 /// `Debug` names the kind and nothing else: this is the one value in a remote connection that carries a

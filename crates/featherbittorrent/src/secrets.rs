@@ -20,6 +20,9 @@ use fbtt_core::Secret;
 use fbtt_core::ui_state::{LoginMethod, RemoteTarget};
 use fbtt_tui::SecretInput;
 use keyring::{Entry, Error as KeychainError};
+// The address half of an account name is spelled out of a parsed URL, so `http://h:1` and `http://h:1/` are
+// one entry (see [`normalised_server`]) - the same reading the connect screen and reqwest use.
+use url::Url;
 use zeroize::Zeroizing;
 
 /// The service every featherbittorrent entry is filed under, so one person's servers sit together and
@@ -94,7 +97,7 @@ fn signs_with_a_password(login: LoginMethod) -> bool {
     matches!(login, LoginMethod::Password | LoginMethod::GatewayBasic)
 }
 
-/// The name a target's password is kept under: `<user>@<url>`, because one person can hold accounts on
+/// The name a target's password is kept under: `<user>@<server>`, because one person can hold accounts on
 /// several servers and several accounts on one of them.
 ///
 /// `None` for the methods that sign with a key, and for a password method with no user name or no address
@@ -108,8 +111,36 @@ fn account(target: &RemoteTarget) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|user| !user.is_empty())?;
-    let url = target.url.trim();
-    (!url.is_empty()).then(|| format!("{user}@{url}"))
+    let server = normalised_server(target.url.trim())?;
+    Some(format!("{user}@{server}"))
+}
+
+/// The address half of an account name, spelled one way. `http://alice:8090`, `http://alice:8090/` and
+/// `HTTP://Alice:8090` are one entry, because none of those differences is a different server to anybody
+/// typing a password twice - and the connect screen's own answer, a saved `ui.yaml`, and something typed in
+/// by hand have to land on the same name or the password would not be found where it was put.
+///
+/// A path *is* kept (`https://gateway.example/bit` is a different place from `https://gateway.example`),
+/// except for the bare `/` that every parser adds and nobody types. A query or fragment is not part of the
+/// address a server is dialled by, so neither is kept. What this cannot read as an http or https address has
+/// no account at all, which is the safe answer: nothing is looked up and nothing is kept.
+fn normalised_server(url: &str) -> Option<String> {
+    let parsed = url.parse::<Url>().ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // `Url` has already lower-cased the scheme and the host, and `port()` says nothing about a port that is
+    // its scheme's default. An IPv6 address comes out of `host_str` with the brackets a URL needs already on
+    // it, so `[::1]` is filed once rather than as both `::1` and `[::1]`.
+    let host = parsed.host_str()?;
+    let port = parsed
+        .port()
+        .map_or(String::new(), |port| format!(":{port}"));
+    let path = match parsed.path().trim_end_matches('/') {
+        "" => String::new(),
+        path => path.to_string(),
+    };
+    Some(format!("{}://{}{}{}", parsed.scheme(), host, port, path))
 }
 
 /// What the connect screen collected, spelled as `fbtt-core` wants a credential.
@@ -138,8 +169,11 @@ pub fn remote_secret(target: &RemoteTarget, input: &SecretInput) -> Secret {
 /// What this run can start a connection with.
 #[derive(Debug)]
 pub enum StartSecret {
-    /// The credential to start with, and nothing left to ask anybody.
-    Ready(Secret),
+    /// The credential to start with, and nothing left to ask anybody. `from_keychain` says where it came
+    /// from, which is the only way this run can later tell "the server said no to the password we kept" from
+    /// "the server said no to the password somebody just typed": only the first is worth taking out of the
+    /// keychain, and only the first means the person has to be asked again.
+    Ready { secret: Secret, from_keychain: bool },
     /// Something this target signs in with is not here. Start the connection anyway - it says once, through
     /// the client, why nothing appeared - and open the connect screen prefilled so the person can supply
     /// what is missing. `notice` is the line to put beside that question when the keychain itself could
@@ -158,10 +192,17 @@ pub fn decide_start_secret(
     unavailable: bool,
 ) -> StartSecret {
     if !signs_with_a_password(target.login) {
-        return StartSecret::Ready(remote_secret(target, &SecretInput::default()));
+        return StartSecret::Ready {
+            secret: remote_secret(target, &SecretInput::default()),
+            from_keychain: false,
+        };
     }
     match stored {
-        Some(password) => StartSecret::Ready(Secret::Password(password)),
+        // The keychain's own answer, which is what makes a later refusal worth acting on.
+        Some(password) => StartSecret::Ready {
+            secret: Secret::Password(password),
+            from_keychain: true,
+        },
         // Nothing was kept - or nothing could be asked. A password login with no password is what the
         // remote backend already reports as one credential that does not go with its method: one line, no
         // attempts against the server, and a header that says why the table is empty.
@@ -230,17 +271,23 @@ impl std::fmt::Debug for KeepPlan {
     }
 }
 
-/// The pure half of [`keep_password`]: what the answer says to do about the keychain.
+/// The pure half of what an answer says about the keychain: which one operation, if any, it asks for.
+///
+/// What comes back is carried to [`crate::switch`], which runs it only once the connection has proved it can
+/// sign in - see [`apply_keep`].
 pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
     let Some(account) = account(target) else {
         return KeepPlan::Nothing;
     };
     match (&input.password, input.remember) {
-        // The box was ticked: the next run starts from here without asking.
-        (Some(password), true) => KeepPlan::Keep {
+        // The box was ticked: the next run starts from here without asking. An empty box is not a password
+        // worth keeping - a later run would sign in with nothing and wonder why the server said no - so an
+        // answer that typed nothing keeps whatever is already there instead.
+        (Some(password), true) if !password.is_empty() => KeepPlan::Keep {
             account,
             password: password.clone(),
         },
+        (Some(_), true) => KeepPlan::Nothing,
         // It was not ticked, so nothing is kept and what an earlier answer left behind goes: "asked each
         // time" has to mean that even for somebody who connected here with a remembered password before.
         (Some(_), false) => KeepPlan::Forget { account },
@@ -249,39 +296,49 @@ pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
     }
 }
 
-/// Does what [`keep_plan`] says, off the thread that draws the screen.
+/// Does what [`keep_plan`] says: at most one call, on whatever thread it is asked on. The thread that draws
+/// the screen asks it inside [`tokio::task::spawn_blocking`], never on its own.
 ///
-/// The `Err` is the line to show beside a connection that goes ahead anyway: nothing was stored either
-/// way, and the password is already in hand, so a keychain that will not answer is worth saying out loud
-/// rather than retrying. Its own words are left out on purpose - what the person needs to know is that
-/// nothing was remembered, not which system call refused it.
-pub async fn keep_password(
+/// The `Err` is the line to show beside a connection that goes ahead anyway - nothing was stored either way,
+/// and the password is already in hand, so a keychain that will not answer is worth saying out loud rather
+/// than retrying. Its own words are left out on purpose: what the person needs to know is that nothing was
+/// remembered, not which system call refused it. A plan that asks for nothing never reaches the keychain.
+pub fn apply_keep(store: &dyn SecretStore, plan: &KeepPlan) -> Result<(), String> {
+    let asked = match plan {
+        KeepPlan::Nothing => Ok(()),
+        KeepPlan::Keep { account, password } => store.set(account, password),
+        KeepPlan::Forget { account } => store.delete(account),
+    };
+    asked.map_err(|_| KEYCHAIN_UNAVAILABLE.to_string())
+}
+
+/// Takes this target's stored password out of the keychain, because the server said no to it: the next run
+/// asks instead of repeating the mistake. A target with no account to name by has nothing kept under it, so
+/// the keychain is not opened at all.
+pub async fn forget_password(
     store: Arc<dyn SecretStore + Send + Sync>,
     target: RemoteTarget,
-    input: SecretInput,
 ) -> Result<(), String> {
-    let do_it = move |store: Arc<dyn SecretStore + Send + Sync>| match keep_plan(&target, &input) {
-        KeepPlan::Nothing => Ok(()),
-        KeepPlan::Keep { account, password } => store.set(&account, &password),
-        KeepPlan::Forget { account } => store.delete(&account),
-    };
-    match tokio::task::spawn_blocking(move || do_it(store)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(KEYCHAIN_UNAVAILABLE.to_string()),
+    let plan = account(&target).map_or(KeepPlan::Nothing, |account| KeepPlan::Forget { account });
+    match tokio::task::spawn_blocking(move || apply_keep(&*store, &plan)).await {
+        Ok(answer) => answer,
+        // A keychain call is a call to another process: one that refused and one that was dropped mid-flight
+        // are the same answer to the person, so they get the same line.
+        Err(_) => Err(KEYCHAIN_UNAVAILABLE.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        KEYCHAIN_UNAVAILABLE, KeepPlan, SecretStore, StartSecret, account, decide_start_secret,
-        keep_password, keep_plan, remote_secret, start_secret_for,
+        KEYCHAIN_UNAVAILABLE, KeepPlan, StartSecret, account, apply_keep, decide_start_secret,
+        forget_password, keep_plan, normalised_server, remote_secret, start_secret_for,
     };
+    use crate::fake_store::FakeStore;
     use fbtt_core::Secret;
     use fbtt_core::ui_state::{LoginMethod, RemoteTarget};
     use fbtt_tui::SecretInput;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use zeroize::Zeroizing;
 
     /// A target a person would actually type in: this machine's server, signed in to as `alice`.
@@ -292,89 +349,6 @@ mod tests {
             user: Some("alice".to_string()),
             ..RemoteTarget::default()
         }
-    }
-
-    /// A keychain that answers from a map, and can be made to answer like one that is not there.
-    #[derive(Debug, Default)]
-    struct FakeStore {
-        entries: Mutex<HashMap<String, String>>,
-        /// Every operation asked of it, in order, so a test can see that some were never asked for.
-        calls: Mutex<Vec<String>>,
-        /// Whether this keychain refuses everything, the way a locked or missing one does.
-        unavailable: bool,
-    }
-
-    impl FakeStore {
-        fn new() -> FakeStore {
-            FakeStore::default()
-        }
-
-        /// A keychain that hands back its own error for every operation.
-        fn broken() -> FakeStore {
-            FakeStore {
-                unavailable: true,
-                ..FakeStore::default()
-            }
-        }
-
-        fn kept(&self, account: &str) -> Option<String> {
-            self.entries
-                .lock()
-                .expect("no panic inside the lock")
-                .get(account)
-                .cloned()
-        }
-
-        fn asked(&self) -> Vec<String> {
-            std::mem::take(&mut *self.calls.lock().expect("no panic inside the lock"))
-        }
-    }
-
-    impl SecretStore for FakeStore {
-        fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>, String> {
-            record(self, "get");
-            if self.unavailable {
-                return Err("the secret service is not running".to_string());
-            }
-            Ok(self
-                .entries
-                .lock()
-                .expect("no panic inside the lock")
-                .get(account)
-                .map(|password| Zeroizing::new(password.clone())))
-        }
-
-        fn set(&self, account: &str, password: &str) -> Result<(), String> {
-            record(self, "set");
-            if self.unavailable {
-                return Err("the secret service is not running".to_string());
-            }
-            self.entries
-                .lock()
-                .expect("no panic inside the lock")
-                .insert(account.to_string(), password.to_string());
-            Ok(())
-        }
-
-        fn delete(&self, account: &str) -> Result<(), String> {
-            record(self, "delete");
-            if self.unavailable {
-                return Err("the secret service is not running".to_string());
-            }
-            self.entries
-                .lock()
-                .expect("no panic inside the lock")
-                .remove(account);
-            Ok(())
-        }
-    }
-
-    fn record(store: &FakeStore, call: &str) {
-        store
-            .calls
-            .lock()
-            .expect("no panic inside the lock")
-            .push(call.to_string());
     }
 
     /// A password is kept under the server it belongs to, and a key login never asks the keychain.
@@ -414,6 +388,63 @@ mod tests {
             ..target(LoginMethod::Password)
         };
         assert_eq!(account(&no_url), None);
+    }
+
+    /// One server is one account, whatever way its address was spelled: the connect screen's answer, what a
+    /// `ui.yaml` was edited into, and what an earlier run kept have to land on the same name or the password
+    /// would not be found where it was put.
+    #[test]
+    fn one_server_is_one_account_name() {
+        let spelled = |url: &str| {
+            account(&RemoteTarget {
+                url: url.to_string(),
+                ..target(LoginMethod::Password)
+            })
+        };
+        let one_entry = [
+            ("http://alice:8090", "alice@http://alice:8090"),
+            ("http://alice:8090/", "alice@http://alice:8090"),
+            ("  http://alice:8090/  ", "alice@http://alice:8090"),
+            ("HTTP://Alice:8090", "alice@http://alice:8090"),
+            // A port that is its scheme's own default is not a second server either.
+            ("http://alice:80", "alice@http://alice"),
+            ("http://alice", "alice@http://alice"),
+        ];
+        for (url, name) in one_entry {
+            assert_eq!(
+                spelled(url),
+                Some(name.to_string()),
+                "{url} should name one account"
+            );
+        }
+
+        // A path *is* another place, so it stays; the bare `/` every parser adds is not.
+        assert_eq!(
+            spelled("https://gateway.example/bit/"),
+            Some("alice@https://gateway.example/bit".to_string())
+        );
+        assert_eq!(
+            spelled("https://gateway.example"),
+            Some("alice@https://gateway.example".to_string())
+        );
+
+        // An IPv6 address keeps the brackets a URL needs, so `::1` is not filed twice.
+        assert_eq!(
+            spelled("http://[::1]:8090"),
+            Some("alice@http://[::1]:8090".to_string())
+        );
+
+        // An address this run cannot read as http or https has no account at all: nothing is looked up, and
+        // nothing is kept, which is the safe answer for something typed into the wrong field.
+        assert_eq!(spelled("ssh://alice@example"), None);
+        assert_eq!(spelled("not an address"), None);
+
+        // The address on its own, which is what the account name is made of: lower-cased, with the default
+        // port and the bare `/` left out.
+        assert_eq!(
+            normalised_server("HTTPS://Example.COM:443/"),
+            Some("https://example.com".to_string())
+        );
     }
 
     /// What the connect screen collected is chosen by the method, not by what was left in a field.
@@ -460,7 +491,18 @@ mod tests {
     fn a_stored_password_starts_the_connection_without_asking() {
         let stored = Some(Zeroizing::new("hunter2".to_string()));
         match decide_start_secret(&target(LoginMethod::Password), stored, false) {
-            StartSecret::Ready(Secret::Password(password)) => assert_eq!(&*password, "hunter2"),
+            StartSecret::Ready {
+                secret: Secret::Password(password),
+                from_keychain,
+            } => {
+                assert_eq!(&*password, "hunter2");
+                // Where the password came from is the only thing that later tells a refusal apart: this run
+                // can now say "the server said no to what we kept" (see `crate::switch`).
+                assert!(
+                    from_keychain,
+                    "a password out of the keychain is the keychain's own"
+                );
+            }
             other => panic!("the keychain had the password, so this run asks: {other:?}"),
         }
 
@@ -496,10 +538,19 @@ mod tests {
             LoginMethod::GatewayKey,
         ] {
             match decide_start_secret(&target(login), None, true) {
-                StartSecret::Ready(secret) => assert!(
-                    !matches!(secret, Secret::Password(_)),
-                    "{login:?} was handed a password it does not sign with"
-                ),
+                StartSecret::Ready {
+                    secret,
+                    from_keychain,
+                } => {
+                    assert!(
+                        !matches!(secret, Secret::Password(_)),
+                        "{login:?} was handed a password it does not sign with"
+                    );
+                    assert!(
+                        !from_keychain,
+                        "{login:?} was told something came out of the keychain when nothing was looked up",
+                    );
+                }
                 StartSecret::Ask { .. } => panic!("{login:?} had nothing missing to ask about"),
             }
         }
@@ -509,18 +560,20 @@ mod tests {
     #[tokio::test]
     async fn the_keychain_is_read_once_and_only_for_a_password() {
         let store = Arc::new(FakeStore::new());
-        store
-            .entries
-            .lock()
-            .expect("no panic inside the lock")
-            .insert(
-                "alice@http://127.0.0.1:8090".to_string(),
-                "hunter2".to_string(),
-            );
+        store.put("alice@http://127.0.0.1:8090", "hunter2");
 
         let started = start_secret_for(store.clone(), target(LoginMethod::Password)).await;
         match started {
-            StartSecret::Ready(Secret::Password(password)) => assert_eq!(&*password, "hunter2"),
+            StartSecret::Ready {
+                secret: Secret::Password(password),
+                from_keychain,
+            } => {
+                assert_eq!(&*password, "hunter2");
+                assert!(
+                    from_keychain,
+                    "this is the run that has to notice a refusal of it",
+                );
+            }
             other => panic!("the entry was there, got {other:?}"),
         }
         assert_eq!(store.asked(), vec!["get".to_string()]);
@@ -529,7 +582,13 @@ mod tests {
         let store = Arc::new(FakeStore::new());
         let started = start_secret_for(store.clone(), target(LoginMethod::KeyFile)).await;
         assert!(
-            matches!(started, StartSecret::Ready(Secret::KeyPassphrase(None))),
+            matches!(
+                started,
+                StartSecret::Ready {
+                    secret: Secret::KeyPassphrase(None),
+                    from_keychain: false,
+                }
+            ),
             "a key file was sent to the keychain: {started:?}"
         );
         assert!(
@@ -590,6 +649,19 @@ mod tests {
             other => panic!("the box was ticked, got {other:?}"),
         }
 
+        // An empty box is not a password worth keeping: a later run would sign in with nothing and wonder why
+        // the server said no. Whatever is already kept stays kept.
+        let empty = SecretInput {
+            password: Some(Zeroizing::new(String::new())),
+            remember: true,
+            ..SecretInput::default()
+        };
+        assert_eq!(
+            keep_plan(&target(LoginMethod::Password), &empty),
+            KeepPlan::Nothing,
+            "nothing was typed, so nothing is kept"
+        );
+
         // A method with no password of ours to keep is nothing to do, whichever way the box stands - and
         // `remember` cannot even be true for one, which the connect screen's own rule makes sure of.
         assert_eq!(
@@ -609,9 +681,10 @@ mod tests {
         );
     }
 
-    /// The same three answers, carried out against a fake keychain.
-    #[tokio::test]
-    async fn keeping_a_password_writes_it_once() {
+    /// The same three answers, carried out against a fake keychain: one plan, at most one call, and the words
+    /// the person can act on when the keychain will not answer.
+    #[test]
+    fn keeping_a_password_writes_it_once() {
         let account = "alice@http://127.0.0.1:8090";
         let remembered = SecretInput {
             password: Some(Zeroizing::new("hunter2".to_string())),
@@ -619,56 +692,67 @@ mod tests {
             ..SecretInput::default()
         };
 
-        let store = Arc::new(FakeStore::new());
-        keep_password(
-            store.clone(),
-            target(LoginMethod::Password),
-            remembered.clone(),
+        let store = FakeStore::new();
+        apply_keep(
+            &store,
+            &keep_plan(&target(LoginMethod::Password), &remembered),
         )
-        .await
         .expect("the fake keychain takes it");
         assert_eq!(store.kept(account), Some("hunter2".to_string()));
         assert_eq!(store.asked(), vec!["set".to_string()]);
 
         // The same answer with the box left alone takes the entry out again.
-        let store = Arc::new(FakeStore::new());
-        store
-            .entries
-            .lock()
-            .expect("no panic inside the lock")
-            .insert(account.to_string(), "stale".to_string());
-        keep_password(
-            store.clone(),
-            target(LoginMethod::Password),
-            not_remembered(&remembered),
+        let store = FakeStore::new();
+        store.put(account, "stale");
+        apply_keep(
+            &store,
+            &keep_plan(&target(LoginMethod::Password), &not_remembered(&remembered)),
         )
-        .await
         .expect("forgetting is an ordinary answer");
         assert_eq!(store.kept(account), None);
 
-        // A key login leaves the keychain alone whatever the form collected.
-        let store = Arc::new(FakeStore::new());
-        keep_password(
-            store.clone(),
-            target(LoginMethod::KeyFile),
-            remembered.clone(),
+        // A plan that asks for nothing never reaches the keychain: a key login leaves it alone whatever the
+        // form collected.
+        let store = FakeStore::new();
+        apply_keep(
+            &store,
+            &keep_plan(&target(LoginMethod::KeyFile), &remembered),
         )
-        .await
         .expect("nothing was asked of the keychain");
         assert!(store.asked().is_empty(), "a key login opened the keychain");
 
         // A keychain that will not answer says so once, in the words the person can act on, and stores
         // nothing.
-        let store = Arc::new(FakeStore::broken());
-        let problem = keep_password(
-            store.clone(),
-            target(LoginMethod::Password),
-            remembered.clone(),
+        let store = FakeStore::broken();
+        let problem = apply_keep(
+            &store,
+            &keep_plan(&target(LoginMethod::Password), &remembered),
         )
-        .await
         .expect_err("a locked keychain does not take a password");
         assert_eq!(problem, KEYCHAIN_UNAVAILABLE);
         assert!(store.kept(account).is_none(), "nothing was stored");
+    }
+
+    /// What the run does with a password the server said no to: it comes out of the keychain, so the next run
+    /// asks instead of making the same refusal happen again.
+    #[tokio::test]
+    async fn a_refused_password_is_taken_out_of_the_keychain() {
+        let account = "alice@http://127.0.0.1:8090";
+        let store = Arc::new(FakeStore::new());
+        store.put(account, "wrong");
+
+        forget_password(store.clone(), target(LoginMethod::Password))
+            .await
+            .expect("the fake keychain hands it back");
+        assert_eq!(store.kept(account), None);
+        assert_eq!(store.asked(), vec!["delete".to_string()]);
+
+        // A login that signs some other way has no entry of ours to take out, so the keychain is not opened.
+        let store = Arc::new(FakeStore::new());
+        forget_password(store.clone(), target(LoginMethod::KeyFile))
+            .await
+            .expect("there was nothing to take out");
+        assert!(store.asked().is_empty(), "a key login opened the keychain");
     }
 
     /// The line the person sees instead of a stored password: it names what happens next, because they

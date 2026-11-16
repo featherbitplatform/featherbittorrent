@@ -48,6 +48,10 @@ keyring.workspace = true
 # What a password read out of the keychain is held in, so it is overwritten when this run is done with
 # it - the same wrapper `fbtt-core`'s `Secret` uses.
 zeroize.workspace = true
+# Spelling the address half of a keychain account name, so `http://host:1` and `http://host:1/` are one
+# entry rather than two (see `secrets.rs`). The same parser the connect screen and reqwest already use, so
+# this adds no crate to the build.
+url.workspace = true
 # The `Stream` trait for polling that event stream inside `tokio::select!`.
 futures-core.workspace = true
 # The runtime: `rt-multi-thread` because the backend task runs long engine steps that

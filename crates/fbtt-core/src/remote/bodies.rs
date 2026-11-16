@@ -14,6 +14,8 @@ use reqwest::Response;
 
 use crate::engine::map::clean;
 
+use super::SIGN_IN_REFUSED;
+
 /// The largest response body this client reads. A torrent list, a file list and a peer list are all far
 /// below it; what reaches it is a server answering a question about a million-file torrent, or one that
 /// is not answering in JSON at all.
@@ -40,7 +42,7 @@ impl ApiError {
     pub(crate) fn notice(&self) -> String {
         match self {
             ApiError::Transport(problem) => format!("the server could not be reached: {problem}"),
-            ApiError::Refused(reason) => format!("sign-in was refused: {reason}"),
+            ApiError::Refused(reason) => format!("{SIGN_IN_REFUSED}: {reason}"),
             ApiError::Answer(message) => message.clone(),
         }
     }

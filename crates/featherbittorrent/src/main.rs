@@ -15,9 +15,12 @@ use fbtt_core::Paths;
 mod admin;
 mod backend;
 mod exit;
+#[cfg(test)]
+mod fake_store;
 mod run;
 mod secrets;
 mod serve;
+mod switch;
 mod terminal;
 mod wizard;
 
