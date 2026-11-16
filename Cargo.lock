@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "directories",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "directories",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "featherbittorrent"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
