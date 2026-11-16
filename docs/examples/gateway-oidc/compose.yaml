@@ -9,8 +9,9 @@
 #   https://auth.example.test:9443/      Authelia's portal, its own TLS
 #   127.0.0.1:8090 is NOT reachable from the host: only the gateway can reach the server.
 #
-# The ports are 443 and 9443 so every URL works without an odd port in it; Authelia listens on 9091
-# inside the network, TLS included, which is what its issuer URL must name.
+# The gateway publishes 443, so the torrent URL has no port in it. Authelia listens on 9443 inside
+# the network as well as on the host, TLS included: its issuer https://auth.example.test:9443 has to
+# work for the browser and for the gateway's own callouts alike.
 
 services:
   # Generates the self-signed certificate pair into a named volume on first run and fixes ownership
@@ -49,7 +50,9 @@ services:
       - "443:8443" # data plane (HTTPS); the admin API stays inside the network
     volumes:
       - ./config/gateway:/etc/gateway:ro
-      - certs:/etc/gateway/tls:ro
+      # Beside /etc/gateway, not inside it: that one is a read-only bind mount, and Docker cannot
+      # create a mountpoint inside it. system.yaml names this path.
+      - certs:/etc/gateway-tls:ro
     environment:
       # From .env (README step 2): the web client's secret at Authelia, and the gateway's own cookie
       # sealing secret. Both are demo values living in plain files; in production use a secret store.
@@ -67,18 +70,18 @@ services:
       certs:
         condition: service_completed_successfully
       authelia:
-        condition: service_started
+        condition: service_healthy # the image's own healthcheck; discovery works from then on
       featherbittorrent:
         condition: service_started
 
   # Pinned to the exact release this example was verified against: 4.39 moved the OIDC endpoints
   # under /api/oidc/, and a different major or minor could move them again. Read
   # config/authelia/configuration.yml before starting anything: its client registration carries two
-  # placeholders that README step 4 fills in.
+  # placeholders that README step 4 fills in, and users_database.yml one that step 5 fills in.
   authelia:
     image: authelia/authelia:4.39.28
     ports:
-      - "9443:9091" # the portal and the OIDC endpoints, TLS served by Authelia itself
+      - "9443:9443" # the portal and the OIDC endpoints, TLS served by Authelia itself
     volumes:
       - ./config/authelia:/config:ro
       - certs:/tls:ro
@@ -92,7 +95,7 @@ services:
       - session_secret
       - storage_encryption_key
       - oidc_hmac_secret
-      - web_client_secret
+      - web_client_secret_digest
       - oidc_jwks_key
     networks:
       featherbit:
@@ -135,8 +138,8 @@ secrets:
     file: ./secrets/storage_encryption_key
   oidc_hmac_secret:
     file: ./secrets/oidc_hmac_secret
-  web_client_secret:
-    file: ./secrets/web_client_secret
+  web_client_secret_digest:
+    file: ./secrets/web_client_secret_digest
   oidc_jwks_key:
     file: ./secrets/oidc_jwks_key
 

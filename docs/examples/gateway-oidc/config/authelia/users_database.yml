@@ -1,14 +1,14 @@
 # The one account this example needs, for browser logins at the portal (the TUI's gateway login
 # never consults it - its credential is the key pair). Hash a password with Authelia's own tool:
 #
-#   docker compose run --rm authelia authelia crypto hash generate argon2 --password 'a passphrase'
+#   docker run --rm authelia/authelia:4.39.28 authelia crypto hash generate argon2 --password 'a passphrase'
 #
-# It prints `Digest: $argon2id$...`; copy that value over REPLACE_ME below, quotes included, and
-# restart Authelia so it reads this file again (`docker compose restart authelia`). The tool needs
-# the file backend in this directory's configuration.yml, which is why it runs through compose.
+# It prints `Digest: $argon2id$...`; copy the whole value after `Digest: ` over the quoted
+# placeholder below, and restart Authelia if it is already running (`docker compose restart
+# authelia`) so it reads this file again.
 
 users:
   alice:
     displayname: 'Alice Example'
     email: 'alice@example.test'
-    password: '$argon2id$REPLACE_ME'
+    password: 'REPLACE_WITH_THE_DIGEST'

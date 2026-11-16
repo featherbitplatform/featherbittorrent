@@ -87,14 +87,15 @@ When the gateway is the door, the connect screen (`c`) has two methods for it:
   Register the client with your provider: a client id, the token endpoint's URL as the token URL, and
   the public key as the client's JWK. With Authelia the registered `key_id` must equal the fingerprint
   line `ssh-keygen -lf` prints (`SHA256:<base64>`), because that is what the assertion's header names,
-  and `token_endpoint_auth_signing_alg` must be `ES256`. Two more settings are needed because this
-  client sends the older assertion shape: Authelia 4.39 defaults to RFC 10070, which requires the
-  issuer identifier rather than the endpoint URL as the audience, so a provider fronting
-  featherbittorrent wants `enable_client_assertion_legacy_audience: true`; and it defaults a client to
-  accepting only the `client.authentication.jwt` header type, so ours (`typ: JWT`, the value RFC 7523
-  has always allowed) needs `client_assertion_jwt_validation_header_allow_types` listing both. The
-  example under [docs/examples/gateway-oidc/](examples/gateway-oidc/) shows a working registration with
-  all four, and Authelia's own reference for these keys is its
+  and `token_endpoint_auth_signing_alg` must be `ES256`. Authelia 4.39 accepts the assertion exactly
+  as the TUI sends it (`typ: JWT`, the token URL as audience) without any extra switch, with two
+  details to get right. The public key goes in as a PEM naming the P-256 curve, and some
+  `ssh-keygen` builds (macOS among them) export explicit curve parameters instead, which Authelia
+  rejects; pipe the export through `openssl ec -pubin -param_enc named_curve -pubout`. And set the
+  revocation, introspection and pushed-authorization endpoint auth methods to `private_key_jwt` as
+  well, or Authelia defaults them to `client_secret_basic` and refuses a client with no secret. The
+  example under [docs/examples/gateway-oidc/](examples/gateway-oidc/) shows a working registration,
+  and Authelia's own reference for these keys is its
   [OpenID Connect clients configuration page](https://www.authelia.com/configuration/identity-providers/openid-connect/clients/).
 
 - **`gateway password`** is plain HTTP Basic at the gateway (its `basic-auth` plugin, or any proxy's
@@ -161,7 +162,9 @@ policies:
 `bearer_only: true` validates a bearer token against the provider's JWKS (signature, expiry, issuer);
 `bearer_only: false` runs the interactive Authorization Code flow with PKCE for browsers instead. The
 two modes are separate nodes on separate routes, which is why the example splits `/api/*` from the
-rest of the host.
+rest of the host. Routes that match on `host` need `http2.enabled: false` in `system.yaml` with the
+gateway release the example was verified against: it reads the host name from the `Host` header
+only, which HTTP/2 requests do not carry, so they would get `No route matched`.
 
 A worked-out stack, with Authelia as the provider and `featherbittorrent serve` behind it, is
 [docs/examples/gateway-oidc/](examples/gateway-oidc/).

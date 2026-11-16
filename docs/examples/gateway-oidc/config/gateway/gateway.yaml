@@ -116,9 +116,9 @@ policies:
           scope: openid profile email
           session:
             secret: ${GATEWAY_SESSION_SECRET}
+            absolute_timeout: 3600 # seconds since login, whatever the activity
             cookie:
               name: featherbit_session
-              lifetime: 3600
           logout_path: /logout
 
       - id: backend
