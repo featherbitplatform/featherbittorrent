@@ -1,0 +1,108 @@
+# Authelia for the gateway-oidc example, written against 4.39.28 (the tag compose.yaml pins).
+# Since 4.39 the OIDC endpoints live under /api/oidc/, which is why the token URL is
+# https://auth.example.test:9443/api/oidc/token and not a bare path.
+#
+# Secrets arrive two ways. The template filter (compose sets X_AUTHELIA_CONFIG_FILTERS=template)
+# reads the signing key and the web client's secret from the files compose mounts under
+# /run/secrets; the session secret, the storage encryption key and the HMAC secret arrive through
+# the *_FILE environment variables in compose.yaml instead. Never define the same secret both here
+# and by its *_FILE variable: Authelia refuses to start when a secret has two sources.
+
+server:
+  address: 'tcp://:9091/'
+  # TLS ends at Authelia itself. The browser reaches this listener directly (compose publishes it
+  # as the host's 9443), and so do the gateway's callouts, so nothing in front has to rewrite Host
+  # or forwarded headers: the issuer derives exactly from https://auth.example.test:9443.
+  tls:
+    key: /tls/key.pem
+    certificate: /tls/cert.pem
+
+log:
+  level: info
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+
+storage:
+  local:
+    path: /database/authelia.db
+
+session:
+  cookies:
+    # The cookie covers both hostnames, and authelia_url is where a visitor is sent to sign in. Both
+    # must agree with the URL actually opened, because Authelia derives its issuer from the request.
+    - domain: 'example.test'
+      authelia_url: 'https://auth.example.test:9443'
+
+identity_providers:
+  oidc:
+    # featherbittorrent's assertion names the token endpoint as its audience (that is where it is
+    # posted). Since 4.39 Authelia defaults to RFC 10070, which demands the issuer identifier as the
+    # sole audience, so this legacy switch is what makes our client_credentials login work. A
+    # provider that insists on the new rule needs an assertion naming the issuer instead.
+    enable_client_assertion_legacy_audience: true
+
+    # One RSA key signs the access tokens and ID tokens; the gateway validates them against this
+    # issuer's JWKS. The template filter indents the PEM into this block scalar for us (`mindent` and
+    # `msquote` are Authelia's own helpers), which is why README step 2 writes secrets/oidc_jwks_key as
+    # plain PEM with no leading spaces.
+    jwks:
+      - key_id: 'featherbittorrent-example'
+        algorithm: 'RS256'
+        use: 'sig'
+        key: {{ secret "/run/secrets/oidc_jwks_key" | mindent 10 "|" | msquote }}
+
+    clients:
+      # The TUI's `gateway private key` login: client credentials with a signed assertion
+      # (private_key_jwt), so no shared secret exists anywhere near the laptop. featherbittorrent
+      # names the signing key in the assertion header with its OpenSSH fingerprint, and Authelia
+      # selects the registered key by that kid exactly - so key_id must be the fingerprint README
+      # step 4 prints, colons included. Client keys here are RSA or ECDSA only, hence P-256 and
+      # ES256; token_endpoint_auth_signing_alg has to name the same algorithm the header does.
+      - client_id: 'featherbittorrent-tui'
+        client_name: 'featherbittorrent TUI'
+        grant_types: ['client_credentials']
+        authorization_policy: 'one_factor'
+        # A client_credentials token carries no ID token, and Authelia will not let this kind of
+        # client ask for `openid` at all. Nothing here decides who you are inside
+        # featherbittorrent: the server runs with its own logins off and trusts the gateway.
+        scopes: ['profile', 'email']
+        access_token_signed_response_alg: 'RS256'
+        token_endpoint_auth_method: 'private_key_jwt'
+        token_endpoint_auth_signing_alg: 'ES256'
+        # Second escape hatch for the same assertion: 4.39 defaults a client to accepting only the
+        # `client.authentication.jwt` value in the header's `typ`, and featherbittorrent sends the
+        # plain `JWT` that RFC 7523 has always allowed. Listing both keeps the door open for older
+        # assertions too.
+        client_assertion_jwt_validation_header_allow_types: ['client.authentication.jwt', 'JWT']
+        jwks:
+          - key_id: 'SHA256:REPLACE_WITH_YOUR_FINGERPRINT'
+            algorithm: 'ES256'
+            use: 'sig'
+            # Paste your public key between the markers (README step 4). It is a public key, so it
+            # can stay in this file. Keep the two-space indent of the PEM lines.
+            key: |
+              -----BEGIN PUBLIC KEY-----
+              REPLACE_WITH_YOUR_PUBLIC_KEY_LINES
+              -----END PUBLIC KEY-----
+
+      # Browser login: the gateway's interactive openid-connect node exchanges codes for this
+      # client and authenticates itself to the token endpoint with HTTP Basic, which is what
+      # client_secret_basic means (Authelia's default when nothing is set). The secret is injected
+      # from its secret file as plaintext and hashed by Authelia at load; the same value sits in
+      # .env for the gateway (README step 2).
+      - client_id: 'featherbittorrent-web'
+        client_name: 'featherbittorrent browser login'
+        grant_types: ['authorization_code', 'refresh_token']
+        response_types: ['code']
+        redirect_uris:
+          - 'https://torrent.example.test/oidc/callback'
+        scopes: ['openid', 'profile', 'email']
+        authorization_policy: 'one_factor'
+        consent_mode: 'auto'
+        client_secret: '{{ secret "/run/secrets/web_client_secret" | trim }}'
+
+notifier:
+  filesystem:
+    filename: /tmp/authelia/notification.txt

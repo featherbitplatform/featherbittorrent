@@ -1,0 +1,146 @@
+# featherbittorrent behind the featherbit gateway with Authelia as its OIDC provider.
+#
+# Three services, one certificate volume, and a one-time generation step (README.md) that fills
+# ./secrets/ and ./.env - neither is committed. The host machine needs torrent.example.test and
+# auth.example.test in /etc/hosts pointing at this machine (README step 1), then:
+#
+#   https://torrent.example.test/        browser login (interactive OIDC at the gateway)
+#   https://torrent.example.test/api/*   bearer tokens (the TUI's gateway private key login)
+#   https://auth.example.test:9443/      Authelia's portal, its own TLS
+#   127.0.0.1:8090 is NOT reachable from the host: only the gateway can reach the server.
+#
+# The ports are 443 and 9443 so every URL works without an odd port in it; Authelia listens on 9091
+# inside the network, TLS included, which is what its issuer URL must name.
+
+services:
+  # Generates the self-signed certificate pair into a named volume on first run and fixes ownership
+  # for the gateway's uid. That last step is not incidental: openssl writes a private key mode 0600
+  # regardless of umask, and the featherbit image runs as uid 65532, so a key owned by anyone else
+  # fails startup with "failed to read TLS private key ... Permission denied". Authelia's container
+  # reads the same pair as root, which can read it whatever its owner.
+  certs:
+    image: alpine/openssl:3.3.2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ -s /tls/cert.pem ] && [ -s /tls/key.pem ]; then
+          echo "certs: reusing the existing pair in the volume"
+        else
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tls/key.pem -out /tls/cert.pem \
+            -days 365 \
+            -subj "/CN=torrent.example.test" \
+            -addext "subjectAltName=DNS:torrent.example.test,DNS:auth.example.test"
+          echo "certs: generated a self-signed certificate for both example hosts"
+        fi
+        chown 65532:65532 /tls/cert.pem /tls/key.pem
+        chmod 600 /tls/key.pem
+        chmod 644 /tls/cert.pem
+    volumes:
+      - certs:/tls
+
+  gateway:
+    image: featherbit/featherbit:${FEATHERBIT_TAG:-latest}
+    command:
+      - --system-config=/etc/gateway/system.yaml
+      - --gateway-config=/etc/gateway/gateway.yaml
+    ports:
+      - "443:8443" # data plane (HTTPS); the admin API stays inside the network
+    volumes:
+      - ./config/gateway:/etc/gateway:ro
+      - certs:/etc/gateway/tls:ro
+    environment:
+      # From .env (README step 2): the web client's secret at Authelia, and the gateway's own cookie
+      # sealing secret. Both are demo values living in plain files; in production use a secret store.
+      WEB_CLIENT_SECRET: ${WEB_CLIENT_SECRET:?run the README generation step first}
+      GATEWAY_SESSION_SECRET: ${GATEWAY_SESSION_SECRET:?run the README generation step first}
+      LOG_LEVEL: info
+    # So the gateway's own callouts (discovery, JWKS, token exchange) reach Authelia under its real
+    # hostname while staying inside this network: the name maps to Authelia's fixed address below.
+    extra_hosts:
+      - "auth.example.test:172.28.0.11"
+    networks:
+      featherbit:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      authelia:
+        condition: service_started
+      featherbittorrent:
+        condition: service_started
+
+  # Pinned to the exact release this example was verified against: 4.39 moved the OIDC endpoints
+  # under /api/oidc/, and a different major or minor could move them again. Read
+  # config/authelia/configuration.yml before starting anything: its client registration carries two
+  # placeholders that README step 4 fills in.
+  authelia:
+    image: authelia/authelia:4.39.28
+    ports:
+      - "9443:9091" # the portal and the OIDC endpoints, TLS served by Authelia itself
+    volumes:
+      - ./config/authelia:/config:ro
+      - certs:/tls:ro
+      - authelia-data:/database
+    environment:
+      X_AUTHELIA_CONFIG_FILTERS: template
+      AUTHELIA_SESSION_SECRET_FILE: /run/secrets/session_secret
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /run/secrets/storage_encryption_key
+      AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE: /run/secrets/oidc_hmac_secret
+    secrets:
+      - session_secret
+      - storage_encryption_key
+      - oidc_hmac_secret
+      - web_client_secret
+      - oidc_jwks_key
+    networks:
+      featherbit:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  # Built from the repository root's Dockerfile; `serve` reads the config mounted below and asks
+  # nothing, because that file already names a server section. No published ports: the outside
+  # reaches this service only through the gateway, which is what auth-off behind a gateway means.
+  featherbittorrent:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    volumes:
+      - ./config/featherbittorrent:/data/config
+      - fbtt-library:/data/library
+    environment:
+      FBTT_CONFIG_DIR: /data/config
+      FBTT_DATA_DIR: /data/library
+    ports:
+      # BitTorrent itself still needs its way in from peers; the API deliberately has no mapping.
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+    networks:
+      - featherbit
+
+networks:
+  featherbit:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+# Host files created by the README generation step; none of them are committed.
+secrets:
+  session_secret:
+    file: ./secrets/session_secret
+  storage_encryption_key:
+    file: ./secrets/storage_encryption_key
+  oidc_hmac_secret:
+    file: ./secrets/oidc_hmac_secret
+  web_client_secret:
+    file: ./secrets/web_client_secret
+  oidc_jwks_key:
+    file: ./secrets/oidc_jwks_key
+
+volumes:
+  certs:
+  authelia-data:
+  fbtt-library:

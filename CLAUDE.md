@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.9.0`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface and the local backend over `fbt::Session`), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering) and `featherbittorrent` (the binary that wires terminal, runtime and backend together). The screen side of a backend comes apart through `Client::split`: the command sender and the two receivers become fields the runtime owns, because a method on the client borrows the whole client and one `select!` branch cannot hold that borrow while another sends on it.
+**featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.9.0`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface, the local backend over `fbt::Session`, the remote backend and its login methods), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering), `fbtt-server` (the HTTP server: fbt-api's routes plus this product's auth, device and fs routes, the Host guard when auth is off) and `featherbittorrent` (the binary that wires terminal, runtime, backends, the wizard and the `user`/`device` admin commands together). The screen side of a backend comes apart through `Client::split`: the command sender and the two receivers become fields the runtime owns, because a method on the client borrows the whole client and one `select!` branch cannot hold that borrow while another sends on it.
 
-Status: milestone 1, the local client, is complete on `feature/m1-local-client`: the scaffold and gates, the config, the platform paths, the library lock, the local backend (the client interface plus the engine over `fbt::Session`) and the TUI over them. Next is milestone 2: `serve`, the remote client, authentication, and the first release (`0.1.0`). The workspace version (`0.0.0`) is bumped on the first `release/X.Y.Z` branch.
+Status: milestone 1, the local client, is complete (branch `feature/m1-local-client`). Milestone 2, on `feature/m2-server`, is where this branch sits: `serve`, the remote backend, logins (users and passwords, Ed25519 device keys, gateway private key and gateway password), the folder picker, the devices screen, the wizard and hand-off, `docs/server.md` and `docs/reverse-proxy.md` with a runnable gateway-Authelia example under `docs/examples/gateway-oidc/`, a root `Dockerfile`, and the release workflow that turns a `v*` tag into archives for macOS, Linux and Windows. The first release (`0.1.0`) comes with this milestone; the workspace version (`0.0.0`) is bumped on the first `release/X.Y.Z` branch.
 
-Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. The current plan is `docs/superpowers/plans/2026-11-14-milestone-1-local-client.md`, and its Global Constraints are the rules below.
+Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. The current plan is `docs/superpowers/plans/2026-11-15-milestone-2-server.md`, and its Global Constraints are the rules below.
 
 ## Rules specific to this repo
 
@@ -40,6 +40,32 @@ Run `source "$HOME/.cargo/env"` first if cargo is not on PATH.
 # The client: no subcommand runs the local TUI (it needs a real terminal; a second
 # instance on a locked library prints one line and exits 3 without touching the tty)
 cargo run -p featherbittorrent
+
+# The same library with no screen: logs to stderr, one line per event, and the first
+# line is exactly `listening on <addr>`. Ctrl-C or SIGTERM stops it. A config.yaml with
+# a `server:` section means no wizard questions; without one it asks five (docs/server.md).
+cargo run -p featherbittorrent -- serve
+
+# Logins and devices in a server's config.yaml. A running server reads them when it
+# starts, so restart it for a change to take effect. `device add` takes an
+# `ssh-ed25519` public key line or a file holding one (stdin with no argument).
+cargo run -p featherbittorrent -- user set alice
+cargo run -p featherbittorrent -- user list
+cargo run -p featherbittorrent -- user remove alice
+cargo run -p featherbittorrent -- device add 'studio laptop' ~/.ssh/id_ed25519.pub
+cargo run -p featherbittorrent -- device list
+cargo run -p featherbittorrent -- device remove 'studio laptop'
+
+# serve's two debug-build-only flags, hidden from help and compiled out of release
+# builds: --stop-file PATH stops as soon as that file exists, and --offline keeps every
+# socket on loopback with DHT, LSD, UPnP and NAT-PMP off. Tests and scripts use them.
+cargo run -p featherbittorrent -- serve --offline
+
+# Release version helper (its test is `bash dev/test-release-version.sh`): it prints the
+# workspace version and refuses a tag that does not match it; --notes prints that
+# version's CHANGELOG.md section, which is what the release workflow publishes as notes.
+bash dev/release-version.sh
+bash dev/release-version.sh --notes
 
 # Full gate, as CI runs it (fmt is Linux-only in CI; deny runs as cargo-deny-action)
 cargo fmt --all

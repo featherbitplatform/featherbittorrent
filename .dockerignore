@@ -1,0 +1,12 @@
+# A Docker build needs the workspace manifest, the lockfile, the toolchain pin and the crate
+# sources. `target/` alone would make every build hand gigabytes to the daemon before it starts,
+# and compose builds this image with the repository root as its context (see
+# docs/examples/gateway-oidc/compose.yaml), so the exclusions belong here rather than beside the
+# Dockerfile.
+
+target/
+.git/
+.github/
+.superpowers/
+docs/
+dev/

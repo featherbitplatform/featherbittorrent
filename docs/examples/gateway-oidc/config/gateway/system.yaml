@@ -1,0 +1,31 @@
+# featherbit gateway global settings for this example. Read once at startup: changes here need
+# `docker compose up -d` again, not just a file edit. Routes and policies live in gateway.yaml.
+#
+# The certificate is the self-signed pair the `certs` service put into the shared volume (SANs cover
+# both torrent.example.test and auth.example.test). In production drop real certificates in the same
+# way, which README.md describes under "Use your own certificate".
+
+listener:
+  bind: "0.0.0.0"
+  port: 8443 # compose publishes this as the host's 443
+
+tls:
+  cert_path: /etc/gateway/tls/cert.pem
+  key_path: /etc/gateway/tls/key.pem
+  min_version: "1.2"
+
+http2:
+  enabled: true
+
+logging:
+  level: ${LOG_LEVEL:-info}
+  format: text
+
+# The admin API and web UI stay inside the compose network in this example (no published port).
+# Change these credentials before exposing it anywhere.
+admin:
+  bind: "0.0.0.0"
+  port: 9090
+  username: ${ADMIN_USER:-admin}
+  password: ${ADMIN_PASSWORD:-change-me}
+  ui_enabled: true
