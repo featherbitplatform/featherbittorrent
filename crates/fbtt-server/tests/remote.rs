@@ -35,7 +35,8 @@ use fbtt_server::auth::password;
 use serde_json::{Value, json};
 use signature::Verifier;
 use ssh_key::{
-    Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, Signature, rand_core::UnwrapErr,
+    Algorithm, EcdsaCurve, HashAlg, LineEnding, PrivateKey, PublicKey, Signature,
+    rand_core::UnwrapErr,
 };
 
 /// How long a test waits for anything. A server start plus an engine check takes a moment; nothing here
@@ -177,6 +178,19 @@ fn device(name: &str, key: &PrivateKey) -> DeviceEntry {
 fn keypair() -> PrivateKey {
     let mut rng = UnwrapErr(getrandom::SysRng);
     PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("an ed25519 key")
+}
+
+/// A fresh ECDSA P-256 key pair, the kind `ssh-keygen -t ecdsa -b 256` makes: what a gateway that documents
+/// a `private_key_jwt` grant hands out.
+fn ecdsa_keypair() -> PrivateKey {
+    let mut rng = UnwrapErr(getrandom::SysRng);
+    PrivateKey::random(
+        &mut rng,
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        },
+    )
+    .expect("a p256 key")
 }
 
 /// The one-line OpenSSH public key of `key`.
@@ -1407,6 +1421,84 @@ async fn gateway_key_gets_and_uses_token() {
     shutdown(&mut client).await;
 }
 
+/// A gateway that hands out ECDSA client keys gets an assertion it can actually check: the header says
+/// `ES256`, and the signature is the two scalars at their fixed width rather than OpenSSH's mpints. The fake
+/// verifies it with the `p256` crate, which is what a provider does - ssh-key would have taken either
+/// spelling, so this is the test that proves the conversion went the right way.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_key_es256_gets_token() {
+    let key = ecdsa_keypair();
+    let public: PublicKey = key.public_key().clone();
+    assert!(
+        public.key_data().ecdsa().is_some(),
+        "the fixture is a P-256 key"
+    );
+    let fake = Fake::gateway(public.clone(), 3_600);
+    let addr = serve(
+        api_routes(get(events))
+            .route("/token", post(token))
+            .with_state(Arc::clone(&fake)),
+    )
+    .await;
+
+    let pem = key.to_openssh(LineEnding::LF).expect("the key file");
+    // A scratch directory, as with the Ed25519 key: it is a private key, and a test that fails halfway
+    // through should still take it with it.
+    let dir = ScratchDir::new("gateway_key_es256");
+    let key_file = write_file(dir.path(), "id_ecdsa_p256", pem.as_bytes());
+    let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file.clone()));
+    remote.token_url = Some(format!("http://{addr}/token"));
+    remote.client_id = Some(fake.client_id.clone());
+
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None));
+    wait_for_state(&mut client, true).await;
+
+    // The endpoint checked the signature before it issued anything, so what reached it is worth reading back:
+    // a header naming the wrong algorithm, or an mpint pair where scalars belong, would have been a refusal
+    // and no Connected rather than something this test gets to look at.
+    let assertions = fake.assertions.lock().expect("the test state").clone();
+    let Some(assertion) = assertions.first() else {
+        panic!("the assertion never reached the token endpoint");
+    };
+    let (unsigned, signature) = assertion.rsplit_once('.').expect("a signed JWT");
+    let header = BASE64_URL_SAFE_NO_PAD
+        .decode(unsigned.split_once('.').expect("a header and claims").0)
+        .expect("a base64url header");
+    let header: Value = serde_json::from_slice(&header).expect("the header is JSON");
+    assert_eq!(
+        header.get("alg").and_then(Value::as_str),
+        Some("ES256"),
+        "a P-256 key signs ES256, and the gateway is told so before it checks anything"
+    );
+    let raw = BASE64_URL_SAFE_NO_PAD
+        .decode(signature)
+        .expect("a base64url signature");
+    assert_eq!(raw.len(), 64, "the two scalars travel at their fixed width");
+    // The check the endpoint ran is not a rubber stamp: the same bytes verify against this key, and one bit
+    // changed in `r` does not. Without the first of these two, "no refusal" would only mean the fake said yes
+    // to everything.
+    assert!(
+        verify_es256(&public, unsigned.as_bytes(), &raw),
+        "the assertion verifies against the key it names"
+    );
+    let mut tampered = raw.clone();
+    tampered[16] ^= 0x80;
+    assert!(
+        !verify_es256(&public, unsigned.as_bytes(), &tampered),
+        "a signature is not a claim anybody can edit"
+    );
+
+    // And the token that trade bought is carried on every request afterwards, the event stream included.
+    let seen = fake.seen.lock().expect("the test state").clone();
+    assert!(
+        seen.iter().all(|line| line.starts_with("Bearer token-")),
+        "every API request carried the issued token: {seen:?}"
+    );
+    assert!(seen.len() > 1, "the event stream carried it too: {seen:?}");
+
+    shutdown(&mut client).await;
+}
+
 /// A credential is replaced before it expires rather than after - and not on every call. An eight-second
 /// token renews at four seconds (half its life: see `fbtt_core`'s gateway module), so within seconds a second
 /// token appears, and the first one carries many requests on the way there.
@@ -1533,29 +1625,39 @@ async fn token(State(fake): State<Arc<Fake>>, body: axum::body::Bytes) -> Respon
         return bad("the signature is not base64url");
     };
 
-    // The signature first, because everything else about the assertion is somebody's word until it holds.
+    // The signature first, because everything else about the assertion is somebody's word until it holds -
+    // except the header's `alg`, which is what says how it has to be held.
     let Some(public) = &fake.public_key else {
         return bad("this gateway issues no tokens");
     };
-    let Ok(signature) = Signature::new(Algorithm::Ed25519, signature) else {
-        return bad("the signature is not an Ed25519 one");
-    };
-    // `Verifier` and not `PublicKey::verify`: a JWT carries a bare Ed25519 signature rather than an
-    // `SSHSIG`, and this is the trait ssh-key implements for exactly that shape.
-    if Verifier::verify(public, unsigned.as_bytes(), &signature).is_err() {
-        return bad("the assertion is not signed by the key it names");
-    }
-
     let Ok(header) = serde_json::from_slice::<Value>(&header) else {
         return bad("the header is not JSON");
     };
+    match header.get("alg").and_then(Value::as_str) {
+        // `Verifier` and not `PublicKey::verify`: a JWT carries a bare Ed25519 signature rather than an
+        // `SSHSIG`, and this is the trait ssh-key implements for exactly that shape.
+        Some("EdDSA") => {
+            let Ok(signature) = Signature::new(Algorithm::Ed25519, signature) else {
+                return bad("the signature is not an Ed25519 one");
+            };
+            if Verifier::verify(public, unsigned.as_bytes(), &signature).is_err() {
+                return bad("the assertion is not signed by the key it names");
+            }
+        }
+        Some("ES256") => {
+            if !verify_es256(public, unsigned.as_bytes(), &signature) {
+                return bad("the assertion is not an ES256 signature this key made");
+            }
+        }
+        // `alg: none` is in here too, because a gateway that fell through to "no signature needed" would be
+        // handing out tokens to anybody who could spell a client id.
+        _ => return bad("alg is neither EdDSA nor ES256"),
+    }
+
     let Ok(claims) = serde_json::from_slice::<Value>(&claims) else {
         return bad("the claims are not JSON");
     };
     let claim = |name: &str| claims.get(name).and_then(Value::as_str).unwrap_or_default();
-    if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
-        return bad("alg is not EdDSA");
-    }
     if header
         .get("kid")
         .and_then(Value::as_str)
@@ -1616,6 +1718,26 @@ async fn token(State(fake): State<Arc<Fake>>, body: axum::body::Bytes) -> Respon
         })),
     )
         .into_response()
+}
+
+/// An ES256 assertion checked the way a provider checks one: fixed-width `r || s`, against the curve point.
+///
+/// The check comes from the `p256` crate and not from ssh-key on purpose: ssh-key would have accepted the
+/// mpint spelling of the same signature, so verifying with it would only prove that one library agrees with
+/// itself about how to read its own bytes. What a gateway actually receives is the other spelling, and this
+/// is the only way in this tree to say whether that one arrived.
+fn verify_es256(public: &PublicKey, unsigned: &[u8], signature: &[u8]) -> bool {
+    let Some(ecdsa) = public.key_data().ecdsa() else {
+        return false;
+    };
+    let Ok(key) = p256::ecdsa::VerifyingKey::try_from(ecdsa) else {
+        return false;
+    };
+    // Sixty-four bytes or nothing: `from_slice` is the spelling that says so instead of guessing.
+    let Ok(signature) = p256::ecdsa::Signature::from_slice(signature) else {
+        return false;
+    };
+    key.verify(unsigned, &signature).is_ok()
 }
 
 /// One value out of an `application/x-www-form-urlencoded` body. This fake parses it by hand because axum's

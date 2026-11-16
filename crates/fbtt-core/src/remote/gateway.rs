@@ -66,15 +66,22 @@ impl Gateway {
             &self.secret,
         )
         .await?;
-        let unsigned = assertion(&device, &self.client_id, &self.token_url);
-        let signature = device.sign(unsigned.as_bytes()).await?;
-        let encoded = BASE64_URL_SAFE_NO_PAD.encode(signature);
+        // Which algorithm the header names follows which key was loaded: Ed25519 signs `EdDSA`, P-256 signs
+        // `ES256`. The gateway is told before it checks anything, because a provider that only takes ECDSA
+        // client keys has to be able to see that this one sent something it can check.
+        let Some(alg) = device.jws_alg() else {
+            return Err(
+                "the device key is not one this client signs a gateway assertion with".to_string(),
+            );
+        };
+        let unsigned = assertion(&device, alg, &self.client_id, &self.token_url);
+        let signature = BASE64_URL_SAFE_NO_PAD.encode(device.sign_jws(unsigned.as_bytes()).await?);
         let response = client
             .post(&self.token_url)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_assertion_type", JWT_BEARER),
-                ("client_assertion", &format!("{unsigned}.{encoded}")),
+                ("client_assertion", &format!("{unsigned}.{signature}")),
             ])
             .send()
             .await
@@ -99,8 +106,9 @@ impl Gateway {
 
 /// The JWT assertion a `private_key_jwt` grant is built from: the two base64url parts, unsigned. What
 /// gets signed is exactly these bytes, which is what makes the signature checkable by a gateway that has
-/// only this client's public key and no shared secret.
-fn assertion(device: &Device, client_id: &str, token_url: &str) -> String {
+/// only this client's public key and no shared secret. `alg` is the header's promise about the signature
+/// that will follow it ([`Device::jws_alg`] answers that for whichever key was loaded).
+fn assertion(device: &Device, alg: &str, client_id: &str, token_url: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -116,7 +124,7 @@ fn assertion(device: &Device, client_id: &str, token_url: &str) -> String {
         let _ = std::fmt::Write::write_fmt(&mut jti, format_args!("{byte:02x}"));
     }
     let header = serde_json::json!({
-        "alg": "EdDSA",
+        "alg": alg,
         "typ": "JWT",
         // The key a gateway should check the signature against, spelled the way it saw it on the list.
         "kid": device.public.fingerprint(HashAlg::Sha256).to_string(),

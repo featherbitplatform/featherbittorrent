@@ -68,10 +68,12 @@ argon2 = "0.6"
 base64 = "0.23"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 sha2 = "0.11"
-# Device keys: the OpenSSH public key line and `sshsig`. No default features - ecdsa would drag in
-# `sec1` for a key type nobody can log in with, and ed25519 is the only one this milestone accepts
-# (RSA pulls the `rsa` crate, which carries an open advisory). `encryption` is what reads a
-# passphrase-protected key file, `rand_core` is what makes `PrivateKey::random` available to tests.
+# Device keys: the OpenSSH public key line and `sshsig`. No default features: ed25519 is what a
+# featherbittorrent server takes for a device login, and `ecdsa` (which pulls `sec1`) is turned on only by
+# `fbtt-core`, for the P-256 keys a gateway's `private_key_jwt` assertion is signed with - see that crate's
+# manifest. RSA stays off everywhere: it pulls the `rsa` crate, which carries an open advisory.
+# `encryption` is what reads a passphrase-protected key file, `rand_core` is what makes
+# `PrivateKey::random` available to tests.
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = [
     "ed25519",
     "encryption",
@@ -83,6 +85,12 @@ ssh-key = { version = "0.7.0-rc.11", default-features = false, features = [
 # not in scope just because the trait that names them is - so the trait is depended on directly, at the
 # version ssh-key 0.7 uses, which is what makes it the same trait the impl is written for.
 signature = { version = "3", default-features = false }
+# A dev-dependency only, and only to check one thing: an ES256 assertion the way a gateway checks it, as
+# fixed-width `r || s` against a P-256 key. ssh-key cannot be the check for that because it spells the same
+# signature as two SSH mpints - which is what this client sends, so a test needs the other spelling to prove
+# the conversion. The version is the one ssh-key's `p256` feature asks for, so the two are one crate in the
+# tree; `ecdsa` is the feature that names `Signature` and `VerifyingKey`, and nothing else is needed.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 # Only for the `http` types an `AuthRequest` carries (the method and the headers), which fbt-api
 # does not re-export. Depending on axum itself - not on `http` - is what keeps ours one crate with
 # the `HeaderMap` fbt-api hands us. fbt-api turns the serving features on for the tree.

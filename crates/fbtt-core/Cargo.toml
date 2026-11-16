@@ -40,8 +40,11 @@ signature.workspace = true
 # ...or held by ssh-agent, in which case its bytes are never read. `agent` is the tokio client: the
 # blocking one would stop the backend's task.
 ssh-agent-lib = { workspace = true, features = ["agent"] }
-# The device key a login or a gateway assertion is signed with, from its file.
-ssh-key.workspace = true
+# The device key a login or a gateway assertion is signed with, from its file. `p256` is for the gateway
+# login only: providers that document a `private_key_jwt` grant hand out RSA or ECDSA client keys and often
+# take no Ed25519 at all, so an ES256 key has to be readable, signable and recognisable here. A
+# featherbittorrent device login stays Ed25519-only (see `remote::device`).
+ssh-key = { workspace = true, features = ["p256"] }
 thiserror.workspace = true
 # The password and key passphrase, overwritten when they are dropped.
 zeroize.workspace = true

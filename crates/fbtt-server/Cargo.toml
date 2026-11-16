@@ -61,6 +61,10 @@ reqwest = { workspace = true, default-features = false, features = ["json"] }
 # public key. ssh-key implements `signature::Verifier` for its keys but does not re-export the trait, so
 # the test names it here to call that one method.
 signature.workspace = true
+# ...and an ES256 assertion the way a provider does: as fixed-width `r || s`, which is what the client sent
+# after converting OpenSSH's mpint spelling. Verification has to come from outside ssh-key or the test would
+# only prove that ssh-key agrees with itself about its own encoding.
+p256.workspace = true
 # `#[tokio::test]`, and a runtime with worker threads: each test runs a server, an engine and a
 # blocking-pool Argon2 verify at once. `net` is for the two servers `tests/remote.rs` puts up of its own -
 # a hostile one and a gateway one - beside the real one.
