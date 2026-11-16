@@ -79,7 +79,7 @@ impl Backend {
                 };
                 self.notify(Notice::Info(format!("Added {shown}")));
             }
-            Err(problem) => self.notify(Notice::Error(clean(&problem.notice()))),
+            Err(problem) => self.notify(problem.notice()),
         }
     }
 
@@ -188,7 +188,7 @@ impl Backend {
                 path: Some(path),
                 roots,
                 dirs: Vec::new(),
-                error: Some(clean(&problem.notice())),
+                error: Some(clean(&problem.line())),
             },
         }
     }
@@ -210,14 +210,14 @@ impl Backend {
                     .await
                 {
                     Ok(()) => self.refresh_devices().await,
-                    Err(problem) => self.notify(Notice::Error(clean(&problem.notice()))),
+                    Err(problem) => self.notify(problem.notice()),
                 }
             }
             DeviceCommand::Remove(name) => {
                 let path = format!("/api/v1/auth/devices/{}", encode(&name));
                 match self.api.empty(self.api.delete(&path)).await {
                     Ok(()) => self.refresh_devices().await,
-                    Err(problem) => self.notify(Notice::Error(clean(&problem.notice()))),
+                    Err(problem) => self.notify(problem.notice()),
                 }
             }
         }
@@ -234,7 +234,7 @@ impl Backend {
             Err(problem) => {
                 // A server with authentication off has no device list to give at all, which is worth
                 // saying; a server that is down is already being reported by the refresh loop.
-                self.notify(Notice::Error(clean(&problem.notice())));
+                self.notify(problem.notice());
             }
         }
     }

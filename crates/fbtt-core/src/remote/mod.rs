@@ -73,14 +73,13 @@ const BACKOFF: [Duration; 6] = [
     Duration::from_secs(30),
 ];
 
-/// The words every sign-in refusal this client puts on a screen start with.
+/// The words every sign-in refusal this client puts on a screen starts with.
 ///
-/// Public because the binary reads it back out of a notice: a run that started with a password it read out
-/// of the system keychain needs to know when a server said no to *that* password, so it can take the entry
-/// out and ask the person again - which is a different answer from "this server could not be reached", and
-/// cannot be told apart from one by anything else in the two things a screen gets. The notice itself is made
-/// in `bodies`, above, and only cleaned for drawing, so this prefix survives it.
-pub const SIGN_IN_REFUSED: &str = "sign-in was refused";
+/// Not the seam a screen's owner acts on any more - `Notice::SignInRefused` is that - but still the wording
+/// every refusal shares, whether it arrives as that variant or folded into somebody else's sentence: the line
+/// inside a folder listing that failed for this reason, the reason in a sentence about the event stream. Kept
+/// here so no call site invents its own way of saying bad news about a credential.
+pub(crate) const SIGN_IN_REFUSED: &str = "sign-in was refused";
 
 /// What a connection uses to prove who is asking.
 ///

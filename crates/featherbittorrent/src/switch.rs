@@ -8,14 +8,22 @@
 //!   engine can, and an engine that will not start must not cost anybody the connection they already have.
 //! - Nothing is written down about a server until its own snapshot says the sign-in worked. `ui.yaml` and the
 //!   keychain both wait for that answer, which is what [`Login`] and [`settle`] are for: a password the server
-//!   refused is not worth keeping, and an address nobody reached is not worth pointing the next run at.
+//!   refused is not worth keeping, and an address nobody reached is not worth pointing the next run at. A
+//!   server this run only borrowed - the hand-off to one running on this library - is never written down at
+//!   all (see [`Remembered`]).
+//! - Nothing on the screen thread waits for anything outside it. A keychain call and a file write go to
+//!   blocking threads whose lines come back on [`Work`]'s queue, which the loop reads whenever they arrive: a
+//!   machine whose keychain is asleep costs a late line, never a screen that stopped drawing. The switch does
+//!   wait - starting and stopping a backend is one step after another - but it happens between two turns of
+//!   the loop, while the person is looking at the `Saving...` pane or at the frame before it, so nothing is
+//!   caught halfway through an animation.
 //! - The lock this library's engine needs is asked for before anything else is touched, so a switch that was
 //!   never going to happen stops nothing (`plan_switch` carries that rule).
 //!
-//! The two decisions that need no terminal and no file system are pure (`plan_switch` and
-//! `initial_target` live in `backend.rs`); what has effects - starting, stopping, saving, the keychain - is
-//! small, ordered, and takes its seams as arguments (`show`, `start_engine`) so the parts worth testing can
-//! be tested without any of it.
+//! The decisions that need no terminal, no keychain and no file system are pure: `plan_switch` and
+//! `initial_target` in `backend.rs`, [`remembered_ui`] here. What has effects - starting, stopping, saving,
+//! the keychain - is small, ordered, and takes its seams as arguments (`show`, `start_engine`) so the parts
+//! worth testing can be tested without any of it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,9 +39,9 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::{Fill, Paragraph};
+use tokio::sync::mpsc;
 
 use fbtt_core::client::ClientParts;
-use fbtt_core::remote::SIGN_IN_REFUSED;
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
 use fbtt_core::{
     Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, Secret,
@@ -44,8 +52,7 @@ use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, them
 use crate::backend::{Backend, BackendKind, LockOutcome, SwitchPlan, plan_switch};
 use crate::run::{cannot_lock, library_in_use};
 use crate::secrets::{
-    KEYCHAIN_UNAVAILABLE, KeepPlan, SecretStore, apply_keep, forget_password, keep_plan,
-    remote_secret,
+    KeepPlan, SecretStore, apply_keep, forget_password, keep_plan, remote_secret,
 };
 
 /// The frame clock: redraws land at most this far apart, and only over a `dirty` flag.
@@ -64,6 +71,19 @@ const ALREADY_ON_THIS_LIBRARY: &str = "This library is already running its own e
 /// and knowing why keeps them from typing the same wrong thing a third time.
 const SAVED_PASSWORD_REFUSED: &str = "The saved password was refused; enter it again.";
 
+/// Whether a connection is worth writing into `ui.yaml` once it signs in.
+#[derive(Debug)]
+enum Remembered {
+    /// Somebody chose this server: a previous run wrote it into `ui.yaml`, or a person typed the address into
+    /// the connect screen. The next run starts here too, so settling writes it down.
+    Chosen,
+    /// This run borrowed the server rather than chose it: the hand-off to the featherbittorrent running on
+    /// this library. Not written down, because that server exists only while the other run is up. Pointing the
+    /// next run at it would have it dial an address nobody answers while its own engine sat unused, and the
+    /// offer about that server is something only a start on this library makes.
+    Borrowed,
+}
+
 /// What a connection was signed in as, and what this run still owes it.
 ///
 /// A server is not remembered, and its password is not kept, the moment a connection is made: until that
@@ -81,6 +101,9 @@ pub struct Login {
     target: RemoteTarget,
     /// What the keychain should hold once this connection has signed in - see [`crate::secrets::keep_plan`].
     keep: KeepPlan,
+    /// Whether this address belongs in `ui.yaml` once the sign-in answers - see [`Remembered`] and
+    /// [`remembered_ui`].
+    remembers: Remembered,
     /// Whether the credential it signs with came out of the keychain.
     from_keychain: bool,
     /// Whether the first sign-in has been paid for. Once it has, nothing here is owed again, so a snapshot
@@ -92,11 +115,13 @@ impl Login {
     /// A connection this run started from what it remembered: what `ui.yaml` named, signed with whatever the
     /// keychain held for it - or with nothing yet, when what is missing is about to be asked for on the
     /// connect screen. Nothing was collected from anybody, so there is nothing new to keep; `from_keychain`
-    /// says whether the credential it does sign with came out of there.
+    /// says whether the credential it does sign with came out of there. A previous run already chose this
+    /// address, so settling has nothing new to write about it.
     pub fn remembered(target: RemoteTarget, from_keychain: bool) -> Login {
         Login {
             target,
             keep: KeepPlan::Nothing,
+            remembers: Remembered::Chosen,
             from_keychain,
             settled: false,
         }
@@ -104,23 +129,104 @@ impl Login {
 
     /// A connection that came out of the connect screen. What the keychain should hold is what the person
     /// asked for - see [`keep_plan`] - and a password they just typed is not one the keychain can be wrong
-    /// about, so a refusal of it needs no repair.
+    /// about, so a refusal of it needs no repair. They chose this address, so it is what the next run starts
+    /// on too.
     pub fn answered(target: RemoteTarget, keep: KeepPlan) -> Login {
         Login {
             target,
             keep,
+            remembers: Remembered::Chosen,
+            from_keychain: false,
+            settled: false,
+        }
+    }
+
+    /// The hand-off: this run connected to a server that another featherbittorrent is running on *this*
+    /// library, because that other run offered it. The address was taken, not chosen, and it stops being real
+    /// the moment that other run closes, so nothing about it is written down (see [`Remembered`]). It signs
+    /// with what this run already holds: nobody was asked for a credential, so there is nothing new to keep
+    /// and nothing the keychain could be wrong about.
+    pub fn borrowed(target: RemoteTarget) -> Login {
+        Login {
+            target,
+            keep: KeepPlan::Nothing,
+            remembers: Remembered::Borrowed,
             from_keychain: false,
             settled: false,
         }
     }
 }
 
-/// What switching a screen from one backend to another may need from the run itself: where this library's
-/// files are, and where a connect password lives. The config is not here because a switch does not reuse
-/// startup's: it reads `config.yaml` again (see [`local_config`]).
-pub struct Library<'a> {
+/// What `ui.yaml` says once this connection has signed in, or `None` to leave the file exactly as it found
+/// it. Pure because which address the next run should start on is a decision rather than an effect, and the
+/// hand-off rule is the part of that decision worth testing without a file system to test against.
+fn remembered_ui(login: &Login) -> Option<LastUsed> {
+    match login.remembers {
+        Remembered::Chosen => Some(LastUsed::Remote(login.target.clone())),
+        Remembered::Borrowed => None,
+    }
+}
+
+/// The work this run does away from the screen, and where its lines come back.
+///
+/// A keychain call and a file write are conversations with something that may take a while to answer - on
+/// macOS a keychain can be waiting for somebody to unlock it - so neither happens on the thread that draws
+/// the screen: each goes to a blocking thread (see [`send_work`]) and whatever it says arrives on this queue,
+/// which the loop reads whenever it turns up (see [`run_loop`]). What a job needs - this library's files, and
+/// where its connect passwords live - travels here because that is all this run ever sends away for. The
+/// config does not: a switch reads `config.yaml` again (see [`local_config`]) because it needs the answer in
+/// hand before it can start an engine on it, and that read happens between two turns of the loop, where
+/// nothing is drawing.
+///
+/// One sender stays in this struct between jobs, which is what keeps the queue open: a queue with no senders
+/// left reads as a closed one, and the loop would be told there is nothing to read on every single turn.
+pub struct Work<'a> {
+    /// Where this library's files are: `config.yaml`, `ui.yaml`, the lock.
     pub paths: &'a Paths,
+    /// Where a connect password lives between runs.
     pub store: &'a Arc<dyn SecretStore + Send + Sync>,
+    tx: mpsc::Sender<Notice>,
+    rx: mpsc::Receiver<Notice>,
+}
+
+impl<'a> Work<'a> {
+    /// The queue for one run's off-screen work, with its two ends already wired together.
+    pub fn new(paths: &'a Paths, store: &'a Arc<dyn SecretStore + Send + Sync>) -> Work<'a> {
+        // Eight lines is more than this run can have in flight at once - a sign-in's two writes and the
+        // delete that follows a refusal. A queue that did fill up would block the thread it was sent to, which
+        // is allowed to block, rather than the screen, which is not.
+        let (tx, rx) = mpsc::channel(8);
+        Work {
+            paths,
+            store,
+            tx,
+            rx,
+        }
+    }
+
+    /// Gives up this side of the queue and hands back the reading end: what has already been sent still
+    /// arrives, and the reader sees the queue close when the last job in flight has answered. Only a test does
+    /// this, to know that a save it asked for has finished; a run keeps its queue as long as its screen.
+    #[cfg(test)]
+    fn into_reader(self) -> mpsc::Receiver<Notice> {
+        let Work { tx, rx, .. } = self;
+        drop(tx);
+        rx
+    }
+}
+
+/// Runs one job on a thread that may have to wait for something outside this process - a keychain, a disk -
+/// and puts whatever it has to say to the person on the queue the screen reads. Nothing waits for the job: a
+/// conversation that never answers costs this run one line of news, not its next frame. Sending from that
+/// thread is `blocking_send`, which may wait for room in the queue because that thread is allowed to wait,
+/// and drops the line when the screen has gone and nobody is reading any more.
+fn send_work(tx: &mpsc::Sender<Notice>, job: impl FnOnce() -> Vec<Notice> + Send + 'static) {
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        for notice in job() {
+            let _ = tx.blocking_send(notice);
+        }
+    });
 }
 
 /// Why the loop ended. `Failed` is a failure of this process - its line travels with it,
@@ -190,7 +296,7 @@ pub async fn run_session(
     mut screen: Screen<'_>,
     mut backend: Backend,
     mut login: Option<Login>,
-    library: &Library<'_>,
+    work: &mut Work<'_>,
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
 ) -> (Quit, Backend) {
@@ -201,7 +307,7 @@ pub async fn run_session(
             &mut screen,
             &mut parts,
             login.as_mut(),
-            library,
+            work,
             stream,
             signal,
         )
@@ -212,7 +318,7 @@ pub async fn run_session(
         match outcome {
             Outcome::Quit(quit) => return (quit, backend),
             Outcome::Connect(request) => {
-                match switch(library, backend, request, &mut screen, &mut |model| {
+                match switch(work, backend, request, &mut screen, &mut |model| {
                     draw_saving(terminal, model)
                 })
                 .await
@@ -238,20 +344,22 @@ pub async fn run_session(
     }
 }
 
-/// Keys, snapshots, notices and the frame clock, waited on all at once. Nothing here awaits a backend
-/// reply: each branch takes what has arrived and returns. The channels arrive as separate parts so that no
-/// borrow of one can fight a use of another in the same `select!`.
+/// Keys, snapshots, notices and the frame clock, waited on all at once. Nothing here awaits: every branch
+/// takes what has arrived and returns, and the only work that talks to another process or a disk is sent away
+/// (see [`Work`]), so a keychain that is asleep cannot hold this screen still. The channels arrive as separate
+/// parts so that no borrow of one can fight a use of another in the same `select!`.
 ///
-/// Two things read what arrives rather than only drawing it: the first snapshot that says this connection
-/// signed in pays for it (see [`settle`]), and a line saying the kept password was refused takes that entry
-/// out and asks again (see [`stored_password_refused`]). Both are once-per-connection, and both leave the
-/// backend's channels alone.
+/// Three things read what arrives rather than only drawing it: the first snapshot that says this connection
+/// signed in sends off what that sign-in owes (see [`settle`]), a line saying the kept password was refused
+/// takes that entry out and asks again (see [`stored_password_refused`]), and the lines those jobs answer with
+/// go on the footer like any other news. The first two are once per connection, and neither touches the
+/// backend's channels.
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     screen: &mut Screen<'_>,
     parts: &mut ClientParts,
     mut login: Option<&mut Login>,
-    library: &Library<'_>,
+    work: &mut Work<'_>,
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
 ) -> Outcome {
@@ -259,6 +367,13 @@ async fn run_loop(
     // other - so they are taken out here, once, rather than reached through `screen` in every branch.
     let model = &mut *screen.model;
     let snap = &mut *screen.snap;
+    // The same for the queue's two ends: this loop reads one while every job it sends writes the other, and a
+    // branch cannot hold the reading end open if an arm body is reaching through `work` at the same time. What
+    // a job needs travels as its own handle for the same reason.
+    let tx = work.tx.clone();
+    let rx = &mut work.rx;
+    let paths = work.paths;
+    let store = Arc::clone(work.store);
     // Nothing has been drawn yet, so the first tick draws.
     let mut dirty = true;
     let mut last_watch = model.watch();
@@ -312,17 +427,13 @@ async fn run_loop(
                     *snap = parts.snapshots.borrow_and_update().clone();
                     model.sync_selection(snap);
                     dirty = true;
-                    // The first snapshot that says this connection is in is what its password and its
-                    // place in `ui.yaml` were waited for. Nobody else can answer that question: this run
-                    // did not dial the server, this backend did.
-                    let owed = match login.as_deref_mut() {
-                        Some(login) if signed_in(snap) => {
-                            settle(login, Arc::clone(library.store), library.paths).await
-                        }
-                        _ => Vec::new(),
-                    };
-                    for notice in owed {
-                        model.push_notice(notice, Instant::now());
+                    match login.as_deref_mut() {
+                        // The first snapshot that says this connection is in is what its password and its
+                        // place in `ui.yaml` were waited for. Nobody else can answer that question: this run
+                        // did not dial the server, this backend did. What it owes goes off to a thread that may
+                        // wait for a keychain; whatever it answers with arrives on the queue below.
+                        Some(login) if signed_in(snap) => settle(login, &store, paths, &tx),
+                        _ => {}
                     }
                 }
                 // The backend is gone; nothing more will change on this screen.
@@ -360,13 +471,24 @@ async fn run_loop(
                         if model.modal.is_none() {
                             model.modal = Some(Modal::connect(Some(&target)));
                         }
-                        // A keychain that will not answer has nothing we can take out of it, and the line
-                        // above already says what happens next: this failure needs no second notice.
-                        let _ = forget_password(Arc::clone(library.store), target).await;
+                        // The entry goes, on a thread that may have to wait for the keychain to answer. This
+                        // screen has already said what happens next, so it does not also wait for the delete:
+                        // whether the old entry came out is not something the person can act on any differently
+                        // right now, and a keychain that will not delete anything says so on the queue below.
+                        forget(target, &store, &tx);
                     }
                 }
                 // The backend stopped and the queue is read out: the screen has all it gets.
                 None => return Outcome::Quit(Quit::Ok),
+            },
+            // Whatever was sent off the screen answers here, whenever its thread gets an answer: a `ui.yaml`
+            // that would not write, or a keychain that would not. Nothing waits for any of it - a run that ends
+            // first loses a line about work it is no longer doing, which is the deal this queue makes. A closed
+            // queue cannot happen while this loop runs: `work` keeps a sender of its own open between jobs, and
+            // a queue with a live sender is never closed - so there is nothing to report when nothing arrives.
+            done = once(rx.recv()) => if let Some(notice) = done {
+                model.push_notice(notice, Instant::now());
+                dirty = true;
             },
             _ = frame.tick() => {
                 // Notices expire on the clock rather than on a key press. `tick` reports
@@ -397,14 +519,16 @@ async fn run_loop(
     }
 }
 
-/// Acts on the connect screen's answer: start what was named, then stop what was running, then remember it.
+/// Acts on the connect screen's answer: start what was named, then stop what was running. What the answer is
+/// worth writing down comes along with it - `ui.yaml` for this library's own engine, and what a server
+/// connection still owes in [`Login`] - because nothing about a server is remembered before its sign-in answers.
 ///
 /// The lock is asked about before anything else (see [`plan_switch`]), because a person who cannot have this
 /// library should not lose the connection they already have for a switch that could not happen; and the new
 /// backend starts before the old one is stopped, because an engine's start is the one thing here that can
 /// fail. A `Kept` therefore means nothing was stopped at all.
 async fn switch(
-    library: &Library<'_>,
+    work: &Work<'_>,
     backend: Backend,
     request: ConnectRequest,
     screen: &mut Screen<'_>,
@@ -415,7 +539,7 @@ async fn switch(
     // holder that is itself).
     let (new_lock, outcome) = match (&request.target, backend.kind()) {
         (ConnectTarget::Local, BackendKind::Remote) => {
-            let acquired = LibraryLock::acquire(&library.paths.lock_file());
+            let acquired = LibraryLock::acquire(&work.paths.lock_file());
             let outcome = LockOutcome::of(&acquired);
             (acquired.ok(), outcome)
         }
@@ -426,22 +550,13 @@ async fn switch(
             Switched::Kept(backend, Notice::Info(ALREADY_ON_THIS_LIBRARY.to_string()))
         }
         SwitchPlan::LibraryInUse => {
-            Switched::Kept(backend, Notice::Error(library_in_use(library.paths)))
+            Switched::Kept(backend, Notice::Error(library_in_use(work.paths)))
         }
         SwitchPlan::LockFailed(problem) => {
-            Switched::Kept(backend, Notice::Error(cannot_lock(library.paths, &problem)))
+            Switched::Kept(backend, Notice::Error(cannot_lock(work.paths, &problem)))
         }
         SwitchPlan::Go => {
-            switch_onward(
-                library,
-                backend,
-                request,
-                new_lock,
-                screen,
-                show,
-                start_engine,
-            )
-            .await
+            switch_onward(work, backend, request, new_lock, screen, show, start_engine).await
         }
     }
 }
@@ -453,7 +568,7 @@ async fn switch(
 /// nothing at all in a test - and `start_engine` is the engine start itself, handed in so that the case this
 /// function exists to get right (an engine that will not start) can be tested without an engine.
 async fn switch_onward<F>(
-    library: &Library<'_>,
+    work: &Work<'_>,
     backend: Backend,
     request: ConnectRequest,
     new_lock: Option<LibraryLock>,
@@ -497,37 +612,42 @@ where
             let Some(lock) = new_lock else {
                 return Switched::Kept(
                     backend,
-                    Notice::Error(cannot_lock(library.paths, "the lock went missing")),
+                    Notice::Error(cannot_lock(work.paths, "the lock went missing")),
                 );
             };
             // The config is read again now rather than reused from startup: limits changed during this run
             // are in that file and nowhere else (the engine writes them there), and an engine started on
             // what was in memory would quietly put them back.
             let mut lines = Vec::new();
-            let (config, problem) = match local_config(library.paths) {
+            let (config, problem) = match local_config(work.paths) {
                 Ok(both) => both,
                 Err(problem) => return Switched::Kept(backend, Notice::Error(problem)),
             };
             if let Some(problem) = problem {
                 lines.push(Notice::Error(problem));
             }
-            let next = match start_engine(config, library.paths.clone(), lock).await {
+            let next = match start_engine(config, work.paths.clone(), lock).await {
                 Ok(next) => next,
                 // Nothing was stopped to get here, so nothing has to be put back: this run keeps the
                 // connection it had and reads the engine's own reason for refusing on the footer.
                 Err(problem) => return Switched::Kept(backend, Notice::Error(problem)),
             };
-            // This library's own engine needs nothing proved about it - it is running here, on this
-            // library - so `ui.yaml` can say so now. A connection waits for its first sign-in.
-            let remembered = UiState {
+            // This library's own engine needs nothing proved about it - it is running here, on this library -
+            // so `ui.yaml` can say so now, where a connection waits for its first sign-in. The write goes off
+            // the screen as every file write in this run does; if the file would not take it, the line saying
+            // so arrives on the queue beside the rest of this switch's news.
+            let ui = UiState {
                 last_used: LastUsed::Local,
             };
-            if let Err(problem) = remembered.save(library.paths) {
-                lines.push(Notice::Error(could_not_save(
-                    library.paths,
-                    &problem.to_string(),
-                )));
-            }
+            let paths = work.paths.clone();
+            send_work(&work.tx, move || {
+                ui.save(&paths)
+                    .err()
+                    .map(|problem| {
+                        vec![Notice::Error(could_not_save(&paths, &problem.to_string()))]
+                    })
+                    .unwrap_or_default()
+            });
             (next, None, lines)
         }
     };
@@ -638,54 +758,75 @@ fn signed_in(snap: &Snapshot) -> bool {
     )
 }
 
-/// The first snapshot that says a connection signed in pays what starting it borrowed: `ui.yaml` pointed at
-/// this server, and the password the person said to keep.
+/// What the first snapshot that says a connection signed in owes, sent away from the screen rather than
+/// waited on: `ui.yaml` pointed at this server - unless this run only borrowed it, which is what
+/// [`remembered_ui`] decides - and the password the person said to keep.
 ///
 /// Both wait for the backend's own answer because until then nobody knows whether this address and this
-/// credential are worth remembering - a run that reached nothing should not leave its next run pointed at
+/// credential are worth remembering: a run that reached nothing should not leave its next run pointed at
 /// nothing, and a password a server refused is not a password to keep. A keychain that will not write and a
-/// file that will not save come back as lines for the footer; the connection stands either way. Once it has
-/// been paid for it is never owed again, so the snapshot that arrives every second costs nothing.
-async fn settle(
+/// file that will not save come back as lines on the screen's queue; the connection stands either way. Once a
+/// connection has been paid for it is never owed again, so the snapshot that arrives every second after it
+/// costs nothing.
+fn settle(
     login: &mut Login,
-    store: Arc<dyn SecretStore + Send + Sync>,
+    store: &Arc<dyn SecretStore + Send + Sync>,
     paths: &Paths,
-) -> Vec<Notice> {
+    tx: &mpsc::Sender<Notice>,
+) {
     if login.settled {
-        return Vec::new();
+        return;
     }
     login.settled = true;
     let keep = std::mem::replace(&mut login.keep, KeepPlan::Nothing);
-    let ui = UiState {
-        last_used: LastUsed::Remote(login.target.clone()),
-    };
+    // Decided here, on the screen's thread, because it is a decision and not an effect: which address the next
+    // run should start on. What follows is only the writing of it.
+    let ui = remembered_ui(login).map(|last_used| UiState { last_used });
     let paths = paths.clone();
-    // A file write and a call to another process, neither of which belongs on the thread that draws the
-    // screen. Whichever of them answers badly is said in the words the person can act on; a blocking task
-    // that was dropped mid-flight gets the same line as one that refused, because to the person they are
-    // the same answer.
-    let lines = tokio::task::spawn_blocking(move || {
+    let store = Arc::clone(store);
+    send_work(tx, move || {
         let mut lines = Vec::new();
-        if let Err(problem) = ui.save(&paths) {
-            lines.push(could_not_save(&paths, &problem.to_string()));
+        if let Some(ui) = ui
+            && let Err(problem) = ui.save(&paths)
+        {
+            lines.push(Notice::Error(could_not_save(&paths, &problem.to_string())));
         }
         if let Err(problem) = apply_keep(&*store, &keep) {
-            lines.push(problem);
+            lines.push(Notice::Error(problem));
         }
         lines
-    })
-    .await
-    .unwrap_or_else(|_| vec![KEYCHAIN_UNAVAILABLE.to_string()]);
-    lines.into_iter().map(Notice::Error).collect()
+    });
+}
+
+/// Takes this server's stored password out of the keychain, on a thread that may have to wait for it.
+///
+/// The line telling the person what to do about the refusal is already on the footer by the time this is sent,
+/// so nothing here waits for the answer. The one thing worth saying back is that the keychain would not delete,
+/// which arrives on the queue like any other news: an entry left behind is not fatal, because the next run
+/// reads it, is refused the same way, and asks the person again.
+fn forget(
+    target: RemoteTarget,
+    store: &Arc<dyn SecretStore + Send + Sync>,
+    tx: &mpsc::Sender<Notice>,
+) {
+    let store = Arc::clone(store);
+    send_work(tx, move || {
+        forget_password(&*store, &target)
+            .err()
+            .map(|problem| vec![Notice::Error(problem)])
+            .unwrap_or_default()
+    });
 }
 
 /// Whether one line from a connection says the password this run read out of the keychain was refused.
 ///
-/// The two things a backend gives a screen - a snapshot and a line - cannot say "refused" except in words,
-/// so this is where `fbtt_core::remote::SIGN_IN_REFUSED` is read back out of one. That coupling is why only
-/// a password that came out of the keychain is acted on: what somebody just typed needs no repair (they are
-/// looking at the screen they typed it into), and once this connection has signed in, a later refusal is
-/// about something else entirely - a token that expired, a server that changed its users.
+/// The variant is the whole test: the remote backend puts `Notice::SignInRefused` on the queue when it is the
+/// credential that the server said no to (see `fbtt_core::remote`), so nothing here has to pick a refusal out
+/// of words another failure might use too. What this run still has to decide for itself is which refusals are
+/// its business: only a password that came out of the keychain means "what we kept was wrong", which is a thing
+/// to take out and to ask again about, while what somebody just typed needs no repair (they are looking at the
+/// screen they typed it into), and once this connection has signed in a later refusal is about something else
+/// entirely - a token that expired, a server that changed its users.
 ///
 /// Fires once: `from_keychain` goes with the answer, so a server that keeps refusing does not reopen the
 /// question every backoff pause.
@@ -693,7 +834,7 @@ fn stored_password_refused(login: &mut Login, notice: &Notice) -> bool {
     if !login.from_keychain || login.settled {
         return false;
     }
-    let refused = matches!(notice, Notice::Error(text) if text.starts_with(SIGN_IN_REFUSED));
+    let refused = matches!(notice, Notice::SignInRefused(_));
     if refused {
         login.from_keychain = false;
     }
@@ -714,8 +855,12 @@ pub fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
             return;
         }
         frame.render_widget(Fill::new(" ").bg(theme::INK_950), area);
+        // A refused sign-in is bad news about the connection like any other error: the same colour and the
+        // same words, so a run that was told its password was wrong does not read as one that is quietly saving.
         let line = match model.notice() {
-            Some(Notice::Error(text)) => format::safe(text).fg(theme::RED_500),
+            Some(Notice::Error(text)) | Some(Notice::SignInRefused(text)) => {
+                format::safe(text).fg(theme::RED_500)
+            }
             Some(Notice::Info(text)) => format::safe(text).fg(theme::INK_300),
             None => SAVING.fg(theme::INK_300),
         };
@@ -772,7 +917,7 @@ impl<S: Stream> Future for OnceStream<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Library, Login, Screen, Switched, could_not_save, local_config, settle,
+        Login, Screen, Switched, Work, could_not_save, local_config, remembered_ui, settle,
         stored_password_refused, switch_onward,
     };
     use crate::backend::{Backend, BackendKind};
@@ -786,6 +931,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
     use zeroize::Zeroizing;
 
     /// The two directories of one scratch library, made real. The `ScratchDir` is what cleans them up, so a
@@ -830,6 +976,18 @@ mod tests {
         move |_config, _paths, _lock| Box::pin(async move { Err(problem.clone()) })
     }
 
+    /// Gives up the sending end of a work queue (which is what closes it: nothing else holds a sender) and reads
+    /// everything the jobs in flight answer before it closes. On a run where nothing went wrong, that is nothing
+    /// at all - which is also the point: a test cannot assert about a `ui.yaml` or a keychain until the job that
+    /// writes them has finished, and this is what finishing means.
+    async fn answered(mut reader: mpsc::Receiver<Notice>) -> Vec<Notice> {
+        let mut lines = Vec::new();
+        while let Some(notice) = reader.recv().await {
+            lines.push(notice);
+        }
+        lines
+    }
+
     /// A switch back to the local engine starts it on what `config.yaml` says *now*, not on what startup read
     /// at the beginning of the run: limits changed during a run live in that file and nowhere else.
     #[tokio::test]
@@ -844,10 +1002,7 @@ mod tests {
         // engine on. It is not passed to `switch_onward` at all - the file is what it reads.
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let library = Library {
-            paths: &paths,
-            store: &store,
-        };
+        let work = Work::new(&paths, &store);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
@@ -871,7 +1026,7 @@ mod tests {
             snap: &mut snap,
         };
         let switched = switch_onward(
-            &library,
+            &work,
             running,
             ConnectRequest {
                 target: ConnectTarget::Local,
@@ -906,7 +1061,13 @@ mod tests {
         );
         assert!(login.is_none(), "this library's engine signs in to nothing");
         assert!(notices.is_empty(), "nothing went wrong: {notices:?}");
-        // An engine on this library needs nothing proved about it, so `ui.yaml` says so right away.
+        // An engine on this library needs nothing proved about it, so `ui.yaml` says so - sent off the screen,
+        // so the queue is closed and read before anything is asserted about the file. A save that went in says
+        // nothing at all.
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "a save that went in had nothing to report"
+        );
         assert_eq!(UiState::load(&paths).last_used, LastUsed::Local);
     }
 
@@ -930,10 +1091,7 @@ mod tests {
 
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let library = Library {
-            paths: &paths,
-            store: &store,
-        };
+        let work = Work::new(&paths, &store);
 
         let running = Backend::start_remote(before.clone(), Secret::None);
         let mut snap = running.initial_snapshot();
@@ -943,7 +1101,7 @@ mod tests {
             snap: &mut snap,
         };
         let switched = switch_onward(
-            &library,
+            &work,
             running,
             ConnectRequest {
                 target: ConnectTarget::Local,
@@ -970,7 +1128,11 @@ mod tests {
             notice,
             Notice::Error("the library would not open".to_string())
         );
-        // Nothing was written about a switch that did not happen...
+        // Nothing was written about a switch that did not happen: no work was even sent off the screen...
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "a switch that kept its backend had nothing to send away"
+        );
         assert_eq!(UiState::load(&paths).last_used, LastUsed::Remote(before));
         // ...and the library this run took for the engine that never started is free again.
         LibraryLock::acquire(&paths.lock_file())
@@ -985,10 +1147,7 @@ mod tests {
         fs::write(paths.config_file(), "listen_port: 6881\n").expect("a config");
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let library = Library {
-            paths: &paths,
-            store: &store,
-        };
+        let work = Work::new(&paths, &store);
 
         let server = RemoteTarget {
             url: "https://bit.example".to_string(),
@@ -1004,7 +1163,7 @@ mod tests {
             snap: &mut snap,
         };
         let switched = switch_onward(
-            &library,
+            &work,
             running,
             ConnectRequest {
                 target: ConnectTarget::Remote(server.clone()),
@@ -1034,19 +1193,23 @@ mod tests {
             "the keychain was written to already"
         );
 
-        // The answer arrives, and what was held back is paid for: the address remembered, the password kept.
+        // The answer arrives, and what was held back is paid for. It is sent away from the screen rather than
+        // waited on, so the queue is closed and read before anything is asserted about the file or the keychain:
+        // that is how a test knows the writes have finished. A second snapshot - which is what arrives every
+        // second after this one - owes nothing, so it sends nothing.
         let mut login = login.expect("a connection comes with its sign-in");
-        let notices = settle(&mut login, Arc::clone(&store), &paths).await;
-        assert!(notices.is_empty(), "both went in: {notices:?}");
+        settle(&mut login, work.store, work.paths, &work.tx);
+        settle(&mut login, work.store, work.paths, &work.tx);
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "neither write had anything to report"
+        );
         assert_eq!(UiState::load(&paths).last_used, LastUsed::Remote(server));
         assert_eq!(
             fake.kept("alice@https://bit.example"),
             Some("hunter2".to_string())
         );
-
-        // A snapshot arrives every second. Only the first one that says this connection is in owes anything.
-        let notices = settle(&mut login, Arc::clone(&store), &paths).await;
-        assert!(notices.is_empty());
+        // Only the first sign-in paid anything: a connection is not written down again on every snapshot.
         assert_eq!(fake.asked(), vec!["set".to_string()]);
     }
 
@@ -1054,7 +1217,8 @@ mod tests {
     /// kept it: what somebody just typed needs no repair, and a server nobody can reach makes nothing wrong.
     #[test]
     fn a_refusal_of_the_saved_password_is_only_worth_acting_on_once() {
-        let refusal = Notice::Error("sign-in was refused: the password was wrong".to_string());
+        let refusal =
+            Notice::SignInRefused("sign-in was refused: the password was wrong".to_string());
         let mut saved = Login::remembered(nowhere(), true);
         assert!(stored_password_refused(&mut saved, &refusal));
         assert!(
@@ -1066,6 +1230,17 @@ mod tests {
         assert!(
             !stored_password_refused(&mut typed, &refusal),
             "what somebody just typed is not the keychain's mistake"
+        );
+
+        // Which *kind* of notice it was is the signal, not which words it used: a line that says the same thing
+        // about something else (the event stream giving up on this credential, say) is drawn and left alone.
+        let mut saved = Login::remembered(nowhere(), true);
+        assert!(
+            !stored_password_refused(
+                &mut saved,
+                &Notice::Error("sign-in was refused: the password was wrong".to_string())
+            ),
+            "an error that happens to use those words is not this run's business"
         );
 
         let mut saved = Login::remembered(nowhere(), true);
@@ -1084,6 +1259,74 @@ mod tests {
         assert!(
             !stored_password_refused(&mut settled, &refusal),
             "this run already knows the password was good once"
+        );
+    }
+
+    /// Which address the next run starts on is decided from the connection alone: a server somebody chose goes
+    /// into `ui.yaml`, and the hand-off to a server running on this library does not. That one exists only while
+    /// the other run that offered it is up, so pointing the next run at it would have it dial an address nobody
+    /// answers while its own engine sat unused - and the offer about that server is something only a start on
+    /// this library makes.
+    #[test]
+    fn a_borrowed_server_is_not_the_one_the_next_run_starts_on() {
+        let server = RemoteTarget {
+            url: "https://bit.example".to_string(),
+            ..RemoteTarget::default()
+        };
+        assert_eq!(
+            remembered_ui(&Login::remembered(server.clone(), false)),
+            Some(LastUsed::Remote(server.clone())),
+            "a previous run chose this address, so the next one starts on it too"
+        );
+        assert_eq!(
+            remembered_ui(&Login::answered(server.clone(), KeepPlan::Nothing)),
+            Some(LastUsed::Remote(server)),
+            "somebody typed this address into the connect screen"
+        );
+        assert_eq!(
+            remembered_ui(&Login::borrowed(nowhere())),
+            None,
+            "the hand-off is not written down: `ui.yaml` stays where it was"
+        );
+    }
+
+    /// A run that took the hand-off leaves `ui.yaml` exactly as it found it, even after its connection signs in:
+    /// still this library. That is what makes the next run drive its own engine, and be offered the server again
+    /// if the other run is still up - which a start pointed at somebody else's address would not be.
+    #[tokio::test]
+    async fn a_borrowed_connection_leaves_ui_yaml_where_it_found_it() {
+        let (_dir, paths) = scratch_library("switch_borrowed_server");
+        fs::write(paths.config_file(), "listen_port: 6881\n").expect("a config");
+        UiState {
+            last_used: LastUsed::Local,
+        }
+        .save(&paths)
+        .expect("a ui.yaml pointing at this library");
+
+        let fake = Arc::new(FakeStore::new());
+        let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
+        let work = Work::new(&paths, &store);
+        let borrowed = RemoteTarget {
+            url: "http://127.0.0.1:8090".to_string(),
+            ..RemoteTarget::default()
+        };
+
+        // The sign-in answer arrives for a connection nobody chose and nobody typed a password into.
+        let mut login = Login::borrowed(borrowed);
+        settle(&mut login, work.store, work.paths, &work.tx);
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "nothing went wrong: there was nothing to report"
+        );
+
+        assert_eq!(
+            UiState::load(&paths).last_used,
+            LastUsed::Local,
+            "the next run drives this library and is offered the server again"
+        );
+        assert!(
+            fake.asked().is_empty(),
+            "a borrowed server has no password of ours to keep"
         );
     }
 

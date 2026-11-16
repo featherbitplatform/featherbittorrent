@@ -56,10 +56,12 @@ async fn within<T>(what: impl std::future::Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("nothing happened within {} seconds", DEADLINE.as_secs()))
 }
 
-/// The text of a notice, whichever kind it was.
+/// The text of a notice, whichever kind it was. A refused sign-in is bad news about the connection like any
+/// other error, so the tests below that only read words treat it the same way; the ones that care which kind
+/// they were handed use [`notice_of_kind`] instead.
 fn text(notice: Notice) -> String {
     match notice {
-        Notice::Info(line) | Notice::Error(line) => line,
+        Notice::Info(line) | Notice::Error(line) | Notice::SignInRefused(line) => line,
     }
 }
 
@@ -342,6 +344,28 @@ async fn notices_until(client: &mut Client, enough: impl Fn(&[String]) -> bool) 
         }
     }
     lines
+}
+
+/// Reads notices until one of them is the kind `is_one` describes, which is what a test needs when the *kind*
+/// is the thing under test rather than its words: the binary takes a kept password out of its keychain on the
+/// strength of [`fbtt_core::Notice::SignInRefused`] alone, so a backend that put that news in an ordinary
+/// error line would leave it looking for something it is never sent.
+async fn notice_that(client: &mut Client, is_one: impl Fn(&Notice) -> bool) -> Notice {
+    let until = tokio::time::Instant::now() + DEADLINE;
+    while tokio::time::Instant::now() < until {
+        match within(tokio::time::timeout(POLL * 8, client.notice())).await {
+            Ok(Some(notice)) if is_one(&notice) => return notice,
+            // Other news about this connection is not what this helper was asked for, but it says the backend
+            // is alive and talking. A quiet queue means the same, and is waited out like `notices_until` does.
+            Ok(Some(_)) | Err(_) => {}
+            // The backend stopped: nothing more will arrive.
+            Ok(None) => break,
+        }
+    }
+    panic!(
+        "no notice of the kind asked for arrived within {} seconds",
+        DEADLINE.as_secs()
+    );
 }
 
 /// Ends the connection and proves it ended: `Shutdown` goes in, and notices are read until the queue
@@ -670,7 +694,10 @@ async fn server_restart_reconnects() {
 }
 
 /// A wrong password is one line the person can act on, and a link that says it is down - not a panic, and
-/// not a client that has stopped answering.
+/// not a client that has stopped answering. It arrives as `Notice::SignInRefused` rather than as an ordinary
+/// error that happens to use the word "refused": whoever wired this client keeps passwords for its servers,
+/// and can only tell "the entry we kept is wrong" from "this request did not work" when the refusal is handed
+/// to them as itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_password_is_a_notice() {
     let lib = Library::new("remote_wrong_password", vec![alice()], vec![]);
@@ -681,12 +708,13 @@ async fn wrong_password_is_a_notice() {
         Secret::Password("not the password".to_string().into()),
     );
 
-    let lines = notices_so_far(&mut client).await;
+    let refusal = notice_that(&mut client, |notice| {
+        matches!(notice, Notice::SignInRefused(_))
+    })
+    .await;
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("sign-in was refused")),
-        "a refused login says so: {lines:?}"
+        matches!(&refusal, Notice::SignInRefused(reason) if reason.contains("sign-in was refused")),
+        "a refused login arrives as a refusal somebody can act on, in its own words: {refusal:?}"
     );
     let snapshot = client.snapshot();
     assert!(

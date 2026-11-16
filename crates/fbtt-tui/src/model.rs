@@ -222,7 +222,9 @@ impl Model {
         match self.modal.take() {
             // This dialog asked the question this notice answers.
             Some(Modal::Add(mut form)) if form.awaiting_answer => match &notice {
-                Notice::Error(text) => {
+                // A server that will not accept this client's credential failed this add the same way a
+                // refused magnet did: the reason belongs inside the box that is waiting for an answer.
+                Notice::Error(text) | Notice::SignInRefused(text) => {
                     form.error = Some(text.clone());
                     // The answer arrived, whatever it was: a later notice is about something else.
                     form.awaiting_answer = false;

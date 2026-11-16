@@ -381,13 +381,13 @@ fn warn_on_hosts_that_cannot_match(allowed: &[String]) {
     }
 }
 
-/// One line for one report from the engine. Both kinds go out as warnings because both mean something is
-/// not as the person expects: a state file that had to be kept aside, a torrent whose resume data would
-/// not come back, a save that left a torrent out. The text is the engine's own line, already cleaned for
-/// display by whoever made it.
+/// One line for one report from the engine. Every kind goes out as a warning because every one means
+/// something is not as the person expects: a state file that had to be kept aside, a torrent whose resume
+/// data would not come back, a save that left a torrent out. The text is the engine's own line, already
+/// cleaned for display by whoever made it.
 fn warn_notice(notice: &Notice) {
     match notice {
-        Notice::Info(text) | Notice::Error(text) => {
+        Notice::Info(text) | Notice::Error(text) | Notice::SignInRefused(text) => {
             tracing::warn!(problem = %text, "the library reported a problem");
         }
     }

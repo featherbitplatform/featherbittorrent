@@ -296,8 +296,8 @@ pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
     }
 }
 
-/// Does what [`keep_plan`] says: at most one call, on whatever thread it is asked on. The thread that draws
-/// the screen asks it inside [`tokio::task::spawn_blocking`], never on its own.
+/// Does what [`keep_plan`] says: at most one call, on whatever thread it is asked on. That thread is a
+/// blocking one, never the thread that draws the screen (see `crate::switch::send_work`).
 ///
 /// The `Err` is the line to show beside a connection that goes ahead anyway - nothing was stored either way,
 /// and the password is already in hand, so a keychain that will not answer is worth saying out loud rather
@@ -315,17 +315,15 @@ pub fn apply_keep(store: &dyn SecretStore, plan: &KeepPlan) -> Result<(), String
 /// Takes this target's stored password out of the keychain, because the server said no to it: the next run
 /// asks instead of repeating the mistake. A target with no account to name by has nothing kept under it, so
 /// the keychain is not opened at all.
-pub async fn forget_password(
-    store: Arc<dyn SecretStore + Send + Sync>,
-    target: RemoteTarget,
-) -> Result<(), String> {
-    let plan = account(&target).map_or(KeepPlan::Nothing, |account| KeepPlan::Forget { account });
-    match tokio::task::spawn_blocking(move || apply_keep(&*store, &plan)).await {
-        Ok(answer) => answer,
-        // A keychain call is a call to another process: one that refused and one that was dropped mid-flight
-        // are the same answer to the person, so they get the same line.
-        Err(_) => Err(KEYCHAIN_UNAVAILABLE.to_string()),
-    }
+///
+/// An ordinary function rather than a future, because whoever calls it is already off the screen's thread and
+/// on one that is allowed to wait (see `crate::switch::forget`): a call that may take a while to answer should
+/// not also be something somebody has to keep holding a task open for.
+pub fn forget_password(store: &dyn SecretStore, target: &RemoteTarget) -> Result<(), String> {
+    let Some(account) = account(target) else {
+        return Ok(());
+    };
+    apply_keep(store, &KeepPlan::Forget { account })
 }
 
 #[cfg(test)]
@@ -735,22 +733,20 @@ mod tests {
 
     /// What the run does with a password the server said no to: it comes out of the keychain, so the next run
     /// asks instead of making the same refusal happen again.
-    #[tokio::test]
-    async fn a_refused_password_is_taken_out_of_the_keychain() {
+    #[test]
+    fn a_refused_password_is_taken_out_of_the_keychain() {
         let account = "alice@http://127.0.0.1:8090";
-        let store = Arc::new(FakeStore::new());
+        let store = FakeStore::new();
         store.put(account, "wrong");
 
-        forget_password(store.clone(), target(LoginMethod::Password))
-            .await
+        forget_password(&store, &target(LoginMethod::Password))
             .expect("the fake keychain hands it back");
         assert_eq!(store.kept(account), None);
         assert_eq!(store.asked(), vec!["delete".to_string()]);
 
         // A login that signs some other way has no entry of ours to take out, so the keychain is not opened.
-        let store = Arc::new(FakeStore::new());
-        forget_password(store.clone(), target(LoginMethod::KeyFile))
-            .await
+        let store = FakeStore::new();
+        forget_password(&store, &target(LoginMethod::KeyFile))
             .expect("there was nothing to take out");
         assert!(store.asked().is_empty(), "a key login opened the keychain");
     }

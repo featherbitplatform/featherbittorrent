@@ -406,6 +406,11 @@ pub enum Notice {
     Info(String),
     /// Something did not, with the reason fit to draw.
     Error(String),
+    /// A sign-in was refused with the credential this client signs with, drawn as an error is (it is bad
+    /// news about the same thing) but kept apart because somebody has to *do* something about it: a run that
+    /// read that password out of its own keychain now knows the entry is wrong, which is a different answer
+    /// from "this request did not work". What it carries is the reason, fit to draw.
+    SignInRefused(String),
 }
 
 /// The backend's half of the channels a [`Client`] is built from.

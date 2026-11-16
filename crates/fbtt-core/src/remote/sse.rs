@@ -95,7 +95,7 @@ pub(crate) fn spawn(
                 outcome = async {
                     match api.events_with(&credential).await {
                         Ok(response) => read(response, &wake).await,
-                        Err(problem) => Some(problem.notice()),
+                        Err(problem) => Some(problem.line()),
                     }
                 } => Attempt::Ended(outcome),
                 changed = gate.changed() => match changed {

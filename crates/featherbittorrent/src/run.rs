@@ -22,7 +22,7 @@ use fbtt_tui::{Modal, Model};
 use crate::backend::{Backend, LockOutcome, Start, initial_target, named_server};
 use crate::secrets::{Keychain, SecretStore, StartSecret, start_secret_for};
 use crate::switch::{
-    Library, Login, Quit, Screen, ShutdownSignal, draw_saving, run_session, start_watching,
+    Login, Quit, Screen, ShutdownSignal, Work, draw_saving, run_session, start_watching,
 };
 use crate::terminal::Terminal;
 
@@ -170,9 +170,16 @@ pub async fn run() -> ExitCode {
                     (secret, false, Some(target.clone()), notice)
                 }
             };
-            // Nothing was collected from anybody to start this connection, so nothing new is kept for it;
-            // what the keychain already holds stays there until this server says whether it is right.
-            let login = Login::remembered(target.clone(), from_keychain);
+            // Nothing was collected from anybody to start this connection, so nothing new is kept for it; what
+            // the keychain already holds stays there until this server says whether it is right. The hand-off is
+            // a smaller promise than a remembered server: this run took an address another run offered it, and
+            // that server only exists while that run is up, so nothing about it is written down even once it has
+            // signed in (see `crate::switch::Remembered`).
+            let login = if connect_screen {
+                Login::borrowed(target.clone())
+            } else {
+                Login::remembered(target.clone(), from_keychain)
+            };
             (
                 Backend::start_remote(target.clone(), secret),
                 Some(login),
@@ -198,6 +205,12 @@ pub async fn run() -> ExitCode {
     model.sync_selection(&snap);
     start_watching(&backend, &model);
 
+    // The queue for work this run must not wait on: what a sign-in owes (a `ui.yaml` write and a keychain
+    // write), and the delete that follows a refusal of a kept password. It is made here, before the screen,
+    // because it lives as long as the screen does - every backend this run switches to sends its work on this
+    // same queue, and the loop reads the answers whenever they turn up.
+    let mut work = Work::new(&paths, &store);
+
     // The event stream is made once for the whole screen and let go before the last save: its reader owns
     // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
     let (quit, running) = {
@@ -210,10 +223,7 @@ pub async fn run() -> ExitCode {
             },
             backend,
             login,
-            &Library {
-                paths: &paths,
-                store: &store,
-            },
+            &mut work,
             &mut stream,
             &mut signal,
         )
@@ -248,7 +258,8 @@ enum Opening {
     /// Connect to `target`. `start` says what it signs in with and whether something still has to be asked
     /// for it on the connect screen; `connect_screen` opens that screen anyway, prefilled, for a target this
     /// run named itself - the server running on this library - where the address is known but how to sign in
-    /// to it is not.
+    /// to it is not. Such a connection is borrowed rather than chosen, so nothing about it is written down
+    /// even after it signs in (see `crate::switch::Remembered`).
     Server {
         target: RemoteTarget,
         start: StartSecret,

@@ -362,11 +362,11 @@ async fn json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Re
     let status = response.status();
     let body = read_capped(response)
         .await
-        .map_err(|problem| problem.notice())?;
+        .map_err(|problem| problem.line())?;
     if !status.is_success() {
         return Err(reason(&body, status));
     }
-    from_json(body).map_err(|problem| problem.notice())
+    from_json(body).map_err(|problem| problem.line())
 }
 
 /// The reason a server or gateway gave for refusing something, or the status when it gave none. The message

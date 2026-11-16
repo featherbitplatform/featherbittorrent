@@ -89,14 +89,14 @@ impl Gateway {
         let status = response.status();
         let body = read_capped(response)
             .await
-            .map_err(|problem| problem.notice())?;
+            .map_err(|problem| problem.line())?;
         if !status.is_success() {
             return Err(format!(
                 "the gateway refused this client: {}",
                 reason(&body, status)
             ));
         }
-        let token: TokenDto = from_json(body).map_err(|problem| problem.notice())?;
+        let token: TokenDto = from_json(body).map_err(|problem| problem.line())?;
         if token.access_token.is_empty() {
             return Err("the gateway answered with no access token".to_string());
         }

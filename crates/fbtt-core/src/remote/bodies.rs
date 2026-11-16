@@ -12,6 +12,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 use reqwest::Response;
 
+use crate::client::Notice;
 use crate::engine::map::clean;
 
 use super::SIGN_IN_REFUSED;
@@ -38,12 +39,28 @@ pub(crate) enum ApiError {
 }
 
 impl ApiError {
-    /// The one line this error becomes on the screen, fit to draw.
-    pub(crate) fn notice(&self) -> String {
+    /// The words this error says about itself, fit to draw. For a caller that needs the text rather than the
+    /// notice: a reason folded into a sentence about the event stream, the line inside a folder listing's own
+    /// error field. A failure of one of this client's calls that is going *to* a screen wants
+    /// [`notice`](Self::notice), which says which kind it was.
+    pub(crate) fn line(&self) -> String {
         match self {
             ApiError::Transport(problem) => format!("the server could not be reached: {problem}"),
             ApiError::Refused(reason) => format!("{SIGN_IN_REFUSED}: {reason}"),
             ApiError::Answer(message) => message.clone(),
+        }
+    }
+
+    /// This error as one notice for a screen, cleaned on the way. A refused credential is its own variant,
+    /// not an error that happens to say so: whoever wired this client may be holding the password it was
+    /// signed with, and can only take that password out if the refusal arrives as a refusal (see
+    /// [`Notice::SignInRefused`]). Everything else is news to draw, in the words this client uses for it -
+    /// which are the same words, so the two kinds differ only in what they tell whoever is holding them.
+    pub(crate) fn notice(&self) -> Notice {
+        let line = clean(&self.line());
+        match self {
+            ApiError::Refused(_) => Notice::SignInRefused(line),
+            _ => Notice::Error(line),
         }
     }
 

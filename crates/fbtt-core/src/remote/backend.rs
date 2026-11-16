@@ -14,7 +14,6 @@ use tokio::sync::mpsc;
 use crate::client::{
     Command, Connection, Detail, DetailTab, LinkState, Notice, Snapshot, TorrentId, Totals,
 };
-use crate::engine::map::clean;
 use crate::remote::bodies::ApiError;
 use crate::remote::routes::{tab_path, torrent_route};
 use crate::remote::{BACKOFF, Backend, Gate, REFRESH, SLOW_REFRESH, map};
@@ -124,7 +123,7 @@ impl Backend {
                 // next trouble is news again.
                 if !self.complained {
                     self.complained = true;
-                    self.notify(Notice::Error(clean(&problem.notice())));
+                    self.notify(problem.notice());
                 }
             }
         }
@@ -237,7 +236,7 @@ impl Backend {
     /// answer, exactly as it is for the local backend.
     pub(crate) fn report(&self, outcome: Result<(), ApiError>) {
         if let Err(problem) = outcome {
-            self.notify(Notice::Error(clean(&problem.notice())));
+            self.notify(problem.notice());
         }
     }
 
