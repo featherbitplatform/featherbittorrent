@@ -1335,6 +1335,7 @@ dependencies = [
  "fbtt-core",
  "ratatui",
  "ssh-key 0.7.0-rc.12",
+ "url",
  "zeroize",
 ]
 

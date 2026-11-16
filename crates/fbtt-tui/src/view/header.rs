@@ -60,10 +60,14 @@ fn connection_line(snap: &Snapshot) -> Line<'static> {
             let identity = format!(" ({scheme} · {})", format::safe(auth));
             let name = format::safe(name);
             match state {
+                // The brief's words for this state, kept exactly: `connecting...`. They lead because the
+                // state is the reason the numbers under this line are uncertain, and the name stays where
+                // the connected line puts it - which server is still worth knowing while its link is up in
+                // the air, and the two lines put the name in nearly the same column.
                 LinkState::Connecting => Line::from(vec![
-                    Span::styled("connecting to ", muted),
+                    Span::styled("connecting... ", muted),
                     Span::styled(name, Style::new().fg(theme::CYAN_400)),
-                    Span::styled(format!("{identity}..."), muted),
+                    Span::styled(identity, muted),
                 ]),
                 LinkState::Connected => Line::from(vec![
                     Span::styled("connected to ", muted),

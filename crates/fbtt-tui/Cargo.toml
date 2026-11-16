@@ -28,3 +28,7 @@ zeroize.workspace = true
 # The connect screen asks a device key file whether it is encrypted before it asks for a passphrase,
 # which is `ssh-key`'s question to answer (its own features are named in the workspace table).
 ssh-key.workspace = true
+# The address question - does this password leave this machine unencrypted? - is answered with `Url::host()`,
+# the same reading reqwest dials, so a backslash or a user name spelled into the authority cannot make the
+# screen call a remote host loopback.
+url.workspace = true

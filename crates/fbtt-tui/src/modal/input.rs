@@ -91,12 +91,31 @@ impl Input {
 /// typed goes straight into the zeroizing string rather than into a `String` somebody could clone, and
 /// what is drawn is one `*` per character rather than the characters themselves. The cursor is kept
 /// separately for the same reason - a masked field has no text to measure it against on screen.
-#[derive(Clone, Default, PartialEq, Eq)]
+///
+/// The string arrives with room for `SECRET_CAPACITY` characters so that typing never reallocates:
+/// when a `String` grows, the bytes it has already moved are left in memory that is freed without being
+/// overwritten, which is the one thing a zeroizing string exists to prevent.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Masked {
     /// What has been typed, and the only place it lives.
     text: Zeroizing<String>,
     /// The character the next one is typed before, counted from 0.
     cursor: usize,
+}
+
+/// How much a secret field is ready for from the first keystroke: comfortably more than a password or a
+/// key passphrase anybody types by hand or pastes, so nothing has to move while it is being typed. Past
+/// this length the string grows as any other would, and the bytes it leaves behind are freed rather than
+/// overwritten - which is why the limit is worth knowing about even though nothing refuses a longer one.
+const SECRET_CAPACITY: usize = 256;
+
+impl Default for Masked {
+    fn default() -> Masked {
+        Masked {
+            text: Zeroizing::new(String::with_capacity(SECRET_CAPACITY)),
+            cursor: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for Masked {
@@ -318,5 +337,30 @@ mod tests {
             at_cursor, "",
             "a cursor after the last character has nothing on it"
         );
+    }
+
+    #[test]
+    fn a_secret_arrives_with_room_for_a_password() {
+        // Typing into a secret is not supposed to move it: a `String` that grows leaves the bytes it has
+        // already moved in memory that is freed without being overwritten.
+        let mut secret = Masked::new();
+        let room = secret.text.capacity();
+        assert!(
+            room >= SECRET_CAPACITY,
+            "a fresh secret field should be ready for a password, not for one character"
+        );
+
+        for c in "correct horse battery staple hunter2".chars() {
+            secret.insert(c);
+        }
+        assert_eq!(
+            secret.text.capacity(),
+            room,
+            "typing a normal-length password reallocated the field, which is how bytes get left behind"
+        );
+
+        // Emptying it keeps the room for the next attempt.
+        secret.clear();
+        assert_eq!(secret.text.capacity(), room);
     }
 }

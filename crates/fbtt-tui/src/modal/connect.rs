@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent};
 use fbtt_core::ui_state::{LoginMethod, RemoteTarget};
 use ssh_key::PrivateKey;
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::modal::add::expand_tilde;
@@ -36,6 +37,15 @@ const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
 /// rather than explaining itself in a line somebody has already scrolled past.
 const PLAIN_HTTP_WARNING: &str =
     "Password sent without encryption: use https through a reverse proxy.";
+
+/// What the screen says about an address it cannot read as one this client can dial. It names the shape
+/// that works rather than repeating the parser's complaint, because what has to happen next is typing.
+const NOT_AN_ADDRESS: &str = "Enter a server address such as https://host:port";
+
+/// What the screen says about `https://alice:secret@bit.example`. The fields beside this one are where a
+/// user name and its password belong: an address that carries them would keep a password in the URL, in
+/// what `Debug` prints of the last connection, and in whatever dials it.
+const USER_IN_ADDRESS: &str = "Put the user name in its own field, not in the address";
 
 /// The words the login row cycles through, in the order `Left` and `Right` walk them. They name what
 /// the person is being asked for, because that is what the rows under it turn out to be.
@@ -216,8 +226,12 @@ impl ConnectForm {
             }
             KeyCode::Esc => {
                 // Coming back out of a passphrase prompt is an answer too: the key path was the wrong
-                // one, and closing the whole screen would be more than that mistake deserves.
+                // one, and closing the whole screen would be more than that mistake deserves. What was
+                // typed into the prompt goes with it - the next prompt is about a different file, and a
+                // secret sitting in a field nobody can see is a secret kept for no reason.
                 if self.asking.take().is_some() {
+                    self.passphrase.clear();
+                    self.error = None;
                     self.clamp_focus();
                     Answer::Stay
                 } else {
@@ -383,9 +397,21 @@ impl ConnectForm {
             })]);
         }
 
-        let url = self.url.text.trim().to_string();
-        if server_host(&url).is_none() {
-            self.error = Some("Use an http:// or https:// address.".to_string());
+        // Read the address with the parser this client's HTTP library uses. Deciding the encryption warning
+        // from a spelling of our own is how `http://evil.example\@localhost/` came to be called loopback:
+        // WHATWG ends the authority at that backslash, and reqwest dials `evil.example`.
+        let parsed = match address(&self.url.text) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                self.error = Some(reason);
+                return Answer::Stay;
+            }
+        };
+
+        // Login text spelled into the address is refused rather than dialled, so that a password never ends
+        // up in the URL, in `last_target`, or in whatever prints it.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            self.error = Some(USER_IN_ADDRESS.to_string());
             return Answer::Stay;
         }
 
@@ -417,7 +443,7 @@ impl ConnectForm {
 
         // A password that is about to cross an unencrypted hop gets asked about once, and only once per
         // address: a person who has read it and pressed Enter again has said they accept.
-        if needs_user && !self.warned && password_crosses_the_network(&url) {
+        if needs_user && !self.warned && password_crosses_the_network(&parsed) {
             self.warned = true;
             self.error = None;
             return Answer::Stay;
@@ -551,67 +577,51 @@ fn method_words(login: LoginMethod) -> &'static str {
         .map_or("login", |(_, words)| words)
 }
 
-/// The host an address names, `None` when it does not name one at all: no scheme this client can use, or
-/// a scheme with nothing after it. Whether the rest of it is a real address is the connection's business;
-/// this is only the question of what to call it and whether it needs encrypting.
-fn server_host(url: &str) -> Option<&str> {
-    let without_scheme = match (strip_scheme(url, "http://"), strip_scheme(url, "https://")) {
-        (Some((_, rest)), _) | (None, Some((_, rest))) => rest,
-        (None, None) => return None,
-    };
-    // The authority ends where the path, the query or a fragment begins, and starts after whatever
-    // user name was spelled into it.
-    let authority = without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(without_scheme);
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = match authority.strip_prefix('[') {
-        // A literal IPv6 address keeps its brackets and puts the port after them.
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    (!host.is_empty()).then_some(host)
+/// What was typed, read as an address: `Ok` holds it when this client could dial it. The parser is
+/// reqwest's own - WHATWG rules, so a backslash inside an `http://` URL ends the authority exactly where a
+/// slash does - which is the point: the screen's question about encryption has to be answered against the
+/// host the connection will actually reach, not against a spelling of ours.
+fn address(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url.trim()).map_err(|_| NOT_AN_ADDRESS.to_string())?;
+    // Only the two schemes this client can dial. `ftp://bit.example` and `mailto:alice` parse into something
+    // with a host and mean nothing here.
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(NOT_AN_ADDRESS.to_string());
+    }
+    // A scheme with nothing after it (`https://`) has no host to dial, which is what this line is about.
+    // `https:///x` does have one: WHATWG skips the extra slash and reads `x` as the host, so a person who
+    // typed that dials a host called `x`, and whether it exists is the connection's thing to report.
+    // Terminals report what a person typed, and people type `HTTP://` as readily as `http://`; the parser
+    // reads both, having lowercased the scheme.
+    parsed.host().ok_or_else(|| NOT_AN_ADDRESS.to_string())?;
+    Ok(parsed)
 }
 
-/// `url` without `scheme`, when it starts with it. Terminals report what a person typed, and people type
-/// `HTTP://` as readily as `http://`.
-fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<(&'a str, &'a str)> {
-    let (head, rest) = url.split_at(scheme.len().min(url.len()));
-    head.eq_ignore_ascii_case(scheme).then_some((head, rest))
+/// Whether the password typed into this address would cross a network it cannot encrypt: plain `http://` to
+/// a host that is not this machine. Loopback needs no encryption because nothing leaves the machine, and
+/// the screen says so about everything else rather than refusing it - plenty of servers run on a LAN behind
+/// a proxy that has not been set up yet, and some people mean that.
+fn password_crosses_the_network(address: &Url) -> bool {
+    address.scheme() == "http" && !is_loopback(address)
 }
 
-/// Whether this address would carry a password over a network it cannot encrypt: plain `http://` to a
-/// host that is not this machine. Loopback needs no encryption because nothing leaves the machine, and
-/// the screen says so about everything else rather than refusing it - plenty of servers run on a LAN
-/// behind a proxy that has not been set up yet, and some people mean that.
-fn password_crosses_the_network(url: &str) -> bool {
-    match (strip_scheme(url, "http://"), server_host(url)) {
-        (Some(_), Some(host)) => !is_loopback(host),
-        _ => false,
+/// Whether this address names this machine: `localhost` and its subdomains, anything the parser read as an
+/// address in `127.0.0.0/8`, and the IPv6 loopback address. Names are not resolved here - a host that
+/// reaches loopback by way of `/etc/hosts` is still somebody else's name on the wire, and a person who put
+/// it in an `http://` address should still be told their password goes in the clear.
+fn is_loopback(address: &Url) -> bool {
+    match address.host() {
+        Some(Host::Ipv4(at)) => at.is_loopback(),
+        Some(Host::Ipv6(at)) => at.is_loopback(),
+        // The port and any login text are already off this, and so is the case: a trailing dot is the same
+        // host spelled absolutely, which is what a person types when they mean "this exact name and no
+        // search domain".
+        Some(Host::Domain(name)) => {
+            let name = name.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        None => false,
     }
-}
-
-/// Whether a host means this machine: `localhost` and its aliases, anything in `127.0.0.0/8`, and the
-/// IPv6 loopback address. Written out rather than resolved because this decides a warning, not a route,
-/// and a name that resolves to loopback by way of `/etc/hosts` is still worth telling somebody about.
-fn is_loopback(host: &str) -> bool {
-    // A trailing dot is the same host spelled absolutely, and people type it when they mean "this exact
-    // name and no search domain".
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    if host == "::1" || host == "0:0:0:0:0:0:0:1" {
-        return true;
-    }
-    let mut octets = host.split('.');
-    let Some(first) = octets.next() else {
-        return false;
-    };
-    first.parse::<u8>().is_ok_and(|first| first == 127)
-        && octets.clone().count() == 3
-        && octets.all(|octet| octet.parse::<u8>().is_ok())
 }
 
 /// Whether the device key at `path` is encrypted, which is the question that decides whether there is a
@@ -744,32 +754,90 @@ fn label(row: &Field) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A host spelled as an address, so the loopback question gets asked the way it is asked in the form.
+    fn host_address(host: &str) -> Url {
+        let spelling = if host.contains(':') {
+            format!("http://[{host}]")
+        } else {
+            format!("http://{host}")
+        };
+        Url::parse(&spelling).unwrap_or_else(|why| panic!("{spelling:?} is not an address: {why}"))
+    }
+
     #[test]
-    fn an_address_names_a_host_or_does_not_connect() {
-        assert_eq!(server_host("https://bit.example"), Some("bit.example"));
-        assert_eq!(server_host("http://127.0.0.1:8090"), Some("127.0.0.1"));
-        // The path, the query and a user name spelled into the authority are none of the host.
-        assert_eq!(
-            server_host("https://alice@bit.example/torrents?x=1"),
-            Some("bit.example")
-        );
-        assert_eq!(server_host("http://[::1]:8090/list"), Some("::1"));
-        // No scheme, or a scheme with nothing after it, is not an address this client can dial.
+    fn an_address_that_is_not_one_is_refused() {
+        // No scheme at all, a scheme this client cannot dial, or an authority the parser will not accept.
         for url in [
             "bit.example",
+            "127.0.0.1:8090",
             "ftp://bit.example",
+            "mailto:alice@bit.example",
             "https://",
+            // Digits and dots that are not an address: refused rather than dialled, because a person who
+            // typed this meant one of the four numbers below.
+            "http://127.0.0.1.5",
             "",
+            "   ",
+        ] {
+            assert_eq!(
+                address(url),
+                Err(NOT_AN_ADDRESS.to_string()),
+                "{url:?} is not an address"
+            );
+        }
+
+        // Either scheme, in either case, with or without a port and a path. `https:///x` counts: WHATWG
+        // skips the extra slash and reads `x` as the host, which is exactly what the connection dials, so
+        // there is nothing for the screen to say about it.
+        for url in [
+            "https://bit.example",
+            "HTTP://10.0.0.5:8090",
+            "http://[::1]:8090/list",
+            "  http://localhost:8090  ",
             "https:///x",
         ] {
-            assert_eq!(server_host(url), None, "{url:?} names no host");
+            assert!(address(url).is_ok(), "{url:?} is an address");
+        }
+    }
+
+    #[test]
+    fn the_warning_follows_the_host_the_http_library_would_dial() {
+        // The case this was rewritten for. WHATWG ends the authority at a backslash, so reqwest dials
+        // `evil.example` and takes the password with it; splitting on `@` first read this as loopback and
+        // let the password go without a word.
+        assert!(password_crosses_the_network(
+            &address("http://evil.example\\@localhost/").unwrap()
+        ));
+
+        // The same reading for a user name spelled into an address whose host is somebody else: the host
+        // is `evil`, so the password leaves this machine whatever the user name looks like. (The form
+        // refuses login text in the address before it gets here; what this line protects is the decision.)
+        assert!(password_crosses_the_network(
+            &address("http://localhost@evil").unwrap()
+        ));
+
+        // Loopback needs no warning, and neither does anything already encrypted.
+        for url in [
+            "http://[::1]:8090",
+            "http://127.0.0.1:8090",
+            "http://localhost:8090",
+            "https://bit.example",
+        ] {
+            assert!(
+                !password_crosses_the_network(&address(url).unwrap()),
+                "{url:?} was reported as unencrypted off the machine"
+            );
         }
     }
 
     #[test]
     fn a_password_only_needs_asking_about_off_this_machine() {
-        assert!(password_crosses_the_network("http://bit.example"));
-        assert!(password_crosses_the_network("HTTP://10.0.0.5:8090"));
+        assert!(password_crosses_the_network(
+            &address("http://bit.example").unwrap()
+        ));
+        assert!(password_crosses_the_network(
+            &address("HTTP://10.0.0.5:8090").unwrap()
+        ));
         // Loopback in any of its spellings, and anything encrypted, needs no warning at all.
         for url in [
             "http://127.0.0.1:8090",
@@ -780,7 +848,7 @@ mod tests {
             "https://bit.example",
         ] {
             assert!(
-                !password_crosses_the_network(url),
+                !password_crosses_the_network(&address(url).unwrap()),
                 "{url:?} was reported as unencrypted off the machine"
             );
         }
@@ -793,10 +861,11 @@ mod tests {
             "LOCALHOST",
             "a.localhost",
             "::1",
+            "0:0:0:0:0:0:0:1",
             "127.0.0.1",
             "127.255.255.254",
         ] {
-            assert!(is_loopback(host), "{host:?} is this machine");
+            assert!(is_loopback(&host_address(host)), "{host:?} is this machine");
         }
         for host in [
             "bit.example",
@@ -804,10 +873,14 @@ mod tests {
             "128.0.0.1",
             "::2",
             "localhost.localdomain",
+            // The parser reads a one-part address as `0.0.0.127`, so the digits at the front are not what
+            // decides this. (Five parts never get here: `http://127.0.0.1.5` is refused as an address.)
             "127",
-            "127.0.0.1.5",
         ] {
-            assert!(!is_loopback(host), "{host:?} is not this machine");
+            assert!(
+                !is_loopback(&host_address(host)),
+                "{host:?} is not this machine"
+            );
         }
     }
 
@@ -980,5 +1053,33 @@ mod tests {
                 .expect_err("a path that is not there should not answer"),
             missing
         );
+    }
+
+    #[test]
+    fn escaping_a_passphrase_prompt_lets_go_of_what_was_typed_into_it() {
+        use crossterm::event::KeyModifiers;
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let mut form = ConnectForm::new(None);
+        form.url = Input::new("https://bit.example".to_string());
+        form.login = LoginMethod::KeyFile;
+        // The prompt the screen puts up when the key file says it is encrypted. A test has no
+        // passphrase-protected key to open, so the state goes in the way the screen would have put it.
+        form.asking = Some(PathBuf::from("/home/alice/.ssh/id_ed25519"));
+        form.focus_on(Field::Passphrase);
+        type_into_masked(
+            &mut form.passphrase,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(form.on_key(esc), Answer::Stay, "the prompt was open");
+        assert!(form.asking.is_none(), "and Esc put it away");
+        assert!(
+            form.passphrase.is_empty(),
+            "a secret typed into a prompt that has been closed is kept for nobody"
+        );
+
+        // With no prompt up, Esc is still the caller's to answer as closing the screen.
+        assert_eq!(form.on_key(esc), Answer::Close(Vec::new()));
     }
 }

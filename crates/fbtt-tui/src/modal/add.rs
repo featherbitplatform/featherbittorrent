@@ -100,7 +100,7 @@ impl AddForm {
         }
 
         if is_pick_key(key) {
-            let (picker, actions) = FolderPicker::open();
+            let (picker, actions) = FolderPicker::open(snap);
             self.picker = Some(picker);
             return Answer::Keep(actions);
         }
@@ -110,7 +110,7 @@ impl AddForm {
                 // Walking past the folder field walks into the picker rather than back to the source:
                 // `Shift+Tab` is how you come out of it, which is the same shape as every other dialog.
                 if self.focused == DIR_FIELD {
-                    let (picker, actions) = FolderPicker::open();
+                    let (picker, actions) = FolderPicker::open(snap);
                     self.picker = Some(picker);
                     return Answer::Keep(actions);
                 }

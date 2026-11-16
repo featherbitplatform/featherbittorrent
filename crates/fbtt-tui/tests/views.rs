@@ -685,12 +685,12 @@ fn header_shows_lost_link() {
         "a lost link was not drawn as the failure it is"
     );
 
-    // A link still dialling says that, so a table with nothing in it yet reads as waiting rather than as
-    // empty.
+    // A link still dialling says exactly that, so a table with nothing in it yet reads as waiting rather
+    // than as empty, and it still names the server it is trying to reach.
     let connecting = server(LinkState::Connecting);
     let text = Screen::new(&model_of(&connecting), &connecting, 100, 30).text();
     assert!(
-        text.contains("connecting to bit.example"),
+        text.contains("connecting... bit.example (http · password)"),
         "a link that has not answered yet said nothing about itself: {text:?}"
     );
 

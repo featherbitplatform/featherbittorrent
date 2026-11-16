@@ -98,6 +98,12 @@ tracing = "0.1"
 # names rustls with the `ring` provider, which is what `fbt`'s own `tls` feature turns on, so no
 # second crypto provider joins the tree; these tests speak plain http to loopback and ask for none.
 reqwest = { version = "0.12", default-features = false }
+# The URL parser, which the connect screen decides its encryption warning with: `Url::host()` is what says
+# whether a password typed into an address would cross a network it cannot encrypt. reqwest parses the URLs
+# it dials with this same crate, so the warning and the connection read `http://evil.example\@localhost/`
+# the same way - which is the only reading the warning is worth having. Already in the tree through
+# reqwest, on the version that resolves here (2.5.8), so this adds no versions to Cargo.lock.
+url = "2.5"
 # The remote backend signs logins with a device key held by ssh-agent as well as in a file, so it
 # speaks the agent protocol rather than reimplementing it. Its `agent` feature is what turns on the
 # tokio client; without it only the blocking one exists, and the backend's task must not block.

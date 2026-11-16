@@ -1027,6 +1027,45 @@ fn folder_picker_navigates_and_selects() {
 }
 
 #[test]
+fn the_picker_takes_an_answer_named_differently_from_the_folder_it_asked_for() {
+    // A backend that canonicalises paths answers `/downloads` with the folder that path actually is. That
+    // has to read as the answer to the picker's own ask - waiting for the name it typed left it saying
+    // `reading folders...` over an answer it had already got - and the name the backend gave is what goes
+    // into the field, because that is the folder that exists.
+    let roots = folders(None, &[]);
+    let mut model = model_of(&roots);
+    model.handle_key(letter('a'), &roots);
+    model.handle_key(ctrl('o'), &roots);
+    assert_eq!(
+        model.handle_key(key(KeyCode::Enter), &roots),
+        vec![Action::Command(Command::ListDirs(Some(PathBuf::from(
+            "/downloads"
+        ))))],
+        "the picker did not ask for the folder it opened"
+    );
+
+    // The listing that arrives is not the one that was on screen when the ask went out, so it is the
+    // answer, and the folder on screen is the one it names rather than the one that was typed.
+    let canonical = folders(Some("/private/downloads"), &["shows"]);
+    let text = Screen::new(&model, &canonical, 100, 30).text();
+    assert!(
+        text.contains("/private/downloads") && !text.contains("reading folders"),
+        "a canonicalised answer was not taken as an answer: {text:?}"
+    );
+
+    // Choosing hands that spelling to the field.
+    assert!(
+        model.handle_key(letter('s'), &canonical).is_empty(),
+        "choosing a folder sent something to the backend: it is only text in a field"
+    );
+    assert_eq!(
+        add_form(&model).dir.text,
+        "/private/downloads",
+        "the folder that was asked for went into the field instead of the folder that exists"
+    );
+}
+
+#[test]
 fn devices_add_and_remove_send_commands() {
     // A device list belongs to a server, so the key that opens one is answered by the connection rather
     // than by the table: on a library running its own engine there is no list to show.

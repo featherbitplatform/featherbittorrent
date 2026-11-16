@@ -92,7 +92,7 @@ fn connect_screen_builds_request() {
     assert!(
         screen
             .text()
-            .contains("Use an http:// or https:// address."),
+            .contains("Enter a server address such as https://host:port"),
         "the screen refused the address without saying why: {:?}",
         screen.text()
     );
@@ -169,6 +169,29 @@ fn connect_screen_builds_request() {
     assert!(
         screen.text().contains(SERVER_URL),
         "reopening the screen did not offer back the address that was just used: {:?}",
+        screen.text()
+    );
+
+    // Choosing this library's own engine leaves that remembered server where it is. Somebody stepping back
+    // to the local library is the likeliest person of all to step out to their server again, and throwing
+    // the address away at that moment punishes the wrong thing.
+    press(&mut model, &snap, key(KeyCode::Left)); // Server -> Local engine
+    press(&mut model, &snap, key(KeyCode::Enter));
+    assert_eq!(
+        model.last_target(),
+        Some(&RemoteTarget {
+            url: SERVER_URL.to_string(),
+            login: LoginMethod::Password,
+            user: Some("alice".to_string()),
+            ..RemoteTarget::default()
+        }),
+        "going local threw away the server this run came from"
+    );
+    press(&mut model, &snap, letter('c'));
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen.text().contains(SERVER_URL),
+        "the address was gone from the screen after a visit to the local engine: {:?}",
         screen.text()
     );
 }
@@ -249,6 +272,103 @@ fn http_password_warning_needs_second_enter() {
         model.handle_key(key(KeyCode::Enter), &snap),
         vec![Action::Connect(request("https://bit.example", "hunter2"))],
         "an address made encrypted was still held at the warning it had outgrown"
+    );
+}
+
+#[test]
+fn a_remote_host_warns_however_the_address_is_spelled() {
+    let snap = library();
+
+    // The case the address parsing was rewritten for. WHATWG ends the authority at a backslash, which is
+    // what reqwest's parser does with an `http://` URL, so this one dials `evil.example` and takes the
+    // password with it - and a screen that read the `@` first called it loopback and said nothing.
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(
+        &mut model,
+        &snap,
+        "http://evil.example\\@localhost/",
+        "alice",
+        "hunter2",
+    );
+    assert!(
+        model.handle_key(key(KeyCode::Enter), &snap).is_empty(),
+        "the password left for the host behind the backslash without a word"
+    );
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen
+            .text()
+            .contains("Password sent without encryption: use https through a reverse proxy."),
+        "the screen did not warn about the host it would actually dial: {:?}",
+        screen.text()
+    );
+    // The second Enter is the answer to the warning, and it dials what was typed.
+    assert_eq!(
+        model.handle_key(key(KeyCode::Enter), &snap),
+        vec![Action::Connect(request(
+            "http://evil.example\\@localhost/",
+            "hunter2"
+        ))],
+        "the warning did not end in the connection it warned about"
+    );
+
+    // A literal IPv6 loopback address is this machine: the brackets are how an address is spelled, not
+    // something a person should be asked to confirm.
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(&mut model, &snap, "http://[::1]:8090", "alice", "hunter2");
+    assert_eq!(
+        model.handle_key(key(KeyCode::Enter), &snap),
+        vec![Action::Connect(request("http://[::1]:8090", "hunter2"))],
+        "a password to this machine was held at a warning about networks"
+    );
+}
+
+#[test]
+fn login_text_in_an_address_is_refused_rather_than_dialled() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(
+        &mut model,
+        &snap,
+        "https://alice:secret@bit.example",
+        "alice",
+        "hunter2",
+    );
+
+    // A password spelled into the address would live in the URL, in what the run remembers of the
+    // connection, and in whatever prints it. The field beside this one is where it belongs.
+    assert!(
+        model.handle_key(key(KeyCode::Enter), &snap).is_empty(),
+        "login text in the address was dialled anyway"
+    );
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen
+            .text()
+            .contains("Put the user name in its own field, not in the address"),
+        "the screen did not say where a user name belongs: {:?}",
+        screen.text()
+    );
+
+    // The address is the part that has to change, and nothing else goes with it: the same user and password
+    // go out with an address that names only a host.
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Remember
+    press(&mut model, &snap, key(KeyCode::Tab)); // Remember -> Connect to, the rows wrapping
+    press(&mut model, &snap, key(KeyCode::Tab)); // Connect to -> URL
+    repeat(
+        &mut model,
+        &snap,
+        KeyCode::Backspace,
+        "https://alice:secret@bit.example".len(),
+    );
+    type_text(&mut model, &snap, SERVER_URL);
+    assert_eq!(
+        model.handle_key(key(KeyCode::Enter), &snap),
+        vec![Action::Connect(request(SERVER_URL, "hunter2"))],
+        "refusing the address took the rest of the screen with it"
     );
 }
 

@@ -178,22 +178,22 @@ impl Model {
         self.sync_selection(snap);
         let actions = keys::handle(self, key, snap);
         // A connect answer is also the prefill for the next time the screen opens. What a person just
-        // chose is the best guess at what they will want to change, and choosing this library's own
-        // engine means there is no server address to bring back.
-        if let Some(request) = actions.iter().find_map(|action| match action {
-            Action::Connect(request) => Some(request),
+        // chose is the best guess at what they will want to change. Choosing this library's own engine
+        // leaves the remembered server where it is: somebody stepping back to the local library is most
+        // likely to want their server address waiting for them when they step out again.
+        let chosen = actions.iter().find_map(|action| match action {
+            Action::Connect(request) => Some(&request.target),
             Action::Command(_) | Action::Quit => None,
-        }) {
-            self.last_target = match &request.target {
-                ConnectTarget::Remote(target) => Some(target.clone()),
-                ConnectTarget::Local => None,
-            };
+        });
+        if let Some(ConnectTarget::Remote(target)) = chosen {
+            self.last_target = Some(target.clone());
         }
         actions
     }
 
-    /// What to prefill the connect screen with: what this run connected to last, or `None` when it has
-    /// only ever run on its own engine. A password is never part of it.
+    /// What to prefill the connect screen with: the server this run last connected to, or `None` when it
+    /// has never connected to one. Choosing the local engine does not clear it. A password is never part
+    /// of it.
     pub fn last_target(&self) -> Option<&RemoteTarget> {
         self.last_target.as_ref()
     }
