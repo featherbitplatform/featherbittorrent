@@ -1,4 +1,4 @@
-//! Where one featherbittorrent library lives: `config.yaml` in the platform's
+//! Where one featherbittorrent library lives: `config.yaml` and `ui.yaml` in the platform's
 //! config directory, the session state and the library lock in its data
 //! directory.
 //!
@@ -24,6 +24,8 @@ const PROJECT: (&str, &str, &str) = ("io", "featherbit", "featherbittorrent");
 
 /// The config file, in [`Paths::config_dir`].
 const CONFIG_FILE_NAME: &str = "config.yaml";
+/// Which backend the last run used, in [`Paths::config_dir`] (see [`crate::ui_state`]).
+const UI_FILE_NAME: &str = "ui.yaml";
 /// The engine's resume state, in [`Paths::data_dir`].
 const STATE_FILE_NAME: &str = "session.state";
 /// The lock that keeps a second featherbittorrent off the same library, in
@@ -90,6 +92,11 @@ impl Paths {
     /// The config file: `<config_dir>/config.yaml`.
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join(CONFIG_FILE_NAME)
+    }
+
+    /// Which backend the last run used: `<config_dir>/ui.yaml` (see [`crate::ui_state`]).
+    pub fn ui_file(&self) -> PathBuf {
+        self.config_dir.join(UI_FILE_NAME)
     }
 
     /// The engine's resume state: `<data_dir>/session.state`.

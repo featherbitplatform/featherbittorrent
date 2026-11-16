@@ -1,55 +1,46 @@
-//! The binary's own work: bring one library up, run its screen, put everything back.
+//! The binary's own work: bring one library up, hand the screen over, put everything back.
 //!
-//! Setup happens in order - paths, config, lock, terminal, backend - because every step
-//! answers with its own line before the terminal is touched, and a second instance should
-//! hear "close the other one" rather than see a blank screen blink. The screen goes up
-//! before the engine does: a run that cannot show anything has no reason to start an
-//! engine, and no resume data to write for a library nobody showed. The loop then waits on
-//! four things at once (keys, snapshots, notices, the frame clock), never on a backend
-//! reply: it draws the newest snapshot when something changed, at most thirty frames a
-//! second, and quitting is a command out and a join, not a conversation.
+//! Setup happens in order - paths, config, which backend to start on, lock, terminal, backend - because
+//! every step answers with its own line before the terminal is touched, and a second instance should hear
+//! "close the other one" (or be offered the server running on that library) rather than see a blank screen
+//! blink. The screen goes up before the engine does: a run that cannot show anything has no reason to start
+//! an engine, and no resume data to write for a library nobody showed. From there the screen is
+//! `switch.rs`'s: it owns the loop, and every backend this run moves to after the first one. What is left
+//! here is the part that cannot happen twice - choosing what to start on, and putting the last backend down.
 
-use std::future::Future;
-use std::pin::Pin;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crossterm::event::{Event, EventStream};
-// `std::stream::Stream` is unstable, so the stable one comes from the same futures
-// tree crossterm's own `EventStream` implements it from.
-use futures_core::Stream;
-use ratatui::DefaultTerminal;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::Stylize;
-use ratatui::widgets::{Fill, Paragraph};
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use crossterm::event::EventStream;
 
-use fbtt_core::{
-    ClientParts, Command, Commands, Config, ConfigLoad, LibraryLock, LocalBackend, LockError,
-    Notice, Paths, Snapshot,
+use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, Notice, Paths};
+use fbtt_tui::{Modal, Model};
+
+use crate::backend::{Backend, LockOutcome, Start, initial_target, named_server};
+use crate::secrets::{Keychain, SecretStore, StartSecret, start_secret_for};
+use crate::switch::{
+    Login, Quit, Screen, ShutdownSignal, Work, draw_saving, run_session, start_watching,
 };
-use fbtt_tui::{Model, format, theme, view};
-
 use crate::terminal::Terminal;
 
-/// The frame clock: redraws land at most this far apart, and only over a `dirty` flag.
-const FRAME_TICK: Duration = Duration::from_millis(33);
-/// What the screen says while the last save runs. A run that was told it will not save
-/// shows its notice here instead, so a quit never promises more than the engine kept.
-const SAVING: &str = "Saving...";
-/// What the footer says when a key press produced a command the backend would not take:
-/// its queue was full, so that press did nothing and the person should press it again.
-const BUSY: &str = "Busy, try again";
+/// The offer made to a run whose library another featherbittorrent has taken while running a server on it.
+/// One line, answered with one letter, asked before this run takes the screen out from under that one.
+const OFFERS_LOCAL_SERVER: &str =
+    "A featherbittorrent server is running on this library. Connect to it? y/n";
 
-/// One library's whole run: setup, the loop, the quit. The exit code is the answer.
+/// One library's whole run: setup, the screen, the last stop. The exit code is the answer.
 pub async fn run() -> ExitCode {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => return fail(&error),
     };
+
+    // Where a connect password lives between runs. Making this touches nothing: the keychain is only
+    // reached by the calls below, and only for a target that signs in with a password.
+    let store: Arc<dyn SecretStore + Send + Sync> = Arc::new(Keychain);
 
     // A missing config is written with this library's defaults; a broken one came back
     // from `Config::load` as those defaults plus the line saying what was wrong (the file
@@ -74,23 +65,51 @@ pub async fn run() -> ExitCode {
         Err(error) => return fail(&error),
     };
 
-    // Before the terminal: a held lock is a sentence to read, not a screen to see.
-    let lock = match LibraryLock::acquire(&paths.lock_file()) {
-        Ok(lock) => lock,
-        Err(LockError::Held) => {
-            eprintln!(
-                "Another featherbittorrent is already using this library ({}). Close it first.",
-                paths.data_dir.display()
-            );
-            return ExitCode::from(3);
+    // Which backend the last run used is what decides everything after this: `ui.yaml`, beside
+    // `config.yaml`. A missing file, or bytes this run could not make sense of, already answered "the local
+    // engine" when it was read, so there is always an answer to start from.
+    let ui = UiState::load(&paths);
+
+    // Only a run the file points at this library asks the library whether it is free. A connection needs
+    // nothing from these files - they belong to wherever the server runs - so taking the lock for one would
+    // only make an unrelated featherbittorrent refuse to start for no reason.
+    let (lock, outcome) = match &ui.last_used {
+        LastUsed::Remote(_) => (None, LockOutcome::Taken),
+        LastUsed::Local => {
+            let acquired = LibraryLock::acquire(&paths.lock_file());
+            let outcome = LockOutcome::of(&acquired);
+            (acquired.ok(), outcome)
         }
-        Err(LockError::Io(error)) => {
-            eprintln!(
-                "Could not lock the library ({}): {error}",
-                paths.data_dir.display()
-            );
-            return ExitCode::FAILURE;
-        }
+    };
+
+    // Before the terminal: a library somebody else is driving is a sentence to read, not a screen to see,
+    // and so is the offer about the server running on it - that other run may be drawing on this terminal
+    // right now. A keychain is consulted here too, for the same reason the engine is started after the
+    // screen: nothing a person has to read should happen behind an alternate screen they cannot see yet.
+    let opening = match initial_target(&ui, outcome, named_server(&paths)) {
+        Start::Engine => match lock {
+            Some(lock) => Opening::Engine {
+                // The engine task owns its config. This is the one start that reads it here: a switch back
+                // to the local engine later reads `config.yaml` again, because limits changed during a run
+                // live in that file and nowhere else (see `crate::switch::local_config`).
+                config,
+                lock,
+            },
+            // `Taken` is only ever reported by holding this library, so a run told to drive an engine has
+            // the guard with it. This is a caller's mistake rather than a thing a person can do, so it gets
+            // a line rather than a panic.
+            None => return fail_line(&cannot_lock(&paths, "the lock went missing")),
+        },
+        Start::Server(target) => connect(Arc::clone(&store), target, false).await,
+        // The offer was taken: run on the server this library is already running. Its address is this
+        // program's own guess and its login method is not something this run can know, so the connect screen
+        // goes up prefilled rather than leaving a connection that may need a login nobody was asked for.
+        Start::AskAboutServer(target) => match take_the_offer() {
+            Offer::Taken => connect(Arc::clone(&store), target, true).await,
+            Offer::Declined => return leave(&library_in_use(&paths)),
+        },
+        Start::LibraryInUse => return leave(&library_in_use(&paths)),
+        Start::LockFailed(problem) => return fail_line(&cannot_lock(&paths, &problem)),
     };
 
     // The screen comes up before the engine does. A run with no terminal to draw on has
@@ -109,259 +128,219 @@ pub async fn run() -> ExitCode {
     // would miss it entirely.
     let mut signal = ShutdownSignal::install();
 
-    let (client, task) = match LocalBackend::start(config, &paths, lock).await {
-        Ok(started) => started,
-        Err(error) => {
-            // The terminal goes back first: a line printed onto the alternate screen is
-            // not readable anywhere the person can look. Nothing was written to the
-            // library, so there is no save to wait for; the lock leaves with `lock`.
-            drop(terminal);
-            return fail(&error);
+    // The backend to run on, and what its sign-in is still owed (see `crate::switch::Login`): an engine on
+    // this library owes nothing, because it signs in to nobody.
+    let (backend, login, ask, notice) = match opening {
+        Opening::Engine { config, lock } => {
+            match Backend::start_local(config, &paths, lock).await {
+                Ok(backend) => (backend, None, None, None),
+                Err(error) => {
+                    // The terminal goes back first: a line printed onto the alternate screen is
+                    // not readable anywhere the person can look. Nothing was written to the
+                    // library, so there is no save to wait for; the lock leaves with `lock`.
+                    drop(terminal);
+                    return fail(&error);
+                }
+            }
+        }
+        Opening::Server {
+            target,
+            start,
+            connect_screen,
+        } => {
+            // A connection starts even with something missing from its credential: a server it cannot sign
+            // in to says so once through the client, which is what the empty table beside the connect
+            // screen is for. The screen itself collects whatever was missing - and goes up on top of a target
+            // this run named by itself, whose login method nobody has chosen yet.
+            let (secret, gateway_key, from_keychain, ask, notice) = match start {
+                StartSecret::Ready {
+                    secret,
+                    gateway_key,
+                    from_keychain,
+                } => (
+                    secret,
+                    gateway_key,
+                    from_keychain,
+                    if connect_screen {
+                        Some(target.clone())
+                    } else {
+                        None
+                    },
+                    None,
+                ),
+                StartSecret::Ask {
+                    secret,
+                    gateway_key,
+                    notice,
+                } => (secret, gateway_key, false, Some(target.clone()), notice),
+            };
+            // Nothing was collected from anybody to start this connection, so nothing new is kept for it; what
+            // the keychain already holds stays there until this server says whether it is right. The hand-off is
+            // a smaller promise than a remembered server: this run took an address another run offered it, and
+            // that server only exists while that run is up, so nothing about it is written down even once it has
+            // signed in (see `crate::switch::Remembered`).
+            let login = if connect_screen {
+                Login::borrowed(target.clone())
+            } else {
+                Login::remembered(target.clone(), from_keychain)
+            };
+            (
+                Backend::start_remote(target.clone(), secret, gateway_key),
+                Some(login),
+                ask,
+                notice,
+            )
         }
     };
 
-    // The channels come apart so the loop can hold each one on its own: a method on the
-    // whole client borrows it, and one `select!` branch cannot hold that borrow while
-    // another sends on the same client (see `Client::split`).
-    let ClientParts {
-        commands,
-        mut snapshots,
-        mut notices,
-    } = client.split();
-
     let mut model = Model::new();
-    // The value the watch already holds. The backend builds a snapshot before it
-    // publishes one, so taking it is a clone of an `Arc`, never a wait.
-    let mut snap = snapshots.borrow().clone();
-    model.sync_selection(&snap);
     if let Some(notice) = first_notice {
         model.push_notice(notice, Instant::now());
     }
+    if let Some(problem) = notice {
+        model.push_notice(Notice::Error(problem), Instant::now());
+    }
+    if let Some(target) = &ask {
+        model.modal = Some(Modal::connect(Some(target)));
+    }
+    // The value the watch already holds. The backend builds a snapshot before it
+    // publishes one, so taking it is a clone of an `Arc`, never a wait.
+    let mut snap = backend.initial_snapshot();
+    model.sync_selection(&snap);
+    start_watching(&backend, &model);
 
-    let quit = {
+    // The queue for work this run must not wait on: what a sign-in owes (a `ui.yaml` write and a keychain
+    // write), and the delete that follows a refusal of a kept password. It is made here, before the screen,
+    // because it lives as long as the screen does - every backend this run switches to sends its work on this
+    // same queue, and the loop reads the answers whenever they turn up.
+    let mut work = Work::new(&paths, &store);
+
+    // The event stream is made once for the whole screen and let go before the last save: its reader owns
+    // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
+    let (quit, running) = {
         let mut stream = EventStream::new();
-        // The stream drops at the end of this block: its reader lets go of stdin before
-        // the last save.
-        run_loop(
+        run_session(
             terminal.get_mut(),
-            &mut model,
-            &mut snap,
-            &commands,
-            &mut snapshots,
-            &mut notices,
+            Screen {
+                model: &mut model,
+                snap: &mut snap,
+            },
+            backend,
+            login,
+            &mut work,
             &mut stream,
             &mut signal,
         )
         .await
     };
 
-    // The backend is told once: by this command or, if the queue was full, by `commands`
-    // going out of scope below. No timeout - resume data is worth the wait.
-    commands.send(Command::Shutdown);
-    draw_saving(terminal.get_mut(), &model);
-    drain_notices(&mut model, &mut notices, |model| {
-        draw_saving(terminal.get_mut(), model)
-    });
-    drop(commands);
-
-    let (code, problem) = await_backend(task).await;
+    // The last backend is told once: by a command the loop sent or, if the queue was full, by its channels
+    // going out of scope. No timeout - resume data is worth the wait. Whatever it owes - an engine's last
+    // save, and with it this library's lock - arrives here, on a screen that says what is happening while it
+    // does. A run always ends with a backend under it: a switch that could not go ahead kept the one it had.
+    let stopped = running
+        .stop(&mut model, |model| draw_saving(terminal.get_mut(), model))
+        .await;
     drop(terminal); // The terminal goes back before anything is printed to it.
-    if let Some(problem) = problem {
+    if let Err(problem) = &stopped {
         eprintln!("{problem}");
     }
     if let Quit::Failed(problem) = quit {
         eprintln!("{problem}");
         return ExitCode::FAILURE;
     }
-    code
-}
-
-/// Why the loop ended. `Failed` is a failure of this process - its line travels with it,
-/// to be printed after the terminal is back, because stderr on the alternate screen is
-/// not readable anywhere the person can look. A backend that could not save reports
-/// itself through the join instead.
-enum Quit {
-    Ok,
-    Failed(String),
-}
-
-/// Keys, snapshots, notices and the frame clock, waited on all at once. Nothing here
-/// awaits a backend reply: each branch takes what has arrived and returns. The client's
-/// channels arrive as separate parts so that no borrow of one can fight a use of another
-/// in the same `select!`.
-#[allow(clippy::too_many_arguments)] // four channels, the screen, the model and the signal
-async fn run_loop(
-    terminal: &mut DefaultTerminal,
-    model: &mut Model,
-    snap: &mut Arc<Snapshot>,
-    commands: &Commands,
-    snapshots: &mut watch::Receiver<Arc<Snapshot>>,
-    notices: &mut mpsc::Receiver<Notice>,
-    stream: &mut EventStream,
-    signal: &mut ShutdownSignal,
-) -> Quit {
-    // Nothing has been drawn yet, so the first tick draws.
-    let mut dirty = true;
-    let mut last_watch = model.watch();
-    let mut frame = tokio::time::interval(FRAME_TICK);
-    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            // Every branch is a `once`: each wakes on one event, and re-arming the next
-            // is what an iteration of this loop does anyway.
-            // A stream polled by hand: `OnceStream` turns one item into one future,
-            // which is what a branch that re-arms itself every iteration should be.
-            event = once_stream(&mut *stream) => match event {
-                Some(Ok(Event::Key(key))) => {
-                    for command in model.handle_key(key, snap) {
-                        // A full queue drops this command: the backend handles one at a
-                        // time and every one is short, so 64 deep is more than a person can
-                        // type, and what is dropped is a keystroke they will press again. Say
-                        // so rather than let the screen look like it ignored them - unless
-                        // this was the quit itself, which the `Saving...` screen answers.
-                        if !commands.send(command) && !model.quit_requested() {
-                            model.push_notice(Notice::Error(BUSY.to_string()), Instant::now());
-                        }
-                    }
-                    dirty = true;
-                }
-                Some(Ok(Event::Resize(_, _))) => dirty = true,
-                // A closed event stream is the terminal going away: quit like any other.
-                Some(Err(_)) | None => return Quit::Ok,
-                Some(Ok(_)) => {}
-            },
-            // `changed()` is a method on the receiver this loop owns, and its body reads
-            // that same receiver - no branch here borrows anything another uses. The value
-            // comes from `borrow_and_update`, which takes the snapshot that woke this wait;
-            // reading through the client instead was the old bug: it answered from a
-            // channel the backend no longer writes to.
-            wake = snapshots.changed() => match wake {
-                Ok(()) => {
-                    *snap = snapshots.borrow_and_update().clone();
-                    model.sync_selection(snap);
-                    dirty = true;
-                }
-                // The backend is gone; nothing more will change on this screen.
-                Err(_) => return Quit::Ok,
-            },
-            notice = once(notices.recv()) => match notice {
-                Some(notice) => {
-                    model.push_notice(notice, Instant::now());
-                    dirty = true;
-                    drain_notices(model, notices, |_| {});
-                }
-                // The backend stopped and the queue is read out: the screen has all it gets.
-                None => return Quit::Ok,
-            },
-            _ = frame.tick() => {
-                // Notices expire on the clock rather than on a key press. `tick` reports
-                // nothing, so before and after say whether the footer needs a redraw.
-                let notice_before = model.notice().is_some();
-                model.tick(Instant::now());
-                dirty |= notice_before && model.notice().is_none();
-                if !dirty {
-                    continue;
-                }
-                dirty = false;
-                let watch = model.watch();
-                if watch != last_watch {
-                    commands.send(Command::Watch(watch.clone()));
-                    last_watch = watch;
-                }
-                if let Err(error) = terminal.draw(|frame| view::draw(frame, model, snap)) {
-                    // The screen is the thing that failed: carry the line out of here and
-                    // print it once the terminal is back.
-                    return Quit::Failed(format!("the terminal failed: {error}"));
-                }
-            },
-            _ = once(signal.wait.as_mut()) => return Quit::Ok,
-        }
-        if model.quit_requested() {
-            return Quit::Ok;
-        }
+    match stopped {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
-/// SIGTERM on Unix, Ctrl-C elsewhere (where raw mode does not swallow it), listened for
-/// once at startup: tokio keeps the signal's own queue between polls, so a listener made
-/// once cannot lose a signal that lands mid-loop, while a fresh listener per iteration
-/// can. A system that will not hand over a listener runs without that signal; on Unix
-/// Ctrl-C arrives as a key press instead, and the model's map answers it. Both quit
-/// without asking - a signal is not a person who can answer a confirmation.
-struct ShutdownSignal {
-    wait: Pin<Box<dyn Future<Output = ()> + Send>>,
+/// What the run starts on, once `ui.yaml`, this library and the keychain have been asked about.
+enum Opening {
+    /// Drive this library's engine, on `config`, holding its lock.
+    Engine { config: Config, lock: LibraryLock },
+    /// Connect to `target`. `start` says what it signs in with and whether something still has to be asked
+    /// for it on the connect screen; `connect_screen` opens that screen anyway, prefilled, for a target this
+    /// run named itself - the server running on this library - where the address is known but how to sign in
+    /// to it is not. Such a connection is borrowed rather than chosen, so nothing about it is written down
+    /// even after it signs in (see `crate::switch::Remembered`).
+    Server {
+        target: RemoteTarget,
+        start: StartSecret,
+        connect_screen: bool,
+    },
 }
 
-impl ShutdownSignal {
-    fn install() -> ShutdownSignal {
-        #[cfg(unix)]
-        let wait: Pin<Box<dyn Future<Output = ()> + Send>> =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut term) => Box::pin(async move {
-                    term.recv().await;
-                }),
-                Err(_) => Box::pin(std::future::pending::<()>()),
-            };
-        #[cfg(not(unix))]
-        let wait: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {
-            // Registered once, like the Unix listener; Ctrl-C is not a key here.
-            let _ = tokio::signal::ctrl_c().await;
-        });
-        ShutdownSignal { wait }
+/// Asks the keychain what to sign in to `target` with, which is the one thing about a remembered server
+/// this run cannot read out of `ui.yaml` (see [`crate::secrets`]).
+async fn connect(
+    store: Arc<dyn SecretStore + Send + Sync>,
+    target: RemoteTarget,
+    connect_screen: bool,
+) -> Opening {
+    let start = start_secret_for(store, target.clone()).await;
+    Opening::Server {
+        target,
+        start,
+        connect_screen,
     }
 }
 
-/// The `Saving...` screen, with the newest notice still on its footer: a run that was
-/// told it will not save must not read as one that did.
-fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
-    let _ = terminal.draw(|frame| {
-        let area = frame.area();
-        if area.is_empty() {
-            return;
-        }
-        frame.render_widget(Fill::new(" ").bg(theme::INK_950), area);
-        let line = match model.notice() {
-            Some(Notice::Error(text)) => format::safe(text).fg(theme::RED_500),
-            Some(Notice::Info(text)) => format::safe(text).fg(theme::INK_300),
-            None => SAVING.fg(theme::INK_300),
-        };
-        let [_, middle, _] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-        frame.render_widget(Paragraph::new(line).centered(), middle);
-    });
-}
-
-/// Every notice already queued, taken without waiting: these are the answers a quitting
-/// person should still see, and past their room in the queue they mean nothing new.
-fn drain_notices(
-    model: &mut Model,
-    notices: &mut mpsc::Receiver<Notice>,
-    mut show: impl FnMut(&mut Model),
-) {
-    while let Ok(notice) = notices.try_recv() {
-        model.push_notice(notice, Instant::now());
-        show(model);
+/// Whether the person took the offer about the server running on this library.
+///
+/// Asked only where it can be answered: with no terminal in front of this run there is nobody to ask, and a
+/// question written into a pipe nobody reads would hang a run that milestone 1 lets through with exit 3.
+fn take_the_offer() -> Offer {
+    if !std::io::stdin().is_terminal() {
+        return Offer::Declined;
+    }
+    println!("{OFFERS_LOCAL_SERVER}");
+    // A question still sitting in this process's buffer when the answer is wanted reads as a run that
+    // printed nothing at all.
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    match std::io::stdin().lock().read_line(&mut answer) {
+        // Nothing to read - the end of a pipe, or a stdin that will not answer: the offer stands and this
+        // run leaves, which is what milestone 1 does with a held library.
+        Ok(0) | Err(_) => Offer::Declined,
+        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => Offer::Taken,
+        Ok(_) => Offer::Declined,
     }
 }
 
-/// The backend's answer, joined with no timeout. Its line - a final save that did not
-/// happen - is returned rather than printed here, so the caller can put the terminal
-/// back first: stderr after restore is readable, stderr onto the alternate screen is not.
-async fn await_backend(task: JoinHandle<Result<(), String>>) -> (ExitCode, Option<String>) {
-    let joined = task.await;
-    match joined {
-        Ok(Ok(())) => (ExitCode::SUCCESS, None),
-        Ok(Err(problem)) => (ExitCode::FAILURE, Some(problem)),
-        Err(error) => (
-            ExitCode::FAILURE,
-            Some(format!("the engine task stopped before saving: {error}")),
-        ),
-    }
+/// Whether `take_the_offer` got an answer, and which one.
+enum Offer {
+    /// Connect to the server running on this library instead of driving it here.
+    Taken,
+    /// Say the sentence milestone 1 says about a held library and leave with exit 3: declined, or nobody
+    /// was there to ask.
+    Declined,
+}
+
+/// Prints one line about a run that will not start, and gives the code for a taken library: this is where
+/// the offer ends when it is not taken, and where a held library with nothing else to offer ends too.
+fn leave(problem: &str) -> ExitCode {
+    eprintln!("{problem}");
+    ExitCode::from(3)
+}
+
+/// The sentence milestone 1 answers a held library with - still the answer when this run has nowhere else
+/// to go, and the one the offer about that library leaves off with when it is declined.
+pub fn library_in_use(paths: &Paths) -> String {
+    format!(
+        "Another featherbittorrent is already using this library ({}). Close it first.",
+        paths.data_dir.display()
+    )
+}
+
+/// The line for a library this run could not make sense of at all, which is not the same thing as a holder
+/// and so does not deserve exit 3. Also the one a switch answers with when this library will not come free
+/// for its engine (see `crate::switch`).
+pub fn cannot_lock(paths: &Paths, problem: &str) -> String {
+    format!(
+        "Could not lock the library ({}): {problem}",
+        paths.data_dir.display()
+    )
 }
 
 /// A line for a setup failure, printed before any terminal exists.
@@ -370,42 +349,8 @@ fn fail(error: &dyn std::error::Error) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Polls `f` exactly once and answers right away when it is ready, which is what
-/// `select!` wants from a branch that re-arms itself every iteration of the loop.
-fn once<F: Future>(f: F) -> Once<F> {
-    Once { inner: Box::pin(f) }
-}
-
-struct Once<F> {
-    // Boxed so the wrapper is `Unpin` (what `select!` wants) whatever `F` is; being a
-    // future, it reaches `select!`'s `IntoFuture` through std's blanket impl.
-    inner: Pin<Box<F>>,
-}
-
-impl<F: Future> Future for Once<F> {
-    type Output = F::Output;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
-        self.inner.as_mut().poll(cx)
-    }
-}
-
-/// Polls `s` exactly once, reporting a finished stream as `Ready(None)` and a still-
-/// sleeping one as `Pending`, so a stream joins the same `select!` as the futures above.
-fn once_stream<S: Stream>(s: S) -> OnceStream<S> {
-    OnceStream { inner: Box::pin(s) }
-}
-
-struct OnceStream<S> {
-    // Boxed like `Once`: a future, so `select!`'s `IntoFuture` reaches it through the
-    // blanket impl, and boxing keeps that path free of an `S: Unpin` bound.
-    inner: Pin<Box<S>>,
-}
-
-impl<S: Stream> Future for OnceStream<S> {
-    type Output = Option<S::Item>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        self.inner.as_mut().poll_next(cx)
-    }
+/// The same for a line this run wrote itself rather than got from an error type.
+fn fail_line(problem: &str) -> ExitCode {
+    eprintln!("{problem}");
+    ExitCode::FAILURE
 }

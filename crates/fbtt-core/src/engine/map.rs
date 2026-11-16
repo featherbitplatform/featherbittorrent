@@ -3,6 +3,9 @@
 //! The engine counts bytes per second and names its states in its own vocabulary;
 //! the table wants KiB/s, a stalled column of its own, and only the text a person
 //! can read. Everything crossing here is cut and cleaned on the way.
+//!
+//! This stays inside the crate: it is how [`crate::local`]'s snapshot is built, and an HTTP
+//! server answers in its own shapes rather than these rows.
 
 use std::time::{Duration, Instant};
 
@@ -19,24 +22,24 @@ use crate::client::{
 const KIB: u64 = 1024;
 /// How long a download may take nothing before the table calls it stalled. Long
 /// enough that a slow tracker reply or a handshake is not "stalled".
-pub(super) const STALL_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(30);
 
 /// Text from a torrent file, a peer, a tracker or an error, cut and cleaned the way
 /// every remote string is before it is drawn.
-pub(super) fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     fbt::display_safe(text, fbt::MAX_DISPLAY_CHARS)
 }
 
 /// KiB/s as the engine counts it. A value too large to convert caps out instead of
 /// wrapping into a small limit.
-pub(super) fn rate_bytes(kib: u64) -> u64 {
+pub(crate) fn rate_bytes(kib: u64) -> u64 {
     kib.saturating_mul(KIB)
 }
 
 /// The limits the session is running under, read back from it rather than from what
 /// was last asked for, in KiB/s. A limit that is not a whole KiB shows as the KiB
 /// below it.
-pub(super) fn limits(session: &Session) -> LiveLimits {
+pub(crate) fn limits(session: &Session) -> LiveLimits {
     let rate = session.rate_limit();
     let queue = session.queue_settings();
     LiveLimits {
@@ -57,7 +60,7 @@ pub(super) fn limits(session: &Session) -> LiveLimits {
 /// resumed after an hour paused therefore starts from zero, which is what someone reading the
 /// stalled column expects: `previous` is the value from the last look, `None` the first time
 /// this torrent appears in a snapshot.
-pub(super) fn stalled_clock(
+pub(crate) fn stalled_clock(
     state: TorrentState,
     down_rate: u64,
     previous: Option<Instant>,
@@ -76,7 +79,7 @@ pub(super) fn stalled_clock(
 /// while taking nothing. A download that has done that for [`STALL_AFTER`] is stalled - it is
 /// running, but nothing is arriving, and a person scanning the table needs to see that rather
 /// than a bar stuck at 40 %.
-pub(super) fn row_state(
+pub(crate) fn row_state(
     state: TorrentState,
     progress: f64,
     down_rate: u64,
@@ -115,7 +118,7 @@ pub(super) fn row_state(
 ///
 /// `zero_since` is where [`stalled_clock`] left this torrent's stalled count at the look that
 /// produced `status`, so the row and the map agree about what the torrent has been doing.
-pub(super) fn row(status: &TorrentStatus, zero_since: Instant, now: Instant) -> TorrentRow {
+pub(crate) fn row(status: &TorrentStatus, zero_since: Instant, now: Instant) -> TorrentRow {
     TorrentRow {
         id: TorrentId::from_wire_hash(status.info_hashes.wire_hash()),
         name: clean(&status.name),
@@ -145,7 +148,7 @@ pub(super) fn row(status: &TorrentStatus, zero_since: Instant, now: Instant) -> 
 /// there is nothing for a person to choose about them. The indices stay the engine's,
 /// so [`Command::SetFilePriority`](crate::Command::SetFilePriority) can name a file by
 /// the row it is looking at.
-pub(super) fn file_rows(files: Vec<FileStatus>) -> Vec<FileRow> {
+pub(crate) fn file_rows(files: Vec<FileStatus>) -> Vec<FileRow> {
     files
         .into_iter()
         .filter(|file| !file.pad)
@@ -172,7 +175,7 @@ fn file_priority(priority: Priority) -> FilePriority {
 }
 
 /// The pane's priority as the engine takes it.
-pub(super) fn priority(priority: FilePriority) -> Priority {
+pub(crate) fn priority(priority: FilePriority) -> Priority {
     match priority {
         FilePriority::Skip => Priority::Skip,
         FilePriority::Low => Priority::Low,
@@ -183,7 +186,7 @@ pub(super) fn priority(priority: FilePriority) -> Priority {
 
 /// The peer list. `progress` is the share of the torrent's pieces the peer has: it
 /// is always known once the metadata is, and 0.0 before that, so a bar can be drawn.
-pub(super) fn peer_rows(peers: Vec<PeerStatus>) -> Vec<PeerRow> {
+pub(crate) fn peer_rows(peers: Vec<PeerStatus>) -> Vec<PeerRow> {
     peers
         .into_iter()
         .map(|peer| PeerRow {
@@ -198,7 +201,7 @@ pub(super) fn peer_rows(peers: Vec<PeerStatus>) -> Vec<PeerRow> {
 
 /// The tracker list. A tracker that answered its last announce is `ok`; one that did
 /// not says the reason it gave.
-pub(super) fn tracker_rows(trackers: Vec<TrackerStatus>) -> Vec<TrackerRow> {
+pub(crate) fn tracker_rows(trackers: Vec<TrackerStatus>) -> Vec<TrackerRow> {
     trackers
         .into_iter()
         .map(|tracker| TrackerRow {
@@ -217,7 +220,7 @@ pub(super) fn tracker_rows(trackers: Vec<TrackerStatus>) -> Vec<TrackerRow> {
 
 /// One line about a torrent the session could not take resume data for, naming it by
 /// the hash its row carries.
-pub(super) fn left_out(hashes: &InfoHashes, error: &SessionError) -> String {
+pub(crate) fn left_out(hashes: &InfoHashes, error: &SessionError) -> String {
     format!(
         "{} was left out of the saved state: {}",
         TorrentId::from_wire_hash(hashes.wire_hash()).0,

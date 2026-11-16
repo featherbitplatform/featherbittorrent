@@ -26,7 +26,23 @@ version = 2
 # Unmaintained notices only for crates we depend on directly; transitive ones are outside our
 # control. Vulnerabilities still fail at any depth.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # Both come in through `ssh-agent-lib` 0.6, which pins `ssh-key` 0.6 and is the only thing in this
+    # tree that speaks the ssh-agent protocol (`LoginMethod::Agent`). For a server login neither notice
+    # describes work this product asks of them: the only device key a featherbittorrent server accepts is
+    # Ed25519 (`fbtt_server::auth::keys`), so no RSA private key is ever unlocked and no ECDSA arithmetic
+    # runs on the way in. The gateway login is the exception worth saying out loud rather than glossing:
+    # an ECDSA P-256 device key signs this client's `private_key_jwt` assertion here (`ES256`, see
+    # `fbtt_core::remote::device`), so `crypto-bigint`'s arithmetic does run on a secret value. The fixes
+    # are `rsa` 0.10 and `crypto-bigint` 0.7.6 - releases the pinned `ssh-key` cannot take - so this
+    # records an upstream release we are waiting on, with each crate's exposure named on its own line.
+    "RUSTSEC-2023-0071", # `rsa`: nothing here unlocks or signs with an RSA key, so no affected operation runs.
+    # What runs is a P-256 signature over a challenge this client just made, on the machine that owns the
+    # key. The secret leaking out is the user's own device key, to somebody who can time this process to
+    # the limb - which on the same machine is somebody who can read the key file anyway - so this is the
+    # part of the notice this product does not act on. Revisit it when `ssh-key` can take 0.7.6.
+    "RUSTSEC-2026-0387", # `crypto-bigint`: ES256 gateway logins sign with a P-256 key on this machine.
+]
 
 [bans]
 multiple-versions = "warn"

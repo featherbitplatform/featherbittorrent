@@ -1,0 +1,16 @@
+# The server config for this example. It names a `server:` section on purpose: with one present,
+# `serve` runs without asking the wizard anything, which is what a container needs.
+#
+# Logins are off because the gateway in front decides who gets through (the "gateway only" setup in
+# docs/reverse-proxy.md). allowed_hosts then carries the two names a request can arrive with: the
+# target host the gateway rewrites Host to (bare name, ports are taken off before comparison) and
+# the browser-facing domain that shows up in Origin.
+
+download_dir: downloads # relative: below the library directory, inside the data volume
+listen_port: 6881
+
+server:
+  bind: 0.0.0.0:8090 # every interface inside the container; compose publishes no port for it
+  allowed_hosts: ['featherbittorrent', 'torrent.example.test']
+  auth:
+    enabled: false

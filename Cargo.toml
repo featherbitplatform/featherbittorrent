@@ -21,7 +21,7 @@ all = "warn"
 # Every dependency is declared here and inherited with `dep.workspace = true`;
 # crates never pin their own versions, and each crate names the features it
 # uses. Later tasks add what they need: ratatui and crossterm arrive with the
-# views (Task 5). fbt (git, tag v0.8.0) arrived with the config, whose settings
+# views (Task 5). fbt (git, tag v0.9.0) arrived with the config, whose settings
 # map onto `fbt::Settings`; tokio with the backend task (Task 4).
 [workspace.dependencies]
 # The workspace's own crates, so a member depends on another the same way it depends on
@@ -29,6 +29,8 @@ all = "warn"
 # arrives with the binary (Task 7), which is what makes it a dependency of something.
 fbtt-core = { path = "crates/fbtt-core" }
 fbtt-tui = { path = "crates/fbtt-tui" }
+# Joins the table now that the binary depends on it for `serve`.
+fbtt-server = { path = "crates/fbtt-server" }
 clap = { version = "4.6", features = ["derive"] }
 # The TUI stack. crossterm is the version ratatui's own backend uses (its default),
 # so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
@@ -42,7 +44,10 @@ ratatui = { version = "0.30", default-features = false, features = [
     "layout-cache",
 ] }
 directories = "6"
-fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.8.0", features = ["serde"] }
+fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.9.0", features = ["serde"] }
+# The control API the server serves, on the same tag as the engine it drives: the two come from one
+# repository and one release, so they move together or not at all.
+fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.9.0" }
 # The `Stream` trait only: `std::stream::Stream` is still unstable, and this is the
 # same futures tree crossterm's `EventStream` implements it from. Already in the tree
 # through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.
@@ -56,3 +61,76 @@ thiserror = "2"
 # (`select!` in the backend task) and for `#[tokio::test]`, which arrives in
 # dev-dependencies too.
 tokio = { version = "1", default-features = false }
+
+# The server's login stack (Task 2): Argon2id password hashes, Ed25519 device keys and `sshsig`
+# login signatures, session tokens and challenge nonces, and the base64 they are spelled in.
+argon2 = "0.6"
+base64 = "0.23"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+sha2 = "0.11"
+# Device keys: the OpenSSH public key line and `sshsig`. No default features: ed25519 is what a
+# featherbittorrent server takes for a device login, and `ecdsa` (which pulls `sec1`) is turned on only by
+# `fbtt-core`, for the P-256 keys a gateway's `private_key_jwt` assertion is signed with - see that crate's
+# manifest. RSA stays off everywhere: it pulls the `rsa` crate, which carries an open advisory.
+# `encryption` is what reads a passphrase-protected key file, `rand_core` is what makes
+# `PrivateKey::random` available to tests.
+ssh-key = { version = "0.7.0-rc.11", default-features = false, features = [
+    "ed25519",
+    "encryption",
+    "std",
+    "rand_core",
+] }
+# The `Signer` trait, so a device key can sign a gateway assertion over raw bytes. ssh-key implements
+# it for `PrivateKey` but re-exports only `Signature` and `SigningKey`, and a supertrait's methods are
+# not in scope just because the trait that names them is - so the trait is depended on directly, at the
+# version ssh-key 0.7 uses, which is what makes it the same trait the impl is written for.
+signature = { version = "3", default-features = false }
+# A dev-dependency only, and only to check one thing: an ES256 assertion the way a gateway checks it, as
+# fixed-width `r || s` against a P-256 key. ssh-key cannot be the check for that because it spells the same
+# signature as two SSH mpints - which is what this client sends, so a test needs the other spelling to prove
+# the conversion. The version is the one ssh-key's `p256` feature asks for, so the two are one crate in the
+# tree; `ecdsa` is the feature that names `Signature` and `VerifyingKey`, and nothing else is needed.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+# Only for the `http` types an `AuthRequest` carries (the method and the headers), which fbt-api
+# does not re-export. Depending on axum itself - not on `http` - is what keeps ours one crate with
+# the `HeaderMap` fbt-api hands us. fbt-api turns the serving features on for the tree.
+axum = { version = "0.8", default-features = false }
+# The server's own routes: JSON bodies, and the error body in fbt-api's shape. Already in the tree
+# through axum's own `json` feature, so this adds no versions to Cargo.lock.
+serde_json = "1"
+# The server's log lines (logins, state-file problems, what it listens on). No subscriber here: the
+# binary decides where logs go and turns `tracing-subscriber` on for the run.
+tracing = "0.1"
+# The HTTP client: the tests' first, and from Task 6 the remote backend's. No default features -
+# `default-tls` would pull a system TLS stack next to the one fbt already builds. Whoever needs https
+# names rustls with the `ring` provider, which is what `fbt`'s own `tls` feature turns on, so no
+# second crypto provider joins the tree; these tests speak plain http to loopback and ask for none.
+reqwest = { version = "0.12", default-features = false }
+# The URL parser, which the connect screen decides its encryption warning with: `Url::host()` is what says
+# whether a password typed into an address would cross a network it cannot encrypt. reqwest parses the URLs
+# it dials with this same crate, so the warning and the connection read `http://evil.example\@localhost/`
+# the same way - which is the only reading the warning is worth having. Already in the tree through
+# reqwest, on the version that resolves here (2.5.8), so this adds no versions to Cargo.lock.
+url = "2.5"
+# The remote backend signs logins with a device key held by ssh-agent as well as in a file, so it
+# speaks the agent protocol rather than reimplementing it. Its `agent` feature is what turns on the
+# tokio client; without it only the blocking one exists, and the backend's task must not block.
+ssh-agent-lib = { version = "0.6", default-features = false }
+# What the remote backend holds a password or a key passphrase in while it is in memory: `Zeroizing`
+# overwrites the bytes when they are dropped. Already in the tree through rustls and ssh-key.
+zeroize = "1"
+# The binary's log lines for `serve`, which logs to stderr: `fmt` for the lines themselves,
+# `env-filter` so `RUST_LOG` is honoured. No default features: `ansi` is off because the binary
+# decides itself whether stderr takes colours, and `tracing-log` would bridge a `log` crate that
+# nothing in this workspace logs through.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+# The wizard's and `user set`'s password prompt: one line read with echo off, so a password typed at
+# a terminal never lands in the shell's history or in what the run prints. It has no features to name.
+rpassword = "7"
+# Where a connect password lives between runs: the system keychain. `v1` is the feature that hands each
+# platform its own store - the Apple keychain on macOS, the credential manager on Windows, the secret
+# service on Linux - and nothing else: no default features are turned on beyond naming it. The Linux
+# half is `zbus-secret-service-keyring-store`, which speaks D-Bus in Rust (zbus) and encrypts in Rust
+# (`crypto-rust`, which keyring itself asks for), so no system D-Bus or OpenSSL library is needed to
+# build it. The macOS half links the Security framework the platform already provides.
+keyring = { version = "4.2", default-features = false, features = ["v1"] }

@@ -13,3 +13,12 @@ paths = [
     '''sast-out/''',
     '''\.superpowers/''',
 ]
+
+[[allowlists]]
+# A throwaway P-384 key in a test, generated for the test and never used anywhere
+# else. Scoped to the line that names the constant, so a real key added to this
+# file later is still reported.
+description = "Throwaway P-384 fixture key in device.rs's tests"
+paths = ['''crates/fbtt-core/src/remote/device\.rs''']
+regexTarget = "line"
+regexes = ['''const P384_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----''']

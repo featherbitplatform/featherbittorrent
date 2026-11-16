@@ -12,8 +12,8 @@ use std::time::Duration;
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{
     AddSource, Client, ClientParts, Command, Config, ConfigLoad, Connection, Detail, DetailTab,
-    FilePriority, FileRow, LibraryLock, LiveLimits, LocalBackend, Notice, Paths, RowState,
-    Snapshot, TorrentId, TorrentRow,
+    DeviceCommand, DirListing, FilePriority, FileRow, LibraryLock, LiveLimits, LocalBackend,
+    Notice, Paths, RowState, Snapshot, TorrentId, TorrentRow,
 };
 use tokio::task::JoinHandle;
 
@@ -133,10 +133,20 @@ impl Library {
     /// Takes the library lock and starts a backend on it. The returned session is
     /// the same engine the backend drives, so a test can point it at a peer.
     async fn start(&self) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
+        self.start_on(self.config.clone()).await
+    }
+
+    /// The same, on a config the caller changed first: which settings a run works on is what its saves
+    /// write back, and some tests want a library whose config chose to serve (see
+    /// `limits_save_keeps_allowed_roots_default`).
+    async fn start_on(
+        &self,
+        config: Config,
+    ) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
         let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
         within(LocalBackend::start_for_test(
-            loopback(&self.config),
-            self.config.clone(),
+            loopback(&config),
+            config,
             &self.paths,
             lock,
         ))
@@ -194,6 +204,35 @@ fn info_text(notice: Notice) -> String {
         Notice::Info(text) => text,
         other => panic!("expected an info notice, got {other:?}"),
     }
+}
+
+/// The folders a listing on this machine may name: the download folder, then this host's home directory
+/// when it has one. Those two are where a torrent plausibly goes; anywhere else is somebody else's
+/// business. A host with no home directory gets the download folder alone.
+fn browsable_roots(download_dir: &Path) -> Vec<PathBuf> {
+    let downloads = download_dir.to_path_buf();
+    match directories::UserDirs::new() {
+        Some(dirs) => {
+            let home = dirs.home_dir().to_path_buf();
+            // The same folder named twice would show up twice in the list someone picks from.
+            if home == downloads {
+                vec![downloads]
+            } else {
+                vec![downloads, home]
+            }
+        }
+        None => vec![downloads],
+    }
+}
+
+/// The listing a snapshot carries as the answer to [`Command::ListDirs`].
+fn listing_in(snapshot: &Snapshot) -> DirListing {
+    snapshot.dirs.clone().expect("an answer to ListDirs")
+}
+
+/// The directories inside one folder, spelled out in the order a listing reports them.
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
 }
 
 /// Asks the backend to stop and waits for it: its task only resolves once the state file is
@@ -760,6 +799,127 @@ async fn set_limits_applies_and_persists() {
     shutdown(client, task).await;
 }
 
+/// What a settings change saves on a library that never chose to serve - which is every library whose
+/// `config.yaml` came out of the TUI: rates and a folder, and no `server` key at all. That section is how
+/// another run knows an address to offer for this library, so writing one here would have the library claim
+/// a server it never started (see `named_server` in the binary, which reads exactly this absence).
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_save_writes_no_server_section() {
+    let lib = Library::new("local_settings_save");
+    // The harness' own config names no server, like a run that has only ever driven this library.
+    assert_eq!(lib.config.server, None);
+    let (mut client, task, _) = lib.start().await;
+
+    let mut limits = LiveLimits::from(lib.config.limits);
+    limits.download_kib = 512;
+    assert!(client.send(Command::SetLimits(limits)));
+    wait_for(&mut client, |snapshot| snapshot.limits.download_kib == 512).await;
+
+    let text = fs::read_to_string(lib.paths.config_file()).expect("the limits save wrote a file");
+    assert!(
+        text.contains("download_kib: 512"),
+        "the setting the person changed is in the file: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("server:")),
+        "and no server section appears beside it: {text}"
+    );
+
+    // The parsed answer, which is what a caller editing the file - and the binary's `named_server` - acts
+    // on: no section means no address to offer anybody.
+    let ConfigLoad::Loaded(written) = Config::load(&lib.paths).expect("read the saved config back")
+    else {
+        panic!("a settings save writes a readable file");
+    };
+    assert_eq!(written.server, None);
+    assert_eq!(
+        Config::load_for_edit(&lib.paths.config_file())
+            .expect("the file reads as a config")
+            .expect("the file is there")
+            .server,
+        None,
+        "reading it to edit it invents no section either"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// The limits save writes the config this run resolved, and the roots default has to survive that:
+/// `allowed_roots` stays unnamed in the file, because "no roots named" *is* the download folder. A
+/// file that pinned it would leave the server's root behind the day the person moves `download_dir`.
+/// The library here is one whose config chose to serve - what a `serve` run leaves behind - because a
+/// config with no server section has no roots to pin (see `a_save_without_a_server_section_writes_none`
+/// in the config module).
+#[tokio::test(flavor = "multi_thread")]
+async fn limits_save_keeps_allowed_roots_default() {
+    let lib = Library::new("local_limits_roots");
+    let mut served = lib.config.clone();
+    served.server = Some(fbtt_core::ServerConfig::default());
+    let (mut client, task, _) = lib.start_on(served).await;
+
+    let mut limits = LiveLimits::from(lib.config.limits);
+    limits.download_kib = 250;
+    assert!(client.send(Command::SetLimits(limits)));
+    wait_for(&mut client, |snapshot| snapshot.limits.download_kib == 250).await;
+
+    let ConfigLoad::Loaded(written) =
+        Config::load(&lib.paths).expect("the limits save wrote a file")
+    else {
+        panic!("the config the limits save wrote is readable");
+    };
+    assert_eq!(written.limits.download_kib, 250, "the limit is in the file");
+    assert_eq!(
+        written.download_dir, lib.config.download_dir,
+        "so is the folder this run works on"
+    );
+    let server = written
+        .server
+        .as_ref()
+        .expect("a save keeps the server this library chose");
+    assert!(
+        server.allowed_roots.is_empty(),
+        "the roots default is not pinned to a directory: {:?}",
+        server.allowed_roots
+    );
+
+    // The text says the same thing: no `allowed_roots` line, or an empty list.
+    let text = fs::read_to_string(lib.paths.config_file()).expect("read the file as text");
+    let roots_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("allowed_roots:"));
+    assert!(
+        roots_line.is_none_or(|line| line.trim() == "allowed_roots: []"),
+        "the file leaves the roots unnamed: {text}"
+    );
+
+    // And resolving what was written still means the download folder - and moves with it, which is
+    // the point of leaving the roots unnamed.
+    let downloads = lib.config.download_dir.clone();
+    let resolved = written.clone().resolve(&lib.paths);
+    assert_eq!(
+        resolved
+            .server
+            .expect("resolving keeps the section")
+            .allowed_roots,
+        [downloads],
+        "unnamed roots mean the download folder"
+    );
+
+    let elsewhere = lib.dir.path().join("elsewhere");
+    let mut moved = written;
+    moved.download_dir = elsewhere.clone();
+    let moved = moved.resolve(&lib.paths);
+    assert_eq!(
+        moved.server.expect("and keeps it").allowed_roots,
+        [elsewhere],
+        "and the root follows a folder the person moves"
+    );
+
+    shutdown(client, task).await;
+}
+
 /// Skipping one file of a two-file torrent shows up in the watched file list:
 /// pad files are not listed, and only the named file changes.
 #[tokio::test(flavor = "multi_thread")]
@@ -849,6 +1009,218 @@ async fn set_file_priority_skip() {
         .await;
         drop(snapshot);
     }
+
+    shutdown(client, task).await;
+}
+
+/// The answer for one named folder, asked and taken back: the listing that reports that same path.
+async fn listed(client: &mut Client, path: PathBuf) -> DirListing {
+    assert!(
+        client.send(Command::ListDirs(Some(path.clone()))),
+        "the queue takes ListDirs",
+    );
+    let snapshot = wait_for(client, |snapshot| {
+        snapshot
+            .dirs
+            .as_ref()
+            .is_some_and(|dirs| dirs.path.as_deref() == Some(path.as_path()))
+    })
+    .await;
+    let listing = listing_in(&snapshot);
+    drop(snapshot);
+    listing
+}
+
+/// A local folder listing: the folders to start from, and the directories inside one of them. Sorted by
+/// their own order rather than whatever the disk handed out, nothing hidden, no files, and a link only
+/// where it stays inside a root - the same rules `GET /api/v1/fs/list` answers with, because a person who
+/// browses a server's folders and their own should not get two different answers for one folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_list_dirs_roots_and_child() {
+    let lib = Library::new("local_list_dirs");
+    // Newest name first, so that the order these came off the disk in is not the order they sort into, and
+    // with a hidden folder, a file, a link out of every root, and a folder below one of them to walk on.
+    for name in ["zeta", ".hidden", "beta", "alpha"] {
+        fs::create_dir_all(lib.config.download_dir.join(name)).expect("make a test folder");
+    }
+    fs::write(lib.config.download_dir.join("a-file"), b"not a folder").expect("write a test file");
+    fs::create_dir_all(lib.dir.path().join("outside")).expect("make the folder the link points at");
+    fs::create_dir_all(lib.config.download_dir.join("alpha").join("nested"))
+        .expect("make a deeper folder");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        lib.dir.path().join("outside"),
+        lib.config.download_dir.join("link-out"),
+    )
+    .expect("make a link that leaves every root");
+
+    let (mut client, task, _) = lib.start().await;
+
+    // Nothing named: the folders to start from, and no read of anything.
+    assert!(
+        client.send(Command::ListDirs(None)),
+        "the queue takes ListDirs"
+    );
+    let snapshot = wait_for(&mut client, |snapshot| snapshot.dirs.is_some()).await;
+    let listing = listing_in(&snapshot);
+    drop(snapshot);
+    assert_eq!(listing.path, None, "no folder was named");
+    assert_eq!(listing.error, None, "naming nothing is not a failure");
+    assert_eq!(
+        listing.roots,
+        browsable_roots(&lib.config.download_dir),
+        "the download folder and this host's home directory are where a torrent may go",
+    );
+    assert!(
+        listing.dirs.is_empty(),
+        "the list to start from is `roots`, so there is nothing in `dirs` yet: {:?}",
+        listing.dirs,
+    );
+
+    // One of those folders named: the directories directly inside it, with the hidden folder, the file and
+    // the link that leaves every root left out.
+    let downloads = lib.config.download_dir.clone();
+    let listing = listed(&mut client, downloads.clone()).await;
+    assert_eq!(
+        listing.error, None,
+        "the download folder is there and readable"
+    );
+    assert_eq!(
+        listing.roots,
+        browsable_roots(&downloads),
+        "every answer comes with the folders it was confined to",
+    );
+    assert_eq!(
+        listing.dirs,
+        names(&["alpha", "beta", "zeta"]),
+        "the three folders a torrent could go into, in their own order: {:?}",
+        listing.dirs,
+    );
+
+    // And one step further down, which is how a picker walks.
+    let alpha = downloads.join("alpha");
+    let listing = listed(&mut client, alpha).await;
+    assert_eq!(listing.error, None);
+    assert_eq!(
+        listing.dirs,
+        names(&["nested"]),
+        "a folder below a root is inside it",
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A folder that cannot be listed says so inside the listing rather than as a notice: a picker shows that
+/// line beside the folder it failed on and hands back the roots to go instead to, which is more than one
+/// line about a failure would tell it. The wording is the one the server's route answers with for the same
+/// kind of question, because both are the same listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_list_dirs_error_is_in_listing() {
+    let lib = Library::new("local_list_dirs_error");
+    fs::create_dir_all(lib.config.download_dir.join("alpha")).expect("make a folder");
+    fs::write(lib.config.download_dir.join("a-file"), b"not a folder").expect("write a test file");
+    let elsewhere = lib.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("make a folder outside every root");
+
+    let (mut client, task, _) = lib.start().await;
+
+    // Not there.
+    let missing = lib.config.download_dir.join("not-here");
+    let listing = listed(&mut client, missing.clone()).await;
+    assert_eq!(
+        listing.path.as_deref(),
+        Some(missing.as_path()),
+        "the answer is about the folder that was asked for",
+    );
+    assert_eq!(
+        listing.dirs,
+        names(&[]),
+        "a folder that is not there has no names to report",
+    );
+    let error = listing
+        .error
+        .expect("the reason for a failure travels with the answer");
+    assert!(
+        error.contains("no folder"),
+        "it says what is wrong: {error}"
+    );
+    assert_eq!(
+        listing.roots,
+        browsable_roots(&lib.config.download_dir),
+        "and it still hands back the folders to go instead to",
+    );
+    assert!(
+        client.try_notice().is_none(),
+        "a failed listing is said once, where a person can act on it"
+    );
+
+    // Somewhere else entirely: below this scratch library, outside both roots.
+    let error = listed(&mut client, elsewhere.clone())
+        .await
+        .error
+        .expect("a folder outside every root is refused");
+    assert!(
+        error.contains("outside the allowed folders"),
+        "it says which rule it broke: {error}",
+    );
+
+    // There, and readable, but not a folder, so nothing can be inside it.
+    let file = lib.config.download_dir.join("a-file");
+    let listing = listed(&mut client, file).await;
+    let error = listing.error.expect("a file is nowhere a torrent goes");
+    assert!(
+        error.contains("is not a folder"),
+        "it says what it found: {error}"
+    );
+
+    // A good folder after three bad ones answers normally: a failure is one answer, not the end of the
+    // listing, and it leaves nothing behind that the next question inherits.
+    let listing = listed(&mut client, lib.config.download_dir.clone()).await;
+    assert_eq!(listing.error, None, "the download folder still lists");
+    assert_eq!(
+        listing.dirs,
+        names(&["alpha"]),
+        "only the folder is somewhere to go"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// Devices are a server's list to keep: which keys may sign in lives in that server's `config.yaml`, and a
+/// library running its own engine has no device table to read, add to or remove from. It says so for every
+/// question of that shape - including one whose key it would not have accepted - rather than answering with
+/// an empty list somebody would read as "no devices".
+#[tokio::test(flavor = "multi_thread")]
+async fn local_devices_is_a_notice() {
+    let lib = Library::new("local_devices");
+    let (mut client, task, _) = lib.start().await;
+
+    for command in [
+        DeviceCommand::List,
+        // Not a key this server would parse: refusing devices comes before looking at the key.
+        DeviceCommand::Add {
+            name: "laptop".to_string(),
+            public_key: "ssh-ed25519 AAAA-not-a-key alice@laptop".to_string(),
+        },
+        DeviceCommand::Remove("laptop".to_string()),
+    ] {
+        assert!(
+            client.send(Command::Devices(command.clone())),
+            "the queue takes {command:?}",
+        );
+        assert_eq!(
+            error_text(notice(&mut client).await),
+            "Devices are managed on a server",
+            "{command:?} got the answer a device command gets here",
+        );
+    }
+
+    let snapshot = client.snapshot();
+    assert!(
+        snapshot.devices.is_none(),
+        "a library with no server has no device list, not an empty one",
+    );
+    drop(snapshot);
 
     shutdown(client, task).await;
 }

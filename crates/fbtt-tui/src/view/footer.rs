@@ -63,11 +63,15 @@ fn hints_from(described: &[(&'static str, &'static str)]) -> Line<'static> {
 }
 
 /// The last thing the backend said, in the colour that says whether it was good news or bad news.
-/// How long it stays is the model's business; this line only shows it while it has one.
+/// How long it stays is the model's business; this line only shows it while it has one. A refused sign-in is
+/// bad news about the connection like any other error: who has to act on it is the run's business, not the
+/// footer's, so it is drawn in the same colour with the same text.
 fn notice_line(notice: &Notice) -> Line<'static> {
     let (text, style) = match notice {
         Notice::Info(text) => (text, Style::new().fg(theme::INK_300)),
-        Notice::Error(text) => (text, Style::new().fg(theme::RED_500)),
+        Notice::Error(text) | Notice::SignInRefused(text) => {
+            (text, Style::new().fg(theme::RED_500))
+        }
     };
     Line::from(Span::styled(format::safe(text), style))
 }
@@ -113,5 +117,15 @@ mod tests {
         let text = "a tracker refused an announce";
         let line = notice_line(&Notice::Error(text.to_string()));
         assert_eq!(line.width(), text.chars().count());
+    }
+
+    /// A refused sign-in is drawn exactly like the error it is: the same words in the same colour, on one
+    /// line. What somebody does about it is the run's business; a screen only has to show it as bad news.
+    #[test]
+    fn a_refused_sign_in_is_drawn_like_an_error() {
+        let text = "sign-in was refused: the password was wrong";
+        let refusal = notice_line(&Notice::SignInRefused(text.to_string()));
+        assert_eq!(refusal, notice_line(&Notice::Error(text.to_string())));
+        assert_eq!(refusal.width(), text.chars().count());
     }
 }

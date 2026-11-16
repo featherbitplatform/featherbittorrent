@@ -8,11 +8,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fbtt_core::{
-    Command, Detail, DetailTab, FilePriority, FileRow, RowState, Snapshot, TorrentRow,
+    Command, Connection, Detail, DetailTab, DeviceCommand, FilePriority, FileRow, RowState,
+    Snapshot, TorrentRow,
 };
 
 use crate::modal::{self, Modal};
-use crate::model::{Model, visible_rows};
+use crate::model::{Action, Model, visible_rows};
 
 /// Every key the model answers, and what pressing it does. The help screen lists all of
 /// them; [`FOOTER_KEYS`] chooses which of them a person needs without looking, so those
@@ -35,12 +36,15 @@ pub const KEYS: &[(&str, &str)] = &[
     ("a", "add"),
     ("d", "delete"),
     ("S", "settings"),
+    ("c", "connect"),
+    ("K", "devices"),
     ("?", "help"),
     // These answer inside a dialog or in the file list rather than in the table, and they are in
     // this one list so that the help screen has to mention them too.
     ("Enter", "focus the file list"),
     ("+", "raise the focused file's priority"),
     ("-", "lower the focused file's priority"),
+    ("Ctrl+O", "pick a destination folder"),
     ("Esc", "close a dialog"),
     ("y", "confirm quit"),
     ("q", "quit"),
@@ -48,7 +52,7 @@ pub const KEYS: &[(&str, &str)] = &[
 
 /// The hints the footer has room for, in the order it shows them. Each one is a key of
 /// [`KEYS`].
-pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "?", "q"];
+pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "c", "?", "q"];
 
 /// The hints the footer gives instead while the cursor is in the detail pane's file list, where
 /// `j` and `k` mean files rather than torrents, as the key and what it does there. Every key of it
@@ -65,8 +69,8 @@ pub const FILE_LIST_HINTS: &[(&str, &str)] = &[
 /// the terminal is, so this is a page by agreement rather than a screenful.
 const PAGE_STEP: i32 = 10;
 
-/// Applies one press to `model` and returns what the backend should be told.
-pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<Command> {
+/// Applies one press to `model` and returns what the program should do about it.
+pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<Action> {
     // Only presses count. Windows reports a release for every press, and a key held down
     // repeats: one row at a time either way.
     if key.kind != KeyEventKind::Press {
@@ -79,6 +83,17 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
     // so a shift press is only accepted where it is the whole of the modifier.
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
         return quit_press(model, snap);
+    }
+    // `Ctrl+O` is the one modified key a dialog has to be given: its whole job is to put a folder into
+    // the add dialog's destination field, and the only place it can come from is the list the backend
+    // names. Anywhere else it means nothing, so it is dropped rather than reaching the map below as an
+    // `o` that would start sorting by the next column.
+    if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('o')) {
+        return if matches!(model.modal, Some(Modal::Add(_))) {
+            modal::handle(model, key, snap)
+        } else {
+            Vec::new()
+        };
     }
     if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
         return Vec::new();
@@ -123,12 +138,18 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
                 KeyCode::Char('o') => model.cycle_sort(),
                 KeyCode::Char('O') => model.reverse_sort(),
                 KeyCode::Char('m') => model.toggle_view(),
-                // These five open a dialog, which then answers every key itself. `c` and `s` are
-                // reserved for later milestones: connect, and stream.
+                // These open a dialog, which then answers every key itself. `s` is reserved for
+                // a later milestone: stream.
                 KeyCode::Char('/') => model.modal = Some(Modal::Filter),
                 KeyCode::Char('a') => model.modal = Some(Modal::add(snap)),
                 KeyCode::Char('S') => model.modal = Some(Modal::settings(snap)),
                 KeyCode::Char('?') => model.modal = Some(Modal::Help),
+                // The connect screen is prefilled with what this run connected to last, so that
+                // changing one thing about a server does not mean typing it again.
+                KeyCode::Char('c') => model.modal = Some(Modal::connect(model.last_target())),
+                // Devices belong to a server, so the key that lists them is answered by the
+                // connection rather than by the table.
+                KeyCode::Char('K') => return devices_press(model, snap),
                 KeyCode::Char('d') => {
                     // The question names the torrent it is about, so there has to be one.
                     if let Some(row) = model.selected_row(&rows) {
@@ -143,9 +164,21 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<C
     }
 }
 
+/// `K`: the devices a server lets sign in. Only a server has such a list, so on a library running its
+/// own engine the key does nothing rather than opening a dialog with nothing in it. Opening it sends the
+/// `Devices(List)` that fills it: a list nobody asked for is an empty screen until somebody presses a
+/// key inside it.
+fn devices_press(model: &mut Model, snap: &Snapshot) -> Vec<Action> {
+    if !matches!(snap.connection, Connection::Remote { .. }) {
+        return Vec::new();
+    }
+    model.modal = Some(Modal::devices());
+    vec![Action::Command(Command::Devices(DeviceCommand::List))]
+}
+
 /// `p` for the selected row: a stopped torrent is started and anything else is stopped.
 /// Nothing selected sends nothing.
-fn pause_or_resume(row: Option<&TorrentRow>) -> Vec<Command> {
+fn pause_or_resume(row: Option<&TorrentRow>) -> Vec<Action> {
     let Some(row) = row else {
         return Vec::new();
     };
@@ -163,13 +196,13 @@ fn pause_or_resume(row: Option<&TorrentRow>) -> Vec<Command> {
         | RowState::Stalled
         | RowState::Seeding => Command::Pause(row.id.clone()),
     };
-    vec![command]
+    vec![Action::Command(command)]
 }
 
 /// The press that means "leave": `q`, or Ctrl-C wearing the same meaning. With work still in
 /// progress it asks first - a second press, or `y`, confirms; anything else cancels.
 /// With nothing running one press is enough.
-fn quit_press(model: &mut Model, snap: &Snapshot) -> Vec<Command> {
+fn quit_press(model: &mut Model, snap: &Snapshot) -> Vec<Action> {
     if model.quit_armed() {
         model.quit_now()
     } else if any_downloading(snap) {
@@ -209,7 +242,7 @@ fn focus_file_list(model: &mut Model, snap: &Snapshot) {
 /// of the file under the cursor, and leaving. Everything else is ignored rather than falling
 /// through to the table, because the person pressing it meant the list. Quit is the exception, and
 /// it was answered before any of this ran.
-fn file_list_keys(model: &mut Model, code: KeyCode, snap: &Snapshot) -> Vec<Command> {
+fn file_list_keys(model: &mut Model, code: KeyCode, snap: &Snapshot) -> Vec<Action> {
     match code {
         KeyCode::Esc => {
             model.set_files_focused(false);
@@ -245,7 +278,7 @@ fn file_list_keys(model: &mut Model, code: KeyCode, snap: &Snapshot) -> Vec<Comm
 /// `+` and `-` on the file under the cursor. Only the command is sent: the model does not assume
 /// it worked, so the word in the list changes when the next snapshot says it did. A file already
 /// at the top or the bottom of the ladder sends nothing.
-fn change_priority(model: &Model, snap: &Snapshot, raise: bool) -> Vec<Command> {
+fn change_priority(model: &Model, snap: &Snapshot, raise: bool) -> Vec<Action> {
     let Some(files) = watched_files(model, snap) else {
         return Vec::new();
     };
@@ -264,11 +297,11 @@ fn change_priority(model: &Model, snap: &Snapshot, raise: bool) -> Vec<Command> 
     let Some(id) = &model.selected else {
         return Vec::new();
     };
-    vec![Command::SetFilePriority {
+    vec![Action::Command(Command::SetFilePriority {
         id: id.clone(),
         file: file.index,
         priority: next,
-    }]
+    })]
 }
 
 /// The file list the snapshot holds for the selected torrent, `None` when it holds none: while a

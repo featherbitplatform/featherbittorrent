@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fbtt_core::{
-    Connection, Detail, FilePriority, FileRow, LiveLimits, RowState, Snapshot, TorrentId,
-    TorrentRow, Totals,
+    Connection, Detail, DeviceRow, DirListing, FilePriority, FileRow, LinkState, LiveLimits,
+    RowState, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use fbtt_tui::Model;
 use ratatui::Terminal;
@@ -110,6 +110,8 @@ pub fn library() -> Snapshot {
             ]),
         )),
         default_dir: PathBuf::from("/downloads"),
+        dirs: None,
+        devices: None,
     }
 }
 
@@ -183,6 +185,55 @@ impl Screen {
     pub fn width(&self) -> usize {
         usize::from(self.terminal.backend().buffer().area().width)
     }
+}
+
+/// The folders a backend says it may name, spelled as they were configured: where a destination picker
+/// starts and where going back up comes back to.
+pub const ROOTS: [&str; 2] = ["/downloads", "/home/alice"];
+
+/// The library with one folder listing in it, which is what a destination picker draws. `inside` is the
+/// folder that was asked about - `None` for the list of places to start from - and `dirs` are what is
+/// directly inside it, in the order the backend sorted them.
+pub fn folders(inside: Option<&str>, dirs: &[&str]) -> Snapshot {
+    let mut snap = library();
+    snap.dirs = Some(DirListing {
+        path: inside.map(PathBuf::from),
+        roots: ROOTS.iter().map(|root| PathBuf::from(*root)).collect(),
+        dirs: dirs.iter().map(|dir| (*dir).to_string()).collect(),
+        error: None,
+    });
+    snap
+}
+
+/// The library when its torrents come from a server, with the link in the state `state`: that state is
+/// what a header test is about, and everything else stays the library the other tests read. A server's
+/// snapshot reports what that server reported, so this client's own DHT count is not in it.
+pub fn server(state: LinkState) -> Snapshot {
+    let mut snap = library();
+    snap.totals.dht_nodes = None;
+    snap.connection = Connection::Remote {
+        name: "bit.example".to_string(),
+        secure: false,
+        auth: "password".to_string(),
+        state,
+    };
+    snap
+}
+
+/// The same, with the device list that server gave: each row a name and the fingerprint a person checks
+/// the name against before trusting it.
+pub fn server_with_devices(devices: &[(&str, &str)]) -> Snapshot {
+    let mut snap = server(LinkState::Connected);
+    snap.devices = Some(
+        devices
+            .iter()
+            .map(|(name, fingerprint)| DeviceRow {
+                name: (*name).to_string(),
+                fingerprint: (*fingerprint).to_string(),
+            })
+            .collect(),
+    );
+    snap
 }
 
 /// A model looking at a snapshot the way the binary leaves it after every new one.

@@ -1,0 +1,81 @@
+[package]
+name = "fbtt-server"
+description = "featherbittorrent server: logins, device keys and sessions, plus the routes on top of fbt-api."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# What `tests/server.rs` needs beyond what is public anyway: the counters that let a test prove a password
+# attempt ran an Argon2 verify, and that no more than the clamp of them ran at once. Taking the engine's
+# settings as an argument (`Server::start_with_settings`) is not part of this - something that runs the
+# library away from where its config points needs it in a release build too. The `server` test target below
+# requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
+test-support = []
+
+[dependencies]
+# The password hashes.
+argon2.workspace = true
+# The routes: `Router`, the body and query extractors, and the `http` types an `AuthRequest` carries.
+# fbt-api turns the serving half on for the tree; these are the parts our own code names.
+axum = { workspace = true, features = ["json", "query"] }
+# Session tokens and challenge nonces, spelled in base64.
+base64.workspace = true
+# `fbt::display_safe`, because a folder name or a config device name is remote text by the time a
+# route puts it in a response or a log line.
+fbt.workspace = true
+fbt-api.workspace = true
+fbtt-core.workspace = true
+# The bytes session tokens and challenge nonces are made of.
+getrandom.workspace = true
+# What a session token is stored as: its SHA-256.
+sha2.workspace = true
+# Device keys: the OpenSSH public key line and `sshsig`.
+ssh-key.workspace = true
+# The request and response bodies of our own routes.
+serde.workspace = true
+# The login route parses a body it took as bytes. Already in the tree through axum's `json`.
+serde_json.workspace = true
+thiserror.workspace = true
+# The task that saves the engine every five minutes, its stop signal, and the blocking-pool calls
+# (Argon2 verify, folder listing, config save) that keep them off the connection's task.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+# Log lines: who signed in, what a state-file problem cost, what the server is listening on.
+tracing.workspace = true
+
+[dev-dependencies]
+# The scratch library and `fbtt_core::scratch`, which the integration test builds its own
+# `Paths` and download folder in.
+fbtt-core = { workspace = true, features = ["test-support"] }
+# The tests' client. `json` for reading responses, and nothing else: every request here is plain http to
+# a server on loopback, so no TLS stack and no trust store is asked for - which is also why the workspace
+# default (its native-tls) stays off rather than dragging a system certificate lookup into the tests.
+reqwest = { workspace = true, default-features = false, features = ["json"] }
+# The gateway fake checks a `private_key_jwt` assertion's raw Ed25519 signature against the device's
+# public key. ssh-key implements `signature::Verifier` for its keys but does not re-export the trait, so
+# the test names it here to call that one method.
+signature.workspace = true
+# ...and an ES256 assertion the way a provider does: as fixed-width `r || s`, which is what the client sent
+# after converting OpenSSH's mpint spelling. Verification has to come from outside ssh-key or the test would
+# only prove that ssh-key agrees with itself about its own encoding.
+p256.workspace = true
+# `#[tokio::test]`, and a runtime with worker threads: each test runs a server, an engine and a
+# blocking-pool Argon2 verify at once. `net` is for the two servers `tests/remote.rs` puts up of its own -
+# a hostile one and a gateway one - beside the real one.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[[test]]
+name = "server"
+required-features = ["test-support"]
+
+# The remote backend (Task 6) drives a `Server` from another process's position: the tests live here
+# rather than in fbtt-core so they can start one.
+[[test]]
+name = "remote"
+required-features = ["test-support"]

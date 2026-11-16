@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use fbtt_core::{Command, LiveLimits};
 
-use crate::modal::{Answer, Input, field, keys_hint, type_into};
+use crate::modal::{Action, Answer, Input, field, keys_hint, type_into};
 use ratatui::text::Line;
 
 /// The five fields, in the order `Tab` walks them and in the order [`SettingsForm::fields`]
@@ -86,13 +86,13 @@ impl SettingsForm {
             values[index] = value;
         }
 
-        Answer::Close(vec![Command::SetLimits(LiveLimits {
+        Answer::Close(vec![Action::Command(Command::SetLimits(LiveLimits {
             download_kib: values[0],
             upload_kib: values[1],
             active_downloads: queue_count(values[RATE_FIELDS]),
             active_seeds: queue_count(values[RATE_FIELDS + 1]),
             active_total: queue_count(values[RATE_FIELDS + 2]),
-        })])
+        }))])
     }
 }
 

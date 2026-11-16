@@ -4,7 +4,12 @@ featherbittorrent is a BitTorrent client built on [fbt-lib](https://github.com/f
 
 The clients that came before it (uTorrent, Deluge, qBittorrent) work, and their shape is the one people expect: a torrent list with a detail pane, a daemon and a thin client. featherbittorrent wants that shape snappier and lighter: keypresses that feel instant, redraws that stay smooth with hundreds of torrents, and memory and CPU use small enough for the server to run comfortably on a Raspberry Pi 2B.
 
-Status: milestone 1, the local client, is complete. `featherbittorrent` in a terminal is a whole client: the engine runs in that process, so there is nothing to install beside the binary. The server role (`serve`), the remote backend, authentication and streaming come with milestone 2, which also carries the first release, 0.1.0. Nothing is released yet.
+Status: milestone 1, the local client, is complete: `featherbittorrent` in a terminal is a whole
+client, the engine runs in that process, and there is nothing to install beside the binary.
+Milestone 2, the server role (`serve`), the remote backend, authentication and streaming, lives on
+the `feature/m2-server` branch and carries the first release, 0.1.0; [docs/server.md](docs/server.md)
+and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release archives for macOS, Linux and
+Windows are built by the release workflow on a `v*` tag. Nothing is released yet.
 
 ## Build and run
 
@@ -15,7 +20,12 @@ cargo build --workspace
 cargo run -p featherbittorrent
 ```
 
-Run it from a terminal emulator: it takes the screen (raw mode plus the alternate screen) and gives it back when it quits. `featherbittorrent --version` works anywhere. The `serve` subcommand arrives with milestone 2.
+Run it from a terminal emulator: it takes the screen (raw mode plus the alternate screen) and gives
+it back when it quits. `featherbittorrent --version` works anywhere. `featherbittorrent serve` runs
+the library headless with its HTTP API, first run asked through a short wizard; on any network you do
+not own, put the [featherbit gateway](https://github.com/featherbitplatform/gateway) or another API
+gateway or reverse proxy in front of it for TLS, throttling and further authentication. The server's
+own guide is [docs/server.md](docs/server.md).
 
 ## Usage
 
@@ -40,10 +50,13 @@ Run it from a terminal emulator: it takes the screen (raw mode plus the alternat
 | `a` | add |
 | `d` | delete |
 | `S` | settings |
+| `c` | connect |
+| `K` | devices |
 | `?` | help |
 | `Enter` | focus the file list |
 | `+` | raise the focused file's priority |
 | `-` | lower the focused file's priority |
+| `Ctrl+O` | pick a destination folder |
 | `Esc` | close a dialog |
 | `y` | confirm quit |
 | `q` | quit |
@@ -80,6 +93,11 @@ Changing limits in the settings dialog (`S`) applies them to the running session
 
 A `config.yaml` that is not valid YAML does not stop the app: it is moved aside as `config.yaml.bad`, the run starts on the defaults, and one line about what was wrong appears on screen. The state file follows the same rule. An unreadable `session.state` becomes `session.state.bad` rather than being overwritten, and resume data that cannot all be turned back into torrents is copied to `session.state.bak` first, so the missing ones are not lost to the next save.
 
+A `server:` section in the same file is what `featherbittorrent serve` acts on: the address its API
+listens on, which folders the API may name, which host names it answers when nobody signs in, and who
+has to sign in. The TUI reads none of it; every field, default and rule is in
+[docs/server.md](docs/server.md).
+
 ### Scratch directories
 
 Two environment variables point the app at a different library, which is how you try it without touching your own:
@@ -100,6 +118,12 @@ Another featherbittorrent is already using this library (/Users/you/Library/Appl
 
 It exits with code 3 and changes nothing. Other failures print one line and exit 1; a run that quit cleanly exits 0. SIGTERM (and Ctrl-C where the terminal does not report it as a key) quits without asking, because a signal is nobody who can answer a confirmation.
 
+When the busy run is `featherbittorrent serve` on this library and this TUI last used the library
+locally, the second run asks instead of only failing: `A featherbittorrent server is running on this
+library. Connect to it? y/n`. Answering `y` connects to that server rather than starting an engine,
+and the sign-in you complete there is borrowed and never written down; answering `n` gives the exit-3
+line above. The lock and the hand-off are spelled out in [docs/server.md](docs/server.md).
+
 ## Gates
 
 Every change runs the same gates locally and in CI:
@@ -116,7 +140,7 @@ CI runs fmt on Linux, clippy and tests on Linux, macOS and Windows, where both p
 
 ## Design
 
-The binding design is [docs/superpowers/specs/2026-11-14-featherbittorrent-design.md](docs/superpowers/specs/2026-11-14-featherbittorrent-design.md). The plan for the current milestone sits next to it.
+The binding design is [docs/superpowers/specs/2026-11-14-featherbittorrent-design.md](docs/superpowers/specs/2026-11-14-featherbittorrent-design.md). The plan for the current milestone sits next to it. A worked-out deployment, gateway and provider stack you can run is [docs/examples/gateway-oidc/](docs/examples/gateway-oidc/).
 
 ## License
 

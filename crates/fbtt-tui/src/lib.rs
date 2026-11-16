@@ -15,6 +15,9 @@ pub mod model;
 pub mod theme;
 pub mod view;
 
-pub use modal::{AddForm, Input, Modal, SettingsForm};
-pub use model::{Descending, Model, SortKey, View, visible_rows};
+pub use modal::{
+    AddForm, ConnectForm, ConnectRequest, ConnectTarget, DevicesForm, FolderPicker, Input, Masked,
+    Modal, SecretInput, SettingsForm,
+};
+pub use model::{Action, Descending, Model, SortKey, View, visible_rows};
 pub use view::draw;
