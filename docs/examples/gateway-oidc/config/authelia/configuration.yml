@@ -1,0 +1,128 @@
+# Authelia for the gateway-oidc example, written against 4.39.28 (the tag compose.yaml pins).
+# Since 4.39 the OIDC endpoints live under /api/oidc/, which is why the token URL is
+# https://auth.example.test:9443/api/oidc/token and not a bare path.
+#
+# Secrets arrive two ways. The template filter (compose sets X_AUTHELIA_CONFIG_FILTERS=template)
+# reads the signing key and the web client's secret digest from the files compose mounts under
+# /run/secrets; the session secret, the storage encryption key and the HMAC secret arrive through
+# the *_FILE environment variables in compose.yaml instead. Never define the same secret both here
+# and by its *_FILE variable: Authelia refuses to start when a secret has two sources.
+
+server:
+  # 9443 inside the container too, the same port compose publishes. The gateway reaches Authelia
+  # inside the network under the same URL the browser uses (https://auth.example.test:9443, through
+  # the gateway's extra_hosts entry), so the port has to be the same on both sides.
+  address: 'tcp://:9443/'
+  # TLS ends at Authelia itself, so nothing in front has to rewrite Host or forwarded headers: the
+  # issuer derives exactly from https://auth.example.test:9443.
+  tls:
+    key: /tls/key.pem
+    certificate: /tls/cert.pem
+
+log:
+  level: info
+
+authentication_backend:
+  # No mail server in this example, so no "forgot password" flow (it would also need its own
+  # identity_validation.reset_password.jwt_secret).
+  password_reset:
+    disable: true
+  file:
+    path: /config/users_database.yml
+
+# Only consulted by forward-auth proxies, which this example does not use: the OIDC clients below
+# carry their own authorization_policy. Authelia still insists on a valid section, and deny with no
+# rules is not one, so the one host this stack serves gets one_factor and everything else is denied.
+access_control:
+  default_policy: 'deny'
+  rules:
+    - domain: 'torrent.example.test'
+      policy: 'one_factor'
+
+storage:
+  local:
+    path: /database/authelia.db
+
+session:
+  cookies:
+    # The cookie covers both hostnames, and authelia_url is where a visitor is sent to sign in. Both
+    # must agree with the URL actually opened, because Authelia derives its issuer from the request.
+    - domain: 'example.test'
+      authelia_url: 'https://auth.example.test:9443'
+
+identity_providers:
+  oidc:
+    # One RSA key signs the access tokens and ID tokens; the gateway validates them against this
+    # issuer's JWKS. The template filter indents the PEM into this block scalar for us (`mindent` and
+    # `msquote` are Authelia's own helpers), which is why README step 2 writes secrets/oidc_jwks_key as
+    # plain PEM with no leading spaces.
+    jwks:
+      - key_id: 'featherbittorrent-example'
+        algorithm: 'RS256'
+        use: 'sig'
+        key: {{ secret "/run/secrets/oidc_jwks_key" | mindent 10 "|" | msquote }}
+
+    clients:
+      # The TUI's `gateway private key` login: client credentials with a signed assertion
+      # (private_key_jwt), so no shared secret exists anywhere near the laptop. featherbittorrent
+      # names the signing key in the assertion header with its OpenSSH fingerprint, and Authelia
+      # selects the registered key by that kid exactly - so key_id must be the fingerprint README
+      # step 4 prints, `SHA256:` prefix included. Client keys here are RSA or ECDSA only, hence P-256
+      # and ES256; token_endpoint_auth_signing_alg has to name the same algorithm the header does.
+      # Authelia 4.39.28 accepts the assertion as featherbittorrent sends it (`typ: JWT`, the token
+      # URL as its audience) with no extra switch.
+      - client_id: 'featherbittorrent-tui'
+        client_name: 'featherbittorrent TUI'
+        grant_types: ['client_credentials']
+        authorization_policy: 'one_factor'
+        # A client_credentials token carries no ID token, and Authelia will not let this kind of
+        # client ask for `openid` at all. Nothing here decides who you are inside
+        # featherbittorrent: the server runs with its own logins off and trusts the gateway.
+        scopes: ['profile', 'email']
+        # The access token is a JWT (RFC 9068) the gateway checks offline against the JWKS. RFC 9068
+        # wants an `aud` in it, and implicit mode puts this audience there without the client asking.
+        access_token_signed_response_alg: 'RS256'
+        audience: ['https://torrent.example.test']
+        requested_audience_mode: 'implicit'
+        token_endpoint_auth_method: 'private_key_jwt'
+        token_endpoint_auth_signing_alg: 'ES256'
+        # Every endpoint a client authenticates at defaults to client_secret_basic, which would make
+        # Authelia demand a client_secret this client does not have. The key covers them all.
+        revocation_endpoint_auth_method: 'private_key_jwt'
+        revocation_endpoint_auth_signing_alg: 'ES256'
+        introspection_endpoint_auth_method: 'private_key_jwt'
+        introspection_endpoint_auth_signing_alg: 'ES256'
+        pushed_authorization_request_endpoint_auth_method: 'private_key_jwt'
+        pushed_authorization_request_endpoint_auth_signing_alg: 'ES256'
+        jwks:
+          # Paste the fingerprint after `SHA256:` (README step 4), so the line reads
+          # key_id: 'SHA256:<43 base64 characters>'.
+          - key_id: 'SHA256:REPLACE_WITH_YOUR_FINGERPRINT'
+            algorithm: 'ES256'
+            use: 'sig'
+            # Paste your public key between the markers (README step 4). It is a public key, so it
+            # can stay in this file. Keep the indent of the PEM lines.
+            key: |
+              -----BEGIN PUBLIC KEY-----
+              REPLACE_WITH_YOUR_PUBLIC_KEY_LINES
+              -----END PUBLIC KEY-----
+
+      # Browser login: the gateway's interactive openid-connect node exchanges codes for this
+      # client and authenticates itself to the token endpoint with HTTP Basic, which is what
+      # client_secret_basic means (Authelia's default when nothing is set). Authelia only ever sees
+      # the secret's PBKDF2 digest (secrets/web_client_secret_digest); the plaintext sits in .env for
+      # the gateway (README step 2).
+      - client_id: 'featherbittorrent-web'
+        client_name: 'featherbittorrent browser login'
+        grant_types: ['authorization_code']
+        response_types: ['code']
+        redirect_uris:
+          - 'https://torrent.example.test/oidc/callback'
+        scopes: ['openid', 'profile', 'email']
+        authorization_policy: 'one_factor'
+        consent_mode: 'auto'
+        client_secret: '{{ secret "/run/secrets/web_client_secret_digest" | trim }}'
+
+notifier:
+  filesystem:
+    filename: /tmp/authelia/notification.txt

@@ -1,0 +1,330 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - dev/release-version.sh
+      - dev/test-release-version.sh
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+# Read-only by default; only the publish job (tag pushes) gets write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag must be v<workspace version>; the resolver and the changelog extraction are tested
+  # with fake refs and files (pull requests cannot try a real tag). Every packaging job
+  # resolves the version again as its first build-adjacent step, so a wrong tag stops that
+  # job before any compile; this job is what makes the failure show up fast on pull requests.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolver tests
+        run: bash dev/test-release-version.sh
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+
+  # CycloneDX SBOM of the workspace's crates (Cargo.lock). Same generator, pin and naming as
+  # fbt-lib's release workflow, so one toolchain reviews every release artifact of the platform.
+  sbom:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, so a release SBOM never changes format with an unreviewed syft release.
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.54.1
+      - name: Generate the SBOM
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/dist
+          "$SYFT" scan file:Cargo.lock \
+            --source-name featherbittorrent --source-version "$VERSION" \
+            -o "cyclonedx-json=target/dist/featherbittorrent-$VERSION.cdx.json"
+          # An SBOM without components means syft read nothing from the lockfile.
+          jq -e '.components | length > 0' "target/dist/featherbittorrent-$VERSION.cdx.json" > /dev/null \
+            || { echo "::error::no components in the SBOM"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-sbom
+          if-no-files-found: error
+          path: target/dist/featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json
+
+  # The Linux archives are built inside a debian:12 container on native runners of each arch:
+  # the binary must not need a glibc newer than Debian 12 (glibc 2.36), because that is also
+  # what Raspberry Pi OS 12 ships, and an ubuntu-24.04 runner would link against 2.39. The
+  # rustup toolchain installs into the job; ring's C needs the compiler packages below.
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates unzip tar gzip zlib1g-dev
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+      - name: Build
+        run: cargo build --locked --release -p featherbittorrent
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="target/dist/featherbittorrent-$VERSION-$TARGET"
+          mkdir -p "$stage"
+          cp target/release/featherbittorrent "$stage/"
+          cp LICENSE NOTICE README.md "$stage/"
+          tar -C target/dist -czf "target/dist/featherbittorrent-$VERSION-$TARGET.tar.gz" \
+            "featherbittorrent-$VERSION-$TARGET"
+      - name: Smoke the archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/smoke" && mkdir -p "$RUNNER_TEMP/smoke"
+          tar -C "$RUNNER_TEMP/smoke" -xzf "target/dist/featherbittorrent-$VERSION-$TARGET.tar.gz"
+          bin="$RUNNER_TEMP/smoke/featherbittorrent-$VERSION-$TARGET/featherbittorrent"
+          test -x "$bin"
+          "$bin" --version | grep -F "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+
+  # One universal archive from both Apple-silicon and Intel builds, joined with lipo; the
+  # runner is Apple silicon, so the packaged binary runs in the smoke step either way.
+  macos:
+    name: macos-universal
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+      - name: Build both archs
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p featherbittorrent --target aarch64-apple-darwin
+          cargo build --locked --release -p featherbittorrent --target x86_64-apple-darwin
+      - name: Package the universal archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          stage="target/dist/featherbittorrent-$VERSION-universal-apple-darwin"
+          mkdir -p "$stage"
+          lipo -create \
+            target/aarch64-apple-darwin/release/featherbittorrent \
+            target/x86_64-apple-darwin/release/featherbittorrent \
+            -output "$stage/featherbittorrent"
+          cp LICENSE NOTICE README.md "$stage/"
+          tar -C target/dist -czf "target/dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz" \
+            "featherbittorrent-$VERSION-universal-apple-darwin"
+          # lipo says which archs really are in the binary; both must be listed.
+          lipo -archs "$stage/featherbittorrent" | grep -w arm64 | grep -w x86_64 > /dev/null
+      - name: Smoke the archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/smoke" && mkdir -p "$RUNNER_TEMP/smoke"
+          tar -C "$RUNNER_TEMP/smoke" -xzf "target/dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz"
+          bin="$RUNNER_TEMP/smoke/featherbittorrent-$VERSION-universal-apple-darwin/featherbittorrent"
+          test -x "$bin"
+          "$bin" --version | grep -F "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-macos-universal
+          if-no-files-found: error
+          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
+
+  # The Windows archives build for the runner's own arch on native runners of each arch.
+  windows:
+    name: windows-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+      - name: Build
+        run: cargo build --locked --release -p featherbittorrent
+      - name: Package the zip
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $stage = "target\dist\featherbittorrent-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Force "$stage" | Out-Null
+          Copy-Item "target\release\featherbittorrent.exe" "$stage\"
+          Copy-Item LICENSE, NOTICE, README.md "$stage\"
+          Compress-Archive -Path "$stage" `
+            -DestinationPath "target\dist\featherbittorrent-$env:VERSION-$env:TARGET.zip"
+      - name: Smoke the archive
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = "target\dist\featherbittorrent-$env:VERSION-$env:TARGET.zip"
+          [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path $zip), "$env:RUNNER_TEMP\smoke")
+          $bin = "$env:RUNNER_TEMP\smoke\featherbittorrent-$env:VERSION-$env:TARGET\featherbittorrent.exe"
+          if (-not (Test-Path $bin)) { throw "no binary in the archive" }
+          $printed = & $bin --version | Out-String
+          if ($printed -notlike "*$env:VERSION*") { throw "--version did not print the release version" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-windows-${{ matrix.arch }}
+          if-no-files-found: error
+          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+
+  # One release with every system's archive plus the SBOM, published only when every job
+  # passed: any failing job skips this one, so nothing is published. Only a tag push
+  # publishes; a pull request or manual run builds and checks, never releases. The release
+  # is made as a draft, gets all files, and only then is published, so a failed upload never
+  # leaves a half-published release; a re-run first removes the draft a failed run left.
+  publish:
+    name: publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, sbom, linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Put below the version's CHANGELOG.md section and above the generated notes.
+      NOTES: >-
+        Archives for macOS (universal `.tar.gz`), Linux x86_64 and aarch64 (`.tar.gz`, built
+        on Debian 12 so they run wherever Debian 12 or Raspberry Pi OS 12 runs) and Windows
+        x86_64 and aarch64 (`.zip`). Each archive holds the binary beside `LICENSE`, `NOTICE`
+        and `README.md`; `featherbittorrent-<version>.cdx.json` is its CycloneDX SBOM. Debian
+        packages arrive in milestone 4.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: featherbittorrent-*
+          merge-multiple: true
+          path: dist
+      - name: Release notes from the changelog
+        # The version's section of CHANGELOG.md (its lines after the heading, trimmed), then
+        # the downloads paragraph; the generated notes follow.
+        run: |
+          set -euo pipefail
+          bash dev/release-version.sh --notes > "$RUNNER_TEMP/notes.md"
+          printf '\n%s\n' "$NOTES" >> "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Check every file is here
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat > "$RUNNER_TEMP/release-files" <<EOF
+          dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz
+          dist/featherbittorrent-$VERSION-x86_64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-$VERSION-x86_64-pc-windows-msvc.zip
+          dist/featherbittorrent-$VERSION-aarch64-pc-windows-msvc.zip
+          dist/featherbittorrent-$VERSION.cdx.json
+          EOF
+          missing=0
+          while read -r file; do
+            if [ ! -s "$file" ]; then
+              echo "::error::missing or empty: $file"
+              missing=1
+            fi
+          done < "$RUNNER_TEMP/release-files"
+          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 6 ]
+          exit "$missing"
+      - name: Remove a draft a failed run left
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft and .tag_name == env.TAG) | .id' |
+            while read -r id; do
+              echo "deleting the draft release $id for $TAG"
+              gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            done
+      - name: Create the release as a draft
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes "${prerelease[@]}"
+      - name: Upload the files
+        run: |
+          set -euo pipefail
+          mapfile -t files < "$RUNNER_TEMP/release-files"
+          gh release upload "$TAG" "${files[@]}"
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false

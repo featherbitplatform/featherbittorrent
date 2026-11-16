@@ -1,0 +1,349 @@
+//! Browsing the folders this server may name: the roots, and the directories inside one of them.
+//!
+//! This is the destination picker's data source - the list a client walks to choose where a torrent goes -
+//! so it answers with what a picker needs and nothing else: folder names, sorted, no files, no sizes,
+//! nothing hidden. What it may name at all is `server.allowed_roots`, which after
+//! [`fbtt_core::Config::resolve`] is a list of absolute folders (the download folder when the config named
+//! none), and fbt-api enforces the same list on the paths its own routes take.
+//!
+//! What a listing then does - how many names it reports, which ones it skips, what it makes of a symlink,
+//! what counts as outside the roots - is [`fbtt_core::fs_list`]'s, because the local backend answers the
+//! same question about a person's own machine and one set of rules is the point: a folder that listed one
+//! way over HTTP and another way in the picker would be two rules for somebody to keep apart. Decided here
+//! is this API's shape only: the roots a request is confined to, spelled both ways ([`Root`], because a
+//! request arrives in whichever spelling the person typed and on macOS `/var` is a link to `/private/var`,
+//! so the two are not prefixes of one another), the guard that runs before the file system is touched at
+//! all so a client cannot make this server stat - or, on Windows, authenticate to - something outside the
+//! library, and the status and code each answer becomes. The listing reports at most
+//! [`fbtt_core::fs_list::MAX_DIRS`] names.
+
+// `pub(crate)` rather than private because [`Server`](crate::server::Server) prepares the allowed folders
+// into these roots before fbt-api is handed any of them, and it has to name the type to do that.
+pub(crate) use fbtt_core::fs_list::Root;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use axum::Json;
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use fbtt_core::fs_list::{self, ListingError, inside_lexically};
+use serde::{Deserialize, Serialize};
+
+use super::{RouteError, Shared, clean};
+
+/// `GET /api/v1/fs/roots`: the folders this server may name, spelled as `config.yaml` spells them.
+pub(super) async fn roots(State(shared): State<Arc<Shared>>) -> Json<Vec<String>> {
+    Json(
+        shared
+            .roots
+            .iter()
+            .map(|root| root.given.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// `GET /api/v1/fs/list?path=<absolute>`: the directories directly inside `path`, as `{path, dirs}`.
+///
+/// The answer is [`fbtt_core::fs_list`]'s - names cleaned for display and sorted, files and hidden entries
+/// left out, a link listed only where it stays inside a root. A path outside every root is `403`, whether
+/// it got there by `..`, by being somewhere else entirely, or by being a symlink that leads out; one that
+/// is not there is `404`; one that is not a folder, or that no operating system could take (a NUL byte in
+/// the middle of it), is `400`. Refusing a path before anything on disk is looked at is this route's own
+/// job: see [`inside_lexically`].
+pub(super) async fn list(
+    State(shared): State<Arc<Shared>>,
+    given: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Listing>, RouteError> {
+    // A query that is not this shape - no `path` at all, or one that cannot be read as text - comes back
+    // in this API's error shape rather than axum's plain-text one.
+    let Query(query) = given?;
+    // The path as it arrived, kept whole: it is what an error names and what the answer reports back.
+    let asked = query.path;
+    // A NUL byte is where a path stops, so one in the middle is not a path anything could resolve - a
+    // percent-decoded `%00` is how it gets here. Said at once rather than discovered as an error from the
+    // operating system, which reports it differently depending on which one this is running on.
+    if asked.contains('\0') {
+        return Err(RouteError::invalid_request(format!(
+            "invalid path {}",
+            clean(&asked),
+        )));
+    }
+    // Lexical first, so a path this server would refuse anyway costs a comparison and not a stat - and no
+    // trip to the blocking pool to say it.
+    if !inside_lexically(&shared.roots, Path::new(&asked)) {
+        return Err(RouteError::path_not_allowed(&asked));
+    }
+    let roots = Arc::clone(&shared.roots);
+    let target = PathBuf::from(&asked);
+    let dirs = tokio::task::spawn_blocking(move || list_dirs(&roots, &target))
+        .await
+        .map_err(|problem| {
+            RouteError::internal(format!("the folder could not be listed ({problem})"))
+        })??;
+    Ok(Json(Listing { path: asked, dirs }))
+}
+
+/// The directories inside `path`, in this API's answer for them. [`fbtt_core::fs_list::list_dirs`] does the
+/// work and says what went wrong in the words every featherbittorrent listing uses - only the status and
+/// code a client of this API reads are picked here. Runs on the blocking pool because it reads a directory.
+fn list_dirs(roots: &[Root], path: &Path) -> Result<Vec<String>, RouteError> {
+    fs_list::list_dirs(roots, path).map_err(route_problem)
+}
+
+/// One listing problem in this API's error shape: the same answer fbt-api gives for the same kind of
+/// question, with the listing's own line as its message. The variant says which question was answered;
+/// the line it prints is what a client reads, and both come from the listing so they cannot drift apart.
+fn route_problem(problem: ListingError) -> RouteError {
+    match &problem {
+        ListingError::Missing(_) => RouteError::not_found(problem.to_string()),
+        // Its own code, because a client that walks this list to pick a folder has to be able to tell
+        // "somewhere else" from "not allowed here": the first is a mistake in what it asked for, the second
+        // is a limit of this server.
+        ListingError::Outside(_) => RouteError::new(
+            StatusCode::FORBIDDEN,
+            "path_not_allowed",
+            problem.to_string(),
+        ),
+        ListingError::Unusable(_) | ListingError::NotAFolder(_) => {
+            RouteError::invalid_request(problem.to_string())
+        }
+        ListingError::ReadDenied(_) => RouteError::forbidden(problem.to_string()),
+        ListingError::CannotCheck { .. } | ListingError::CannotRead { .. } => {
+            RouteError::internal(problem.to_string())
+        }
+    }
+}
+
+/// The query of `GET /api/v1/fs/list`: the folder to look inside. An absolute path is what the route can
+/// answer for; anything else is refused as outside the roots, like anywhere else it is not welcome.
+#[derive(Debug, Deserialize)]
+pub(super) struct ListQuery {
+    path: String,
+}
+
+/// What a listing answers: the folder that was asked for, spelled as it was asked for, and the
+/// directories directly inside it.
+#[derive(Debug, Serialize)]
+pub(super) struct Listing {
+    path: String,
+    dirs: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Root, inside_lexically, list_dirs};
+    use axum::http::StatusCode;
+    use fbtt_core::fs_list::MAX_DIRS;
+    use fbtt_core::scratch::ScratchDir;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// One allowed root, the folder beside it that is not one, and the scratch directory both are in: what
+    /// these tests check containment against. The root is kept in both spellings because a request arrives
+    /// in whichever one the person typed, and on macOS those two differ for a temp directory (`/var` is a
+    /// link to `/private/var`).
+    struct Tree {
+        /// Removed when this goes down: everything here is inside it. Never read - its whole job is being
+        /// dropped at the end of the test.
+        _dir: ScratchDir,
+        /// The root as `config.yaml` would name it.
+        given: PathBuf,
+        /// ...and as the filesystem spells it, which is what containment is checked against.
+        canonical: PathBuf,
+        /// Below the root's parent: inside the tree somebody drew, outside every root.
+        outside: PathBuf,
+    }
+
+    impl Tree {
+        fn new(tag: &str) -> Tree {
+            let dir = ScratchDir::new(tag);
+            let given = dir.path().join("root");
+            let outside = dir.path().join("outside");
+            fs::create_dir_all(&given).expect("make the root");
+            fs::create_dir_all(&outside).expect("make the folder beside it");
+            let canonical = given.canonicalize().expect("canonicalise the root");
+            Tree {
+                _dir: dir,
+                given,
+                canonical,
+                outside,
+            }
+        }
+
+        /// The one root, spelled both ways, as the routes hold it.
+        fn roots(&self) -> [Root; 1] {
+            [Root {
+                given: self.given.clone(),
+                canonical: self.canonical.clone(),
+            }]
+        }
+
+        /// The directories `list_dirs` reports for `path`.
+        fn list(&self, path: &Path) -> Vec<String> {
+            let roots = self.roots();
+            list_dirs(&roots, path).expect("a listing")
+        }
+    }
+
+    /// The guard that runs before the disk is touched: absolute, no `..`, and below a root in one of its two
+    /// spellings. A relative path and a `..` are refused however tidy they look - a request may not name a
+    /// folder by where this server happened to be started - and a name that merely starts where a root does
+    /// is somebody else's folder.
+    #[test]
+    fn containment_is_lexical_before_it_is_real() {
+        let tree = Tree::new("fs_lexical");
+        let roots = tree.roots();
+
+        for inside in [
+            tree.given.clone(),
+            tree.given.join("alpha"),
+            tree.given.join("deep").join("deeper"),
+            tree.canonical.clone(),
+            tree.canonical.join("alpha"),
+        ] {
+            assert!(
+                inside_lexically(&roots, &inside),
+                "{} is below the root",
+                inside.display(),
+            );
+        }
+
+        // `<root>/../outside` is the case that looks like it belongs and is not: the `..` is refused
+        // lexically, without asking the filesystem where it would have led.
+        for outside in [
+            PathBuf::from("/"),
+            tree.outside.clone(),
+            tree.given.join("..").join("outside"),
+            PathBuf::from("alpha"),
+        ] {
+            assert!(
+                !inside_lexically(&roots, &outside),
+                "{} is not below the root",
+                outside.display(),
+            );
+        }
+
+        // `/library-two` does not live under `/library`, however much the text suggests it: containment is
+        // about components, not prefixes.
+        let neighbour = tree.given.with_file_name("root-2");
+        fs::create_dir_all(&neighbour).expect("make the neighbour");
+        assert!(
+            !inside_lexically(&roots, &neighbour),
+            "{} is a sibling",
+            neighbour.display(),
+        );
+
+        // `<root>/../outside` is what M5 asks about end to end: the route refuses it as outside the roots.
+        // The lexical rule stops it at the `..`, and asking anyway gets the same answer from the listing -
+        // which holds the path to the same rule, so a caller cannot reach the disk by skipping it.
+        let problem = list_dirs(&roots, &tree.given.join("..").join("outside"))
+            .expect_err("a path that leaves the root through `..` is not inside it");
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.code, "path_not_allowed");
+    }
+
+    /// A link inside a root belongs in a listing only if wherever it points is inside a root too. Without
+    /// that rule a destination picker could leave through an alias one directory at a time - list the alias,
+    /// step into it, list what is behind it - with every answer still spelling itself as part of the
+    /// library. A link to nothing at all is left out as well: it is not somewhere a torrent can go.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_is_not_a_folder_in_the_listing() {
+        let tree = Tree::new("fs_links");
+        fs::create_dir_all(tree.given.join("alpha")).expect("make a folder");
+        fs::write(tree.given.join("a-file"), b"not a folder").expect("write a file");
+        std::os::unix::fs::symlink("../outside", tree.given.join("link-out"))
+            .expect("make a link out of the root");
+        std::os::unix::fs::symlink("alpha", tree.given.join("link-in"))
+            .expect("make a link inside the root");
+        std::os::unix::fs::symlink("../not-here", tree.given.join("link-dangling"))
+            .expect("make a dangling link");
+
+        assert_eq!(
+            tree.list(&tree.given),
+            ["alpha", "link-in"],
+            "a folder and a link to one are somewhere a torrent can go; a link out, a dangling link and a \
+             file are not",
+        );
+
+        // Asking for the link out by name is refused once it resolves: the same rule, from the other side.
+        let roots = tree.roots();
+        let problem = list_dirs(&roots, &tree.given.join("link-out"))
+            .expect_err("a link that leads out of every root is not inside one");
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.code, "path_not_allowed");
+
+        // A dangling link resolves to nothing, so it is nowhere a picker can go: `404`, like any folder that
+        // is not there.
+        let problem = list_dirs(&roots, &tree.given.join("link-dangling"))
+            .expect_err("a dangling link is not a folder");
+        assert_eq!(problem.status, StatusCode::NOT_FOUND);
+    }
+
+    /// The listing's own bound: the alphabetically first [`MAX_DIRS`] names, whatever order the folder handed
+    /// them out in, and nothing past them - so a folder with half a million entries costs this server two
+    /// thousand names rather than half a million.
+    #[test]
+    fn listing_keeps_the_alphabetically_first_names() {
+        let tree = Tree::new("fs_cap");
+        // `MAX_DIRS` plus ten, made newest-name-first so that the order they arrived in and the order they
+        // sort into are not the same thing, and zero-padded so that sorting them as text is sorting them by
+        // number.
+        for number in (0..MAX_DIRS + 10).rev() {
+            fs::create_dir_all(tree.given.join(format!("dir-{number:04}")))
+                .expect("make a test folder");
+        }
+
+        let dirs = tree.list(&tree.given);
+        assert_eq!(
+            dirs.len(),
+            MAX_DIRS,
+            "the cap is the answer, not an estimate"
+        );
+        assert_eq!(dirs.first().expect("a name"), "dir-0000");
+        assert_eq!(
+            dirs.last().expect("a name").as_str(),
+            format!("dir-{:04}", MAX_DIRS - 1).as_str(),
+            "what is kept is the alphabetically first `MAX_DIRS`, not whatever came off the disk first"
+        );
+        assert!(
+            !dirs.contains(&format!("dir-{MAX_DIRS:04}")),
+            "the name at the cut-off is out, along with everything after it",
+        );
+    }
+
+    /// A path no operating system could take is the request's mistake, answered as one: `400`, and a message
+    /// that says which path. It used to arrive as a `500`, which blamed this server for a name somebody else
+    /// invented - and `%00` in a query string is how a client sends one by accident.
+    #[test]
+    fn an_unusable_path_is_a_bad_request() {
+        let tree = Tree::new("fs_invalid");
+        let roots = tree.roots();
+        let bad = tree.given.join(format!("a{}b", char::from(0u8)));
+
+        let problem = list_dirs(&roots, &bad).expect_err("no filesystem takes a NUL in a name");
+        assert_eq!(problem.status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.code, "invalid_request");
+        assert!(
+            problem.message.contains("invalid path"),
+            "the message says what is wrong with it: {}",
+            problem.message,
+        );
+
+        // A folder that is not there is still `404`, and something that is not a folder is still `400` - but
+        // with a different message from the one above, because they answer different questions.
+        let problem = list_dirs(&roots, &tree.given.join("not-here")).expect_err("nothing there");
+        assert_eq!(problem.status, StatusCode::NOT_FOUND);
+        fs::write(tree.given.join("a-file"), b"not a folder").expect("write a file");
+        let problem =
+            list_dirs(&roots, &tree.given.join("a-file")).expect_err("a file is not a folder");
+        assert_eq!(problem.status, StatusCode::BAD_REQUEST);
+        assert!(
+            !problem.message.contains("invalid path"),
+            "a file is a usable name in the wrong shape: {}",
+            problem.message,
+        );
+    }
+}

@@ -1,0 +1,64 @@
+[package]
+name = "featherbittorrent"
+description = "BitTorrent client for the terminal: a local TUI, and a server with milestone 2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+# The library this binary wires terminal, runtime and backend together with.
+fbtt-core.workspace = true
+fbtt-tui.workspace = true
+# `featherbittorrent serve`, and the password hashes and device-key checks the admin commands write
+# into config.yaml. No features are asked for: `test-support` adds counters only a test reads, and a
+# release binary must not link them. What this crate needs from the server is public in every build -
+# including `Server::start_with_settings`, which takes the engine settings as an argument because the
+# debug-only `--offline` knob changes them (see `serve.rs`). fbtt-server's own tests get their feature
+# from its `[[test]] required-features`, not from anything here.
+fbtt-server.workspace = true
+# The engine's own settings type, which the debug-only `--offline` knob edits before handing them to
+# the server: it is the only way to keep a test run's sockets on loopback without pretending the
+# config said so.
+fbt.workspace = true
+# Reading whether a config file names a `server` section at all, which the parsed `Config` cannot
+# answer: every field of it has a default, so a file that never mentioned one still reads back as a
+# full server section. See `serve.rs`.
+serde_norway.workspace = true
+# The wizard's and `user set`'s password prompt.
+rpassword.workspace = true
+# Where `serve`'s log lines go: stderr, with `RUST_LOG` honoured.
+tracing-subscriber.workspace = true
+# The log lines themselves (`listening on <addr>`, the stop reason).
+tracing.workspace = true
+# The TUI stack. `event-stream` is what the loop selects over; ratatui's own backend
+# uses the same crossterm version, so one crate drives the terminal.
+crossterm.workspace = true
+ratatui.workspace = true
+# Where a connect password lives between runs (see `secrets.rs`). Only the platform's own store is
+# turned on: `v1` names the Apple keychain, the Windows credential manager and the Linux secret
+# service, one per platform, all of them reached without a C library this build has to bring itself.
+keyring.workspace = true
+# What a password read out of the keychain is held in, so it is overwritten when this run is done with
+# it - the same wrapper `fbtt-core`'s `Secret` uses.
+zeroize.workspace = true
+# Spelling the address half of a keychain account name, so `http://host:1` and `http://host:1/` are one
+# entry rather than two (see `secrets.rs`). The same parser the connect screen and reqwest already use, so
+# this adds no crate to the build.
+url.workspace = true
+# The `Stream` trait for polling that event stream inside `tokio::select!`.
+futures-core.workspace = true
+# The runtime: `rt-multi-thread` because the backend task runs long engine steps that
+# must not stall the event read; `signal` for SIGTERM and Ctrl-C off Unix.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+# The test process holds `LibraryLock` to make the binary's second acquire lose, and `fbtt_core::scratch`
+# gives the pure decisions above a library directory of their own to read.
+fbtt-core = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,24 @@
+# gitleaks configuration: secrets scanning over the full git history (CI) and
+# the working tree. Extends the built-in default ruleset; the allowlist below
+# covers build outputs and scanner output, not real secrets. gitleaks
+# auto-loads this file from the repo root.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Build outputs and scanner output"
+paths = [
+    '''target/''',
+    '''sast-out/''',
+    '''\.superpowers/''',
+]
+
+[[allowlists]]
+# A throwaway P-384 key in a test, generated for the test and never used anywhere
+# else. Scoped to the line that names the constant, so a real key added to this
+# file later is still reported.
+description = "Throwaway P-384 fixture key in device.rs's tests"
+paths = ['''crates/fbtt-core/src/remote/device\.rs''']
+regexTarget = "line"
+regexes = ['''const P384_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----''']

@@ -1,0 +1,150 @@
+# Routes and policies for the gateway-oidc example. Hot-reloaded: edit this file on the host and
+# the running gateway picks the change up without a restart.
+#
+# One host, two doors, plus the provider living under its own hostname on its own published port:
+#
+#   https://torrent.example.test/api/*   bearer tokens (the TUI's `gateway private key` login)
+#   https://torrent.example.test/        interactive OIDC login (browsers; future web UI)
+#   https://auth.example.test:9443/      Authelia, published directly, its own TLS
+#
+# The two openid-connect modes are separate nodes on separate routes: `bearer_only` picks one mode
+# per node. Nothing in either chain reads the request body, so `/api/v1/events` and file streams
+# stream through without a buffering switch (see docs/reverse-proxy.md).
+
+routes:
+  - name: torrent-api
+    match:
+      host: torrent.example.test
+      path: /api/*
+    policy: api-policy
+
+  # Declared after the API route on purpose: routes take first-match-wins order, so this catch-all
+  # is what serves everything else on the host, including the /oidc/callback path below.
+  - name: torrent-web
+    match:
+      host: torrent.example.test
+    policy: web-policy
+
+policies:
+  # The TUI door: validate the access token Authelia issued for the client_credentials assertion,
+  # against Authelia's JWKS (signature, expiry, issuer). No secret needed here; nothing about this
+  # path involves a browser.
+  - name: api-policy
+    error_handler: on-error
+    nodes:
+      - { id: listener, type: listener }
+      - { id: client, type: client }
+
+      - id: throttle
+        type: limit-count
+        config:
+          count: 240
+          time_window: 60
+          rejected_code: 429
+          rejected_msg: too many requests
+
+      - id: tokens
+        type: openid-connect
+        config:
+          bearer_only: true
+          discovery: ${AUTH_DISCOVERY:-https://auth.example.test:9443/.well-known/openid-configuration}
+          # Self-signed demo certificate: the callouts to Authelia skip verification. With real
+          # certificates delete both ssl_verify lines and verification stays on.
+          ssl_verify: false
+          claim_validator:
+            issuer:
+              valid_issuers: ['${AUTH_ISSUER:-https://auth.example.test:9443}']
+
+      - id: backend
+        type: upstream
+        config:
+          targets:
+            # The gateway rewrites Host to this target's host:port on every request; the server's
+            # allowed_hosts therefore lists `featherbittorrent` as a bare name (ports are taken off
+            # before names are compared).
+            - host: ${UPSTREAM_HOST:-featherbittorrent}
+              port: ${UPSTREAM_PORT:-8090}
+
+      - id: on-error
+        type: error-handler
+        config:
+          status_code: 502
+          body_template: '{"error": "{{error.code}}", "message": "{{error.message}}"}'
+
+    edges:
+      - { from: listener.out, to: throttle.in }
+      - { from: throttle.success, to: tokens.in }
+      - { from: throttle.limited, to: client.in }
+      - { from: throttle.error, to: on-error.in }
+      # denied and redirect are mandatory ports; in bearer mode redirect is never taken, but it
+      # still has to be wired. error is a genuine provider failure (502 from the plugin itself).
+      - { from: tokens.denied, to: client.in }
+      - { from: tokens.redirect, to: client.in }
+      - { from: tokens.error, to: on-error.in }
+      - { from: tokens.success, to: backend.in }
+      - { from: backend.success, to: client.in }
+      - { from: backend.error, to: on-error.in }
+      - { from: on-error.success, to: client.in }
+
+  # The browser door: the full Authorization Code flow with PKCE against Authelia. The session is a
+  # sealed cookie (`featherbit_session`), so every gateway instance needs the same `session.secret`;
+  # it comes from .env (README step 2) and has nothing to do with the OIDC `client_secret` next to
+  # it, which is the web client's credential at Authelia.
+  - name: web-policy
+    error_handler: on-error
+    nodes:
+      - { id: listener, type: listener }
+      - { id: client, type: client }
+
+      - id: throttle
+        type: limit-count
+        config:
+          count: 60
+          time_window: 60
+          rejected_code: 429
+          rejected_msg: too many requests
+
+      - id: login
+        type: openid-connect
+        config:
+          bearer_only: false
+          discovery: ${AUTH_DISCOVERY:-https://auth.example.test:9443/.well-known/openid-configuration}
+          ssl_verify: false
+          client_id: featherbittorrent-web
+          client_secret: ${WEB_CLIENT_SECRET}
+          redirect_uri: https://torrent.example.test/oidc/callback
+          scope: openid profile email
+          session:
+            secret: ${GATEWAY_SESSION_SECRET}
+            absolute_timeout: 3600 # seconds since login, whatever the activity
+            cookie:
+              name: featherbit_session
+          logout_path: /logout
+
+      - id: backend
+        type: upstream
+        config:
+          targets:
+            - host: ${UPSTREAM_HOST:-featherbittorrent}
+              port: ${UPSTREAM_PORT:-8090}
+
+      - id: on-error
+        type: error-handler
+        config:
+          status_code: 502
+          body_template: '{"error": "{{error.code}}", "message": "{{error.message}}"}'
+
+    edges:
+      - { from: listener.out, to: throttle.in }
+      - { from: throttle.success, to: login.in }
+      - { from: throttle.limited, to: client.in }
+      - { from: throttle.error, to: on-error.in }
+      # Every browser move (the 302 to the portal, the post-callback 302, a logout) leaves through
+      # redirect; a bad session or flow cookie leaves through denied. Both go straight to the caller.
+      - { from: login.success, to: backend.in }
+      - { from: login.denied, to: client.in }
+      - { from: login.redirect, to: client.in }
+      - { from: login.error, to: on-error.in }
+      - { from: backend.success, to: client.in }
+      - { from: backend.error, to: on-error.in }
+      - { from: on-error.success, to: client.in }
