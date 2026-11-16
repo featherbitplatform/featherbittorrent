@@ -113,3 +113,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 # The wizard's and `user set`'s password prompt: one line read with echo off, so a password typed at
 # a terminal never lands in the shell's history or in what the run prints. It has no features to name.
 rpassword = "7"
+# Where a connect password lives between runs: the system keychain. `v1` is the feature that hands each
+# platform its own store - the Apple keychain on macOS, the credential manager on Windows, the secret
+# service on Linux - and nothing else: no default features are turned on beyond naming it. The Linux
+# half is `zbus-secret-service-keyring-store`, which speaks D-Bus in Rust (zbus) and encrypts in Rust
+# (`crypto-rust`, which keyring itself asks for), so no system D-Bus or OpenSSL library is needed to
+# build it. The macOS half links the Security framework the platform already provides.
+keyring = { version = "4.2", default-features = false, features = ["v1"] }

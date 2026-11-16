@@ -41,6 +41,13 @@ tracing.workspace = true
 # uses the same crossterm version, so one crate drives the terminal.
 crossterm.workspace = true
 ratatui.workspace = true
+# Where a connect password lives between runs (see `secrets.rs`). Only the platform's own store is
+# turned on: `v1` names the Apple keychain, the Windows credential manager and the Linux secret
+# service, one per platform, all of them reached without a C library this build has to bring itself.
+keyring.workspace = true
+# What a password read out of the keychain is held in, so it is overwritten when this run is done with
+# it - the same wrapper `fbtt-core`'s `Secret` uses.
+zeroize.workspace = true
 # The `Stream` trait for polling that event stream inside `tokio::select!`.
 futures-core.workspace = true
 # The runtime: `rt-multi-thread` because the backend task runs long engine steps that
@@ -48,5 +55,6 @@ futures-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
-# The test process holds `LibraryLock` to make the binary's second acquire lose.
-fbtt-core.workspace = true
+# The test process holds `LibraryLock` to make the binary's second acquire lose, and `fbtt_core::scratch`
+# gives the pure decisions above a library directory of their own to read.
+fbtt-core = { workspace = true, features = ["test-support"] }

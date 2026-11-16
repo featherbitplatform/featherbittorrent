@@ -13,8 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use fbtt_core::Paths;
 
 mod admin;
+mod backend;
 mod exit;
 mod run;
+mod secrets;
 mod serve;
 mod terminal;
 mod wizard;
