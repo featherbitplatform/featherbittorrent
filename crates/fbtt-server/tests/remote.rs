@@ -945,6 +945,10 @@ struct Fake {
     /// Every value that reached that header, empty where a request carried none. Recorded before the
     /// credential is looked at, so "no request went out without it" can be answered for refused ones too.
     gateway_keys: Mutex<Vec<String>>,
+    /// What reached the *token endpoint* under that header - a provider's own front door, which is not this
+    /// fake's (`gateway_key_not_sent_to_token_endpoint` puts the two on separate addresses). Recorded only
+    /// when something arrived, so an empty list is the answer "nothing went there".
+    token_gateway_keys: Mutex<Vec<String>>,
     /// Set by a test to end every session this fake handed out - which is how a client finds out its token is
     /// dead the way it does with a real server: by being refused for it.
     revoked: AtomicBool,
@@ -984,6 +988,7 @@ impl Fake {
             session: Mutex::new(String::new()),
             gateway_header: None,
             gateway_keys: Mutex::new(Vec::new()),
+            token_gateway_keys: Mutex::new(Vec::new()),
             revoked: AtomicBool::new(false),
             burst_written: AtomicBool::new(false),
         })
@@ -1030,6 +1035,18 @@ impl Fake {
         Arc::new(fake)
     }
 
+    /// The gateway fake with a front door of its own: a bearer token bought from a provider, and an API key
+    /// every request to *this* server has to carry as well. `header` and `key` are what this fake's routes
+    /// insist on before they look at any credential; the token endpoint is not one of them - a test using
+    /// this fake serves it itself, on its own address, which is the arrangement where "did the key follow the
+    /// assertion out?" has an answer (see `gateway_key_not_sent_to_token_endpoint`).
+    fn keyed_gateway(public_key: PublicKey, ttl: u64, header: &str, key: &str) -> Arc<Fake> {
+        let mut fake = Arc::into_inner(Fake::gateway(public_key, ttl))
+            .expect("nobody else holds this test state");
+        fake.gateway_header = Some((header.to_string(), key.to_string()));
+        Arc::new(fake)
+    }
+
     fn basic(user: &str, password: &str) -> Arc<Fake> {
         Fake::new(Mode::Basic(user.to_string(), password.to_string()))
     }
@@ -1058,6 +1075,25 @@ impl Fake {
             ));
         }
         Ok(())
+    }
+
+    /// Notes what arrived at the token endpoint under this fake's gateway header, which is a different
+    /// machine's door from [`Self::gate`]: nothing here refuses a request for it, because the question a test
+    /// asks is whether this client sent one at all, and a refusal would take the rest of the connection with
+    /// it whatever the answer.
+    fn record_token_gate(&self, headers: &HeaderMap) {
+        let Some((name, _)) = self.gateway_header.as_ref() else {
+            return;
+        };
+        if let Some(value) = headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+        {
+            self.token_gateway_keys
+                .lock()
+                .expect("the test state")
+                .push(value.to_string());
+        }
     }
 
     /// Records a request and says whether its credential is good enough. A request with no
@@ -1849,11 +1885,134 @@ async fn gateway_key_header_sent_with_password_login() {
     shutdown(&mut client).await;
 }
 
+/// The other combination setup 2 allows: a server behind a gateway checking an API key, signing in to a
+/// provider on another address with an assertion of its own. A key that opens this server says nothing to
+/// that provider - it has never seen this client's server, and to the person who set the key up it is
+/// somebody else's host - so the token request goes out carrying only what it signed, while every request
+/// that reaches this server still carries the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_key_not_sent_to_token_endpoint() {
+    const HEADER: &str = "X-API-Key";
+    const KEY: &str = "gateway-secret";
+    let key = keypair();
+    let public: PublicKey = key.public_key().clone();
+    let fake = Fake::keyed_gateway(public, 3_600, HEADER, KEY);
+
+    // Two addresses on purpose. Served from one host, "the key did not follow the assertion" and "there was
+    // no separate door to tell them apart" are the same observation; served from two, only the first of them
+    // can be true, which is what makes the assertion below worth anything.
+    let provider = serve(
+        Router::new()
+            .route("/token", post(token))
+            .with_state(Arc::clone(&fake)),
+    )
+    .await;
+    let addr = serve(api_routes(get(counted_events)).with_state(Arc::clone(&fake))).await;
+
+    let pem = key.to_openssh(LineEnding::LF).expect("the key file");
+    let dir = ScratchDir::new("gateway_key_token_origin");
+    let key_file = write_file(dir.path(), "id_ed25519", pem.as_bytes());
+    let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file));
+    remote.token_url = Some(format!("http://{provider}/token"));
+    remote.client_id = Some(fake.client_id.clone());
+    remote.gateway_key_header = Some(HEADER.to_string());
+
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::KeyPassphrase(None),
+        Some(KEY.to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    // The stream is a request like every other one here, and the last thing to go out once a token is in
+    // hand: waiting for its dial is what makes "every request" below cover it rather than whatever happened
+    // to be queued when the link came up.
+    within(async {
+        while fake.event_dials.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+
+    // The provider was dialled, and dialled as a provider: the assertion it is there to check arrived, and
+    // this connection's server-side key did not.
+    let assertions = fake.assertions.lock().expect("the test state").clone();
+    assert!(
+        !assertions.is_empty(),
+        "the assertion never reached the token endpoint, so nothing below proves anything"
+    );
+    let at_the_provider = fake
+        .token_gateway_keys
+        .lock()
+        .expect("the test state")
+        .clone();
+    assert!(
+        at_the_provider.is_empty(),
+        "the gateway key went out to the token endpoint, which is another host's: {at_the_provider:?}"
+    );
+
+    // It did its job here, though: every request that reached this server carried it - the event stream
+    // included, because its dial is what was just waited for - and what each of them signed with was the
+    // token the provider issued without it.
+    let keys = fake.gateway_keys.lock().expect("the test state").clone();
+    assert!(
+        keys.len() > 1,
+        "hardly any request came through this server's front door: {keys:?}"
+    );
+    assert!(
+        keys.iter().all(|value| value == KEY),
+        "a request went out without the gateway key: {keys:?}"
+    );
+    let seen = fake.seen.lock().expect("the test state").clone();
+    assert!(
+        seen.iter().all(|line| line.starts_with("Bearer token-")),
+        "an API request did not carry the token the provider issued: {seen:?}"
+    );
+
+    // And the recorder is not blind, which is what makes the empty list above an answer rather than an
+    // artefact of nothing ever being recorded: a request that does bring the key is noticed. The endpoint
+    // refuses this one because it carries no assertion to check - printed as it always prints a refusal -
+    // and noting the header happens before any of that.
+    let probe = within(
+        http()
+            .post(format!("http://{provider}/token"))
+            .header(HEADER, KEY)
+            .form(&[("grant_type", "client_credentials")])
+            .send(),
+    )
+    .await
+    .expect("the request reached the provider");
+    assert_eq!(
+        probe.status(),
+        StatusCode::BAD_REQUEST,
+        "the fixture's endpoint stopped behaving"
+    );
+    let recorded = fake
+        .token_gateway_keys
+        .lock()
+        .expect("the test state")
+        .clone();
+    assert_eq!(
+        recorded,
+        vec![KEY.to_string()],
+        "a key that did arrive at the token endpoint was not noticed"
+    );
+
+    shutdown(&mut client).await;
+}
+
 // ---------------------------------------------------------------------------------------- the token route
 
 /// `POST /token`: one assertion checked, one token issued. The gateway fakes register this on top of
-/// [`api_routes`], before that router is given its state.
-async fn token(State(fake): State<Arc<Fake>>, body: axum::body::Bytes) -> Response {
+/// [`api_routes`], before that router is given its state. It notes what arrived under the fake's gateway
+/// header on the way in (see [`Fake::record_token_gate`]): a provider's endpoint has no reason to be told
+/// about a key that opens somebody else's server, and this is how a test finds out whether it was.
+async fn token(
+    State(fake): State<Arc<Fake>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    fake.record_token_gate(&headers);
     let form = String::from_utf8_lossy(&body).into_owned();
     let bad = |problem: &str| {
         // A refusal here is the only way these tests find out their own gateway said no, so it is printed

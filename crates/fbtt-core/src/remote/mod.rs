@@ -52,6 +52,10 @@ use crate::ui_state::{LoginMethod, RemoteTarget};
 use http::Api;
 use stopping::Stopping;
 
+// The gateway header rule the connect screen asks before it lets an answer go out, re-exported from the
+// transport that enforces it: one list of names, asked in two places (see [`gateway_header_name_problem`]).
+pub use http::{GatewayHeaderNameProblem, gateway_header_name_problem};
+
 /// How often the table is rebuilt when nothing else wakes it. A second is what the local backend's half
 /// second buys over HTTP: rates that look alive, a stalled column that ticks, and a server that is not
 /// asked anything it does not need to answer.

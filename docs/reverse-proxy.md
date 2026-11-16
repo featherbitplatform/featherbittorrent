@@ -47,7 +47,13 @@ whether this is somebody it knows, and only then does the server decide whether 
 library. `server.auth.enabled` stays on.
 
 - **Browsers** sign in at the gateway: `openid-connect` with `bearer_only: false`, the interactive
-  Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people).
+  Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people). This half is
+  wired for the web UI featherbittorrent has not got yet, and it is worth being plain about what that means
+  today: there is no browser client to serve. A browser pointed at `/api` gets nothing out of it - without a
+  credential either door recognises it stops with a `401` at the gateway, and a browser that does get through
+  (a bearer token the gateway accepts, say) still meets featherbittorrent's own sign-in on the other side,
+  which a browser session is not an answer to: `401` again, this time from the server. What setup 2 serves
+  today is the TUI.
 - **The TUI** carries an API key the gateway reads before it looks at anything else, and then signs in to
   featherbittorrent as it always has. One `multi-auth` node accepts either credential on one route: its
   `key-auth` sub-plugin is tried first, and a request with no key there has only failed one attempt, so
@@ -136,10 +142,18 @@ stream stays safe through this policy (see "Never buffer the stream").
 
 On the TUI side, both halves are filled in on the connect screen (`c`): the header name, and the key under
 `Gateway key`. The two go together - a header name with no key under it, or a key with no name to send it
-under, is refused on the screen rather than dialled. The key then rides on every request this connection
-makes, the sign-in call included because the gateway stands in front of that too, beside this client's own
-bearer token, so what the server sees is an ordinary `password` (or device key) login whatever the gateway
-thought.
+under, is refused on the screen rather than dialled. A name this client needs for its own request is refused
+there too (`Authorization`, `Proxy-Authorization`, `Content-Type`, `Content-Length`, `Host`, `Cookie`,
+`Connection`, `Transfer-Encoding`, `TE`, `Upgrade`, and anything that is not a header name at all): the key is
+put onto a request under whatever name it is given, replacing what was already there, so a key typed into
+`Authorization` would leave the request carrying the gateway's key as its only proof.
+
+The key then rides on every request this connection makes to that server's address - the sign-in call
+included, because the gateway stands in front of that too - beside this client's own bearer token, so what the
+server sees is an ordinary `password` (or device key) login whatever the gateway thought. That address is the
+only place it goes: a `gateway private key` login whose token endpoint is somebody else's host posts that
+endpoint the assertion it is there to check and nothing else, because a provider that has never seen this
+client's server has nothing to check a key for that server against.
 
 What happens to it afterwards is the same as what happens to a password: answer *remember in the system
 keychain* once and the key is kept there under this server's address, spelled one way so that

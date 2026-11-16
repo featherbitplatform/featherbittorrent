@@ -15,6 +15,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
+use fbtt_core::remote::{GatewayHeaderNameProblem, gateway_header_name_problem};
 use fbtt_core::ui_state::{LoginMethod, RemoteTarget};
 use ssh_key::PrivateKey;
 use url::{Host, Url};
@@ -75,6 +76,16 @@ const GATEWAY_KEY_LABEL: &str = "Gateway key";
 /// `docs/reverse-proxy.md`).
 const GATEWAY_HINT: &str =
     "Empty sends no header. A key-auth gateway that reads X-API-Key wants exactly that name.";
+/// What the screen says about a name this client already puts on its own requests - `Authorization`,
+/// `Content-Type` and the rest. A key typed under one of those replaces what belongs there rather than
+/// riding beside it, so the connection would present the gateway's key as its only proof. The right name is
+/// the person's gateway's setting, so this line points at it instead of listing names somebody could not use
+/// anyway.
+const HEADER_IS_OURS: &str = "This client uses that header itself. Name your gateway's own.";
+/// What the screen says about a spelling HTTP does not allow as a field name at all: `X API Key`, or
+/// `X:API-Key` copied from a gateway whose documentation spells its headers the HTTP/2 way. A wire spelling
+/// carries no space and no colon, which is what this line has to say before a person can fix it.
+const HEADER_NOT_A_NAME: &str = "A header name is letters, digits, dashes and underscores.";
 
 /// How big a device key file may be. An OpenSSH private key is a few hundred bytes, or a few thousand
 /// with its passphrase wrapper around it; something this big is somebody pointing at the wrong file,
@@ -102,9 +113,9 @@ pub struct SecretInput {
     /// holds the key and its bytes are never read at all.
     pub passphrase: Option<Zeroizing<String>>,
     /// The value of the gateway header this target names, for a server behind a gateway that checks one
-    /// before it looks at any credential. It rides on every request beside this client's own proof, which is
-    /// why it comes back here rather than in the target: `ui.yaml` keeps only the header's NAME (see
-    /// [`fbtt_core::ui_state::RemoteTarget`]).
+    /// before it looks at any credential. It rides beside this client's own proof on every request to the
+    /// server it was typed for and nowhere else, which is why it comes back here rather than in the target:
+    /// `ui.yaml` keeps only the header's NAME (see [`fbtt_core::ui_state::RemoteTarget`]).
     pub gateway_key: Option<Zeroizing<String>>,
     /// Whether the password should go into the system keychain as well, under this user name and URL.
     pub remember: bool,
@@ -517,9 +528,19 @@ impl ConnectForm {
         // A front door is named by its header, and the two halves go together: a name with no key is a
         // connection a gateway turns away before it ever sees our credential, and a key with no name is one
         // this client has nowhere to send. Which header a gateway was configured to read is that gateway's
-        // setting, so nothing here checks the spelling beyond pairing it (see `fbtt_core::remote`'s transport,
-        // which says once when a name is not a header name at all).
-        let names_a_header = !self.gateway_header.text.trim().is_empty();
+        // setting, so nothing here chooses a name - but the spelling gets asked about, because two spellings
+        // cost a person more than one line on the row they typed them into (see [`header_name_words`]).
+        let header_name = self.gateway_header.text.trim();
+        let names_a_header = !header_name.is_empty();
+        // Spelling before pairing, because a name this client puts on its own requests is not half of a front
+        // door at all: a key typed under `Authorization` replaces the credential that has to ride beside it
+        // (`HeaderMap::insert` replaces), and what the person sees is a refused sign-in they cannot explain.
+        // The rule is the transport's, so the same spelling is refused here and in `fbtt_core::remote`'s
+        // `GatewayKey::check`, which a hand-edited `ui.yaml` still has to pass.
+        if names_a_header && let Some(problem) = gateway_header_name_problem(header_name) {
+            self.error = Some(header_name_words(problem).to_string());
+            return Answer::Stay;
+        }
         if names_a_header && self.gateway_key.is_empty() {
             self.error = Some("A gateway key header needs the key to send under it.".to_string());
             return Answer::Stay;
@@ -637,6 +658,17 @@ impl ConnectForm {
                 remember: keeps_a_secret && self.remember,
             },
         }
+    }
+}
+
+/// What the screen says about a header name it cannot use. Which names those are is the transport's rule,
+/// asked through [`gateway_header_name_problem`] so this form and `fbtt_core::remote`'s `GatewayKey::check`
+/// refuse exactly the same spellings; only the sentence is chosen here, because what has to happen next on
+/// this screen is typing, and a parser's complaint does not tell a person what to type.
+fn header_name_words(problem: GatewayHeaderNameProblem) -> &'static str {
+    match problem {
+        GatewayHeaderNameProblem::ThisClientsOwnHeader => HEADER_IS_OURS,
+        GatewayHeaderNameProblem::NotAFieldName => HEADER_NOT_A_NAME,
     }
 }
 

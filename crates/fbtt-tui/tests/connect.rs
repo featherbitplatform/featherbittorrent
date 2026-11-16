@@ -521,6 +521,60 @@ fn a_gateway_key_goes_out_under_the_header_that_names_it() {
     );
 }
 
+/// A header name that cannot carry a gateway key is refused on the row it was typed into, and answered there
+/// too. Two spellings get caught: one of this client's own headers (`HeaderMap::insert` replaces, so a key
+/// under `Authorization` would go out instead of this client's own credential rather than beside it), and
+/// something that is not a field name at all. The transport refuses both as well - `ui.yaml` is edited by
+/// hand - but it says so after a connection has been dialled, which makes "your typo is in the header row" a
+/// much better thing to read while the cursor is still on it.
+#[test]
+fn a_gateway_key_header_that_is_not_usable_is_refused_on_its_row() {
+    let snap = library();
+    for (typed, refusal) in [
+        ("Authorization", "This client uses that header itself."),
+        ("content-type", "This client uses that header itself."),
+        ("TE", "This client uses that header itself."),
+        ("X API Key", "A header name is letters, digits, dashes"),
+        ("X:API-Key", "A header name is letters, digits, dashes"),
+    ] {
+        let mut model = model_of(&snap);
+        press(&mut model, &snap, letter('c'));
+        fill_password_login(&mut model, &snap, SERVER_URL, "alice", "hunter2");
+        press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+        type_text(&mut model, &snap, typed);
+        press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key header -> Gateway key
+        type_text(&mut model, &snap, "gateway-secret");
+
+        assert!(
+            model.handle_key(key(KeyCode::Enter), &snap).is_empty(),
+            "{typed:?} was accepted as a name to send a gateway key under"
+        );
+        let screen = Screen::new(&model, &snap, 100, 30);
+        assert!(
+            screen.text().contains(refusal),
+            "the screen did not say what is wrong with {typed:?}: {:?}",
+            screen.text()
+        );
+
+        // Answering it is ordinary typing: back to the row, take the name out, put a usable one in, and the
+        // same Enter goes out with the key that was already typed beside it.
+        press(&mut model, &snap, key(KeyCode::BackTab)); // Gateway key -> Gateway key header
+        repeat(&mut model, &snap, KeyCode::Backspace, typed.chars().count());
+        type_text(&mut model, &snap, "X-API-Key");
+        assert_eq!(
+            model.handle_key(key(KeyCode::Enter), &snap),
+            vec![Action::Connect(keyed_request(
+                SERVER_URL,
+                "hunter2",
+                "X-API-Key",
+                "gateway-secret",
+                false
+            ))],
+            "{typed:?} was refused and then could not be corrected"
+        );
+    }
+}
+
 /// Presses one key `times` over, which is how a test empties a field whose length it knows.
 fn repeat(model: &mut Model, snap: &Snapshot, code: KeyCode, times: usize) {
     for _ in 0..times {

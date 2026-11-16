@@ -62,6 +62,8 @@ pub(crate) struct Auth {
     /// The header a gateway standing in front of this server checks before the request reaches it, when the
     /// target named one. These are the calls that earn the credential, and a gateway that turns them away
     /// means there is no credential to earn - so they carry it too (see [`super::http::gateway_headers`]).
+    /// The exception is the gateway's own token endpoint, which is another host's business and gets nothing
+    /// from this client but the assertion it signed (see [`Gateway::fetch`]).
     gateway: Option<Arc<GatewayKey>>,
     kind: Kind,
 }
@@ -168,7 +170,8 @@ impl Auth {
     /// the one there is has run down.
     pub(crate) async fn credential(&mut self) -> Result<Credential, String> {
         // Field by field, so the immutable halves and the mutable half do not fight over `self`. The gateway
-        // header is only ever read, and it goes out on these calls beside whatever credential they earn.
+        // header is only ever read, and it goes out on these calls beside whatever credential they earn from
+        // this server - the token endpoint excepted, which is another host's (see [`Gateway::fetch`]).
         let Auth {
             client,
             base,
@@ -194,7 +197,7 @@ impl Auth {
                 {
                     return Ok(Credential::Bearer(live.token.clone()));
                 }
-                let live = gateway.fetch(client, key.as_deref()).await?;
+                let live = gateway.fetch(client).await?;
                 gateway.live = Some(live.clone());
                 Ok(Credential::Bearer(live.token))
             }

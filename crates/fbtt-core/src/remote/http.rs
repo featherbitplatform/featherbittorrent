@@ -18,7 +18,14 @@
 //! - **One place decides what goes on the wire.** [`Api::headers`] puts the credential on every call, and
 //!   beside it the gateway's key header when the target named one; the login calls that cannot come through
 //!   `Api` add the same header from [`gateway_headers`]. So "no request reaches this server without the
-//!   header" is a property of this module rather than something each call site has to remember.
+//!   header" is a property of this module rather than something each call site has to remember. The other
+//!   half of the same rule says where that header may *not* go: only to the server's own origin. Every
+//!   address here is [`Api::url`] joining one of this API's paths onto the address the target named, and
+//!   redirects are refused rather than followed ([`client_builder`]), so nothing this client dials has left
+//!   that origin. The one call that goes somewhere else on purpose - a gateway's token endpoint, in
+//!   [`crate::remote::gateway`] - is the one call that carries no gateway key: a provider that has never
+//!   seen this client's key has nothing to check it against, and a key spent on somebody else's host is a
+//!   key handed to whatever runs it.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -171,6 +178,10 @@ impl Api {
     /// One map rather than two calls because a `RequestBuilder` takes its headers as one. Both belong on the
     /// same request: the gateway decides who is asking before it passes the request on, and the server behind
     /// it reads our own token out of the very request the gateway let through.
+    ///
+    /// Nothing here asks where the request is going, because nothing this client builds goes anywhere but
+    /// this server's origin: the addresses come from [`Self::url`] and redirects are refused (see
+    /// [`client_builder`], and the module docs for the whole rule).
     fn headers(&self, credential: &Credential) -> header::HeaderMap {
         let mut headers = credential.header();
         headers.extend(gateway_headers(self.gateway.as_deref()));
@@ -462,6 +473,64 @@ pub(crate) fn basic_header(user: &str, password: &str) -> header::HeaderMap {
     headers
 }
 
+/// The header names a gateway key must not be sent under, spelled lowercase because `HeaderName` lowercases
+/// everything it parses and a person types `Content-Length` as readily as `content-length`.
+///
+/// A gateway header is added to a request with `HeaderMap::insert`, which *replaces* whatever was already
+/// under that name rather than adding a second value beside it. So a key typed into one of these names does
+/// not fail loudly: it deletes something the request needs. `authorization` and `proxy-authorization` are
+/// where this client's own credential goes, so the call would carry the gateway's key as its proof and no
+/// session at all; `content-type` and `content-length` say what the body is and how long it is, which a
+/// server that cannot read the body answers with something unhelpful about the credential; `host`,
+/// `connection`, `transfer-encoding`, `te` and `upgrade` are what HTTP itself writes - `te` and `upgrade`
+/// are the pair a gateway uses to ask for a protocol switch, which is how an events stream that wants none
+/// ends up in somebody's websocket handler; `cookie` is a server's own way of remembering somebody, and this
+/// client keeps nothing in one.
+const OWNED_HEADER_NAMES: [&str; 10] = [
+    "authorization",
+    "proxy-authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "cookie",
+    "connection",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+];
+
+/// Whether `name` is one of those: see [`OWNED_HEADER_NAMES`].
+fn is_our_own_header(name: &header::HeaderName) -> bool {
+    OWNED_HEADER_NAMES.contains(&name.as_str())
+}
+
+/// What is wrong with a name somebody typed for the header a gateway reads its key out of, when something is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayHeaderNameProblem {
+    /// Not a field name in the sense HTTP uses: RFC 9110's `field-name` grammar, which is letters, digits
+    /// and the punctuation a header name may contain - dashes, underscores and dots among them, spaces and
+    /// colons not among them. A space, a colon, an accented letter or a newline all make one of these.
+    NotAFieldName,
+    /// A header this client puts on its own requests: `authorization`, `content-type` and the rest of the
+    /// list in this module. Sending a gateway key under one replaces what belongs there rather than adding
+    /// a second credential beside it.
+    ThisClientsOwnHeader,
+}
+
+/// What is wrong with `name` as a gateway key header, if anything: `None` says a gateway key can go under it.
+///
+/// Whitespace at either end is trimmed away, because that is what a person types into a field whose end they
+/// cannot see (`GatewayKey::check` trims the same way, so the two agree about what ` X-API-Key ` means).
+/// Inside the name there is no licence: every byte has to be one a field name may carry. The connect screen
+/// asks this before it lets an answer go out (`fbtt_tui`'s `modal::connect`) and says what to type instead in
+/// its own words, so the same spelling is refused in both places rather than only at the connection.
+pub fn gateway_header_name_problem(name: &str) -> Option<GatewayHeaderNameProblem> {
+    let Ok(parsed) = header::HeaderName::from_str(name.trim()) else {
+        return Some(GatewayHeaderNameProblem::NotAFieldName);
+    };
+    is_our_own_header(&parsed).then_some(GatewayHeaderNameProblem::ThisClientsOwnHeader)
+}
+
 /// The front door in front of this server: the header a gateway checks before the request reaches it, and
 /// the key that opens it.
 ///
@@ -490,6 +559,13 @@ impl GatewayKey {
     pub(crate) fn check(name: &str, value: Zeroizing<String>) -> Result<GatewayKey, String> {
         let name = header::HeaderName::from_str(name.trim())
             .map_err(|_| format!("{} is not a header name", clean(name)))?;
+        // The same names the connect screen refuses (see [`gateway_header_name_problem`]), asked here too
+        // because `ui.yaml` is edited by hand and this is the only place every target passes through.
+        if is_our_own_header(&name) {
+            return Err(format!(
+                "{name} is a header this client sends itself: a gateway key needs a name of its own"
+            ));
+        }
         if value.is_empty() {
             return Err(format!("the gateway key for {name} is empty"));
         }
@@ -542,5 +618,125 @@ fn gateway_header(
             Err("a gateway key was given with no header to send it under".to_string())
         }
         (None, None) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GatewayHeaderNameProblem, GatewayKey, gateway_header_name_problem, gateway_headers,
+    };
+    use zeroize::Zeroizing;
+
+    /// The fixture every refusal below is asked about: distinctive enough that its appearing in a line means
+    /// the line repeated the secret.
+    const SECRET: &str = "correct-horse-battery";
+
+    /// A gateway key typed into one of this client's own header names is refused before anything is dialled.
+    /// `HeaderMap::insert` replaces, so accepting `Authorization` would have meant every request carrying the
+    /// gateway's key as its only proof: the sign-in call would carry it instead of the password, and the
+    /// server behind the gateway would refuse a login it was never shown. Case-insensitive because
+    /// `HeaderName` lowercases what it parses: `Content-Length` and `content-length` are the same header.
+    #[test]
+    fn a_gateway_key_refuses_a_header_this_client_sends_itself() {
+        for name in [
+            "authorization",
+            "Authorization",
+            " AUTHORIZATION ",
+            "Proxy-Authorization",
+            "host",
+            "Content-Length",
+            "content-type",
+            "Cookie",
+            "connection",
+            "Transfer-Encoding",
+            "TE",
+            "Upgrade",
+        ] {
+            assert_eq!(
+                gateway_header_name_problem(name),
+                Some(GatewayHeaderNameProblem::ThisClientsOwnHeader),
+                "{name:?} is a header this client puts on its own requests"
+            );
+            let problem = GatewayKey::check(name, Zeroizing::new(SECRET.to_string()))
+                .expect_err("a name this client uses itself should not pair with a key");
+            assert!(
+                problem.contains(name.trim().to_lowercase().as_str()),
+                "the refusal did not say which header: {problem}"
+            );
+            assert!(
+                !problem.contains(SECRET),
+                "the refusal repeated the gateway key: {problem}"
+            );
+        }
+    }
+
+    /// The other half of the same name rule: something that is not a field name at all is refused too, rather
+    /// than becoming a transport error on every call. A space and a colon are the two spellings a person
+    /// arrives with most often - `X API Key` read out loud from a gateway's documentation, `X:API-Key` copied
+    /// from one that spells its headers the HTTP/2 way.
+    #[test]
+    fn a_gateway_header_name_has_to_be_one_http_allows() {
+        for name in [
+            "",
+            "   ",
+            "X API Key",
+            "x-api key",
+            "X:API-Key",
+            ":authority",
+            "X-API\tKey",
+            "X-ÄPI-Key",
+            "X-API@Key",
+        ] {
+            assert_eq!(
+                gateway_header_name_problem(name),
+                Some(GatewayHeaderNameProblem::NotAFieldName),
+                "{name:?} is not a header name"
+            );
+            let problem = GatewayKey::check(name, Zeroizing::new(SECRET.to_string()))
+                .expect_err("a name HTTP does not allow should not pair with a key");
+            assert!(
+                problem.ends_with("is not a header name"),
+                "the refusal did not say what was wrong with {name:?}: {problem}"
+            );
+        }
+    }
+
+    /// The names people actually type, accepted: `HeaderName` lowercases them on the way in, so what a target
+    /// keeps and what a request carries is one spelling however the person typed it - which matters because
+    /// a gateway matches header names case-insensitively and this client must not send two different ones.
+    #[test]
+    fn an_ordinary_gateway_header_name_pairs_with_its_key() {
+        for name in [
+            "X-API-Key",
+            "x-api-key",
+            "  X-Api-Key  ",
+            "X_Api_Key",
+            "cf-access-secret",
+        ] {
+            assert_eq!(
+                gateway_header_name_problem(name),
+                None,
+                "{name:?} is usable"
+            );
+            let key = GatewayKey::check(name, Zeroizing::new(SECRET.to_string()))
+                .expect("a gateway's own header name should pair with its key");
+            // The value is redacted where a log line can reach it, and the name travels lowercase: a gateway
+            // matches header names case-insensitively, so one spelling is all this connection should send.
+            let want = name.trim().to_lowercase();
+            assert_eq!(
+                format!("{key:?}"),
+                format!("GatewayKey({want}, <redacted>)")
+            );
+            let headers = gateway_headers(Some(&key));
+            let sent = headers
+                .get(want.as_str())
+                .expect("the key goes out under the name it was paired with");
+            assert_eq!(sent.to_str().expect("an ASCII key"), SECRET);
+            assert!(
+                sent.is_sensitive(),
+                "a secret header says so to anything that prints it"
+            );
+        }
     }
 }

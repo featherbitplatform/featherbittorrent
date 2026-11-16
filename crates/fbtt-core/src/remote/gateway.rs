@@ -16,7 +16,6 @@ use ssh_key::HashAlg;
 use crate::remote::Secret;
 use crate::remote::bodies::{from_json, read_capped};
 use crate::remote::device::Device;
-use crate::remote::http::{GatewayKey, gateway_headers};
 use crate::remote::login::{ASSERTION_LIFE, JWT_BEARER, RENEW_BEFORE, reached, reason};
 use crate::ui_state::LoginMethod;
 
@@ -61,13 +60,13 @@ impl std::fmt::Debug for Live {
 impl Gateway {
     /// One assertion, and the token the gateway trades it for.
     ///
-    /// `gateway` is a header this client sends to that endpoint as well: a deployment can put a key check in
-    /// front of the token route too, and a key that opens the server's front door is the same string.
-    pub(crate) async fn fetch(
-        &self,
-        client: &Client,
-        gateway: Option<&GatewayKey>,
-    ) -> Result<Live, String> {
+    /// No gateway key here, even when this connection has one: `token_url` is somebody else's host as often
+    /// as not - a provider on its own domain, which has never seen this client's server and has nothing to
+    /// check a key that opens that server against - and the requests a gateway key does open are the ones
+    /// this client dials at its own target (see [`crate::remote::http`]'s module docs for where the key may
+    /// go). What makes *this* call safe without it is the signature: the endpoint has this client's public
+    /// key on file and needs no shared secret to check what it signed.
+    pub(crate) async fn fetch(&self, client: &Client) -> Result<Live, String> {
         let device = Device::load(
             LoginMethod::GatewayKey,
             self.key_path.as_deref(),
@@ -91,7 +90,6 @@ impl Gateway {
                 ("client_assertion_type", JWT_BEARER),
                 ("client_assertion", &format!("{unsigned}.{signature}")),
             ])
-            .headers(gateway_headers(gateway))
             .send()
             .await
             .map_err(reached)?;
