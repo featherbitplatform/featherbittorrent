@@ -132,6 +132,21 @@ self-signed pair into its own volume on the first run and reuses it afterwards. 
 once Authelia reports healthy. featherbittorrent's log should end with
 `featherbittorrent is serving address=0.0.0.0:8090 auth=false`.
 
+The server container runs as uid/gid 10001, fixed in the image so host files can be given to it by number.
+Nothing extra is needed for this example's own two mounts: `config/featherbittorrent/config.yaml` is a 0644
+file from the checkout, readable by any uid, and a fresh `fbtt-library` volume takes the ownership
+`/data/library` has in the image. Two things break that: writing the config with a umask that made it
+private (`chmod 644 config/featherbittorrent/config.yaml` puts it back), and a `fbtt-library` volume left
+over from an image that ran as root, which keeps its old owner because Docker only copies the image's
+ownership into a volume that is still empty. Hand such a volume to the server with:
+
+```sh
+docker compose run --rm --user root --entrypoint sh featherbittorrent -c 'chown -R 10001:10001 /data'
+```
+
+`docker compose down -v` is the blunter version of the same fix, and fine here because the example's
+library holds nothing you need to keep.
+
 ## Log in from a browser
 
 Open `https://torrent.example.test/`. With a self-signed certificate your browser will complain
@@ -237,6 +252,10 @@ If your certificate is issued for different hostnames, change each route's `matc
 - **`403` with `the authenticator rejected this request` from featherbittorrent.** With logins off
   the server rejects a Host (or Origin) that is neither loopback nor one of its `allowed_hosts`.
   Add the bare name (no port) to `server.allowed_hosts` in `config/featherbittorrent/config.yaml`.
+- **`Could not lock the library (/data/library): Permission denied`.** The container serves as uid 10001, and
+  a `fbtt-library` volume made by an image that ran as root kept that owner. Run the `chown` line from "Run
+  it", or `docker compose down -v` to get a new volume with the ownership the image gives `/data/library`.
+  The same complaint about `config.yaml` means the file is not readable by everybody: `chmod 644` fixes it.
 - **Login bounces back to the portal forever.** The cookie domain has to cover both hostnames and
   `authelia_url` has to equal the URL you actually open; both are set for this example, so a change
   to one of them without the other is the usual cause.

@@ -107,6 +107,15 @@ services:
   # Built from the repository root's Dockerfile; `serve` reads the config mounted below and asks
   # nothing, because that file already names a server section. No published ports: the outside
   # reaches this service only through the gateway, which is what auth-off behind a gateway means.
+  #
+  # The image serves as uid/gid 10001 (the Dockerfile says why), so both mounts have to agree with
+  # that id. ./config/featherbittorrent does: git checks out 0644 files in 0755 directories, which
+  # anybody can read - re-run `chmod 644 config/featherbittorrent/config.yaml` if you wrote it with a
+  # umask that made it private. fbtt-library needs nothing on a fresh start, because Docker gives a
+  # new named volume the ownership /data/library has in the image, but it copies that only into a
+  # volume that is still empty: one left over from an image that ran as root keeps its old owner, and
+  # the chown line in README.md (or `docker compose down -v`) after upgrading is what gets the server
+  # writing again.
   featherbittorrent:
     build:
       context: ../../..
