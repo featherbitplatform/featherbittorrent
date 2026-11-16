@@ -28,7 +28,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use fbtt_core::{Config, DeviceEntry};
+use fbtt_core::{Config, DeviceEntry, ServerConfig};
 use serde::Deserialize;
 
 use super::{DeviceRow, DeviceTable, RouteError, Shared, clean, locked};
@@ -212,8 +212,12 @@ async fn change(
             )));
         }
     };
-    change(&mut config.server.auth.devices)?;
-    let devices = config.server.auth.devices.clone();
+    // The device list is part of the server section. A config that never named one gets it here: this
+    // route only answers to a server that is already running, so registering a key with it is the same
+    // choice `featherbittorrent device add` makes from a command line.
+    let server = config.server.get_or_insert_with(ServerConfig::default);
+    change(&mut server.auth.devices)?;
+    let devices = server.auth.devices.clone();
     // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`), so a
     // crash leaves either the old list or the new one and never half of each.
     tokio::task::spawn_blocking(move || config.save(&file))

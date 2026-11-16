@@ -15,7 +15,7 @@ there is no setting yet for trusting a private certificate authority of your own
 
 ## The first run: the wizard
 
-`serve` asks five questions before anything is on disk, and writes the answers to `config.yaml`:
+`serve` asks these before anything is on disk, and writes the answers to `config.yaml`:
 
 ```
 Download folder [/home/you/Downloads]:
@@ -28,16 +28,20 @@ User name (empty for none):
 An empty answer takes the bracketed default, which is what this library already does, so taking every
 default changes nothing an existing run would not have done anyway. A bad answer is said out loud and
 asked again, up to three times; then `serve` prints the complaint it last heard and exits 1 without
-writing anything. After a password comes the optional device key question (`Add a device key now?
-[no]:`): paste an `ssh-ed25519 ... [comment]` line, and the comment becomes the device's name when it
-is usable. When logins are on but no user was named, the wizard says so: `No login yet. Create one
-with: featherbittorrent user set`.
+writing anything. Name a user and its password comes next (`Password [hidden]:`, then `Repeat password
+[hidden]:`); leave the name empty and the wizard says so instead: `No login yet. Create one with:
+featherbittorrent user set`.
+
+The last question is asked whatever the answers above were, logins off included: `Add a device key now?
+[no]:`. Say yes and paste an `ssh-ed25519 ... [comment]` line; the comment becomes the device's name when
+it is usable, and when it is not (too long, or something invisible in it) you are asked for a name of your
+own. Answering `no`, or pasting nothing, adds no device key.
 
 The wizard runs only when there is no `config.yaml`, when the file has no `server:` section (one
 written by the TUI never has), or when its bytes could not be read. A config that parses and names a
-server is used as it stands. The questions come before the library lock is even asked about, except
-that the lock itself comes first: while another run holds the library, `serve` neither asks anything
-nor writes anything, and exits 3 with the usual "already using this library" line.
+server is used as it stands. The library lock comes first, before any of these questions: while another
+run holds the library, `serve` neither asks anything nor writes anything, and exits 3 with the usual
+"already using this library" line.
 
 ## The config file
 
@@ -162,9 +166,11 @@ A featherbittorrent server is running on this library. Connect to it? y/n
 
 What a normal remote connection remembers lives in `ui.yaml` beside `config.yaml`: which backend the
 last run used (`last_used: Local`, or `Remote:` with `url`, `login`, and for that method what it needs
-- `user`, `key_path`, a gateway's `token_url` and `client_id`). A connect password is not in that
-file; it lives in the system keychain under its user name. Bad bytes in `ui.yaml` answer "the local
-engine", like a missing file does, and are kept aside as `ui.yaml.bad`.
+- `user`, `key_path`, a gateway's `token_url` and `client_id`, plus `gateway_key_header`, the name of the
+header a gateway in front of that server reads its API key from). The secret half is not in that file: a
+connect password lives in the system keychain under its user name, and a gateway key beside it under the
+server's address (see [docs/reverse-proxy.md](reverse-proxy.md)'s setup 2). Bad bytes in `ui.yaml` answer
+"the local engine", like a missing file does, and are kept aside as `ui.yaml.bad`.
 
 ## Debug-only switches
 

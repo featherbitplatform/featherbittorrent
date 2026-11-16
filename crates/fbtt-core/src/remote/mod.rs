@@ -126,10 +126,20 @@ pub struct RemoteBackend;
 impl RemoteBackend {
     /// Starts a connection to `target` and hands back the handle a screen uses.
     ///
+    /// `secret` is what this connection signs in with; `gateway_key` is the value of the header named by
+    /// `target.gateway_key_header`, for a server behind a gateway that checks one before the request reaches
+    /// it. A target that names such a header needs its key here as well as there - neither half on its own
+    /// is something this client can send - and that pairing, like everything else about a target that cannot
+    /// work, is reported on the client rather than to whoever called.
+    ///
     /// Nothing here waits or fails: the address is dialed by the task this starts, so a server that is down
     /// says so on the client rather than to whoever called. A target and secret that do not go together - a
     /// password login with no user name, a gateway with no token endpoint - is reported the same way.
-    pub fn start(target: RemoteTarget, secret: Secret) -> Client {
+    pub fn start(
+        target: RemoteTarget,
+        secret: Secret,
+        gateway_key: Option<Zeroizing<String>>,
+    ) -> Client {
         let name = server_name(&target.url);
         let secure = target.url.starts_with("https://");
         let auth = method_name(target.login).to_string();
@@ -141,7 +151,7 @@ impl RemoteBackend {
         ));
         let (client, channels) = Client::paired(Arc::clone(&initial));
 
-        match Api::try_new(&target, secret, Arc::new(Stopping::default())) {
+        match Api::try_new(&target, secret, gateway_key, Arc::new(Stopping::default())) {
             Err(problem) => {
                 // Nothing can be asked of this address, so say it once and let the client answer commands
                 // with nothing until it is dropped or asked to stop. The link goes to `Lost` rather than
@@ -155,7 +165,7 @@ impl RemoteBackend {
                     auth,
                     LinkState::Lost { retry_in_secs },
                 )));
-                tokio::spawn(idle(channels.commands));
+                tokio::spawn(idle(channels.commands, channels.snapshot, channels.notices));
                 client
             }
             Ok(api) => {
@@ -262,7 +272,17 @@ async fn relay(
 
 /// A client that was never able to reach anywhere: it answers `Shutdown` and drops the rest, so a screen
 /// that connected to a bad address can still close the connection.
-async fn idle(mut commands: mpsc::Receiver<Command>) {
+///
+/// The two sender ends come along and are dropped only when this does. Left in [`RemoteBackend::start`] they
+/// would go as soon as it returned, and a queue with no senders left reads to the run loop as "the backend
+/// stopped and the queue is read out" - the screen would exit instead of showing the one line saying why
+/// nothing appeared. Holding them here keeps that line reachable and the connection open until its screen
+/// lets go or asks it to stop.
+async fn idle(
+    mut commands: mpsc::Receiver<Command>,
+    _snapshot: watch::Sender<Arc<Snapshot>>,
+    _notices: mpsc::Sender<Notice>,
+) {
     while let Some(command) = commands.recv().await {
         if matches!(command, Command::Shutdown) {
             return;

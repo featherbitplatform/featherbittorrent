@@ -57,10 +57,12 @@ fn request(url: &str, password: &str) -> ConnectRequest {
             key_path: None,
             token_url: None,
             client_id: None,
+            gateway_key_header: None,
         }),
         secret: SecretInput {
             password: Some(Zeroizing::new(password.to_string())),
             passphrase: None,
+            gateway_key: None,
             remember: false,
         },
     }
@@ -258,7 +260,9 @@ fn http_password_warning_needs_second_enter() {
     press(&mut model, &snap, letter('c'));
     fill_password_login(&mut model, &snap, "http://bit.example", "alice", "hunter2");
     press(&mut model, &snap, key(KeyCode::Enter)); // the warning
-    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Remember
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key header -> Gateway key
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key -> Remember
     press(&mut model, &snap, key(KeyCode::Tab)); // Remember -> Connect to, the rows wrapping
     press(&mut model, &snap, key(KeyCode::Tab)); // Connect to -> URL
     repeat(
@@ -355,7 +359,9 @@ fn login_text_in_an_address_is_refused_rather_than_dialled() {
 
     // The address is the part that has to change, and nothing else goes with it: the same user and password
     // go out with an address that names only a host.
-    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Remember
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key header -> Gateway key
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key -> Remember
     press(&mut model, &snap, key(KeyCode::Tab)); // Remember -> Connect to, the rows wrapping
     press(&mut model, &snap, key(KeyCode::Tab)); // Connect to -> URL
     repeat(
@@ -369,6 +375,149 @@ fn login_text_in_an_address_is_refused_rather_than_dialled() {
         model.handle_key(key(KeyCode::Enter), &snap),
         vec![Action::Connect(request(SERVER_URL, "hunter2"))],
         "refusing the address took the rest of the screen with it"
+    );
+}
+
+/// The answer [`request`] gives for a server that stands behind a gateway checking a key of its own: the
+/// header that gateway reads the key out of goes in the target, where `ui.yaml` keeps it, and the key itself
+/// comes back beside the password, where a secret belongs.
+fn keyed_request(
+    url: &str,
+    password: &str,
+    header: &str,
+    key: &str,
+    remember: bool,
+) -> ConnectRequest {
+    ConnectRequest {
+        target: ConnectTarget::Remote(RemoteTarget {
+            url: url.to_string(),
+            login: LoginMethod::Password,
+            user: Some("alice".to_string()),
+            key_path: None,
+            token_url: None,
+            client_id: None,
+            gateway_key_header: Some(header.to_string()),
+        }),
+        secret: SecretInput {
+            password: Some(Zeroizing::new(password.to_string())),
+            passphrase: None,
+            gateway_key: Some(Zeroizing::new(key.to_string())),
+            remember,
+        },
+    }
+}
+
+#[test]
+fn a_gateway_key_goes_out_under_the_header_that_names_it() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(&mut model, &snap, SERVER_URL, "alice", "hunter2");
+
+    // The header row is the only one whose label cannot answer its own question, so what to type there - and
+    // what leaving it empty means - is said while that row has the cursor and nowhere else.
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen.text().contains("Empty sends no header."),
+        "the row a gateway key is named on did not say what empty means: {:?}",
+        screen.text()
+    );
+    assert!(
+        screen.text().contains("X-API-Key"),
+        "the row gave no name to suggest for a key-auth gateway: {:?}",
+        screen.text()
+    );
+
+    type_text(&mut model, &snap, "X-API-Key");
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        !screen.text().contains("Empty sends no header."),
+        "the hint outstayed the name it was explaining: {:?}",
+        screen.text()
+    );
+
+    // The key is a secret like any other here: typed into a masked row, so whatever prints the screen gets
+    // stars rather than the key.
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key header -> Gateway key
+    type_text(&mut model, &snap, "gateway-secret");
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        !screen.text().contains("gateway-secret"),
+        "the gateway key was drawn as itself: {:?}",
+        screen.text()
+    );
+
+    // Remembering is offered for a gateway key exactly as it is for a password, and asking for it is the
+    // person's own press: the screen starts with nothing kept.
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key -> Remember
+    press(&mut model, &snap, key(KeyCode::Right)); // off -> on
+    assert_eq!(
+        model.handle_key(key(KeyCode::Enter), &snap),
+        vec![Action::Connect(keyed_request(
+            SERVER_URL,
+            "hunter2",
+            "X-API-Key",
+            "gateway-secret",
+            true
+        ))],
+        "the answer did not carry both halves of the front door"
+    );
+
+    // A name with no key under it is a connection a gateway turns away before it ever sees our bearer, so it
+    // is refused here rather than dialled.
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(&mut model, &snap, SERVER_URL, "alice", "hunter2");
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+    type_text(&mut model, &snap, "X-API-Key");
+    assert!(
+        model.handle_key(key(KeyCode::Enter), &snap).is_empty(),
+        "a header with no key was sent off to fail at a gateway"
+    );
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen
+            .text()
+            .contains("A gateway key header needs the key to send under it."),
+        "the screen did not say which half was missing: {:?}",
+        screen.text()
+    );
+
+    // And a key with no name to send it under is the same mistake seen from the other side: nowhere to put it.
+    let mut model = model_of(&snap);
+    press(&mut model, &snap, letter('c'));
+    fill_password_login(&mut model, &snap, SERVER_URL, "alice", "hunter2");
+    press(&mut model, &snap, key(KeyCode::Tab)); // Password -> Gateway key header
+    press(&mut model, &snap, key(KeyCode::Tab)); // Gateway key header -> Gateway key
+    type_text(&mut model, &snap, "gateway-secret");
+    assert!(
+        model.handle_key(key(KeyCode::Enter), &snap).is_empty(),
+        "a key with no header was sent off to be dropped"
+    );
+    let screen = Screen::new(&model, &snap, 100, 30);
+    assert!(
+        screen
+            .text()
+            .contains("Name the header this gateway key is sent under."),
+        "the screen did not say what the key was missing: {:?}",
+        screen.text()
+    );
+
+    // Answering the refusal is enough: the same Enter that was refused now goes out with both halves in it.
+    press(&mut model, &snap, key(KeyCode::BackTab)); // Gateway key -> Gateway key header
+    type_text(&mut model, &snap, "X-API-Key");
+    let actions = model.handle_key(key(KeyCode::Enter), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Connect(keyed_request(
+            SERVER_URL,
+            "hunter2",
+            "X-API-Key",
+            "gateway-secret",
+            false
+        ))],
+        "a header typed after the refusal did not carry the key that was already there"
     );
 }
 

@@ -17,6 +17,7 @@
 //! link that says it is down.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -32,7 +33,7 @@ use crate::remote::Secret;
 use crate::remote::bodies::{from_json, read_capped};
 use crate::remote::device::Device;
 use crate::remote::gateway::{Gateway, Live};
-use crate::remote::http::{Credential, basic_header};
+use crate::remote::http::{Credential, GatewayKey, basic_header, gateway_headers};
 use crate::ui_state::{LoginMethod, RemoteTarget};
 
 /// How much of a long credential's life is spent before it is replaced: renewal starts this far ahead of the
@@ -58,6 +59,10 @@ pub(crate) struct Auth {
     client: Client,
     /// The server's address with no trailing slash: `{base}/api/v1/auth/session` is where a session is.
     base: String,
+    /// The header a gateway standing in front of this server checks before the request reaches it, when the
+    /// target named one. These are the calls that earn the credential, and a gateway that turns them away
+    /// means there is no credential to earn - so they carry it too (see [`super::http::gateway_headers`]).
+    gateway: Option<Arc<GatewayKey>>,
     kind: Kind,
 }
 
@@ -92,11 +97,16 @@ struct Server {
 }
 
 impl Auth {
-    /// The credential holder for `target`, signed with `secret`.
+    /// The credential holder for `target`, signed with `secret`, behind a front door that checks `gateway`
+    /// if it names one.
     ///
     /// Errs only about a target and secret that do not go together - a password login with no user name, a
     /// gateway with no token endpoint - which is a thing to say once rather than on every request.
-    pub(crate) fn new(target: &RemoteTarget, secret: Secret) -> Result<Auth, String> {
+    pub(crate) fn new(
+        target: &RemoteTarget,
+        secret: Secret,
+        gateway: Option<Arc<GatewayKey>>,
+    ) -> Result<Auth, String> {
         let client = Client::builder()
             .connect_timeout(LOGIN_TIMEOUT)
             .timeout(LOGIN_TIMEOUT)
@@ -146,14 +156,25 @@ impl Auth {
                 live: None,
             }),
         };
-        Ok(Auth { client, base, kind })
+        Ok(Auth {
+            client,
+            base,
+            gateway,
+            kind,
+        })
     }
 
     /// The credential to put on the next request, signing in or fetching a token when there is none, or
     /// the one there is has run down.
     pub(crate) async fn credential(&mut self) -> Result<Credential, String> {
-        // Field by field, so the immutable halves and the mutable half do not fight over `self`.
-        let Auth { client, base, kind } = self;
+        // Field by field, so the immutable halves and the mutable half do not fight over `self`. The gateway
+        // header is only ever read, and it goes out on these calls beside whatever credential they earn.
+        let Auth {
+            client,
+            base,
+            gateway: key,
+            kind,
+        } = self;
         match kind {
             Kind::Open => Ok(Credential::Open),
             Kind::Basic { user, password } => Ok(Credential::Basic(user.clone(), password.clone())),
@@ -163,7 +184,7 @@ impl Auth {
                 {
                     return Ok(Credential::Bearer(session.token.clone()));
                 }
-                let session = server.sign_in(client, base).await?;
+                let session = server.sign_in(client, base, key.as_deref()).await?;
                 server.session = Some(session.clone());
                 Ok(Credential::Bearer(session.token))
             }
@@ -173,7 +194,7 @@ impl Auth {
                 {
                     return Ok(Credential::Bearer(live.token.clone()));
                 }
-                let live = gateway.fetch(client).await?;
+                let live = gateway.fetch(client, key.as_deref()).await?;
                 gateway.live = Some(live.clone());
                 Ok(Credential::Bearer(live.token))
             }
@@ -235,6 +256,7 @@ impl Auth {
             .client
             .delete(format!("{}/api/v1/auth/session", self.base))
             .timeout(REVOKE_TIMEOUT)
+            .headers(gateway_headers(self.gateway.as_deref()))
             .bearer_auth(&session.token)
             .send();
         // The request's own ceiling plus a wall-clock one: a client on its way out should not have to trust
@@ -268,7 +290,15 @@ impl std::fmt::Debug for Auth {
 
 impl Server {
     /// One login to this server, answered with the token it hands out.
-    async fn sign_in(&self, client: &Client, base: &str) -> Result<Live, String> {
+    ///
+    /// Every request here goes past the same front door as the requests that carry the token afterwards: a
+    /// gateway that checks `gateway` never sees a session token, so what it looks for instead is this header.
+    async fn sign_in(
+        &self,
+        client: &Client,
+        base: &str,
+        gateway: Option<&GatewayKey>,
+    ) -> Result<Live, String> {
         match self.login {
             LoginMethod::Password => {
                 let user = named(&self.user, "a user name")?;
@@ -278,6 +308,7 @@ impl Server {
                 let response = client
                     .post(format!("{base}/api/v1/auth/session"))
                     .headers(basic_header(&user, password))
+                    .headers(gateway_headers(gateway))
                     .send()
                     .await
                     .map_err(reached)?;
@@ -292,6 +323,7 @@ impl Server {
                     &ChallengeBody {
                         public_key: &device.line,
                     },
+                    gateway,
                 )
                 .await?;
                 let nonce = BASE64_URL_SAFE_NO_PAD
@@ -320,6 +352,7 @@ impl Server {
                     client
                         .post(format!("{base}/api/v1/auth/session"))
                         .json(&body)
+                        .headers(gateway_headers(gateway))
                         .send()
                         .await
                         .map_err(reached)?,
@@ -333,12 +366,22 @@ impl Server {
 }
 
 /// A `POST` of JSON that answers JSON, with the failures this client cares about turned into lines.
+///
+/// `gateway` is the header a front door checks before this request reaches the server (see
+/// [`super::http::gateway_headers`]).
 async fn post<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
     body: &impl Serialize,
+    gateway: Option<&GatewayKey>,
 ) -> Result<T, String> {
-    let response = client.post(url).json(body).send().await.map_err(reached)?;
+    let response = client
+        .post(url)
+        .json(body)
+        .headers(gateway_headers(gateway))
+        .send()
+        .await
+        .map_err(reached)?;
     json(response).await
 }
 

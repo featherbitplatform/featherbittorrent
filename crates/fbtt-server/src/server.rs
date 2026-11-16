@@ -88,7 +88,8 @@ pub struct Server {
 
 impl Server {
     /// Serves `config` on `paths`, holding `lock`: the engine on this library's settings, fbt-api plus
-    /// these routes on `config.server.bind`, and a save every [`SAVE_EVERY`] while it runs.
+    /// these routes on the address its `server` section names (its defaults when it names none), and a
+    /// save every [`SAVE_EVERY`] while it runs.
     ///
     /// `config` is the run's resolved one (see [`Config::resolve`]): its allowed roots are what both
     /// this server and fbt-api enforce, and they are made into directories here because fbt-api will not
@@ -136,15 +137,20 @@ impl Server {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<Self, ServerError> {
-        let bind = config.server.bind;
-        let auth_on = config.server.auth_on();
-        let passwords_in_use = !config.server.auth.users.is_empty();
+        // The section this server was started from. A config with none is not a contradiction: `serve`
+        // only gets here once something chose to serve, but a caller that hands its own settings (a test,
+        // or a run serving a library somewhere other than where its config points) may hand a config that
+        // says nothing about a server, and the defaults are then what an unwritten section means.
+        let server = config.server.clone().unwrap_or_default();
+        let bind = server.bind;
+        let auth_on = server.auth_on();
+        let passwords_in_use = !server.auth.users.is_empty();
         // Said before any of the slow work, because it is about how this server will be reached: if
         // someone is going to type a password over this address, they should know now.
         warn_if_passwords_are_exposed(bind, auth_on, passwords_in_use);
-        warn_on_hosts_that_cannot_match(&config.server.allowed_hosts);
+        warn_on_hosts_that_cannot_match(&server.allowed_hosts);
 
-        let roots = prepare_roots(&config.server.allowed_roots).await?;
+        let roots = prepare_roots(&server.allowed_roots).await?;
         // Both spellings of every root go to fbt-api too: it enforces the same containment on the paths
         // its own routes take (save targets, move destinations), and this is the one place the two
         // servers of this library agree about what is allowed.

@@ -46,6 +46,12 @@ pub fn run(
     // taking a default never changes anything.
     let mut config = base.clone();
 
+    // The server questions are asked into their own value, and only handed to the config at the end:
+    // coming through here *is* the choice to serve, which is what makes `[server]` appear in the file.
+    // A base that never chose - a config the TUI saved, or no file at all - starts from these defaults;
+    // one that did keeps what it already said, and `serve` re-answers it anyway.
+    let mut server = base.server.clone().unwrap_or_default();
+
     // 1. Download folder. Any text is a folder here, including one that does not
     //    exist yet: whoever writes into it makes room, and a folder nobody can
     //    create is something the server itself says about, with the operating
@@ -69,8 +75,8 @@ pub fn run(
     })?;
 
     // 3. API address.
-    let default_addr = config.server.bind.to_string();
-    config.server.bind = ask_checked(
+    let default_addr = server.bind.to_string();
+    server.bind = ask_checked(
         input,
         out,
         &format!("API address [{default_addr}]: "),
@@ -88,7 +94,7 @@ pub fn run(
     // 4. Authentication, on by default away from loopback: that is what the server
     //    does with no `auth.enabled` either, so taking the default here leaves the
     //    field unnamed instead of writing a value that says nothing new.
-    let default_yes = !config.server.bind.ip().is_loopback();
+    let default_yes = !server.bind.ip().is_loopback();
     let default_answer = if default_yes { "yes" } else { "no" };
     let auth_on = ask_checked(
         input,
@@ -101,7 +107,7 @@ pub fn run(
         },
     )?;
     if auth_on != default_yes {
-        config.server.auth.enabled = Some(auth_on);
+        server.auth.enabled = Some(auth_on);
     }
 
     // 5. The first login, when authentication is on.
@@ -115,7 +121,7 @@ pub fn run(
             )?,
             Some(name) => {
                 let password = ask_new_password(input, out, secret_input)?;
-                config.server.auth.users.push(fbtt_core::UserEntry {
+                server.auth.users.push(fbtt_core::UserEntry {
                     name,
                     password_hash: hash(&password),
                 });
@@ -154,12 +160,16 @@ pub fn run(
                     ask_device_name(input, out, &line)?
                 }
             };
-            config.server.auth.devices.push(fbtt_core::DeviceEntry {
+            server.auth.devices.push(fbtt_core::DeviceEntry {
                 name,
                 public_key: line,
             });
         }
     }
+
+    // The section exists now because the questions behind it were asked. This is the only place a wizard
+    // run writes it, and `serve` is the only caller of this function.
+    config.server = Some(server);
 
     Ok(config)
 }
@@ -325,13 +335,39 @@ fn ask_name(
     Err(gave_up(&problem))
 }
 
-/// The name question `user set` asks when the command line did not give one. The
-/// bracketed default means an empty answer is an answer.
+/// What the name question prints before an answer, named because a test counts these: three of them is what
+/// three answers look like.
+const USER_NAME_PROMPT: &str = "User name: ";
+
+/// The name question `user set` asks when the command line did not give one. Nothing is a default here:
+/// this command is creating a login, and a name somebody signs in with cannot be empty, so a blank answer
+/// is reported as what it is and asked again rather than invented for them. (The wizard's own login step
+/// takes an empty line as "no login yet", because that question asks whether there are logins at all.)
 pub(crate) fn ask_user_name(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<String, Failure> {
-    ask_checked(input, out, "User name [alice]: ", "alice", accept_name)
+    let mut problem = String::new();
+    for _ in 0..MAX_TRIES {
+        write!(out, "{USER_NAME_PROMPT}")?;
+        out.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            // Nobody left to answer: the same dead end `ask_password` reports for a closed stdin.
+            return Err(Failure::problem(
+                "The name prompt got no input (stdin is closed).",
+            ));
+        }
+        let name = trimmed(&line);
+        match accept_name(&name) {
+            Ok(name) => return Ok(name),
+            Err(complaint) => {
+                writeln!(out, "{complaint}")?;
+                problem = complaint;
+            }
+        }
+    }
+    Err(gave_up(&problem))
 }
 
 /// A key with no usable comment has nothing to name itself, so the person gives it
@@ -420,5 +456,65 @@ fn answer_is_yes(answer: &str) -> Option<bool> {
         "yes" | "y" => Some(true),
         "no" | "n" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `user set` is creating a login, and a name nobody can sign in with is not an answer to its question:
+    /// a blank line is reported as what it is and asked again. The prompt used to carry a bracketed
+    /// `[alice]`, which meant somebody pressing Enter got a user named after the example in the docs - a
+    /// name they never chose, in a config file they will wonder about later.
+    #[test]
+    fn the_user_name_question_asks_again_when_the_answer_is_blank() {
+        let mut input = std::io::Cursor::new("\n  \nalice\n".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let name = match ask_user_name(&mut input, &mut out) {
+            Ok(name) => name,
+            Err(problem) => panic!("the third answer names a user: {}", problem.message),
+        };
+
+        assert_eq!(name, "alice", "a name typed after two blanks is the answer");
+        let asked = String::from_utf8(out).expect("the prompts are ascii");
+        assert_eq!(
+            asked.matches(USER_NAME_PROMPT).count(),
+            3,
+            "a blank was accepted, or a good answer was asked for twice: {asked}"
+        );
+        assert!(
+            asked.contains("A name is at least 1 character."),
+            "the blank was not said out loud before it was asked again: {asked}"
+        );
+        assert!(
+            !asked.contains("[alice]"),
+            "the question still offered something as a default: {asked}"
+        );
+
+        // Three blanks is the end of the asking, and the last complaint is what the command reports.
+        let mut input = std::io::Cursor::new("\n\n\n".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let problem = match ask_user_name(&mut input, &mut out) {
+            Ok(name) => panic!("nobody named a user, and one was made anyway: {name}"),
+            Err(problem) => problem.message,
+        };
+        assert!(
+            problem.contains("A name is at least 1 character."),
+            "the run ended without saying what was wrong with the answers: {problem}"
+        );
+
+        // An input that ends is a different dead end from an answer that is empty, and says so: this is what
+        // `user set` answers a closed stdin with, rather than a complaint it repeats three times.
+        let mut input = std::io::Cursor::new(String::new());
+        let mut out: Vec<u8> = Vec::new();
+        let problem = match ask_user_name(&mut input, &mut out) {
+            Ok(name) => panic!("nothing was typed, and a name came out: {name}"),
+            Err(problem) => problem.message,
+        };
+        assert!(
+            problem.contains("stdin is closed"),
+            "a closed input was reported as a bad answer: {problem}"
+        );
     }
 }

@@ -193,12 +193,15 @@ the generator does, because the gateway reads the private key as uid 65532:
 
 ```sh
 docker compose up -d certs
-docker compose cp cert.pem key.pem certs:/tls/
+docker compose cp cert.pem certs:/tls/
+docker compose cp key.pem certs:/tls/
 docker compose run --rm --entrypoint sh certs -c 'chown 65532:65532 /tls/*.pem; chmod 600 /tls/key.pem; chmod 644 /tls/cert.pem'
 docker compose restart gateway authelia
 ```
 
-If your certificate is issued for different hostnames, change the `host:` entries and
+`docker compose cp` takes one source per run, which is why the pair goes in twice.
+
+If your certificate is issued for different hostnames, change each route's `match.host` and the
 `valid_issuers` in `config/gateway/gateway.yaml`, `authelia_url`, the cookie domain, the
 `access_control` rule, the TUI client's `audience` and the redirect URI in
 `config/authelia/configuration.yml`, and `server.allowed_hosts` in

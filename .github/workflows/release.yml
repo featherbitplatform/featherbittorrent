@@ -67,7 +67,7 @@ jobs:
           path: target/dist/featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json
 
   # The Linux archives are built inside a debian:12 container on native runners of each arch:
-  # the binary must not need a glibc newer than Debian 12 (glibc 2.34), because that is also
+  # the binary must not need a glibc newer than Debian 12 (glibc 2.36), because that is also
   # what Raspberry Pi OS 12 ships, and an ubuntu-24.04 runner would link against 2.39. The
   # rustup toolchain installs into the job; ring's C needs the compiler packages below.
   linux:

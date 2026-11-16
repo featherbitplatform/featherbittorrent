@@ -15,7 +15,12 @@
 //!   per-request timeout; the event stream is the one call without the latter, because it is *meant* to stay
 //!   open, and it is bounded by its own line cap instead ([`crate::remote::sse`]). Every wait here also
 //!   ends when [`Stopping`] says this client is on its way out.
+//! - **One place decides what goes on the wire.** [`Api::headers`] puts the credential on every call, and
+//!   beside it the gateway's key header when the target named one; the login calls that cannot come through
+//!   `Api` add the same header from [`gateway_headers`]. So "no request reaches this server without the
+//!   header" is a property of this module rather than something each call site has to remember.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,18 +70,24 @@ pub(crate) struct Api {
     /// Who we sign in as, and the token that proves it. Shared with the event stream so a re-login on
     /// one half is a re-login on the other.
     auth: Arc<tokio::sync::Mutex<Auth>>,
+    /// The header a gateway standing in front of this server checks before the request reaches it, when the
+    /// target named one. Sent beside the credential on every call here, and shared with [`Auth`] so the
+    /// calls that earn the credential carry it too (see [`GatewayKey`]).
+    gateway: Option<Arc<GatewayKey>>,
     /// Set when this client is stopping: every wait below ends early because of it.
     stopping: Arc<Stopping>,
 }
 
 impl Api {
-    /// The API for `target`, signed in with `secret`.
+    /// The API for `target`, signed in with `secret` and let through the front door by `gateway_key`.
     ///
     /// Errs only about what cannot be asked of a server at all: an address that is not one, a method
-    /// with no credential to go with it, or a client that this build could not put together.
+    /// with no credential to go with it, a gateway header that is not a header or a key that is not there
+    /// to send under it, or a client that this build could not put together.
     pub(crate) fn try_new(
         target: &RemoteTarget,
         secret: crate::remote::Secret,
+        gateway_key: Option<Zeroizing<String>>,
         stopping: Arc<Stopping>,
     ) -> Result<Api, String> {
         let url = reqwest::Url::parse(&target.url)
@@ -88,7 +99,8 @@ impl Api {
             ));
         }
         let base = target.url.trim_end_matches('/').to_string();
-        let auth = Auth::new(target, secret)?;
+        let gateway = gateway_header(target, gateway_key)?;
+        let auth = Auth::new(target, secret, gateway.clone())?;
         let client = client_builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -103,6 +115,7 @@ impl Api {
             events_client,
             base,
             auth: Arc::new(tokio::sync::Mutex::new(auth)),
+            gateway,
             stopping,
         })
     }
@@ -152,6 +165,18 @@ impl Api {
         format!("{}{path}", self.base)
     }
 
+    /// The headers a request from this client carries: the credential's, with the gateway's header beside it
+    /// when the target named one.
+    ///
+    /// One map rather than two calls because a `RequestBuilder` takes its headers as one. Both belong on the
+    /// same request: the gateway decides who is asking before it passes the request on, and the server behind
+    /// it reads our own token out of the very request the gateway let through.
+    fn headers(&self, credential: &Credential) -> header::HeaderMap {
+        let mut headers = credential.header();
+        headers.extend(gateway_headers(self.gateway.as_deref()));
+        headers
+    }
+
     /// The JSON a call answers, read within the cap.
     pub(crate) async fn json<T: DeserializeOwned>(
         &self,
@@ -189,7 +214,9 @@ impl Api {
                     "this request cannot be sent a second time".to_string(),
                 ));
             };
-            let response = self.send(request.headers(credential.header())).await?;
+            let response = self
+                .send(request.headers(self.headers(&credential)))
+                .await?;
             let status = response.status();
             if status.is_success() {
                 return Ok(response);
@@ -233,7 +260,7 @@ impl Api {
         let request = self
             .events_client
             .get(self.url("/api/v1/events"))
-            .headers(credential.header());
+            .headers(self.headers(credential));
         let response = self.send(request).await?;
         let status = response.status();
         if status.is_success() {
@@ -433,4 +460,87 @@ pub(crate) fn basic_header(user: &str, password: &str) -> header::HeaderMap {
         headers.insert(header::AUTHORIZATION, value);
     }
     headers
+}
+
+/// The front door in front of this server: the header a gateway checks before the request reaches it, and
+/// the key that opens it.
+///
+/// The two halves are paired at construction rather than looked up per request, for one reason: a name with
+/// a space in it or a key with a newline in it is something somebody typed into `ui.yaml` or the connect
+/// screen, and it is worth one line said before anything is dialled rather than a transport error on each
+/// call. The value keeps its `Zeroizing` wrapper here and is marked sensitive on its way out, so neither
+/// this struct nor a header map that reaches a log line repeats it.
+pub(crate) struct GatewayKey {
+    name: header::HeaderName,
+    value: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for GatewayKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The name is a setting anybody could read off `ui.yaml`; the key is the secret.
+        write!(f, "GatewayKey({}, <redacted>)", self.name)
+    }
+}
+
+impl GatewayKey {
+    /// Checks these are a header this client can actually send, and pairs them.
+    ///
+    /// Both lines name the header and never the key: an error here is shown on a screen somebody else may
+    /// be looking at, and a gateway key repeated in one is a key spent.
+    pub(crate) fn check(name: &str, value: Zeroizing<String>) -> Result<GatewayKey, String> {
+        let name = header::HeaderName::from_str(name.trim())
+            .map_err(|_| format!("{} is not a header name", clean(name)))?;
+        if value.is_empty() {
+            return Err(format!("the gateway key for {name} is empty"));
+        }
+        // Checked here and built again per request (see [`Self::apply`]) so the secret's only long-lived
+        // home is the `Zeroizing` above: a `HeaderValue` is plain bytes, and its copy of the key would not
+        // be overwritten when this went.
+        header::HeaderValue::from_str(&value).map_err(|_| {
+            format!("the gateway key for {name} is not a value an HTTP header can carry")
+        })?;
+        Ok(GatewayKey { name, value })
+    }
+}
+
+/// The gateway's own header on its own: the target's header when this connection has a key to send under it,
+/// and an empty map when it does not.
+///
+/// A call site hands this to `RequestBuilder::headers` either way and says nothing about the difference -
+/// which is what the login calls need (they carry no session token of ours, so they have no other headers to
+/// fold it into), and it is what [`Api::headers`] extends the credential's map with. The value is built here
+/// rather than kept in a `HeaderValue`, so the key's only long-lived home is its `Zeroizing`; it is marked
+/// sensitive, because a `HeaderValue`'s bytes are where a secret would be printed.
+pub(crate) fn gateway_headers(gateway: Option<&GatewayKey>) -> header::HeaderMap {
+    let mut headers = header::HeaderMap::new();
+    if let Some(key) = gateway {
+        let mut value =
+            header::HeaderValue::from_str(&key.value).expect("checked when this key was paired");
+        value.set_sensitive(true);
+        headers.insert(key.name.clone(), value);
+    }
+    headers
+}
+
+/// The front door for `target`: the header its name names, with the key this run got hold of under it.
+///
+/// Both halves have to be there or neither is. A target that names a header whose key is nowhere describes a
+/// server behind a gateway that will refuse everything before it ever sees our credential - so it gets one
+/// line saying the key is missing, which the person can answer at the connect screen, rather than a refusal
+/// per call. A key with no name to send it under is the same mistake the other way round, and this client
+/// does not guess which header a gateway was configured to read.
+fn gateway_header(
+    target: &RemoteTarget,
+    key: Option<Zeroizing<String>>,
+) -> Result<Option<Arc<GatewayKey>>, String> {
+    match (target.gateway_key_header.as_deref(), key) {
+        (Some(name), Some(key)) => Ok(Some(Arc::new(GatewayKey::check(name, key)?))),
+        (Some(name), None) => Err(format!(
+            "this server is behind a gateway that checks {name}, and no key for it was given"
+        )),
+        (None, Some(_)) => {
+            Err("a gateway key was given with no header to send it under".to_string())
+        }
+        (None, None) => Ok(None),
+    }
 }

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::exit::Failure;
 use crate::wizard::{ask_new_password, ask_user_name, name_problem};
-use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
+use fbtt_core::{Config, DeviceEntry, Paths, ServerConfig, UserEntry};
 use fbtt_server::auth::keys::{fingerprint, parse_device_key};
 use fbtt_server::auth::password::hash;
 
@@ -48,15 +48,12 @@ pub fn set_user(
             name: name.clone(),
             password_hash: hash(&password),
         };
-        match config
-            .server
-            .auth
-            .users
-            .iter_mut()
-            .find(|user| user.name == name)
-        {
+        // A config that never chose to serve gets the section this command is about: registering a login
+        // *is* choosing to serve, and the defaults here are the ones `serve` would have asked about.
+        let server = config.server.get_or_insert_with(ServerConfig::default);
+        match server.auth.users.iter_mut().find(|user| user.name == name) {
             Some(existing) => *existing = entry,
-            None => config.server.auth.users.push(entry),
+            None => server.auth.users.push(entry),
         }
     })?;
     writeln!(out, "Saved user {name}.")?;
@@ -64,9 +61,11 @@ pub fn set_user(
 }
 
 /// Prints the users in `config.yaml`: name, then password hash. With none, the
-/// one line that says so: an empty list is a state of the file, not silence.
+/// one line that says so: an empty list is a state of the file, not silence. A
+/// config with no server section at all has no logins either, which is the same
+/// answer and gets the same line.
 pub fn list_users(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
-    let users = read(paths)?.server.auth.users;
+    let users = read(paths)?.server.unwrap_or_default().auth.users;
     if users.is_empty() {
         writeln!(out, "No users.")?;
     }
@@ -126,15 +125,15 @@ pub fn add_device(
         // second `device add` with a name it already has instead, because a request
         // cannot be assumed to mean the same thing; here the person can see both
         // answers agree that a name belongs to one device.
-        match config
-            .server
+        let server = config.server.get_or_insert_with(ServerConfig::default);
+        match server
             .auth
             .devices
             .iter_mut()
             .find(|device| device.name == name)
         {
             Some(existing) => *existing = entry,
-            None => config.server.auth.devices.push(entry),
+            None => server.auth.devices.push(entry),
         }
     })?;
     writeln!(out, "Added device {name} ({fingerprint}).")?;
@@ -146,13 +145,14 @@ pub fn remove_device(paths: &Paths, out: &mut dyn Write, name: &str) -> Result<(
     let name = name.trim().to_string();
     let mut removed = false;
     edit_config(paths, |config| {
-        let before = config.server.auth.devices.len();
-        config
-            .server
-            .auth
-            .devices
-            .retain(|device| device.name != name);
-        removed = config.server.auth.devices.len() != before;
+        // A config with no server section has no devices registered, which is the same answer as a name
+        // that is not in the list: nothing was taken out.
+        let Some(server) = config.server.as_mut() else {
+            return;
+        };
+        let before = server.auth.devices.len();
+        server.auth.devices.retain(|device| device.name != name);
+        removed = server.auth.devices.len() != before;
     })?;
     match removed {
         true => writeln!(out, "Removed device {name}.")?,
@@ -167,9 +167,13 @@ pub fn remove_user(paths: &Paths, out: &mut dyn Write, name: &str) -> Result<(),
     let name = name.trim().to_string();
     let mut removed = false;
     edit_config(paths, |config| {
-        let before = config.server.auth.users.len();
-        config.server.auth.users.retain(|user| user.name != name);
-        removed = config.server.auth.users.len() != before;
+        // The same as for a device: no server section means no logins to take out.
+        let Some(server) = config.server.as_mut() else {
+            return;
+        };
+        let before = server.auth.users.len();
+        server.auth.users.retain(|user| user.name != name);
+        removed = server.auth.users.len() != before;
     })?;
     match removed {
         true => writeln!(out, "Removed user {name}.")?,
@@ -180,9 +184,10 @@ pub fn remove_user(paths: &Paths, out: &mut dyn Write, name: &str) -> Result<(),
 
 /// Prints registered devices: name, then fingerprint. With none, the one line
 /// that says so. A key the parser cannot read has no fingerprint, so it is named
-/// by what the file calls it instead.
+/// by what the file calls it instead. No server section is the same answer as an
+/// empty list, and gets the same line.
 pub fn list_devices(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
-    let devices = read(paths)?.server.auth.devices;
+    let devices = read(paths)?.server.unwrap_or_default().auth.devices;
     if devices.is_empty() {
         writeln!(out, "No devices.")?;
     }

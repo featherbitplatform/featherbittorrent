@@ -7,6 +7,12 @@
 //! nowhere else. A device key is different by nature: its bytes stay in their file or in ssh-agent, so
 //! only a password is asked of the keychain, and a run that signs some other way never opens it.
 //!
+//! A gateway API key is the second secret this app keeps, and it follows the same rules on its own account:
+//! `ui.yaml` holds only which header the gateway reads (`gateway_key_header`), while the value sits beside
+//! the passwords under `gateway-key:<server>` (see [`gateway_account`]). A target can therefore have two
+//! entries - a password and a front-door key - and one connect answer says what to do with both (see
+//! [`keep_plans`]).
+//!
 //! The keychain is somebody else's process, so two rules follow. Everything here goes through
 //! [`SecretStore`], which a test can answer from a map instead of waking the real one. And every call runs
 //! on a blocking thread: the thread that draws the screen does not wait on another process (CLAUDE.md).
@@ -115,6 +121,27 @@ fn account(target: &RemoteTarget) -> Option<String> {
     Some(format!("{user}@{server}"))
 }
 
+/// The name a gateway's API key is kept under: `gateway-key:<server>`, because that key opens the front door
+/// of one server rather than an account on it - the gateway decides who is in before it knows who is signing
+/// in, and the same person's password for that server sits beside it under `<user>@<server>`.
+///
+/// `None` for a target that names no header, which is every server reached directly: there is no front door,
+/// so there is nothing of ours to look up or keep. A target whose address this run cannot read as http or
+/// https has no account either (see [`normalised_server`]).
+fn gateway_account(target: &RemoteTarget) -> Option<String> {
+    let names_a_header = target
+        .gateway_key_header
+        .as_deref()
+        .is_some_and(|header| !header.trim().is_empty());
+    if !names_a_header {
+        return None;
+    }
+    Some(format!(
+        "gateway-key:{}",
+        normalised_server(target.url.trim())?
+    ))
+}
+
 /// The address half of an account name, spelled one way. `http://alice:8090`, `http://alice:8090/` and
 /// `HTTP://Alice:8090` are one entry, because none of those differences is a different server to anybody
 /// typing a password twice - and the connect screen's own answer, a saved `ui.yaml`, and something typed in
@@ -169,90 +196,131 @@ pub fn remote_secret(target: &RemoteTarget, input: &SecretInput) -> Secret {
 /// What this run can start a connection with.
 #[derive(Debug)]
 pub enum StartSecret {
-    /// The credential to start with, and nothing left to ask anybody. `from_keychain` says where it came
-    /// from, which is the only way this run can later tell "the server said no to the password we kept" from
-    /// "the server said no to the password somebody just typed": only the first is worth taking out of the
-    /// keychain, and only the first means the person has to be asked again.
-    Ready { secret: Secret, from_keychain: bool },
-    /// Something this target signs in with is not here. Start the connection anyway - it says once, through
-    /// the client, why nothing appeared - and open the connect screen prefilled so the person can supply
-    /// what is missing. `notice` is the line to put beside that question when the keychain itself could
-    /// not be consulted, and `None` when it answered plainly that nothing is kept.
+    /// Everything this target signs with is here, and nothing is left to ask anybody. `from_keychain` says
+    /// where the password came from, which is the only way this run can later tell "the server said no to the
+    /// password we kept" from "the server said no to the password somebody just typed": only the first is
+    /// worth taking out of the keychain, and only the first means the person has to be asked again.
+    Ready {
+        secret: Secret,
+        gateway_key: Option<Zeroizing<String>>,
+        from_keychain: bool,
+    },
+    /// Something this target signs in with is not here. Start the connection anyway with whatever *is* in
+    /// hand - it says once, through the client, why nothing appeared - and open the connect screen prefilled
+    /// so the person can supply what is missing. `notice` is the line to put beside that question when the
+    /// keychain itself could not be consulted, and `None` when it answered plainly that nothing is kept.
     Ask {
         secret: Secret,
+        gateway_key: Option<Zeroizing<String>>,
         notice: Option<String>,
     },
 }
 
-/// The pure half of [`start_secret_for`]: what to start with, given what the keychain holds (`stored`) and
+/// What the keychain was asked for one target, and what it answered: both of the entries a target can have,
+/// its password under `<user>@<server>` and its gateway key under `gateway-key:<server>` (see [`account`],
+/// [`gateway_account`]). `None` means nothing is kept there - which is also the answer for a method that
+/// needs neither, whose run never opened the keychain to find that out.
+#[derive(Debug, Default)]
+pub struct Stored {
+    pub login: Option<Zeroizing<String>>,
+    pub gateway_key: Option<Zeroizing<String>>,
+}
+
+/// The pure half of [`start_secret_for`]: what to start with, given what the keychain holds (`held`) and
 /// whether it could be consulted at all (`unavailable`).
-pub fn decide_start_secret(
-    target: &RemoteTarget,
-    stored: Option<Zeroizing<String>>,
-    unavailable: bool,
-) -> StartSecret {
-    if !signs_with_a_password(target.login) {
-        return StartSecret::Ready {
-            secret: remote_secret(target, &SecretInput::default()),
-            from_keychain: false,
-        };
-    }
-    match stored {
+pub fn decide_start_secret(target: &RemoteTarget, held: &Stored, unavailable: bool) -> StartSecret {
+    // The credential this connection signs with, from whatever the keychain had. A password login with no
+    // password is what the remote backend already reports as one credential that does not go with its method:
+    // one line, no attempts against the server, and a header that says why the table is empty - so nothing is
+    // invented here. A method that signs some other way is answered by its own rule, which never involves the
+    // keychain (see [`remote_secret`]).
+    let needs_a_password = signs_with_a_password(target.login);
+    let secret = match (&held.login, needs_a_password) {
         // The keychain's own answer, which is what makes a later refusal worth acting on.
-        Some(password) => StartSecret::Ready {
-            secret: Secret::Password(password),
-            from_keychain: true,
-        },
-        // Nothing was kept - or nothing could be asked. A password login with no password is what the
-        // remote backend already reports as one credential that does not go with its method: one line, no
-        // attempts against the server, and a header that says why the table is empty.
-        None => StartSecret::Ask {
-            secret: Secret::None,
+        (Some(password), true) => Secret::Password(password.clone()),
+        (None, true) => Secret::None,
+        (_, false) => remote_secret(target, &SecretInput::default()),
+    };
+
+    // What this target expects that is not in hand. A named gateway header with no key behind it is missing in
+    // exactly the way a password method with nothing kept is: the connect screen is where it gets typed, and
+    // dialling without it would only produce refusals from something that never saw our credential.
+    let missing = (needs_a_password && held.login.is_none())
+        || (gateway_account(target).is_some() && held.gateway_key.is_none());
+    if missing {
+        // Nothing was kept - or nothing could be asked. A plain "nothing here" answer needs no line beside it:
+        // the connect screen is the line.
+        StartSecret::Ask {
+            secret,
+            gateway_key: held.gateway_key.clone(),
             notice: unavailable.then(|| KEYCHAIN_UNAVAILABLE.to_string()),
-        },
+        }
+    } else {
+        StartSecret::Ready {
+            secret,
+            gateway_key: held.gateway_key.clone(),
+            // Where the password came from is the only thing that later tells a refusal apart: this run can now
+            // say "the server said no to what we kept" (see `crate::switch`).
+            from_keychain: needs_a_password && held.login.is_some(),
+        }
     }
 }
 
 /// [`decide_start_secret`] with the keychain read for it, off the thread that draws the screen.
 ///
-/// A target that signs with a key or with nothing never opens the keychain at all: there is nothing of
-/// ours to look for there, and waking a secret service to find none is not free.
+/// A target that signs with a key or with nothing, and names no gateway header, never opens the keychain at
+/// all: there is nothing of ours to look for there, and waking a secret service to find none is not free.
 pub async fn start_secret_for(
     store: Arc<dyn SecretStore + Send + Sync>,
     target: RemoteTarget,
 ) -> StartSecret {
-    // The method answers this before the keychain is opened: a key login has nothing of ours in there, and
-    // waking a secret service to find none is not free. `account` cannot tell that apart from a password
-    // login with no name yet - both are `None` - so the method is asked first.
-    if !signs_with_a_password(target.login) {
-        return decide_start_secret(&target, None, false);
+    // The method and the header name say which entries could exist before the keychain is opened: `account`
+    // cannot tell a key login apart from a password login with no name yet - both are `None` - so the method is
+    // asked first, and a target that names neither has nothing of ours to look for.
+    let account = account(&target);
+    let gateway = gateway_account(&target);
+    if account.is_none() && gateway.is_none() {
+        return decide_start_secret(&target, &Stored::default(), false);
     }
-    let Some(account) = account(&target) else {
-        // A password method with no user name and no address is not a connection yet, so there is nothing
-        // to look up: ask for all of it on the screen.
-        return StartSecret::Ask {
-            secret: Secret::None,
-            notice: None,
-        };
-    };
-    match tokio::task::spawn_blocking(move || store.get(&account)).await {
-        Ok(Ok(stored)) => decide_start_secret(&target, stored, false),
-        // A keychain call is a call to another process: one that refused and one that was dropped mid-flight
-        // are the same answer to the person, so they get the same line.
-        Ok(Err(_)) | Err(_) => decide_start_secret(&target, None, true),
+    let read = tokio::task::spawn_blocking(move || {
+        (
+            account.as_deref().map(|name| store.get(name)),
+            gateway.as_deref().map(|name| store.get(name)),
+        )
+    })
+    .await;
+    match read {
+        Ok((login, gateway_key)) => {
+            // A keychain call is a call to another process: one that refused and one that was dropped mid-flight
+            // are the same answer to the person, so either one gets the same line - and either one leaves this
+            // run asking for what it could not read.
+            let unavailable = login.as_ref().is_some_and(|got| got.is_err())
+                || gateway_key.as_ref().is_some_and(|got| got.is_err());
+            decide_start_secret(
+                &target,
+                &Stored {
+                    login: login.and_then(Result::ok).flatten(),
+                    gateway_key: gateway_key.and_then(Result::ok).flatten(),
+                },
+                unavailable,
+            )
+        }
+        // The blocking call itself went away before it answered, which is the same thing the person can act on.
+        Err(_) => decide_start_secret(&target, &Stored::default(), true),
     }
 }
 
-/// What to do about the password a connect answer just collected.
+/// What to do about one secret a connect answer just collected: either the password it signs in with, or the
+/// key for the gateway header its target names. [`keep_plans`] answers for both at once.
 #[derive(Clone, PartialEq, Eq)]
 pub enum KeepPlan {
-    /// Nothing of ours for the keychain to hold: this login signs with a key or with nothing, or no
-    /// password was collected to keep.
+    /// Nothing of ours for the keychain to hold: this login signs with a key or with nothing, or no secret was
+    /// collected to keep.
     Nothing,
-    /// Keep this password under `account` so the next run does not ask for it.
+    /// Keep this secret under `account` so the next run does not ask for it.
     Keep {
         account: String,
-        password: Zeroizing<String>,
+        secret: Zeroizing<String>,
     },
     /// Take out whatever is kept under `account`, because the person said not to keep this one: the next
     /// run asks as this one did, and cannot be surprised by a password left from an earlier answer.
@@ -285,7 +353,7 @@ pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
         // answer that typed nothing keeps whatever is already there instead.
         (Some(password), true) if !password.is_empty() => KeepPlan::Keep {
             account,
-            password: password.clone(),
+            secret: password.clone(),
         },
         (Some(_), true) => KeepPlan::Nothing,
         // It was not ticked, so nothing is kept and what an earlier answer left behind goes: "asked each
@@ -293,6 +361,62 @@ pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
         (Some(_), false) => KeepPlan::Forget { account },
         // Nothing was collected (a key method, or a form that could not be submitted): nothing to say.
         (None, _) => KeepPlan::Nothing,
+    }
+}
+
+/// What an answer says about the gateway-key entry: the same three rules as a password, on the account named
+/// by the server whose front door it opens rather than the account it signs in to.
+///
+/// A target that names no header has no such entry - that is every server reached directly - so this says
+/// nothing about the keychain for it, and an answer that collected no key says nothing either: a key left from
+/// an earlier answer is found again by the next run that names the same header, which is what "asked each time"
+/// is supposed to mean when the box is ticked and not when it is not.
+pub fn gateway_keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
+    let Some(account) = gateway_account(target) else {
+        return KeepPlan::Nothing;
+    };
+    match (&input.gateway_key, input.remember) {
+        // Ticked and typed: the next run through this front door does not have to be given the key again.
+        (Some(key), true) if !key.is_empty() => KeepPlan::Keep {
+            account,
+            secret: key.clone(),
+        },
+        (Some(_), true) => KeepPlan::Nothing,
+        // Not ticked: this run used the key and is not keeping it, and whatever an earlier answer left goes
+        // with it so the next run is asked rather than signed in with a key nobody meant to still have.
+        (Some(_), false) => KeepPlan::Forget { account },
+        // No key was collected: nothing this answer can say about that entry.
+        (None, _) => KeepPlan::Nothing,
+    }
+}
+
+/// What one connect answer asks of the keychain, both entries it can speak for: the credential this run signs
+/// in with and the key its target's gateway header names.
+///
+/// The two halves are kept apart on purpose - different accounts, and a person can be asked to keep one without
+/// the other being relevant at all - but they travel together so that one answer cannot half-apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepPlans {
+    pub login: KeepPlan,
+    pub gateway_key: KeepPlan,
+}
+
+impl KeepPlans {
+    /// The pair that asks nothing of the keychain: what a run carries before anybody has answered anything,
+    /// and what it carries again once these have been paid for (see [`KeepPlan::Nothing`]).
+    pub fn nothing() -> KeepPlans {
+        KeepPlans {
+            login: KeepPlan::Nothing,
+            gateway_key: KeepPlan::Nothing,
+        }
+    }
+}
+
+/// [`keep_plan`] and [`gateway_keep_plan`] for one answer.
+pub fn keep_plans(target: &RemoteTarget, input: &SecretInput) -> KeepPlans {
+    KeepPlans {
+        login: keep_plan(target, input),
+        gateway_key: gateway_keep_plan(target, input),
     }
 }
 
@@ -306,7 +430,7 @@ pub fn keep_plan(target: &RemoteTarget, input: &SecretInput) -> KeepPlan {
 pub fn apply_keep(store: &dyn SecretStore, plan: &KeepPlan) -> Result<(), String> {
     let asked = match plan {
         KeepPlan::Nothing => Ok(()),
-        KeepPlan::Keep { account, password } => store.set(account, password),
+        KeepPlan::Keep { account, secret } => store.set(account, secret),
         KeepPlan::Forget { account } => store.delete(account),
     };
     asked.map_err(|_| KEYCHAIN_UNAVAILABLE.to_string())
@@ -329,8 +453,9 @@ pub fn forget_password(store: &dyn SecretStore, target: &RemoteTarget) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        KEYCHAIN_UNAVAILABLE, KeepPlan, StartSecret, account, apply_keep, decide_start_secret,
-        forget_password, keep_plan, normalised_server, remote_secret, start_secret_for,
+        KEYCHAIN_UNAVAILABLE, KeepPlan, StartSecret, Stored, account, apply_keep,
+        decide_start_secret, forget_password, gateway_account, gateway_keep_plan, keep_plan,
+        keep_plans, normalised_server, remote_secret, start_secret_for,
     };
     use crate::fake_store::FakeStore;
     use fbtt_core::Secret;
@@ -451,6 +576,9 @@ mod tests {
         let typed = SecretInput {
             password: Some(Zeroizing::new("hunter2".to_string())),
             passphrase: Some(Zeroizing::new("correct horse".to_string())),
+            // The gateway key is not part of what a connection signs with - it rides beside the credential on
+            // every request - so nothing here should pick it up (see [`gateway_keep_plan`] for where it goes).
+            gateway_key: Some(Zeroizing::new("a front-door key".to_string())),
             remember: true,
         };
 
@@ -484,13 +612,32 @@ mod tests {
         ));
     }
 
+    /// What the keychain answered about a target's own credential, with nothing kept for a gateway header -
+    /// which is every server reached directly.
+    fn held(login: Option<Zeroizing<String>>) -> Stored {
+        Stored {
+            login,
+            gateway_key: None,
+        }
+    }
+
+    /// The same server as [`target`], with a header named for the front door in front of it. The name is what
+    /// `ui.yaml` keeps; every case below is about where the key for it came from.
+    fn keyed(login: LoginMethod) -> RemoteTarget {
+        RemoteTarget {
+            gateway_key_header: Some("X-API-Key".to_string()),
+            ..target(login)
+        }
+    }
+
     /// What the keychain holds decides whether anybody is asked for a password.
     #[test]
     fn a_stored_password_starts_the_connection_without_asking() {
         let stored = Some(Zeroizing::new("hunter2".to_string()));
-        match decide_start_secret(&target(LoginMethod::Password), stored, false) {
+        match decide_start_secret(&target(LoginMethod::Password), &held(stored), false) {
             StartSecret::Ready {
                 secret: Secret::Password(password),
+                gateway_key,
                 from_keychain,
             } => {
                 assert_eq!(&*password, "hunter2");
@@ -500,6 +647,10 @@ mod tests {
                     from_keychain,
                     "a password out of the keychain is the keychain's own"
                 );
+                assert!(
+                    gateway_key.is_none(),
+                    "a server reached directly was handed a front-door key nobody named"
+                );
             }
             other => panic!("the keychain had the password, so this run asks: {other:?}"),
         }
@@ -507,9 +658,14 @@ mod tests {
         // Nothing kept: ask, and start with no credential at all so the connection says once that there
         // is nothing to sign in with instead of trying an empty password. A plain "nothing here" answer
         // needs no line beside it - the connect screen is the line.
-        match decide_start_secret(&target(LoginMethod::Password), None, false) {
-            StartSecret::Ask { secret, notice } => {
+        match decide_start_secret(&target(LoginMethod::Password), &held(None), false) {
+            StartSecret::Ask {
+                secret,
+                gateway_key,
+                notice,
+            } => {
                 assert!(matches!(secret, Secret::None));
+                assert!(gateway_key.is_none());
                 assert_eq!(notice, None);
             }
             other => panic!("no password was kept, so this run should ask: {other:?}"),
@@ -517,8 +673,8 @@ mod tests {
 
         // A keychain that could not be consulted asks the same question and adds the one line the person
         // can act on. Its own words are not shown: which system call refused is not their decision to make.
-        match decide_start_secret(&target(LoginMethod::Password), None, true) {
-            StartSecret::Ask { secret, notice } => {
+        match decide_start_secret(&target(LoginMethod::Password), &held(None), true) {
+            StartSecret::Ask { secret, notice, .. } => {
                 assert!(
                     matches!(secret, Secret::None),
                     "a refused keychain was handed a credential"
@@ -535,14 +691,19 @@ mod tests {
             LoginMethod::Agent,
             LoginMethod::GatewayKey,
         ] {
-            match decide_start_secret(&target(login), None, true) {
+            match decide_start_secret(&target(login), &held(None), true) {
                 StartSecret::Ready {
                     secret,
+                    gateway_key,
                     from_keychain,
                 } => {
                     assert!(
                         !matches!(secret, Secret::Password(_)),
                         "{login:?} was handed a password it does not sign with"
+                    );
+                    assert!(
+                        gateway_key.is_none(),
+                        "{login:?} was dialled with a front-door key its target does not name"
                     );
                     assert!(
                         !from_keychain,
@@ -554,9 +715,125 @@ mod tests {
         }
     }
 
-    /// The whole start path over a fake keychain: the map answers, and the real one is never touched.
+    /// A header named for a front door is a piece this run cannot invent, so it is asked for in the same
+    /// breath as a missing password - whatever else the target signs with - and dialled with whenever the
+    /// keychain has it.
+    #[test]
+    fn a_gateway_key_is_asked_for_whenever_a_header_is_named() {
+        let key = Some(Zeroizing::new("a front-door key".to_string()));
+
+        // Found, on a login that needs no password of its own: dial with both and ask nobody.
+        match decide_start_secret(
+            &keyed(LoginMethod::KeyFile),
+            &Stored {
+                login: None,
+                gateway_key: key.clone(),
+            },
+            false,
+        ) {
+            StartSecret::Ready {
+                secret,
+                gateway_key,
+                from_keychain,
+            } => {
+                assert!(
+                    matches!(secret, Secret::KeyPassphrase(None)),
+                    "a device key was sent to the keychain for its passphrase"
+                );
+                assert_eq!(
+                    gateway_key.as_deref().map(|key| &**key),
+                    Some("a front-door key"),
+                    "the key that was kept should have been dialled with"
+                );
+                assert!(
+                    !from_keychain,
+                    "no password was read out of anything, so a refusal is about nothing this run kept",
+                );
+            }
+            other => panic!("the front-door key was in hand, got {other:?}"),
+        }
+
+        // Missing: ask, and dial with the credential alone rather than pretending the door is open. Which piece
+        // is missing is a line the backend says once before anything is sent (see `fbtt_core::remote`).
+        match decide_start_secret(
+            &keyed(LoginMethod::KeyFile),
+            &Stored {
+                login: None,
+                gateway_key: None,
+            },
+            false,
+        ) {
+            StartSecret::Ask {
+                secret,
+                gateway_key,
+                notice,
+            } => {
+                assert!(
+                    matches!(secret, Secret::KeyPassphrase(None)),
+                    "a missing front-door key cost the credential this login does have"
+                );
+                assert!(gateway_key.is_none());
+                assert_eq!(notice, None, "nothing was kept, so nothing went wrong");
+            }
+            other => panic!("no front-door key was kept, so this run should ask: {other:?}"),
+        }
+
+        // A password method with its password but without its key is still a question for the screen, and the
+        // password it does hold goes out with the answer.
+        match decide_start_secret(
+            &keyed(LoginMethod::Password),
+            &Stored {
+                login: Some(Zeroizing::new("hunter2".to_string())),
+                gateway_key: None,
+            },
+            false,
+        ) {
+            StartSecret::Ask {
+                secret: Secret::Password(password),
+                gateway_key,
+                ..
+            } => {
+                assert_eq!(&*password, "hunter2");
+                assert!(gateway_key.is_none());
+            }
+            other => panic!("a target missing its key should ask, got {other:?}"),
+        }
+
+        // A keychain that could not be consulted says so once, whichever half it was asked about.
+        match decide_start_secret(&keyed(LoginMethod::Password), &Stored::default(), true) {
+            StartSecret::Ask { notice, .. } => {
+                assert_eq!(notice.as_deref(), Some(KEYCHAIN_UNAVAILABLE))
+            }
+            other => panic!("a refused keychain should still ask: {other:?}"),
+        }
+
+        // Which account that key lives under, and when there is no such account at all: the front door belongs
+        // to a server, not to an account on it, so one name serves every login method that target uses.
+        assert_eq!(
+            gateway_account(&keyed(LoginMethod::Password)),
+            Some("gateway-key:http://127.0.0.1:8090".to_string()),
+            "the key is filed under the server whose door it opens"
+        );
+        for login in [
+            LoginMethod::None,
+            LoginMethod::Password,
+            LoginMethod::KeyFile,
+            LoginMethod::Agent,
+            LoginMethod::GatewayKey,
+            LoginMethod::GatewayBasic,
+        ] {
+            assert_eq!(
+                gateway_account(&target(login)),
+                None,
+                "{login:?} reached directly had an entry invented for it"
+            );
+        }
+    }
+
+    /// The whole start path over a fake keychain: the map answers, and the real one is never touched. One read
+    /// per entry this target could have, and none at all for a target that can have none.
     #[tokio::test]
-    async fn the_keychain_is_read_once_and_only_for_a_password() {
+    async fn the_keychain_is_read_once_for_each_entry_a_target_has() {
         let store = Arc::new(FakeStore::new());
         store.put("alice@http://127.0.0.1:8090", "hunter2");
 
@@ -564,9 +841,14 @@ mod tests {
         match started {
             StartSecret::Ready {
                 secret: Secret::Password(password),
+                gateway_key,
                 from_keychain,
             } => {
                 assert_eq!(&*password, "hunter2");
+                assert!(
+                    gateway_key.is_none(),
+                    "no header was named to look a key up under"
+                );
                 assert!(
                     from_keychain,
                     "this is the run that has to notice a refusal of it",
@@ -584,6 +866,7 @@ mod tests {
                 started,
                 StartSecret::Ready {
                     secret: Secret::KeyPassphrase(None),
+                    gateway_key: None,
                     from_keychain: false,
                 }
             ),
@@ -597,8 +880,13 @@ mod tests {
         // An empty keychain asks, with no complaint to add: the screen itself is the question.
         let store = Arc::new(FakeStore::new());
         match start_secret_for(store.clone(), target(LoginMethod::Password)).await {
-            StartSecret::Ask { secret, notice } => {
+            StartSecret::Ask {
+                secret,
+                gateway_key,
+                notice,
+            } => {
                 assert!(matches!(secret, Secret::None));
+                assert!(gateway_key.is_none());
                 assert_eq!(notice, None);
             }
             other => panic!("nothing was kept, got {other:?}"),
@@ -611,6 +899,63 @@ mod tests {
                 notice.as_deref(),
                 Some(KEYCHAIN_UNAVAILABLE),
                 "a keychain that could not be consulted says so before the screen asks"
+            ),
+            other => panic!("a refused keychain should still ask: {other:?}"),
+        }
+
+        // A target with a front door has two entries, and both are read - in order, credential first - because
+        // a run cannot say which one the person is missing until it has asked for both.
+        let store = Arc::new(FakeStore::new());
+        store.put("alice@http://127.0.0.1:8090", "hunter2");
+        store.put("gateway-key:http://127.0.0.1:8090", "a front-door key");
+        match start_secret_for(store.clone(), keyed(LoginMethod::Password)).await {
+            StartSecret::Ready {
+                secret: Secret::Password(password),
+                gateway_key,
+                from_keychain,
+            } => {
+                assert_eq!(&*password, "hunter2");
+                assert_eq!(
+                    gateway_key.as_deref().map(|key| &**key),
+                    Some("a front-door key"),
+                    "the front door was shut on a key that was sitting there"
+                );
+                assert!(from_keychain);
+            }
+            other => panic!("both entries were kept, got {other:?}"),
+        }
+        assert_eq!(
+            store.asked(),
+            vec!["get".to_string(), "get".to_string()],
+            "the keychain was asked about once per entry"
+        );
+
+        // Only the half that is missing is asked for: a password kept and no key kept still dials with the
+        // password, so the person is not made to retype something this run already has.
+        let store = Arc::new(FakeStore::new());
+        store.put("alice@http://127.0.0.1:8090", "hunter2");
+        match start_secret_for(store.clone(), keyed(LoginMethod::Password)).await {
+            StartSecret::Ask {
+                secret: Secret::Password(password),
+                gateway_key,
+                notice,
+            } => {
+                assert_eq!(&*password, "hunter2");
+                assert!(gateway_key.is_none());
+                assert_eq!(notice, None);
+            }
+            other => panic!("the front-door key was not kept, so this run should ask: {other:?}"),
+        }
+
+        // A keychain that cannot answer the second question is reported the same way as one that cannot answer
+        // the first, and the credential it did hand over is still used.
+        let store = Arc::new(FakeStore::broken());
+        store.put("alice@http://127.0.0.1:8090", "hunter2");
+        match start_secret_for(store.clone(), keyed(LoginMethod::Password)).await {
+            StartSecret::Ask { notice, .. } => assert_eq!(
+                notice.as_deref(),
+                Some(KEYCHAIN_UNAVAILABLE),
+                "a keychain that refused one entry says so once"
             ),
             other => panic!("a refused keychain should still ask: {other:?}"),
         }
@@ -639,10 +984,10 @@ mod tests {
         match keep_plan(&target(LoginMethod::Password), &remembered) {
             KeepPlan::Keep {
                 account: named,
-                password,
+                secret,
             } => {
                 assert_eq!(named, account);
-                assert_eq!(&*password, "hunter2");
+                assert_eq!(&*secret, "hunter2");
             }
             other => panic!("the box was ticked, got {other:?}"),
         }
@@ -676,6 +1021,82 @@ mod tests {
         assert_eq!(
             format!("{keeping:?}"),
             "KeepPlan::Keep(alice@http://127.0.0.1:8090, <redacted>)"
+        );
+    }
+
+    /// The front-door key follows the password's rules on its own account: ticked keeps it under
+    /// `gateway-key:<server>`, unticked takes it out, and a target with no header named says nothing about the
+    /// keychain at all - which is what keeps a plain server from waking one.
+    #[test]
+    fn a_gateway_key_follows_the_same_rules_on_its_own_account() {
+        let door = "gateway-key:http://127.0.0.1:8090";
+        let typed = SecretInput {
+            gateway_key: Some(Zeroizing::new("a front-door key".to_string())),
+            ..SecretInput::default()
+        };
+
+        // Unticked: the next run asks as this one did, and what an earlier answer left goes with it.
+        assert_eq!(
+            gateway_keep_plan(&keyed(LoginMethod::Password), &typed),
+            KeepPlan::Forget {
+                account: door.to_string()
+            },
+            "an unticked box means the key is not kept"
+        );
+
+        // Ticked: kept under the server whose door it opens, beside the password rather than in its place.
+        let remembered = SecretInput {
+            remember: true,
+            ..typed.clone()
+        };
+        match gateway_keep_plan(&keyed(LoginMethod::Password), &remembered) {
+            KeepPlan::Keep { account, secret } => {
+                assert_eq!(account, door);
+                assert_eq!(&*secret, "a front-door key");
+            }
+            other => panic!("the box was ticked, got {other:?}"),
+        }
+
+        // A device key with a front door in front of it: the key file is not the keychain's to hold, but the
+        // gateway key is, and one answer says what to do with both.
+        let plans = keep_plans(&keyed(LoginMethod::KeyFile), &remembered);
+        assert_eq!(
+            plans.login,
+            KeepPlan::Nothing,
+            "a device key was offered to the keychain for a key it never holds"
+        );
+        assert_eq!(
+            plans.gateway_key,
+            KeepPlan::Keep {
+                account: door.to_string(),
+                secret: Zeroizing::new("a front-door key".to_string())
+            },
+            "the front-door key was collected with no way to keep it"
+        );
+
+        // A password answer for a server reached directly keeps only the password: there is no front-door entry
+        // for such a server, and writing one would leave a line in the keychain that nothing looks up.
+        let only_a_password = SecretInput {
+            password: Some(Zeroizing::new("hunter2".to_string())),
+            remember: true,
+            ..SecretInput::default()
+        };
+        let plans = keep_plans(&target(LoginMethod::Password), &only_a_password);
+        assert_eq!(
+            plans.login,
+            KeepPlan::Keep {
+                account: "alice@http://127.0.0.1:8090".to_string(),
+                secret: Zeroizing::new("hunter2".to_string())
+            }
+        );
+        assert_eq!(plans.gateway_key, KeepPlan::Nothing);
+
+        // `Debug` redacts both halves the way it redacts one.
+        let plans = keep_plans(&keyed(LoginMethod::Password), &remembered);
+        assert_eq!(
+            format!("{plans:?}"),
+            "KeepPlans { login: KeepPlan::Nothing, gateway_key: KeepPlan::Keep(gateway-key:http://127.0.0.1:8090, <redacted>) }",
+            "a plan repeated in a log line must not repeat the key"
         );
     }
 

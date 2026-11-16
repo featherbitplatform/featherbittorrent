@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fbtt_core::LibraryLock;
+use fbtt_core::{Config, LibraryLock};
 
 #[test]
 fn version_prints_name_and_version() {
@@ -49,6 +49,55 @@ fn lock_held_message() {
     assert!(
         stderr.contains(&scratch.data_dir.display().to_string()),
         "the message names the data directory the lock lives in: {stderr}"
+    );
+}
+
+/// The same locked library, found by a second run whose config came out of its own settings save. This
+/// is the case `[server]` presence decides end to end: a config the TUI wrote says nothing about serving,
+/// so this run has no address to offer and leaves with the same sentence and exit code as a run that
+/// found no file at all - rather than offering to connect to a server nobody started. The decision
+/// itself is tested in `backend::tests::second_tui_on_locked_library_exits_3`; this is the whole run.
+#[test]
+fn settings_saved_library_offers_no_server_when_locked() {
+    let scratch = Scratch::new("locked_after_settings_save");
+    // What a settings change writes: rates and a folder, and no `server` section.
+    let config_path = scratch.config_dir.join("config.yaml");
+    let mut saved = Config::default();
+    saved.limits.download_kib = 512;
+    saved.save(&config_path).expect("save a settings config");
+    let written = fs::read_to_string(&config_path).expect("read the file back");
+    assert!(
+        !written.contains("server"),
+        "a settings save wrote no server section: {written}"
+    );
+
+    // The guard outlives the child, as in `lock_held_message`.
+    let _held = LibraryLock::acquire(&scratch.data_dir.join("library.lock")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .env("FBTT_CONFIG_DIR", &scratch.config_dir)
+        .env("FBTT_DATA_DIR", &scratch.data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a library somebody else is driving is exit code 3: {out:?}"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("already using this library"),
+        "the run says who holds the library: {stderr}"
+    );
+    // And it offers no address: nothing in this file says a server runs here.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("127.0.0.1"),
+        "no server was invented for this library: {stdout}"
     );
 }
 

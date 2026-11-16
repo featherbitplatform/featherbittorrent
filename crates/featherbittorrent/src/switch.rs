@@ -52,7 +52,7 @@ use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, them
 use crate::backend::{Backend, BackendKind, LockOutcome, SwitchPlan, plan_switch};
 use crate::run::{cannot_lock, library_in_use};
 use crate::secrets::{
-    KeepPlan, SecretStore, apply_keep, forget_password, keep_plan, remote_secret,
+    KeepPlans, SecretStore, apply_keep, forget_password, keep_plans, remote_secret,
 };
 
 /// The frame clock: redraws land at most this far apart, and only over a `dirty` flag.
@@ -99,8 +99,9 @@ pub struct Login {
     /// Where this connection goes: what `ui.yaml` is pointed at once it is in, and what the connect screen
     /// is prefilled with when its password turns out to be wrong.
     target: RemoteTarget,
-    /// What the keychain should hold once this connection has signed in - see [`crate::secrets::keep_plan`].
-    keep: KeepPlan,
+    /// What the keychain should hold once this connection has signed in: the credential it signs with and,
+    /// when the target names a gateway header, the key for that header - see [`crate::secrets::keep_plans`].
+    keep: KeepPlans,
     /// Whether this address belongs in `ui.yaml` once the sign-in answers - see [`Remembered`] and
     /// [`remembered_ui`].
     remembers: Remembered,
@@ -120,7 +121,7 @@ impl Login {
     pub fn remembered(target: RemoteTarget, from_keychain: bool) -> Login {
         Login {
             target,
-            keep: KeepPlan::Nothing,
+            keep: KeepPlans::nothing(),
             remembers: Remembered::Chosen,
             from_keychain,
             settled: false,
@@ -128,10 +129,10 @@ impl Login {
     }
 
     /// A connection that came out of the connect screen. What the keychain should hold is what the person
-    /// asked for - see [`keep_plan`] - and a password they just typed is not one the keychain can be wrong
-    /// about, so a refusal of it needs no repair. They chose this address, so it is what the next run starts
-    /// on too.
-    pub fn answered(target: RemoteTarget, keep: KeepPlan) -> Login {
+    /// asked for - see [`crate::secrets::keep_plans`] - and a password they just typed is not one the keychain
+    /// can be wrong about, so a refusal of it needs no repair. They chose this address, so it is what the next
+    /// run starts on too.
+    pub fn answered(target: RemoteTarget, keep: KeepPlans) -> Login {
         Login {
             target,
             keep,
@@ -149,7 +150,7 @@ impl Login {
     pub fn borrowed(target: RemoteTarget) -> Login {
         Login {
             target,
-            keep: KeepPlan::Nothing,
+            keep: KeepPlans::nothing(),
             remembers: Remembered::Borrowed,
             from_keychain: false,
             settled: false,
@@ -171,62 +172,97 @@ fn remembered_ui(login: &Login) -> Option<LastUsed> {
 ///
 /// A keychain call and a file write are conversations with something that may take a while to answer - on
 /// macOS a keychain can be waiting for somebody to unlock it - so neither happens on the thread that draws
-/// the screen: each goes to a blocking thread (see [`send_work`]) and whatever it says arrives on this queue,
-/// which the loop reads whenever it turns up (see [`run_loop`]). What a job needs - this library's files, and
-/// where its connect passwords live - travels here because that is all this run ever sends away for. The
-/// config does not: a switch reads `config.yaml` again (see [`local_config`]) because it needs the answer in
-/// hand before it can start an engine on it, and that read happens between two turns of the loop, where
-/// nothing is drawing.
+/// the screen: each goes to this run's one worker thread (see [`Jobs`], [`send_work`]) and whatever it says
+/// arrives on this queue, which the loop reads whenever it turns up (see [`run_loop`]). What a job needs -
+/// this library's files, and where its connect passwords live - travels with the job because that is all
+/// this run ever sends away for. The config does not: a switch reads `config.yaml` again (see
+/// [`local_config`]) because it needs the answer in hand before it can start an engine on it, and that read
+/// happens between two turns of the loop, where nothing is drawing.
 ///
-/// One sender stays in this struct between jobs, which is what keeps the queue open: a queue with no senders
-/// left reads as a closed one, and the loop would be told there is nothing to read on every single turn.
+/// The worker thread holds the only sending end of that notice queue, which is what keeps it open for the
+/// run's whole life: a queue with no senders left reads as a closed one, and the loop would be told there is
+/// nothing to read on every single turn. It closes when this struct goes and the last job has answered - the
+/// worker stops when the job queue empties with no senders left, and takes its sender with it - which is how
+/// a test knows a save it asked for has finished: giving up its own `Work` leaves only the reading end of
+/// that queue, and reading until it closes is reading everything the worker had to say.
 pub struct Work<'a> {
     /// Where this library's files are: `config.yaml`, `ui.yaml`, the lock.
     pub paths: &'a Paths,
     /// Where a connect password lives between runs.
     pub store: &'a Arc<dyn SecretStore + Send + Sync>,
-    tx: mpsc::Sender<Notice>,
     rx: mpsc::Receiver<Notice>,
+    /// The one worker every job of this run goes to (see [`Jobs`]).
+    jobs: Jobs,
+}
+
+/// One piece of off-screen work: what to do away from the screen, and the lines it has to say when it is
+/// done.
+type Job = Box<dyn FnOnce() -> Vec<Notice> + Send>;
+
+/// This run's one worker thread, reached through a queue nobody ever waits on.
+///
+/// A sign-in owes two writes - `ui.yaml` pointed at the server, and the password the person said to keep -
+/// and a refusal of a kept password owes a delete that belongs beside them. Run on a pool of threads they
+/// can be answered in any order, which is how a save lands after the delete that was meant to undo it, or a
+/// remembered address overwrites a fresher one. One queue drained by one thread makes the order the person
+/// did things in the order they happen in. Cloning this hands out another way of reaching that same thread;
+/// the thread ends when the last handle goes, which is when a run lets go of its [`Work`].
+#[derive(Clone)]
+struct Jobs {
+    tx: mpsc::UnboundedSender<Job>,
 }
 
 impl<'a> Work<'a> {
-    /// The queue for one run's off-screen work, with its two ends already wired together.
+    /// The queue for one run's off-screen work, with its two ends wired together and the thread that does
+    /// the work already started.
     pub fn new(paths: &'a Paths, store: &'a Arc<dyn SecretStore + Send + Sync>) -> Work<'a> {
         // Eight lines is more than this run can have in flight at once - a sign-in's two writes and the
-        // delete that follows a refusal. A queue that did fill up would block the thread it was sent to, which
-        // is allowed to block, rather than the screen, which is not.
+        // delete that follows a refusal. A queue that did fill up would wait on the thread it was sent to,
+        // which is allowed to wait, rather than the screen, which is not.
         let (tx, rx) = mpsc::channel(8);
+        let (jobs_tx, mut waiting) = mpsc::unbounded_channel::<Job>();
+        // A plain thread rather than a task: it spends its life waiting on another process, and being the
+        // only one is what makes this run's writes happen in the order they were asked for. It holds the
+        // notice queue's only sender, and ends when `jobs_tx` and every clone of it go - which is when the
+        // run lets go of this struct.
+        std::thread::spawn(move || {
+            while let Some(job) = waiting.blocking_recv() {
+                for notice in job() {
+                    // This thread may wait for room; the screen never does. A queue nobody reads any more -
+                    // a screen that went away mid-write - costs the line, not the write.
+                    let _ = tx.blocking_send(notice);
+                }
+            }
+        });
         Work {
             paths,
             store,
-            tx,
             rx,
+            jobs: Jobs { tx: jobs_tx },
         }
     }
 
-    /// Gives up this side of the queue and hands back the reading end: what has already been sent still
-    /// arrives, and the reader sees the queue close when the last job in flight has answered. Only a test does
-    /// this, to know that a save it asked for has finished; a run keeps its queue as long as its screen.
+    /// Gives up this side of the work and hands back the reading end of the notice queue: what a job already
+    /// answered still arrives, and the queue closes once the worker has drained what was queued to it and
+    /// stopped. Only a test does this, to know that a save it asked for has finished; a run keeps its queue
+    /// as long as its screen.
     #[cfg(test)]
     fn into_reader(self) -> mpsc::Receiver<Notice> {
-        let Work { tx, rx, .. } = self;
-        drop(tx);
+        let Work { rx, jobs, .. } = self;
+        // Dropping the last handle is what stops the worker, and it takes the queue's sender with it.
+        drop(jobs);
         rx
     }
 }
 
-/// Runs one job on a thread that may have to wait for something outside this process - a keychain, a disk -
-/// and puts whatever it has to say to the person on the queue the screen reads. Nothing waits for the job: a
-/// conversation that never answers costs this run one line of news, not its next frame. Sending from that
-/// thread is `blocking_send`, which may wait for room in the queue because that thread is allowed to wait,
-/// and drops the line when the screen has gone and nobody is reading any more.
-fn send_work(tx: &mpsc::Sender<Notice>, job: impl FnOnce() -> Vec<Notice> + Send + 'static) {
-    let tx = tx.clone();
-    tokio::task::spawn_blocking(move || {
-        for notice in job() {
-            let _ = tx.blocking_send(notice);
-        }
-    });
+/// Hands one job to this run's worker (see [`Jobs`]). Nothing waits for the job, and nothing here can block:
+/// the queue is unbounded, so a screen with three writes to make in one turn makes all three and carries on
+/// drawing. What a job says back arrives on the queue [`Work`] reads whenever the worker gets an answer, and
+/// jobs are answered in the order they were handed over - which is the whole reason there is one of them.
+fn send_work(jobs: &Jobs, job: impl FnOnce() -> Vec<Notice> + Send + 'static) {
+    // A send onto an unbounded queue cannot fail while its receiver is alive; the failure this ignores is a
+    // worker that has already stopped, which means this run is on its way out.
+    let _ = jobs.tx.send(Box::new(job));
 }
 
 /// Why the loop ended. `Failed` is a failure of this process - its line travels with it,
@@ -238,13 +274,14 @@ pub enum Quit {
     Failed(String),
 }
 
-/// What one turn of the loop answered with.
+/// What one turn of the loop answered with. The request is boxed: it is a target plus two secrets, and every
+/// turn that is not a quit hands one back, so a turn would move 232 bytes to say "somebody pressed Enter".
 enum Outcome {
     /// The person is finished (or the terminal or the backend went away, which quits the same way).
     Quit(Quit),
     /// The connect screen's answer: run on that one instead. Acting on it is the loop above
     /// this one's job, so nothing else is sent to a backend that is about to be stopped.
-    Connect(ConnectRequest),
+    Connect(Box<ConnectRequest>),
 }
 
 /// SIGTERM on Unix, Ctrl-C elsewhere (where raw mode does not swallow it), listened for
@@ -318,7 +355,7 @@ pub async fn run_session(
         match outcome {
             Outcome::Quit(quit) => return (quit, backend),
             Outcome::Connect(request) => {
-                match switch(work, backend, request, &mut screen, &mut |model| {
+                match switch(work, backend, *request, &mut screen, &mut |model| {
                     draw_saving(terminal, model)
                 })
                 .await
@@ -329,7 +366,7 @@ pub async fn run_session(
                         notices,
                     } => {
                         backend = next;
-                        login = next_login;
+                        login = next_login.map(|login| *login);
                         for notice in notices {
                             screen.model.push_notice(notice, Instant::now());
                         }
@@ -367,10 +404,10 @@ async fn run_loop(
     // other - so they are taken out here, once, rather than reached through `screen` in every branch.
     let model = &mut *screen.model;
     let snap = &mut *screen.snap;
-    // The same for the queue's two ends: this loop reads one while every job it sends writes the other, and a
-    // branch cannot hold the reading end open if an arm body is reaching through `work` at the same time. What
-    // a job needs travels as its own handle for the same reason.
-    let tx = work.tx.clone();
+    // The same for the queue's two ends: this loop reads one while the worker it sends jobs to writes the
+    // other, and a branch cannot hold the reading end open if an arm body is reaching through `work` at the
+    // same time. What a job needs travels as its own handle for the same reason.
+    let jobs = work.jobs.clone();
     let rx = &mut work.rx;
     let paths = work.paths;
     let store = Arc::clone(work.store);
@@ -407,7 +444,9 @@ async fn run_loop(
                             // The connect screen's answer means "run on that instead". Starting
                             // the one that was named, stopping this one and remembering the choice
                             // are the loop above this one's steps, so it stops here.
-                            Action::Connect(request) => return Outcome::Connect(request),
+                            Action::Connect(request) => {
+                                return Outcome::Connect(Box::new(request))
+                            }
                         }
                     }
                     dirty = true;
@@ -432,7 +471,7 @@ async fn run_loop(
                         // place in `ui.yaml` were waited for. Nobody else can answer that question: this run
                         // did not dial the server, this backend did. What it owes goes off to a thread that may
                         // wait for a keychain; whatever it answers with arrives on the queue below.
-                        Some(login) if signed_in(snap) => settle(login, &store, paths, &tx),
+                        Some(login) if signed_in(snap) => settle(login, &store, paths, &jobs),
                         _ => {}
                     }
                 }
@@ -475,7 +514,7 @@ async fn run_loop(
                         // screen has already said what happens next, so it does not also wait for the delete:
                         // whether the old entry came out is not something the person can act on any differently
                         // right now, and a keychain that will not delete anything says so on the queue below.
-                        forget(target, &store, &tx);
+                        forget(target, &store, &jobs);
                     }
                 }
                 // The backend stopped and the queue is read out: the screen has all it gets.
@@ -591,16 +630,24 @@ where
         // for before anything here moved.
         ConnectTarget::Local => Secret::None,
     };
+    // The gateway key comes out of the answer too, and not out of the target: `ui.yaml` keeps only which header
+    // a gateway reads, so the value is this answer's to carry (see `crate::secrets`'s gateway account). Taken
+    // here, before the answer is pulled apart, so both halves of what a keyed front door needs are in hand
+    // before either backend is touched.
+    let gateway_key = match &request.target {
+        ConnectTarget::Remote(_) => request.secret.gateway_key.clone(),
+        ConnectTarget::Local => None,
+    };
 
     let (next, login, mut notices) = match request.target {
         ConnectTarget::Remote(target) => {
-            let keep = keep_plan(&target, &request.secret);
+            let keep = keep_plans(&target, &request.secret);
             let login = Login::answered(target.clone(), keep);
             // A connection cannot fail to start: an address this run cannot dial says so through the client,
             // which is what the empty table beside the connect screen is for. Nothing is remembered about it
             // yet - not the address, not the password - because nobody has reached it yet.
             (
-                Backend::start_remote(target, secret),
+                Backend::start_remote(target, secret, gateway_key),
                 Some(login),
                 Vec::new(),
             )
@@ -640,7 +687,7 @@ where
                 last_used: LastUsed::Local,
             };
             let paths = work.paths.clone();
-            send_work(&work.tx, move || {
+            send_work(&work.jobs, move || {
                 ui.save(&paths)
                     .err()
                     .map(|problem| {
@@ -671,7 +718,7 @@ where
 
     Switched::Now {
         backend: next,
-        login,
+        login: login.map(Box::new),
         notices,
     }
 }
@@ -688,7 +735,10 @@ enum Switched {
     /// at it.
     Now {
         backend: Backend,
-        login: Option<Login>,
+        /// What this connection's sign-in still owes, boxed: a switch hands one of these back per answer on
+        /// the connect screen and the loop passes it straight to the next turn, so `Kept` - a backend and
+        /// one line - should not pay for a plan nobody has run yet.
+        login: Option<Box<Login>>,
         notices: Vec<Notice>,
     },
     /// Nothing was stopped, because the switch could not happen or was not needed: keep what is running and
@@ -760,7 +810,7 @@ fn signed_in(snap: &Snapshot) -> bool {
 
 /// What the first snapshot that says a connection signed in owes, sent away from the screen rather than
 /// waited on: `ui.yaml` pointed at this server - unless this run only borrowed it, which is what
-/// [`remembered_ui`] decides - and the password the person said to keep.
+/// [`remembered_ui`] decides - and whatever the person said to keep: the password, the gateway key, or both.
 ///
 /// Both wait for the backend's own answer because until then nobody knows whether this address and this
 /// credential are worth remembering: a run that reached nothing should not leave its next run pointed at
@@ -772,27 +822,33 @@ fn settle(
     login: &mut Login,
     store: &Arc<dyn SecretStore + Send + Sync>,
     paths: &Paths,
-    tx: &mpsc::Sender<Notice>,
+    jobs: &Jobs,
 ) {
     if login.settled {
         return;
     }
     login.settled = true;
-    let keep = std::mem::replace(&mut login.keep, KeepPlan::Nothing);
+    let keep = std::mem::replace(&mut login.keep, KeepPlans::nothing());
     // Decided here, on the screen's thread, because it is a decision and not an effect: which address the next
     // run should start on. What follows is only the writing of it.
     let ui = remembered_ui(login).map(|last_used| UiState { last_used });
     let paths = paths.clone();
     let store = Arc::clone(store);
-    send_work(tx, move || {
+    send_work(jobs, move || {
         let mut lines = Vec::new();
         if let Some(ui) = ui
             && let Err(problem) = ui.save(&paths)
         {
             lines.push(Notice::Error(could_not_save(&paths, &problem.to_string())));
         }
-        if let Err(problem) = apply_keep(&*store, &keep) {
-            lines.push(Notice::Error(problem));
+        // The credential first and the front-door key after it, in one job on one worker: the order they were
+        // asked for is the order they happen in, which is what keeps a refused "do not keep this" from being
+        // undone by the other half landing late (see [`Jobs`]). A plan that asks for nothing never reaches the
+        // keychain, so a plain server costs one call as it always did.
+        for plan in [keep.login, keep.gateway_key] {
+            if let Err(problem) = apply_keep(&*store, &plan) {
+                lines.push(Notice::Error(problem));
+            }
         }
         lines
     });
@@ -804,13 +860,9 @@ fn settle(
 /// so nothing here waits for the answer. The one thing worth saying back is that the keychain would not delete,
 /// which arrives on the queue like any other news: an entry left behind is not fatal, because the next run
 /// reads it, is refused the same way, and asks the person again.
-fn forget(
-    target: RemoteTarget,
-    store: &Arc<dyn SecretStore + Send + Sync>,
-    tx: &mpsc::Sender<Notice>,
-) {
+fn forget(target: RemoteTarget, store: &Arc<dyn SecretStore + Send + Sync>, jobs: &Jobs) {
     let store = Arc::clone(store);
-    send_work(tx, move || {
+    send_work(jobs, move || {
         forget_password(&*store, &target)
             .err()
             .map(|problem| vec![Notice::Error(problem)])
@@ -917,12 +969,12 @@ impl<S: Stream> Future for OnceStream<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Login, Screen, Switched, Work, could_not_save, local_config, remembered_ui, settle,
+        Login, Screen, Switched, Work, could_not_save, forget, local_config, remembered_ui, settle,
         stored_password_refused, switch_onward,
     };
     use crate::backend::{Backend, BackendKind};
     use crate::fake_store::FakeStore;
-    use crate::secrets::{KeepPlan, SecretStore};
+    use crate::secrets::{KeepPlan, KeepPlans, SecretStore};
     use fbtt_core::scratch::ScratchDir;
     use fbtt_core::ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
     use fbtt_core::{Config, LibraryLock, Notice, Paths, Secret};
@@ -965,7 +1017,7 @@ mod tests {
     /// the tests below, so it hands back a connection rather than an engine.
     fn started(what: RemoteTarget) -> impl FnOnce(Config, Paths, LibraryLock) -> Starter {
         move |_config, _paths, _lock| {
-            let backend = Backend::start_remote(what.clone(), Secret::None);
+            let backend = Backend::start_remote(what.clone(), Secret::None, None);
             Box::pin(async move { Ok(backend) })
         }
     }
@@ -986,6 +1038,77 @@ mod tests {
             lines.push(notice);
         }
         lines
+    }
+
+    /// The two writes one sign-in owes, and the delete that can follow them, land in the order they were
+    /// asked for - whichever way round they were asked. On a pool of threads a save could arrive after the
+    /// delete that was meant to undo it, leaving kept the very password the person had just refused; one
+    /// worker means whatever was asked for last is what the keychain ends holding.
+    #[tokio::test]
+    async fn off_screen_work_runs_in_the_order_it_was_queued() {
+        let account = "alice@https://bit.example";
+        let server = RemoteTarget {
+            url: "https://bit.example".to_string(),
+            login: LoginMethod::Password,
+            user: Some("alice".to_string()),
+            ..RemoteTarget::default()
+        };
+        let keep = || KeepPlans {
+            login: KeepPlan::Keep {
+                account: account.to_string(),
+                secret: Zeroizing::new("hunter2".to_string()),
+            },
+            gateway_key: KeepPlan::Nothing,
+        };
+
+        // The keep first and the refusal's delete after it: the delete is last, so nothing is kept.
+        let (_dir, paths) = scratch_library("work_keep_then_forget");
+        let fake = Arc::new(FakeStore::new());
+        let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
+        let work = Work::new(&paths, &store);
+        let mut login = Login::answered(server.clone(), keep());
+        settle(&mut login, work.store, work.paths, &work.jobs);
+        forget(server.clone(), work.store, &work.jobs);
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "neither job had anything to report"
+        );
+        assert_eq!(
+            fake.asked(),
+            ["set", "delete"],
+            "the delete ran after the save it was asked after, not before it"
+        );
+        assert_eq!(fake.kept(account), None, "the account ends empty");
+        assert_eq!(
+            UiState::load(&paths).last_used,
+            LastUsed::Remote(server.clone()),
+            "and the address the same sign-in chose was written down"
+        );
+
+        // Asked the other way round - a delete, then a keep - the keep is what stands at the end. What is
+        // being tested is the order, not which one wins: nothing may overtake anything.
+        let (_dir, paths) = scratch_library("work_forget_then_keep");
+        let fake = Arc::new(FakeStore::new());
+        fake.put(account, "stale");
+        let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
+        let work = Work::new(&paths, &store);
+        forget(server.clone(), work.store, &work.jobs);
+        let mut login = Login::answered(server.clone(), keep());
+        settle(&mut login, work.store, work.paths, &work.jobs);
+        assert!(
+            answered(work.into_reader()).await.is_empty(),
+            "neither job had anything to report"
+        );
+        assert_eq!(
+            fake.asked(),
+            ["delete", "set"],
+            "the delete ran before the save that came after it"
+        );
+        assert_eq!(
+            fake.kept(account).as_deref(),
+            Some("hunter2"),
+            "what was asked for last is what the keychain holds"
+        );
     }
 
     /// A switch back to the local engine starts it on what `config.yaml` says *now*, not on what startup read
@@ -1011,14 +1134,14 @@ mod tests {
                 .lock()
                 .expect("no panic inside the lock")
                 .push(config.limits.download_kib);
-            let backend = Backend::start_remote(nowhere(), Secret::None);
+            let backend = Backend::start_remote(nowhere(), Secret::None, None);
             drop((paths, lock));
             Box::pin(async move { Ok(backend) })
         };
 
         // The connection this run is running on, which the switch below replaces. Its own first snapshot is
         // what the screen carries in, so no test has to invent one.
-        let running = Backend::start_remote(nowhere(), Secret::None);
+        let running = Backend::start_remote(nowhere(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
         let mut screen = Screen {
@@ -1093,7 +1216,7 @@ mod tests {
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
         let work = Work::new(&paths, &store);
 
-        let running = Backend::start_remote(before.clone(), Secret::None);
+        let running = Backend::start_remote(before.clone(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
         let mut screen = Screen {
@@ -1155,7 +1278,7 @@ mod tests {
             user: Some("alice".to_string()),
             ..RemoteTarget::default()
         };
-        let running = Backend::start_remote(nowhere(), Secret::None);
+        let running = Backend::start_remote(nowhere(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
         let mut screen = Screen {
@@ -1198,8 +1321,8 @@ mod tests {
         // that is how a test knows the writes have finished. A second snapshot - which is what arrives every
         // second after this one - owes nothing, so it sends nothing.
         let mut login = login.expect("a connection comes with its sign-in");
-        settle(&mut login, work.store, work.paths, &work.tx);
-        settle(&mut login, work.store, work.paths, &work.tx);
+        settle(&mut login, work.store, work.paths, &work.jobs);
+        settle(&mut login, work.store, work.paths, &work.jobs);
         assert!(
             answered(work.into_reader()).await.is_empty(),
             "neither write had anything to report"
@@ -1226,7 +1349,7 @@ mod tests {
             "a server that keeps refusing does not get to ask the person twice"
         );
 
-        let mut typed = Login::answered(nowhere(), KeepPlan::Nothing);
+        let mut typed = Login::answered(nowhere(), KeepPlans::nothing());
         assert!(
             !stored_password_refused(&mut typed, &refusal),
             "what somebody just typed is not the keychain's mistake"
@@ -1279,7 +1402,7 @@ mod tests {
             "a previous run chose this address, so the next one starts on it too"
         );
         assert_eq!(
-            remembered_ui(&Login::answered(server.clone(), KeepPlan::Nothing)),
+            remembered_ui(&Login::answered(server.clone(), KeepPlans::nothing())),
             Some(LastUsed::Remote(server)),
             "somebody typed this address into the connect screen"
         );
@@ -1313,7 +1436,7 @@ mod tests {
 
         // The sign-in answer arrives for a connection nobody chose and nobody typed a password into.
         let mut login = Login::borrowed(borrowed);
-        settle(&mut login, work.store, work.paths, &work.tx);
+        settle(&mut login, work.store, work.paths, &work.jobs);
         assert!(
             answered(work.into_reader()).await.is_empty(),
             "nothing went wrong: there was nothing to report"

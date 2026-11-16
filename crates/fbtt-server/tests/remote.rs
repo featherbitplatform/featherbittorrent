@@ -105,7 +105,11 @@ impl Library {
     /// never beside it.
     async fn serve_on(&self, port: u16) -> (Server, SocketAddr) {
         let mut config = self.config.clone();
-        config.server.bind = format!("127.0.0.1:{port}")
+        config
+            .server
+            .as_mut()
+            .expect("this library's config chose to serve")
+            .bind = format!("127.0.0.1:{port}")
             .parse()
             .expect("a loopback bind address");
         let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
@@ -145,7 +149,8 @@ fn base_config(
 ) -> Config {
     Config {
         download_dir: scratch.join("downloads"),
-        server: ServerConfig {
+        // These tests are about serving, so their configs say so.
+        server: Some(ServerConfig {
             bind: format!("127.0.0.1:{port}")
                 .parse()
                 .expect("a loopback bind address"),
@@ -155,7 +160,7 @@ fn base_config(
                 devices,
             },
             ..ServerConfig::default()
-        },
+        }),
         ..Config::default()
     }
 }
@@ -213,6 +218,7 @@ fn target(
         user: user.map(str::to_string),
         key_path,
         token_url: None,
+        gateway_key_header: None,
         client_id: None,
     }
 }
@@ -462,6 +468,7 @@ async fn remote_password_end_to_end() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
 
     // The first thing a screen needs to know is whether the address answered at all, and where a torrent
@@ -585,6 +592,7 @@ async fn remote_key_file_end_to_end() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::KeyFile, None, Some(key_file.clone())),
         Secret::KeyPassphrase(Some("correct horse".to_string().into())),
+        None,
     );
 
     let connected = wait_for_state(&mut client, true).await;
@@ -636,6 +644,7 @@ async fn server_restart_reconnects() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
     wait_for_state(&mut client, true).await;
     assert!(client.send(Command::Add {
@@ -706,6 +715,7 @@ async fn wrong_password_is_a_notice() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("not the password".to_string().into()),
+        None,
     );
 
     let refusal = notice_that(&mut client, |notice| {
@@ -748,9 +758,11 @@ async fn a_target_that_cannot_be_used_says_the_link_is_down() {
             user: None,
             key_path: None,
             token_url: None,
+            gateway_key_header: None,
             client_id: None,
         },
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
 
     let lines = notices_until(&mut client, |lines| !lines.is_empty()).await;
@@ -770,6 +782,63 @@ async fn a_target_that_cannot_be_used_says_the_link_is_down() {
     );
 
     // It still answers its screen, including the request to stop.
+    assert!(client.send(Command::ListDirs(None)));
+    shutdown(&mut client).await;
+}
+
+/// A connection that could not be started keeps both of its answer queues open.
+///
+/// The case this covers is a restart: `ui.yaml` points at a password target, the keychain no longer holds a
+/// password for it, so `start` fails on the pairing of method and secret before anything is dialled. It still
+/// owes the screen one line saying what is missing - but a queue with no senders left reads as a finished
+/// backend, and a run loop that believes that quits before the person has read the line, which is exactly the
+/// case that has to arrive at the connect screen with the address and method still filled in. So the sender
+/// ends travel with the task that answers `Shutdown` and go only when it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_that_failed_before_dialling_keeps_the_queues_open() {
+    let nowhere = "127.0.0.1:1".parse().expect("a port nothing listens on");
+    let mut client = RemoteBackend::start(
+        target(nowhere, LoginMethod::Password, Some("alice"), None),
+        // A password login with no password in it: what a restart without a keychain entry hands over.
+        Secret::None,
+        None,
+    );
+
+    let lines = notices_until(&mut client, |lines| !lines.is_empty()).await;
+    assert!(
+        lines.iter().any(|line| line.contains("password")),
+        "the line says what is missing: {lines:?}"
+    );
+
+    // The snapshot published by `start` is the last one this connection will have, and taking it marks that
+    // change as seen - so asking for the next one is what shows whether the queue behind it is still open.
+    within(client.changed().changed())
+        .await
+        .expect("the down state arrives");
+    let Connection::Remote { state, .. } = &client.snapshot().connection else {
+        panic!("a remote backend says where it came from");
+    };
+    assert!(
+        matches!(state, LinkState::Lost { .. }),
+        "nothing can be asked of this address: {state:?}"
+    );
+
+    // Both queues are quiet rather than closed. `Ok(None)` is the queue ending, which is what a run loop
+    // takes as "this backend has stopped and everything it had to say has been read" - the thing that used to
+    // end the screen too early. A timeout means nothing answered yet, which is the state a live connection is
+    // in while its person decides what to do about the line above.
+    match within(tokio::time::timeout(POLL * 4, client.notice())).await {
+        Ok(None) => panic!("the notice queue closed while the connection was still open"),
+        Ok(Some(extra)) => eprintln!("a second line arrived: {}", text(extra)),
+        Err(_) => {}
+    }
+    match within(tokio::time::timeout(POLL * 4, client.changed().changed())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_gone)) => panic!("the snapshot queue closed while the connection was still open"),
+        Err(_) => {}
+    }
+
+    // It answers the request to stop, and only then do the queues close - which is what ends this drain.
     assert!(client.send(Command::ListDirs(None)));
     shutdown(&mut client).await;
 }
@@ -804,6 +873,7 @@ async fn shutdown_is_quick_when_server_is_gone() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
     wait_for_state(&mut client, true).await;
 
@@ -868,6 +938,13 @@ struct Fake {
     event_dials: AtomicUsize,
     /// The session token `Mode::Session` accepts right now: empty until somebody logs in.
     session: Mutex<String>,
+    /// The header a gateway standing in front of this fake reads its API key out of, and the value it insists
+    /// on. `None` for every fake that is not behind one, which is most of them: this is what a request has to
+    /// carry *in addition to* whatever `mode` asks for (see `docs/reverse-proxy.md`'s setup 2).
+    gateway_header: Option<(String, String)>,
+    /// Every value that reached that header, empty where a request carried none. Recorded before the
+    /// credential is looked at, so "no request went out without it" can be answered for refused ones too.
+    gateway_keys: Mutex<Vec<String>>,
     /// Set by a test to end every session this fake handed out - which is how a client finds out its token is
     /// dead the way it does with a real server: by being refused for it.
     revoked: AtomicBool,
@@ -905,6 +982,8 @@ impl Fake {
             logins: AtomicUsize::new(0),
             event_dials: AtomicUsize::new(0),
             session: Mutex::new(String::new()),
+            gateway_header: None,
+            gateway_keys: Mutex::new(Vec::new()),
             revoked: AtomicBool::new(false),
             burst_written: AtomicBool::new(false),
         })
@@ -930,6 +1009,16 @@ impl Fake {
         Fake::new(Mode::Session)
     }
 
+    /// The same server behind a gateway that checks a key of its own first: `header` has to arrive with
+    /// `key` under it on every request, this fake's own login call included, and the password session is what
+    /// opens once it does. Two credentials are asked for and neither one is the other's substitute.
+    fn keyed_session(header: &str, key: &str) -> Arc<Fake> {
+        let mut fake =
+            Arc::into_inner(Fake::new(Mode::Session)).expect("nobody else holds this test state");
+        fake.gateway_header = Some((header.to_string(), key.to_string()));
+        Arc::new(fake)
+    }
+
     /// The bearer fake for a device key, with the token's life spelled out. Which credential counts is
     /// decided by what the token endpoint issues, so this one is strict from the first request: a call
     /// that arrives without a bearer token has not earned one.
@@ -945,10 +1034,37 @@ impl Fake {
         Fake::new(Mode::Basic(user.to_string(), password.to_string()))
     }
 
+    /// The front door, asked about before any credential: what a gateway standing in front of this fake looks
+    /// for on its way in, and what it says to a request that did not bring one. Nothing below this runs for
+    /// such a request, which is the whole arrangement setup 2 is - the gateway decides whether this is
+    /// somebody before this server ever sees a bearer token.
+    fn gate(&self, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+        let Some((name, want)) = self.gateway_header.as_ref() else {
+            return Ok(());
+        };
+        let given = headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        self.gateway_keys
+            .lock()
+            .expect("the test state")
+            .push(given.clone());
+        if &given != want {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "the gateway key is not this one".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Records a request and says whether its credential is good enough. A request with no
     /// `Authorization` at all is what a server running with auth off gets, so it is only refused once this
     /// fake has decided somebody must prove who they are.
     fn check(&self, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+        self.gate(headers)?;
         let given = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -1133,6 +1249,12 @@ async fn endless_events(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Re
 /// how long it lives. It counts every attempt - right or wrong - because counting those is how a test shows
 /// a client is retrying on a ladder rather than hammering a refused password.
 async fn session_login(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    // The gateway's door stands in front of this route as well: a key-auth gateway that only covered the
+    // reading routes would let a login through without ever having checked its key. A refusal here is not a
+    // refused password, so nothing is counted for it.
+    if let Err(problem) = fake.gate(&headers) {
+        return problem.into_response();
+    }
     fake.logins.fetch_add(1, Ordering::SeqCst);
     let given = headers
         .get(header::AUTHORIZATION)
@@ -1217,8 +1339,11 @@ async fn hostile_server_is_bounded() {
     let fake = Fake::open();
     let addr = serve(api_routes(get(endless_events)).with_state(Arc::clone(&fake))).await;
 
-    let mut client =
-        RemoteBackend::start(target(addr, LoginMethod::None, None, None), Secret::None);
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
     // The three rude answers land on different polls - this fake serves them in order, one per call - so
     // the test waits for all three lines instead of guessing how many polls a moment covers.
     let lines = notices_until(&mut client, |lines| {
@@ -1274,6 +1399,7 @@ async fn wrong_password_does_not_hammer_login() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("not the password".to_string().into()),
+        None,
     );
     // Counting starts once the first refusal is in: counting from before it would be measuring how long a
     // login takes rather than how often one is attempted.
@@ -1319,6 +1445,7 @@ async fn mid_session_401_relogs_once() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::Password, Some("alice"), None),
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
     wait_for_state(&mut client, true).await;
     assert_eq!(
@@ -1379,8 +1506,11 @@ async fn a_burst_of_events_costs_one_refresh() {
     let fake = Fake::plain();
     let addr = serve(api_routes(get(burst_events)).with_state(Arc::clone(&fake))).await;
 
-    let mut client =
-        RemoteBackend::start(target(addr, LoginMethod::None, None, None), Secret::None);
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
     wait_for_state(&mut client, true).await;
 
     // The frames are behind the server, and a moment to let this client have read them: over loopback a few
@@ -1429,7 +1559,7 @@ async fn gateway_key_gets_and_uses_token() {
     remote.token_url = Some(format!("http://{addr}/token"));
     remote.client_id = Some(fake.client_id.clone());
 
-    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None));
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None), None);
     wait_for_state(&mut client, true).await;
 
     let assertions = fake.assertions.lock().expect("the test state").clone();
@@ -1478,7 +1608,7 @@ async fn gateway_key_es256_gets_token() {
     remote.token_url = Some(format!("http://{addr}/token"));
     remote.client_id = Some(fake.client_id.clone());
 
-    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None));
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None), None);
     wait_for_state(&mut client, true).await;
 
     // The endpoint checked the signature before it issued anything, so what reached it is worth reading back:
@@ -1549,7 +1679,7 @@ async fn gateway_token_refreshed_before_expiry() {
     remote.token_url = Some(format!("http://{addr}/token"));
     remote.client_id = Some(fake.client_id.clone());
 
-    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None));
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None), None);
     wait_for_state(&mut client, true).await;
 
     // Two different tokens on two requests means the first was replaced while it was still valid: a client
@@ -1593,6 +1723,7 @@ async fn gateway_basic_sent_on_every_request() {
     let mut client = RemoteBackend::start(
         target(addr, LoginMethod::GatewayBasic, Some("alice"), None),
         Secret::Password("hunter2".to_string().into()),
+        None,
     );
     wait_for_state(&mut client, true).await;
 
@@ -1606,6 +1737,114 @@ async fn gateway_basic_sent_on_every_request() {
         panic!("a gateway target says how it signed in");
     };
     assert_eq!(auth, "gateway password");
+
+    shutdown(&mut client).await;
+}
+
+/// Setup 2 from `docs/reverse-proxy.md`: a gateway checking a key of its own in front of a featherbittorrent
+/// server whose login is a password. Both halves have to arrive on every request this client makes - the key
+/// under the header that gateway reads it from, and this client's own bearer under `Authorization` - and the
+/// login call is one of those requests, because the gateway stands in front of it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_key_header_sent_with_password_login() {
+    const HEADER: &str = "X-API-Key";
+    const KEY: &str = "gateway-secret";
+    let fake = Fake::keyed_session(HEADER, KEY);
+    let addr = serve(
+        api_routes(get(counted_events))
+            .route("/api/v1/auth/session", post(session_login))
+            .with_state(Arc::clone(&fake)),
+    )
+    .await;
+
+    let mut client = RemoteBackend::start(
+        RemoteTarget {
+            // Only the name is what `ui.yaml` keeps for a target like this; the value comes out of the
+            // keychain, and this argument is what that hands over (see `featherbittorrent`'s secrets).
+            gateway_key_header: Some(HEADER.to_string()),
+            ..target(addr, LoginMethod::Password, Some("alice"), None)
+        },
+        Secret::Password("hunter2".to_string().into()),
+        Some(KEY.to_string().into()),
+    );
+
+    let connected = wait_for_state(&mut client, true).await;
+    let Connection::Remote { auth, .. } = &connected.connection else {
+        panic!("a remote backend says how it signed in");
+    };
+    assert_eq!(
+        auth, "password",
+        "a gateway key changed which login this connection is"
+    );
+
+    // The stream is a request like every other one here, and the last thing to go out after a sign-in:
+    // waiting for its dial is what makes "every request" cover it rather than cover whatever happened to be
+    // queued when the link came up.
+    within(async {
+        while fake.event_dials.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+
+    // The login itself went through this front door: the fake answers 403 before it looks at a password, so
+    // a client that forgot the header would have no session to be `Connected` on at all.
+    assert_eq!(
+        fake.logins.load(Ordering::SeqCst),
+        1,
+        "one login earned the session"
+    );
+
+    // Everything after it carried the key too. The value is recorded once per request, refusals included, so
+    // an empty entry is a request that went out without one and a short list is a front door only some of
+    // the requests were dialled through.
+    let keys = fake.gateway_keys.lock().expect("the test state").clone();
+    assert!(
+        keys.len() >= 4,
+        "the header arrived at the login and hardly anywhere else: {keys:?}"
+    );
+    assert!(
+        keys.iter().all(|value| value == KEY),
+        "a request went out without the gateway key: {keys:?}"
+    );
+
+    // Neither half stands in for the other. This fake's own bearer, with no header in front of it:
+    let token = fake.session_token();
+    let roots = format!("http://{addr}/api/v1/fs/roots");
+    let alone = within(http().get(&roots).bearer_auth(&token).send())
+        .await
+        .expect("the request reached the fake");
+    assert_eq!(
+        alone.status(),
+        StatusCode::FORBIDDEN,
+        "the bearer alone does not open this door"
+    );
+
+    // and the key alone, which is a gateway's credential and not this server's:
+    let ours = within(http().get(&roots).header(HEADER, KEY).send())
+        .await
+        .expect("the request reached the fake");
+    assert_eq!(
+        ours.status(),
+        StatusCode::UNAUTHORIZED,
+        "a gateway key was taken for a featherbittorrent session"
+    );
+
+    // and the two together, which is what this client sends.
+    let both = within(
+        http()
+            .get(&roots)
+            .bearer_auth(&token)
+            .header(HEADER, KEY)
+            .send(),
+    )
+    .await
+    .expect("the request reached the fake");
+    assert!(
+        both.status().is_success(),
+        "the two halves together did not open the door: {}",
+        both.status()
+    );
 
     shutdown(&mut client).await;
 }

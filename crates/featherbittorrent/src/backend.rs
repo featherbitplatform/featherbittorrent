@@ -19,11 +19,11 @@ use std::time::Instant;
 use fbtt_core::client::{ClientParts, Command, Commands};
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
 use fbtt_core::{
-    Config, LibraryLock, LocalBackend, LockError, Paths, RemoteBackend, Secret, ServerConfig,
-    Snapshot,
+    Config, LibraryLock, LocalBackend, LockError, Paths, RemoteBackend, Secret, Snapshot,
 };
 use fbtt_tui::{ConnectTarget, Model};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 /// The one backend this run drives: the channels the loop waits on, and what stopping it has to wait for.
 #[derive(Debug)]
@@ -57,13 +57,19 @@ impl Backend {
         })
     }
 
-    /// Connects to `target`, signed in with `secret`.
+    /// Connects to `target`, signed in with `secret`, with `gateway_key` sent under whatever header the target
+    /// names for a gateway standing in front of it.
     ///
-    /// Nothing here waits or fails: [`RemoteBackend::start`] reports an unusable address or a credential
-    /// that does not go with the method through the client, which is what the screen draws.
-    pub fn start_remote(target: RemoteTarget, secret: Secret) -> Backend {
+    /// Nothing here waits or fails: [`RemoteBackend::start`] reports an unusable address, a credential that
+    /// does not go with the method, or a header named without the key to send under it, through the client,
+    /// which is what the screen draws.
+    pub fn start_remote(
+        target: RemoteTarget,
+        secret: Secret,
+        gateway_key: Option<Zeroizing<String>>,
+    ) -> Backend {
         Backend::Remote {
-            parts: RemoteBackend::start(target, secret).split(),
+            parts: RemoteBackend::start(target, secret, gateway_key).split(),
         }
     }
 
@@ -286,47 +292,30 @@ fn loopback_target(bind: SocketAddr) -> RemoteTarget {
 
 /// Whether this library's `config.yaml` names a server of its own, and the address it says it listens on.
 ///
-/// The parsed [`Config`] cannot answer this: every one of its fields has a default, so a config written
-/// by the TUI - which never listens on anything - still reads back with a full `server` section. What
-/// decides is whether the file ever said anything about a server (`serve` writes one, and
-/// `Config::save` drops one that only holds defaults), which is the same question `serve.rs` asks before
-/// it runs its wizard. Bytes that are not YAML answer `None`: a config this run could not read cannot
-/// have told anybody about a server either.
+/// Presence is the whole question, which is why [`Config`]'s `server` field is optional: a config the TUI
+/// saved for itself never chose to serve, and inventing the default address for it would tell a second
+/// machine "there is a server here" about a library nobody started a server on. Only a file that carries
+/// `[server]` - written by `serve`, the setup wizard, `featherbittorrent user` or `featherbittorrent
+/// device` - answers here, and a section naming something but no address means
+/// [`fbtt_core::ServerConfig`]'s own default: that is what the server that wrote it listened on. A
+/// `server:` line with nothing under it names no server - there is nothing in it to serve on, and
+/// `serve` asks its questions again. Bytes this run cannot read as a config answer `None`: a file it
+/// could not read cannot have told anybody about a server either.
 pub fn named_server(paths: &Paths) -> Option<SocketAddr> {
-    let text = std::fs::read_to_string(paths.config_file()).ok()?;
-    server_address_of(&text)
-}
-
-/// The pure half of [`named_server`]: the address a config file's bytes name, `None` when they name no
-/// server at all. A section that names no address means the default ([`Config`]'s own), because that is
-/// what the server that wrote the section listened on.
-fn server_address_of(text: &str) -> Option<SocketAddr> {
-    let value = serde_norway::from_str::<serde_norway::Value>(text).ok()?;
-    let server = value.get("server")?;
-    match server.get("bind") {
-        Some(serde_norway::Value::String(text)) => {
-            Some(text.parse::<SocketAddr>().ok().unwrap_or_else(default_bind))
-        }
-        // A section with nothing under it, or an address spelled in a shape this run cannot read: the
-        // default is what `serve` would have listened on anyway.
-        _ => Some(default_bind()),
-    }
-}
-
-/// The address a server with no `bind` in its config listens on.
-fn default_bind() -> SocketAddr {
-    ServerConfig::default().bind
+    Config::load_for_edit(&paths.config_file())
+        .ok()?
+        .and_then(|config| config.server.map(|server| server.bind))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BackendKind, ConnectTarget, LockOutcome, Start, SwitchPlan, initial_target,
-        loopback_target, named_server, plan_switch, server_address_of,
+        loopback_target, named_server, plan_switch,
     };
-    use fbtt_core::Paths;
     use fbtt_core::scratch::ScratchDir;
     use fbtt_core::ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
+    use fbtt_core::{Config, Paths};
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -473,37 +462,9 @@ mod tests {
         );
     }
 
-    /// Only a config file that ever said something about a server counts as one, because every field of
-    /// the parsed `Config` has a default.
-    #[test]
-    fn only_a_config_that_names_a_server_offers_one() {
-        assert_eq!(server_address_of("listen_port: 6881\n"), None);
-        assert_eq!(
-            server_address_of(
-                "download_dir: /home/alice/Downloads\nlimits:\n  download_kib: 512\n"
-            ),
-            None,
-            "a config written by the TUI names no server"
-        );
-        assert_eq!(
-            server_address_of("server:\n  bind: \"0.0.0.0:9000\"\n"),
-            Some(bind("0.0.0.0:9000"))
-        );
-        // A section with nothing under it, or an address this run cannot read, is the default address:
-        // that is what a server started from this file would listen on anyway.
-        assert_eq!(server_address_of("server:\n"), Some(default_bind()));
-        assert_eq!(
-            server_address_of("server:\n  bind: not-an-address\n"),
-            Some(default_bind())
-        );
-        assert_eq!(
-            server_address_of("server: [unterminated\n"),
-            None,
-            "not YAML at all"
-        );
-    }
-
-    /// The file half of the same question, on a scratch library.
+    /// Only a config file that ever said something about a server counts as one: whether the file named a
+    /// server is a fact in the parsed `Config` now, so a settings save from the TUI - which has no server
+    /// section to invent an address from - cannot offer somebody a connection they never asked for.
     #[test]
     fn named_server_reads_the_config_file() {
         let dir = ScratchDir::new("named_server");
@@ -518,12 +479,83 @@ mod tests {
         );
 
         fs::create_dir_all(&paths.config_dir).expect("the config directory");
-        fs::write(paths.config_file(), "listen_port: 6881\n").expect("write a config");
-        assert_eq!(named_server(&paths), None);
+
+        // What a settings save from the TUI leaves behind: rates and a folder, and no server.
+        let saved = Config {
+            listen_port: 6881,
+            ..Config::default_for(&paths)
+        };
+        saved
+            .save(&paths.config_file())
+            .expect("save a settings config");
+        assert_eq!(
+            named_server(&paths),
+            None,
+            "a config written by the TUI names no server"
+        );
 
         fs::write(paths.config_file(), "server:\n  bind: \"127.0.0.1:8090\"\n")
             .expect("write a config naming a server");
-        assert_eq!(named_server(&paths), Some(bind("127.0.0.1:8090")));
+        assert_eq!(named_server(&paths), some_bind("127.0.0.1:8090"));
+
+        // A section that names something else but no address is the address `serve` would have listened on
+        // anyway. An address this run cannot read, and bytes that are not YAML at all, tell this run nothing
+        // about a server - which is also what they tell it about the library, since such a file is not a config.
+        fs::write(
+            paths.config_file(),
+            "server:\n  allowed_hosts:\n    - bit.local\n",
+        )
+        .expect("write a section naming a host but no address");
+        assert_eq!(named_server(&paths), Some(default_bind()));
+        // A line with nothing under it names no server: it is the same answer as not writing it, because
+        // there is nothing in it to serve on. `serve` asks its questions again and writes a real section.
+        fs::write(paths.config_file(), "server:\n").expect("write a line with nothing under it");
+        assert_eq!(named_server(&paths), None);
+        fs::write(paths.config_file(), "server:\n  bind: not-an-address\n")
+            .expect("write a section naming something that is not an address");
+        assert_eq!(named_server(&paths), None);
+        fs::write(paths.config_file(), "server: [unterminated\n")
+            .expect("write bytes that are not YAML");
+        assert_eq!(named_server(&paths), None, "not YAML at all");
+    }
+
+    /// The decision milestone 1's exit code 3 hangs on, made from a real file rather than from an address
+    /// handed to the function: a library whose config came out of the TUI has no server section, so the run
+    /// that finds it locked has nothing to offer and answers with the sentence `run` prints at exit 3 (see
+    /// `library_in_use`) instead of offering a connection to a server nobody started.
+    #[test]
+    fn second_tui_on_locked_library_exits_3() {
+        let dir = ScratchDir::new("second_tui");
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        fs::create_dir_all(&paths.config_dir).expect("the config directory");
+
+        // What a settings save leaves behind, written by the same code a run's limits save uses.
+        let saved = Config {
+            listen_port: 6881,
+            ..Config::default_for(&paths)
+        };
+        saved
+            .save(&paths.config_file())
+            .expect("save a settings config");
+
+        assert_eq!(
+            initial_target(&UiState::default(), LockOutcome::Held, named_server(&paths)),
+            Start::LibraryInUse,
+            "the other run gets the sentence, not an offer"
+        );
+
+        // The same library after somebody did choose to serve: now there is an address, and a held library
+        // that runs a server is worth one question about it.
+        fs::write(paths.config_file(), "server:\n  bind: \"127.0.0.1:8090\"\n")
+            .expect("write a config naming a server");
+        assert_eq!(
+            initial_target(&UiState::default(), LockOutcome::Held, named_server(&paths)),
+            Start::AskAboutServer(loopback_target(bind("127.0.0.1:8090"))),
+            "a library that named a server is worth asking about"
+        );
     }
 
     fn bind(text: &str) -> SocketAddr {

@@ -65,6 +65,16 @@ const CLIENT_ID_LABEL: &str = "Client id";
 const AGENT_LABEL: &str = "Sign with ssh-agent";
 /// The toggle that says whether the password goes to the system keychain as well as to the server.
 const REMEMBER_LABEL: &str = "Remember in the system keychain";
+/// The header a gateway standing in front of this server reads its key out of, and the key itself. Only the
+/// name is written to `ui.yaml`; the value goes to the system keychain beside the passwords.
+const GATEWAY_HEADER_LABEL: &str = "Gateway key header";
+const GATEWAY_KEY_LABEL: &str = "Gateway key";
+/// What the gateway rows say while the header row is empty, which is the one thing about them a label does
+/// not answer: that empty means no front door at all, and what to type when there is one. The name suggested
+/// is the one this project's own gateway example configures its key-auth plugin to read (see
+/// `docs/reverse-proxy.md`).
+const GATEWAY_HINT: &str =
+    "Empty sends no header. A key-auth gateway that reads X-API-Key wants exactly that name.";
 
 /// How big a device key file may be. An OpenSSH private key is a few hundred bytes, or a few thousand
 /// with its passphrase wrapper around it; something this big is somebody pointing at the wrong file,
@@ -91,6 +101,11 @@ pub struct SecretInput {
     /// The passphrase of the device key file, `None` when the file is not encrypted or when ssh-agent
     /// holds the key and its bytes are never read at all.
     pub passphrase: Option<Zeroizing<String>>,
+    /// The value of the gateway header this target names, for a server behind a gateway that checks one
+    /// before it looks at any credential. It rides on every request beside this client's own proof, which is
+    /// why it comes back here rather than in the target: `ui.yaml` keeps only the header's NAME (see
+    /// [`fbtt_core::ui_state::RemoteTarget`]).
+    pub gateway_key: Option<Zeroizing<String>>,
     /// Whether the password should go into the system keychain as well, under this user name and URL.
     pub remember: bool,
 }
@@ -126,6 +141,11 @@ pub struct ConnectForm {
     client_id: Input,
     /// The device key to sign with, or to look for in ssh-agent.
     key_path: Input,
+    /// Which header a gateway in front of this server reads its key out of, empty for a server reached
+    /// directly. Only this name is remembered in `ui.yaml`.
+    gateway_header: Input,
+    /// The key that gateway checks, held only where it is typed.
+    gateway_key: Masked,
     /// Whether the password goes to the system keychain too.
     remember: bool,
     /// Which row of the ones this state shows takes what is typed.
@@ -169,14 +189,22 @@ enum Field {
     KeyPath,
     /// The passphrase of that key, while the screen knows it needs one.
     Passphrase,
+    /// Which header a gateway in front of this server reads its key out of. Empty means there is no front
+    /// door, which is every server reached directly.
+    GatewayHeader,
+    /// The key that gateway checks, typed into a masked row.
+    GatewayKey,
 }
 
 impl ConnectForm {
     /// The screen as `c` opens it: pointed at a server, and prefilled with `last` when this library has
     /// been connected somewhere before (or is being offered the server running on its own library).
+    ///
+    /// Prefilled with a password target starts the cursor on the password row: that is the one thing this run
+    /// could not get hold of by itself, and it is what has to be typed before Enter means anything here.
     pub fn new(last: Option<&RemoteTarget>) -> ConnectForm {
         let last_key_path = last.and_then(|target| target.key_path.as_ref());
-        ConnectForm {
+        let mut form = ConnectForm {
             server: true,
             url: Input::new(last.map_or("", |target| target.url.as_str())),
             login: last.map_or(LoginMethod::None, |target| target.login),
@@ -202,13 +230,47 @@ impl ConnectForm {
                 Some(path) => path.to_string_lossy().into_owned(),
                 None => DEFAULT_KEY_PATH.to_string(),
             }),
+            // The header name is what `ui.yaml` kept; the key itself was never in that file, so this row
+            // starts empty whatever the last run signed in with (see `crate::secrets`'s gateway account).
+            gateway_header: Input::new(
+                last.and_then(|target| target.gateway_key_header.as_deref())
+                    .unwrap_or_default(),
+            ),
+            gateway_key: Masked::new(),
             remember: false,
             focused: 0,
             warned: false,
             asking: None,
             passphrase: Masked::new(),
             error: None,
+        };
+        // A run that restarted onto a saved password server, whose keychain entry is gone, arrives here with
+        // the address and the method filled in and nothing to sign in with. The password is the one piece
+        // this screen cannot supply from what it was given (see [`ConnectForm::submit`]: what the keychain
+        // holds is never retyped from it), so the cursor starts there rather than at the top of the form. A
+        // target that signs with a key, or with nothing, has no such gap and keeps the first row.
+        if form.signs_with_a_password() && form.password.is_empty() {
+            form.focus_on(Field::Password);
         }
+        form
+    }
+
+    /// Whether this login signs in with a user name and a password: the pair this screen asks for together,
+    /// and refuses to send with either of them blank.
+    fn signs_with_a_password(&self) -> bool {
+        matches!(
+            self.login,
+            LoginMethod::Password | LoginMethod::GatewayBasic
+        )
+    }
+
+    /// Whether this screen has anything the keychain could keep: a password, or the key for a gateway header.
+    ///
+    /// A device key is never kept there - its bytes stay in their file or in ssh-agent - so a key login with
+    /// no front door offers nothing to remember and shows no row for it. The header name is what decides for a
+    /// key login because that is the setting that says this server has a gateway key at all.
+    fn offers_the_keychain(&self) -> bool {
+        self.signs_with_a_password() || !self.gateway_header.text.trim().is_empty()
     }
 
     /// Applies one press. `Tab` walks the rows this state shows, Enter asks to connect, and Left and
@@ -264,7 +326,7 @@ impl ConnectForm {
         match self.login {
             LoginMethod::None => {}
             LoginMethod::Password | LoginMethod::GatewayBasic => {
-                fields.extend([Field::User, Field::Password, Field::Remember]);
+                fields.extend([Field::User, Field::Password]);
             }
             // An agent-held key is found by its public half, which lives beside it as `.pub`, so the path
             // is still worth asking for even though its bytes are never read.
@@ -276,6 +338,18 @@ impl ConnectForm {
                 }
             }
         }
+        // The front door comes after the credential, and on every server target: what a gateway in front of
+        // this server checks before it looks at any credential is not something to guess from a login method
+        // - an open server sits behind a keyed gateway as easily as a passworded one does - and leaving both
+        // rows empty is what says there is no gateway at all.
+        fields.extend([Field::GatewayHeader, Field::GatewayKey]);
+        // The keychain is then offered for whatever this screen could collect for it: a password, or the key
+        // for a header (see [`ConnectForm::offers_the_keychain`]).
+        if self.offers_the_keychain() {
+            fields.push(Field::Remember);
+        }
+        // The passphrase prompt is last because it appears in answer to something else: the key file saying it
+        // is encrypted, which is only known once everything above has been filled in.
         if self.asking.is_some() {
             fields.push(Field::Passphrase);
         }
@@ -383,6 +457,8 @@ impl ConnectForm {
             }
             Field::Password => type_into_masked(&mut self.password, key),
             Field::Passphrase => type_into_masked(&mut self.passphrase, key),
+            Field::GatewayHeader => type_into(&mut self.gateway_header, key),
+            Field::GatewayKey => type_into_masked(&mut self.gateway_key, key),
             Field::Target | Field::Login | Field::Remember | Field::Agent => false,
         }
     }
@@ -417,10 +493,7 @@ impl ConnectForm {
 
         // Each method is asked for its own pieces before any of them goes out: a target that cannot be
         // connected to is the screen's mistake to catch, not something to hand to a backend.
-        let needs_user = matches!(
-            self.login,
-            LoginMethod::Password | LoginMethod::GatewayBasic
-        );
+        let needs_user = self.signs_with_a_password();
         if needs_user && self.user.text.trim().is_empty() {
             self.error = Some("This login needs a user name.".to_string());
             return Answer::Stay;
@@ -439,6 +512,21 @@ impl ConnectForm {
                     Some("This login needs the client id this installation uses.".to_string());
                 return Answer::Stay;
             }
+        }
+
+        // A front door is named by its header, and the two halves go together: a name with no key is a
+        // connection a gateway turns away before it ever sees our credential, and a key with no name is one
+        // this client has nowhere to send. Which header a gateway was configured to read is that gateway's
+        // setting, so nothing here checks the spelling beyond pairing it (see `fbtt_core::remote`'s transport,
+        // which says once when a name is not a header name at all).
+        let names_a_header = !self.gateway_header.text.trim().is_empty();
+        if names_a_header && self.gateway_key.is_empty() {
+            self.error = Some("A gateway key header needs the key to send under it.".to_string());
+            return Answer::Stay;
+        }
+        if !names_a_header && !self.gateway_key.is_empty() {
+            self.error = Some("Name the header this gateway key is sent under.".to_string());
+            return Answer::Stay;
         }
 
         // A password that is about to cross an unencrypted hop gets asked about once, and only once per
@@ -533,15 +621,20 @@ impl ConnectForm {
             client_id: (self.login == LoginMethod::GatewayKey)
                 .then(|| non_empty(&self.client_id))
                 .flatten(),
+            // The header's name is the half that belongs in `ui.yaml`; the value it opens with comes back in
+            // the secret below, because a file somebody cats is not where a key goes.
+            gateway_key_header: non_empty(&self.gateway_header),
         };
 
+        let keeps_a_secret = self.offers_the_keychain();
         ConnectRequest {
             target: ConnectTarget::Remote(target),
             secret: SecretInput {
                 password: (password_method && !self.password.is_empty())
                     .then(|| self.password.take()),
                 passphrase,
-                remember: password_method && self.remember,
+                gateway_key: (!self.gateway_key.is_empty()).then(|| self.gateway_key.take()),
+                remember: keeps_a_secret && self.remember,
             },
         }
     }
@@ -688,6 +781,12 @@ pub(crate) fn lines(form: &ConnectForm) -> Vec<Line<'static>> {
     if form.warned {
         lines.push(caution(PLAIN_HTTP_WARNING));
     }
+    // The one row whose label cannot answer its own question: what to type there, and what leaving it empty
+    // means. Said only while that row has the cursor, so a screen about a server reached directly does not
+    // spend a line on a gateway nobody is using.
+    if form.focused_field() == Field::GatewayHeader && form.gateway_header.text.trim().is_empty() {
+        lines.push(advice(GATEWAY_HINT));
+    }
     lines.push(advice(
         "Left and Right move in typed text, or change a choice",
     ));
@@ -730,6 +829,8 @@ fn line(form: &ConnectForm, row: Field, focused: bool, width: usize) -> Line<'st
         Field::KeyPath => field(label(&row), &form.key_path, width, false),
         Field::Password => masked_field(label(&row), &form.password, width),
         Field::Passphrase => masked_field(label(&row), &form.passphrase, width),
+        Field::GatewayHeader => field(label(&row), &form.gateway_header, width, false),
+        Field::GatewayKey => masked_field(label(&row), &form.gateway_key, width),
     }
 }
 
@@ -747,6 +848,8 @@ fn label(row: &Field) -> &'static str {
         Field::Agent => AGENT_LABEL,
         Field::KeyPath => "Key path",
         Field::Passphrase => "Passphrase",
+        Field::GatewayHeader => GATEWAY_HEADER_LABEL,
+        Field::GatewayKey => GATEWAY_KEY_LABEL,
     }
 }
 
@@ -889,10 +992,23 @@ mod tests {
         let mut form = ConnectForm::new(None);
         let rows = form.shown();
         assert!(rows.contains(&Field::Url), "a server asked for no address");
-        // No login asks for nothing else.
+        // No login asks for nothing but the front door, which every server target gets and which most people
+        // leave empty: two rows that say "no gateway" by being blank cost less than a screen that cannot ask
+        // about one at all.
         form.login = LoginMethod::None;
-        assert_eq!(form.shown(), vec![Field::Target, Field::Url, Field::Login]);
+        assert_eq!(
+            form.shown(),
+            vec![
+                Field::Target,
+                Field::Url,
+                Field::Login,
+                Field::GatewayHeader,
+                Field::GatewayKey
+            ]
+        );
 
+        // A password asks for its pair, and the keychain row comes last: it is about what to do with
+        // everything above it.
         form.login = LoginMethod::Password;
         assert_eq!(
             form.shown(),
@@ -902,6 +1018,8 @@ mod tests {
                 Field::Login,
                 Field::User,
                 Field::Password,
+                Field::GatewayHeader,
+                Field::GatewayKey,
                 Field::Remember
             ]
         );
@@ -919,13 +1037,28 @@ mod tests {
                 Field::TokenUrl,
                 Field::ClientId,
                 Field::Agent,
-                Field::KeyPath
+                Field::KeyPath,
+                Field::GatewayHeader,
+                Field::GatewayKey
             ]
         );
         form.agent = true;
         assert!(
             !form.shown().contains(&Field::KeyPath),
             "ssh-agent was asked for a key file as well"
+        );
+
+        // A device key with no front door has nothing the keychain could hold - its bytes stay in their file -
+        // so it gets no keychain row until there is a gateway key worth keeping.
+        form.login = LoginMethod::KeyFile;
+        assert!(
+            !form.shown().contains(&Field::Remember),
+            "a device key was offered the keychain for a key the keychain never holds"
+        );
+        form.gateway_header = Input::new("X-API-Key".to_string());
+        assert!(
+            form.shown().contains(&Field::Remember),
+            "a gateway key was collected with no way to say whether to keep it"
         );
 
         // The local engine asks for nothing but the choice itself.
@@ -981,6 +1114,7 @@ mod tests {
                 key_path: None,
                 token_url: Some("https://auth.example/token".to_string()),
                 client_id: Some("featherbittorrent".to_string()),
+                gateway_key_header: None,
             }),
             "ssh-agent was given a key file to sign with"
         );
@@ -1003,6 +1137,7 @@ mod tests {
                 key_path: Some(expand_tilde("~/.ssh/id_ed25519")),
                 token_url: Some("https://auth.example/token".to_string()),
                 client_id: Some("featherbittorrent".to_string()),
+                gateway_key_header: None,
             }),
             "a gateway key file was sent as it was typed"
         );
@@ -1081,5 +1216,81 @@ mod tests {
 
         // With no prompt up, Esc is still the caller's to answer as closing the screen.
         assert_eq!(form.on_key(esc), Answer::Close(Vec::new()));
+    }
+
+    /// A restart onto a saved password server whose keychain entry is gone reaches this screen with the
+    /// address and method filled in and nothing to sign in with, so the cursor starts on the row that has to
+    /// be answered before Enter can mean anything. Before this, it started at the top of the form and the
+    /// person had to find the password row themselves - after a run that exited on the way to the screen,
+    /// which is not a thing anybody expects to have to Tab through.
+    #[test]
+    fn a_password_target_opens_on_the_password_row() {
+        use crossterm::event::KeyModifiers;
+
+        let saved = RemoteTarget {
+            url: "https://bit.example".to_string(),
+            login: LoginMethod::Password,
+            user: Some("alice".to_string()),
+            ..RemoteTarget::default()
+        };
+        let mut form = ConnectForm::new(Some(&saved));
+        assert_eq!(form.url.text, "https://bit.example", "the address was kept");
+        assert_eq!(form.user.text, "alice", "and so was the user name");
+        assert_eq!(
+            form.focused_field(),
+            Field::Password,
+            "a saved password target with nothing typed starts on the piece that is missing"
+        );
+
+        // What is typed goes where the cursor is: one letter through the real press handler, and the answer
+        // this run gets holds a password rather than nothing.
+        assert_eq!(
+            form.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Answer::Stay
+        );
+        let request = form.request(None);
+        assert_eq!(
+            request.secret.password.as_deref().map(|p| &**p),
+            Some("h"),
+            "the row the screen opened on is the row that took what was typed"
+        );
+
+        // A gateway password login is the same kind of credential, so it opens the same way.
+        let gateway = RemoteTarget {
+            url: "https://bit.example".to_string(),
+            login: LoginMethod::GatewayBasic,
+            user: Some("alice".to_string()),
+            ..RemoteTarget::default()
+        };
+        assert_eq!(
+            ConnectForm::new(Some(&gateway)).focused_field(),
+            Field::Password,
+            "a gateway password was left to hunt for its own password too"
+        );
+
+        // Nothing else arrives with a piece missing in this way: a key login, a server that needs no
+        // credential, and a screen opened with nothing saved all start at the top.
+        for login in [
+            LoginMethod::None,
+            LoginMethod::KeyFile,
+            LoginMethod::Agent,
+            LoginMethod::GatewayKey,
+        ] {
+            let target = RemoteTarget {
+                url: "https://bit.example".to_string(),
+                login,
+                ..RemoteTarget::default()
+            };
+            assert_eq!(
+                ConnectForm::new(Some(&target)).focused_field(),
+                Field::Target,
+                "{login:?} was sent to a row it does not sign with"
+            );
+        }
+        assert_eq!(
+            ConnectForm::new(None).focused_field(),
+            Field::Target,
+            "a screen with nothing saved has no missing piece to point at"
+        );
     }
 }

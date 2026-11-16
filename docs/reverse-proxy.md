@@ -42,12 +42,115 @@ gateway (`limit-count`) and treat the server's shared budget as the backstop it 
 
 ### 2. Both doors: gateway login first, featherbittorrent login on top
 
-The browser-facing door (or any visitor that should pass a portal login) gets the gateway's own
-authentication, for example `openid-connect` in interactive mode against an OIDC provider; signed-in
-API clients then still sign in to featherbittorrent itself, because `server.auth.enabled` stays on. The
-TUI does not care what the gateway thinks: it carries its own session token through the gateway, which
-is where `limit-count` and TLS come free. With logins on there is no host-name guessing at all: every
-request has to carry a token, so `server.allowed_hosts` is irrelevant in this setup.
+Two credentials travel together in this setup and neither one stands in for the other: the gateway decides
+whether this is somebody it knows, and only then does the server decide whether it is a user of *this*
+library. `server.auth.enabled` stays on.
+
+- **Browsers** sign in at the gateway: `openid-connect` with `bearer_only: false`, the interactive
+  Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people).
+- **The TUI** carries an API key the gateway reads before it looks at anything else, and then signs in to
+  featherbittorrent as it always has. One `multi-auth` node accepts either credential on one route: its
+  `key-auth` sub-plugin is tried first, and a request with no key there has only failed one attempt, so
+  `openid-connect` gets its turn at the same door.
+
+```yaml
+# gateway.yaml (the example folder has the full version)
+routes:
+  - name: api
+    match: { host: torrent.example.test, path: /api/* }
+    policy: api-policy
+  - name: web
+    match: { host: torrent.example.test }
+    policy: web-policy
+
+policies:
+  # The API route takes either credential: a TUI with its key, or a browser session's bearer token.
+  - name: api-policy
+    nodes:
+      - { id: listener, type: listener }
+      - { id: client, type: client }
+      - id: doors
+        type: multi-auth
+        config:
+          auth_plugins:
+            - key-auth:
+                keys: ["featherbit-tui-key"]
+                header_name: x-api-key
+            - openid-connect:
+                discovery: https://auth.example.test/.well-known/openid-configuration
+                bearer_only: true
+                claim_validator:
+                  issuer: { valid_issuers: ["https://auth.example.test"] }
+      - id: backend
+        type: upstream
+        config:
+          targets:
+            - { host: featherbittorrent, port: 8090 }
+    edges:
+      - from: listener.out
+        to: doors.in
+      - from: doors.denied
+        to: client.in
+      - from: doors.success
+        to: backend.in
+      - from: backend.success
+        to: client.in
+
+  # Browsers get the interactive flow, which is the one that redirects to the portal and back.
+  - name: web-policy
+    nodes:
+      - { id: listener, type: listener }
+      - { id: client, type: client }
+      - id: portal
+        type: openid-connect
+        config:
+          discovery: https://auth.example.test/.well-known/openid-configuration
+          bearer_only: false
+          claim_validator:
+            issuer: { valid_issuers: ["https://auth.example.test"] }
+      - id: backend
+        type: upstream
+        config:
+          targets:
+            - { host: featherbittorrent, port: 8090 }
+    edges:
+      - from: listener.out
+        to: portal.in
+      - from: portal.denied
+        to: client.in
+      - from: portal.redirect
+        to: client.in
+      - from: portal.success
+        to: backend.in
+      - from: backend.success
+        to: client.in
+```
+
+`multi-auth` runs its sub-plugins in the order they are listed and lets the request through on the first
+success; `denied` (a mandatory port) is where a request that failed every one of them leaves, wired
+straight to `client` so the prepared `401` reaches whoever knocked instead of continuing into the
+upstream. `key-auth` compares what it finds against its `keys` list and reads it from `header_name`,
+which defaults to `x-api-key` and is matched case-insensitively: whatever you put there is exactly what
+goes in the connect screen's `Gateway key header` row. Neither node reads the request body, so the events
+stream stays safe through this policy (see "Never buffer the stream").
+
+On the TUI side, both halves are filled in on the connect screen (`c`): the header name, and the key under
+`Gateway key`. The two go together - a header name with no key under it, or a key with no name to send it
+under, is refused on the screen rather than dialled. The key then rides on every request this connection
+makes, the sign-in call included because the gateway stands in front of that too, beside this client's own
+bearer token, so what the server sees is an ordinary `password` (or device key) login whatever the gateway
+thought.
+
+What happens to it afterwards is the same as what happens to a password: answer *remember in the system
+keychain* once and the key is kept there under this server's address, spelled one way so that
+`https://torrent.example.test` and `https://torrent.example.test/` are one entry
+(`gateway-key:https://torrent.example.test`), while `ui.yaml` records only the header name and never the
+value - a file somebody can `cat` says that a gateway stands in front of this server without saying what
+opens it. Leave the header row empty and no such header is sent at all, which is right for every server
+you reach directly.
+
+With logins on there is no host-name guessing at all: every request has to carry a token, so
+`server.allowed_hosts` is irrelevant in this setup.
 
 ### 3. Gateway only: featherbittorrent auth off
 

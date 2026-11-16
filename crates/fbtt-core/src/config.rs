@@ -6,8 +6,10 @@
 //! left out stays whatever the engine's own default is. A download folder may be
 //! named relative to the library (`download_dir: dl`), which is where it lands;
 //! see [`Config::resolve`]. The `server` section says where `featherbittorrent serve`
-//! listens, which folders its API may name, and whether anyone has to sign in. A file
-//! that cannot be parsed does not stop the app. It runs on this library's defaults, and
+//! listens, which folders its API may name, and whether anyone has to sign in; it is
+//! written only by a run that chose to serve (`serve`, the setup wizard, `user` or
+//! `device`), so a config the TUI saves for itself carries none - see [`Config::server`].
+//! A file that cannot be parsed does not stop the app. It runs on this library's defaults, and
 //! the file it could not read is kept aside as `config.yaml.bad` so the next save cannot
 //! overwrite what we never understood.
 
@@ -242,7 +244,14 @@ pub struct Config {
     pub cache_size_mib: u64,
     /// The headless server: where it listens, what its API may name, and who signs in. A run of
     /// the TUI reads none of this; `featherbittorrent serve` is what acts on it.
-    pub server: ServerConfig,
+    ///
+    /// `None` means this config never chose to serve, which is not the same as choosing the defaults:
+    /// it is why a second machine that finds this library locked cannot invent an address for the
+    /// server holding it ([`crate::ui_state`] and `named_server` in the binary read this field for
+    /// exactly that). A config written by `serve`, the setup wizard, or `featherbittorrent user` and
+    /// `device` names one; a config the TUI saves for itself does not. See the module docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerConfig>,
 }
 
 impl Default for Config {
@@ -284,11 +293,13 @@ impl Config {
     /// `server.allowed_roots` is put through the same rule, and an empty list becomes
     /// the download folder alone: the folders the API may name have to be absolute
     /// directories for the server to confine requests to them, and a config that names
-    /// no root means "downloads only", not "everything on this machine".
+    /// no root means "downloads only", not "everything on this machine". A config with no
+    /// `server` section at all gets none added here: resolving is not deciding to serve.
     pub fn resolve(mut self, paths: &Paths) -> Config {
         self.download_dir = absolute_dir(&self.download_dir, paths);
-        self.server.allowed_roots =
-            resolved_roots(&self.server.allowed_roots, &self.download_dir, paths);
+        if let Some(server) = self.server.as_mut() {
+            server.allowed_roots = resolved_roots(&server.allowed_roots, &self.download_dir, paths);
+        }
         self
     }
 
@@ -300,7 +311,8 @@ impl Config {
             listen_port: DEFAULT_LISTEN_PORT,
             limits: Limits::default(),
             cache_size_mib: DEFAULT_CACHE_SIZE_MIB,
-            server: ServerConfig::default(),
+            // No server section: this config has not chosen to serve anything.
+            server: None,
         }
     }
 
@@ -368,7 +380,9 @@ impl Config {
     /// What goes in is this config with `server.allowed_roots` unnamed when it is only the download
     /// folder [`resolve`] filled in: a run saves the config it resolved, and pinning the roots to
     /// that directory would leave the server's root behind the day the person moves `download_dir`.
-    /// An empty list means "the download folder" on disk, which is what keeps following it.
+    /// An empty list means "the download folder" on disk, which is what keeps following it. A config with
+    /// no `server` section writes no `[server]` either: a settings save from the TUI does not put this
+    /// library into serving, and a file written without one stays written without one.
     ///
     /// [`resolve`]: Self::resolve
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
@@ -392,13 +406,21 @@ impl Config {
     }
 
     /// This config as it belongs in a file: the roots unnamed when they are the one directory
-    /// [`resolve`](Self::resolve) would fill in anyway. See [`save`](Self::save).
+    /// [`resolve`](Self::resolve) would fill in anyway, and no `server` section added when this
+    /// config has none. See [`save`](Self::save).
     fn for_the_file(&self) -> Config {
         let mut out = self.clone();
-        let pins_only_downloads =
-            out.server.allowed_roots.len() == 1 && out.server.allowed_roots[0] == out.download_dir;
+        let pins_only_downloads = out.server.as_ref().is_some_and(|server| {
+            server.allowed_roots.len() == 1 && server.allowed_roots[0] == out.download_dir
+        });
         if pins_only_downloads {
-            out.server.allowed_roots.clear();
+            // Writing the roots back when they are only what `resolve` fills in would pin the
+            // server to today's download folder.
+            out.server
+                .as_mut()
+                .expect("a section that pinned the roots")
+                .allowed_roots
+                .clear();
         }
         out
     }
@@ -876,70 +898,73 @@ mod tests {
     /// The server section's defaults, and the one rule that decides whether anyone has to sign
     /// in: a server on loopback does not, a server anyone can reach does, and only an explicit
     /// `enabled: false` turns that off. A config file that names part of the section keeps the
-    /// rest at these defaults, like every other part of it.
+    /// rest at these defaults, like every other part of it - but having a section at all is a
+    /// choice, which [`a_save_without_a_server_section_writes_none`] is about.
     #[test]
     fn server_config_defaults() {
         let dir = ScratchDir::new("config_server");
         let paths = library(&dir);
 
-        let defaults = Config::default();
+        let defaults = ServerConfig::default();
         assert_eq!(
-            defaults.server.bind,
+            defaults.bind,
             "127.0.0.1:8090".parse().expect("the default bind"),
             "the API listens on loopback unless the config says otherwise"
         );
         assert!(
-            defaults.server.allowed_roots.is_empty(),
+            defaults.allowed_roots.is_empty(),
             "no roots are named until the run resolves the config: {:?}",
-            defaults.server.allowed_roots
+            defaults.allowed_roots
         );
         assert!(
-            defaults.server.allowed_hosts.is_empty(),
+            defaults.allowed_hosts.is_empty(),
             "nothing but localhost and an address is answered until the config names a host: {:?}",
-            defaults.server.allowed_hosts
+            defaults.allowed_hosts
         );
-        assert_eq!(defaults.server.auth.enabled, None);
-        assert!(defaults.server.auth.users.is_empty());
-        assert!(defaults.server.auth.devices.is_empty());
+        assert_eq!(defaults.auth.enabled, None);
+        assert!(defaults.auth.users.is_empty());
+        assert!(defaults.auth.devices.is_empty());
 
         assert!(
-            !defaults.server.auth_on(),
+            !defaults.auth_on(),
             "a server on loopback does not need a login"
         );
-        let mut localhost = Config::default();
-        localhost.server.bind = "[::1]:8090".parse().expect("the IPv6 loopback");
-        assert!(!localhost.server.auth_on(), "::1 is loopback too");
+        let localhost = ServerConfig {
+            bind: "[::1]:8090".parse().expect("the IPv6 loopback"),
+            ..ServerConfig::default()
+        };
+        assert!(!localhost.auth_on(), "::1 is loopback too");
 
-        let mut public = Config::default();
-        public.server.bind = "0.0.0.0:8090".parse().expect("a bind on every address");
+        let public = ServerConfig {
+            bind: "0.0.0.0:8090".parse().expect("a bind on every address"),
+            ..ServerConfig::default()
+        };
         assert!(
-            public.server.auth_on(),
+            public.auth_on(),
             "a server anyone can reach signs people in"
         );
 
         let mut turned_off = public.clone();
-        turned_off.server.auth.enabled = Some(false);
+        turned_off.auth.enabled = Some(false);
         assert!(
-            !turned_off.server.auth_on(),
+            !turned_off.auth_on(),
             "only an explicit `enabled: false` turns authentication off"
         );
 
-        let let_in = Config {
-            server: ServerConfig {
-                auth: AuthConfig {
-                    enabled: Some(true),
-                    ..AuthConfig::default()
-                },
-                ..ServerConfig::default()
+        let let_in = ServerConfig {
+            auth: AuthConfig {
+                enabled: Some(true),
+                ..AuthConfig::default()
             },
-            ..Config::default()
+            ..ServerConfig::default()
         };
         assert!(
-            let_in.server.auth_on(),
+            let_in.auth_on(),
             "and `enabled: true` keeps it on even on loopback"
         );
 
-        // A file naming one server setting keeps the rest at the defaults above.
+        // A file naming one server setting keeps the rest at the defaults above. Naming any part of it is
+        // also what makes the section exist: there is no implicit one to overwrite.
         fs::write(
             paths.config_file(),
             "server:\n  bind: 0.0.0.0:8090\n  auth:\n    enabled: false\n",
@@ -948,10 +973,13 @@ mod tests {
         let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read it back") else {
             panic!("a config naming the server is still a config");
         };
-        assert_eq!(config.server.bind, public.server.bind);
-        assert!(!config.server.auth_on());
+        let named = config
+            .server
+            .expect("naming part of the server gives a section");
+        assert_eq!(named.bind, public.bind);
+        assert!(!named.auth_on());
         assert_eq!(
-            config.server.allowed_roots, defaults.server.allowed_roots,
+            named.allowed_roots, defaults.allowed_roots,
             "the part the file leaves out is default too"
         );
 
@@ -963,33 +991,39 @@ mod tests {
             "server:\n  allowed_hosts:\n    - bit.local\n    - LAN-Server\n",
         )
         .expect("write a config naming hosts");
-        let ConfigLoad::Loaded(named) = Config::load(&paths).expect("read the host names back")
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read the host names back")
         else {
             panic!("a config naming hosts is still a config");
         };
+        // Resolving - the step that makes every root absolute - keeps the section it was given.
+        let resolved = config
+            .clone()
+            .resolve(&paths)
+            .server
+            .expect("resolving does not drop a server");
+        let named = config.server.expect("hosts are part of the server section");
         assert_eq!(
-            named.server.allowed_hosts,
+            named.allowed_hosts,
             ["bit.local", "LAN-Server"],
             "spelling is kept: the comparison that uses these is the case-insensitive one"
         );
         assert_eq!(
-            named.server.bind, defaults.server.bind,
+            named.bind, defaults.bind,
             "a file naming only hosts leaves the rest alone"
         );
-        let resolved = named.clone().resolve(&paths);
         assert_eq!(
-            resolved.server.allowed_hosts, named.server.allowed_hosts,
+            resolved.allowed_hosts, named.allowed_hosts,
             "resolving roots says nothing about names"
         );
         assert!(
-            !resolved.server.allowed_hosts.is_empty(),
+            !resolved.allowed_hosts.is_empty(),
             "and it does not clear them either"
         );
 
         // And what a save writes is what the next run reads.
         let with_users = Config {
-            server: ServerConfig {
-                bind: public.server.bind,
+            server: Some(ServerConfig {
+                bind: public.bind,
                 allowed_roots: vec![paths.data_dir.join("share")],
                 allowed_hosts: vec!["bit.local".to_string()],
                 auth: AuthConfig {
@@ -1000,7 +1034,7 @@ mod tests {
                     }],
                     devices: Vec::new(),
                 },
-            },
+            }),
             ..Config::default()
         };
         with_users
@@ -1012,31 +1046,108 @@ mod tests {
         }
     }
 
+    /// A config that never chose to serve - which is what the TUI saves when somebody changes a rate or a
+    /// download folder - writes no `[server]` at all and reads back with none. That is the difference
+    /// between "this library has a server on it, at this address" and "nobody has said so": the machine
+    /// that finds the library locked may only name an address once the first is true (see `named_server`
+    /// in the binary, and `second_tui_on_locked_library_exits_3` beside the `serve` tests).
+    #[test]
+    fn a_save_without_a_server_section_writes_none() {
+        let dir = ScratchDir::new("config_no_server");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        // What a settings change saves: another port, and the same absence of a server.
+        let config = Config {
+            listen_port: 51_999,
+            limits: Limits {
+                download_kib: 512,
+                ..Limits::default()
+            },
+            ..Config::default()
+        };
+        config.save(&path).expect("save a settings-only config");
+
+        let written = fs::read_to_string(&path).expect("read the file back");
+        assert!(
+            !written.contains("server"),
+            "no server section appears in a config that never chose one: {written}"
+        );
+        let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("read it back") else {
+            panic!("a settings-only config is still a config");
+        };
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.listen_port, 51_999);
+        assert_eq!(
+            loaded.server, None,
+            "and the run that reads it has no address to offer anybody"
+        );
+
+        // Resolving such a config invents no section either: roots belong to a server that is going to
+        // run, and this library is not running one.
+        assert_eq!(loaded.resolve(&paths).server, None);
+
+        // A file that did name a server keeps it through a save made by somebody changing only a rate:
+        // the section is what the person chose, not something a settings save drops.
+        fs::write(&path, "server:\n  bind: 127.0.0.1:8099\n")
+            .expect("write a config naming a server");
+        let mut edited = Config::load_for_edit(&path)
+            .expect("read it for editing")
+            .expect("the file is there");
+        edited.listen_port = 6882;
+        edited.save(&path).expect("save the edit");
+        let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("read the edit back") else {
+            panic!("a config naming a server is still a config");
+        };
+        assert_eq!(
+            loaded.server.expect("the section survives").bind,
+            "127.0.0.1:8099"
+                .parse()
+                .expect("the address the file named"),
+            "a settings save keeps the serving somebody else chose"
+        );
+    }
+
     /// The folders the API may touch: none named means the download folder alone, and a named
-    /// one follows `download_dir`'s rule - relative to the library, absolute left alone.
+    /// one follows `download_dir`'s rule - relative to the library, absolute left alone. Only a
+    /// config that has a server section gets roots at all (see
+    /// [`a_save_without_a_server_section_writes_none`]).
     #[test]
     fn allowed_roots_default_to_the_download_dir() {
         let dir = ScratchDir::new("config_allowed_roots");
         let paths = library(&dir);
 
-        let nothing_named = Config::default().resolve(&paths);
+        let nothing_named = Config {
+            server: Some(ServerConfig::default()),
+            ..Config::default()
+        }
+        .resolve(&paths);
         let downloads = nothing_named.download_dir.clone();
         assert_eq!(
-            nothing_named.server.allowed_roots,
+            nothing_named
+                .server
+                .expect("the section was given")
+                .allowed_roots,
             [downloads],
             "with no roots in the config the download folder is the one root"
         );
 
         let named = Config {
-            server: ServerConfig {
+            server: Some(ServerConfig {
                 allowed_roots: vec![PathBuf::from("share"), paths.data_dir.join("elsewhere")],
                 ..ServerConfig::default()
-            },
+            }),
             ..Config::default()
         }
         .resolve(&paths);
+        let roots = named
+            .server
+            .as_ref()
+            .expect("the section was given")
+            .allowed_roots
+            .clone();
         assert_eq!(
-            named.server.allowed_roots,
+            roots,
             [
                 paths.data_dir.join("share"),
                 paths.data_dir.join("elsewhere")
@@ -1045,8 +1156,14 @@ mod tests {
         );
 
         // Resolving twice changes nothing, as it does for `download_dir`.
-        let roots = named.server.allowed_roots.clone();
-        assert_eq!(named.resolve(&paths).server.allowed_roots, roots);
+        assert_eq!(
+            named
+                .resolve(&paths)
+                .server
+                .expect("still there")
+                .allowed_roots,
+            roots
+        );
     }
 
     /// A password hash is a secret: nothing that prints a config may show it. `Debug` names the
@@ -1070,14 +1187,14 @@ mod tests {
 
         // The same through a config, and through a list of users.
         let config = Config {
-            server: ServerConfig {
+            server: Some(ServerConfig {
                 auth: AuthConfig {
                     enabled: Some(true),
                     users: vec![user.clone()],
                     ..AuthConfig::default()
                 },
                 ..ServerConfig::default()
-            },
+            }),
             ..Config::default()
         };
         let shown = format!("{config:?}");

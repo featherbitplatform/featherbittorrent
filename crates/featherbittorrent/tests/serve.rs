@@ -135,23 +135,28 @@ fn wizard_answers_become_config() {
     );
     assert_eq!(config.listen_port, 6881, "the port default");
     assert_eq!(
-        config.server.bind.to_string(),
+        serving(&config).bind.to_string(),
         "127.0.0.1:8090",
         "the API address default"
     );
-    assert_eq!(config.server.auth.enabled, None, "{:?}", config.server.auth);
+    assert_eq!(
+        serving(&config).auth.enabled,
+        None,
+        "{:?}",
+        serving(&config).auth
+    );
     assert!(
-        config.server.auth.users.is_empty(),
+        serving(&config).auth.users.is_empty(),
         "authentication off asks for no login"
     );
 
     // Away from loopback the default flips to yes, so a login is asked for - and a
     // password typed twice differently is retried instead of ending the run.
     let base = fbtt_core::Config {
-        server: fbtt_core::ServerConfig {
+        server: Some(fbtt_core::ServerConfig {
             bind: "10.0.0.5:8090".parse().expect("an address on this network"),
             ..Default::default()
-        },
+        }),
         ..Default::default()
     };
     let mut input = Cursor::new("\n\n\n\nalice\nfirst\nsecond\nfirst\nfirst\nno\n".to_string());
@@ -163,10 +168,11 @@ fn wizard_answers_become_config() {
         "a password typed twice differently says so: {said}"
     );
     assert_eq!(
-        config.server.auth.enabled, None,
+        serving(&config).auth.enabled,
+        None,
         "yes was the default here, so nothing new is recorded"
     );
-    let users = &config.server.auth.users;
+    let users = &serving(&config).auth.users;
     assert_eq!(users.len(), 1, "one login: {users:?}");
     assert_eq!(users[0].name, "alice", "the name as typed");
     assert!(
@@ -182,7 +188,7 @@ fn wizard_answers_become_config() {
     let config = answered(&base, &mut input, &mut out);
     let said = String::from_utf8(out).expect("the prompts are text");
     assert!(
-        config.server.auth.users.is_empty(),
+        serving(&config).auth.users.is_empty(),
         "an empty name asks for no password and creates no login"
     );
     assert!(
@@ -206,7 +212,7 @@ fn wizard_answers_become_config() {
         said.contains("ed25519"),
         "an RSA key line says what to use instead: {said}"
     );
-    let devices = &config.server.auth.devices;
+    let devices = &serving(&config).auth.devices;
     assert_eq!(devices.len(), 1, "the good key went in: {devices:?}");
     assert_eq!(devices[0].public_key, ED25519_KEY);
     assert_eq!(
@@ -219,7 +225,7 @@ fn wizard_answers_become_config() {
     let mut input = Cursor::new("\n\n\n\nalice\n hunter2 \n hunter2 \nno\n".to_string());
     let mut out: Vec<u8> = Vec::new();
     let config = answered(&base, &mut input, &mut out);
-    let hash = &config.server.auth.users[0].password_hash;
+    let hash = &serving(&config).auth.users[0].password_hash;
     assert!(
         fbtt_server::auth::password::verify(hash, " hunter2 "),
         "the spaces that were typed are in the password that was hashed"
@@ -246,7 +252,8 @@ fn wizard_answers_become_config() {
         "a comment too long to be a name says why it was not used: {said}"
     );
     assert_eq!(
-        config.server.auth.devices[0].name, "work laptop",
+        serving(&config).auth.devices[0].name,
+        "work laptop",
         "and the name given instead is what goes in the file"
     );
 
@@ -289,6 +296,15 @@ fn wizard_answers_become_config() {
         3,
         "asked three times and no more: {said}"
     );
+}
+
+/// The server section a wizard run wrote. Coming through the wizard is choosing to serve - these are
+/// the questions serving asks - so its answers always come back as a section.
+fn serving(config: &fbtt_core::Config) -> &fbtt_core::ServerConfig {
+    config
+        .server
+        .as_ref()
+        .expect("the wizard asked the server questions")
 }
 
 /// How many times `needle` appears in `haystack`: how many times a question was asked.

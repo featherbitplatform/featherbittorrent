@@ -133,10 +133,20 @@ impl Library {
     /// Takes the library lock and starts a backend on it. The returned session is
     /// the same engine the backend drives, so a test can point it at a peer.
     async fn start(&self) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
+        self.start_on(self.config.clone()).await
+    }
+
+    /// The same, on a config the caller changed first: which settings a run works on is what its saves
+    /// write back, and some tests want a library whose config chose to serve (see
+    /// `limits_save_keeps_allowed_roots_default`).
+    async fn start_on(
+        &self,
+        config: Config,
+    ) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
         let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
         within(LocalBackend::start_for_test(
-            loopback(&self.config),
-            self.config.clone(),
+            loopback(&config),
+            config,
             &self.paths,
             lock,
         ))
@@ -789,13 +799,65 @@ async fn set_limits_applies_and_persists() {
     shutdown(client, task).await;
 }
 
+/// What a settings change saves on a library that never chose to serve - which is every library whose
+/// `config.yaml` came out of the TUI: rates and a folder, and no `server` key at all. That section is how
+/// another run knows an address to offer for this library, so writing one here would have the library claim
+/// a server it never started (see `named_server` in the binary, which reads exactly this absence).
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_save_writes_no_server_section() {
+    let lib = Library::new("local_settings_save");
+    // The harness' own config names no server, like a run that has only ever driven this library.
+    assert_eq!(lib.config.server, None);
+    let (mut client, task, _) = lib.start().await;
+
+    let mut limits = LiveLimits::from(lib.config.limits);
+    limits.download_kib = 512;
+    assert!(client.send(Command::SetLimits(limits)));
+    wait_for(&mut client, |snapshot| snapshot.limits.download_kib == 512).await;
+
+    let text = fs::read_to_string(lib.paths.config_file()).expect("the limits save wrote a file");
+    assert!(
+        text.contains("download_kib: 512"),
+        "the setting the person changed is in the file: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("server:")),
+        "and no server section appears beside it: {text}"
+    );
+
+    // The parsed answer, which is what a caller editing the file - and the binary's `named_server` - acts
+    // on: no section means no address to offer anybody.
+    let ConfigLoad::Loaded(written) = Config::load(&lib.paths).expect("read the saved config back")
+    else {
+        panic!("a settings save writes a readable file");
+    };
+    assert_eq!(written.server, None);
+    assert_eq!(
+        Config::load_for_edit(&lib.paths.config_file())
+            .expect("the file reads as a config")
+            .expect("the file is there")
+            .server,
+        None,
+        "reading it to edit it invents no section either"
+    );
+
+    shutdown(client, task).await;
+}
+
 /// The limits save writes the config this run resolved, and the roots default has to survive that:
 /// `allowed_roots` stays unnamed in the file, because "no roots named" *is* the download folder. A
 /// file that pinned it would leave the server's root behind the day the person moves `download_dir`.
+/// The library here is one whose config chose to serve - what a `serve` run leaves behind - because a
+/// config with no server section has no roots to pin (see `a_save_without_a_server_section_writes_none`
+/// in the config module).
 #[tokio::test(flavor = "multi_thread")]
 async fn limits_save_keeps_allowed_roots_default() {
     let lib = Library::new("local_limits_roots");
-    let (mut client, task, _) = lib.start().await;
+    let mut served = lib.config.clone();
+    served.server = Some(fbtt_core::ServerConfig::default());
+    let (mut client, task, _) = lib.start_on(served).await;
 
     let mut limits = LiveLimits::from(lib.config.limits);
     limits.download_kib = 250;
@@ -812,10 +874,14 @@ async fn limits_save_keeps_allowed_roots_default() {
         written.download_dir, lib.config.download_dir,
         "so is the folder this run works on"
     );
+    let server = written
+        .server
+        .as_ref()
+        .expect("a save keeps the server this library chose");
     assert!(
-        written.server.allowed_roots.is_empty(),
+        server.allowed_roots.is_empty(),
         "the roots default is not pinned to a directory: {:?}",
-        written.server.allowed_roots
+        server.allowed_roots
     );
 
     // The text says the same thing: no `allowed_roots` line, or an empty list.
@@ -833,7 +899,10 @@ async fn limits_save_keeps_allowed_roots_default() {
     let downloads = lib.config.download_dir.clone();
     let resolved = written.clone().resolve(&lib.paths);
     assert_eq!(
-        resolved.server.allowed_roots,
+        resolved
+            .server
+            .expect("resolving keeps the section")
+            .allowed_roots,
         [downloads],
         "unnamed roots mean the download folder"
     );
@@ -843,7 +912,7 @@ async fn limits_save_keeps_allowed_roots_default() {
     moved.download_dir = elsewhere.clone();
     let moved = moved.resolve(&lib.paths);
     assert_eq!(
-        moved.server.allowed_roots,
+        moved.server.expect("and keeps it").allowed_roots,
         [elsewhere],
         "and the root follows a folder the person moves"
     );

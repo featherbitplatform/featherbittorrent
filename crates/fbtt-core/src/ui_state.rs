@@ -61,6 +61,12 @@ pub struct RemoteTarget {
     /// The client id this installation is known to a gateway by, which is what a `GatewayKey` assertion
     /// says `iss` and `sub` are. Only `GatewayKey` uses it.
     pub client_id: Option<String>,
+    /// The name of a header a gateway standing in front of this server checks before the request reaches
+    /// it - `X-API-Key`, or whatever that gateway's key-auth plugin was told to read. Only the NAME lives
+    /// here: the value is a secret, and it goes in the system keychain under this address like a password
+    /// does (see the binary's `secrets` module). A target written before this field existed has none, and
+    /// so does one whose server answers directly.
+    pub gateway_key_header: Option<String>,
 }
 
 /// How a target signs in.
@@ -186,6 +192,7 @@ mod tests {
                 key_path: Some(PathBuf::from("/home/alice/.ssh/id_ed25519")),
                 token_url: None,
                 client_id: None,
+                gateway_key_header: None,
             }),
         };
         remote.save(&paths).expect("save the last connection");
@@ -220,10 +227,84 @@ mod tests {
                 key_path: None,
                 token_url: None,
                 client_id: None,
+                gateway_key_header: None,
             }),
         };
         open_server.save(&paths).expect("save the open server");
         assert_eq!(UiState::load(&paths), open_server);
+    }
+
+    /// A target that goes through a keyed gateway keeps the header NAME through a save, and nothing else
+    /// about that key is written: `ui.yaml` sits in the same directory as `config.yaml`, where a person reads
+    /// their own config, and the value belongs in the keychain under its account like a password does.
+    #[test]
+    fn a_gateway_key_header_survives_a_save_without_its_value() {
+        let dir = ScratchDir::new("ui_state_gateway_key_header");
+        let paths = library(&dir);
+
+        let keyed = UiState {
+            last_used: LastUsed::Remote(RemoteTarget {
+                url: "https://bit.example".to_string(),
+                login: LoginMethod::Password,
+                user: Some("alice".to_string()),
+                gateway_key_header: Some("X-API-Key".to_string()),
+                ..RemoteTarget::default()
+            }),
+        };
+        keyed
+            .save(&paths)
+            .expect("save a target that names a gateway header");
+        assert_eq!(
+            UiState::load(&paths),
+            keyed,
+            "the header name is what the next run dials with"
+        );
+
+        let text = fs::read_to_string(paths.ui_file()).expect("read the file back");
+        let gateway_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("gateway"))
+            .collect();
+        assert_eq!(
+            gateway_lines,
+            ["  gateway_key_header: X-API-Key"],
+            "the header's name is written down and nothing about its value: {text}"
+        );
+
+        // A server that answers directly names no header, and the target says so on the page rather than
+        // inventing one - the same shape as every `ui.yaml` written before this field existed.
+        let plain = UiState {
+            last_used: LastUsed::Remote(RemoteTarget {
+                url: "http://127.0.0.1:8090".to_string(),
+                login: LoginMethod::Password,
+                user: Some("alice".to_string()),
+                ..RemoteTarget::default()
+            }),
+        };
+        plain.save(&paths).expect("save a plain target");
+        assert_eq!(
+            UiState::load(&paths),
+            plain,
+            "nothing was invented for a header this target does not name"
+        );
+        let text = fs::read_to_string(paths.ui_file()).expect("read the file back");
+        assert!(
+            text.contains("gateway_key_header: null"),
+            "a target with no gateway in front of it says so on the page: {text}"
+        );
+
+        // And a hand-edited file that leaves the line out entirely is still a connection this run can make:
+        // the field defaults to nothing, which is what a server reached directly needs it to be.
+        fs::write(
+            paths.ui_file(),
+            "last_used: !Remote\n  url: \"http://127.0.0.1:8090\"\n  login: Password\n  user: alice\n",
+        )
+        .expect("write a file with no gateway line");
+        assert_eq!(
+            UiState::load(&paths),
+            plain,
+            "a file that leaves the header out is not treated as unreadable"
+        );
     }
 
     /// A gateway target keeps what a gateway needs (its token endpoint and this installation's client id)
@@ -242,6 +323,7 @@ mod tests {
                 key_path: Some(PathBuf::from("/home/alice/.ssh/id_ed25519")),
                 token_url: Some("https://auth.example/oauth/token".to_string()),
                 client_id: Some("featherbittorrent-alice".to_string()),
+                gateway_key_header: None,
             }),
         };
         gateway
@@ -263,6 +345,7 @@ mod tests {
                 key_path: None,
                 token_url: None,
                 client_id: None,
+                gateway_key_header: None,
             }),
         };
         basic
@@ -287,6 +370,7 @@ mod tests {
                     key_path: None,
                     token_url: None,
                     client_id: None,
+                    gateway_key_header: None,
                 }),
             },
             "an older file loads with nothing filled in"

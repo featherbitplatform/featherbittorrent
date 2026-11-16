@@ -138,10 +138,13 @@ impl Shared {
         roots: Vec<fs::Root>,
         dummy_password_hash: Option<String>,
     ) -> Self {
-        let devices = Mutex::new(DeviceTable::build(&config.server.auth.devices));
+        // The login stores are built from the server section; a config with none is the defaults, which is
+        // what `Server::build` serves on in the same case.
+        let server = config.server.clone().unwrap_or_default();
+        let devices = Mutex::new(DeviceTable::build(&server.auth.devices));
         Shared {
-            auth: Arc::new(FbttAuth::new(&config.server)),
-            users: config.server.auth.users.clone(),
+            auth: Arc::new(FbttAuth::new(&server)),
+            users: server.auth.users.clone(),
             devices,
             changing_devices: tokio::sync::Mutex::new(()),
             base_config: config,

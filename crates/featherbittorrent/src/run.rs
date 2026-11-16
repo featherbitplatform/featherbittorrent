@@ -152,12 +152,14 @@ pub async fn run() -> ExitCode {
             // in to says so once through the client, which is what the empty table beside the connect
             // screen is for. The screen itself collects whatever was missing - and goes up on top of a target
             // this run named by itself, whose login method nobody has chosen yet.
-            let (secret, from_keychain, ask, notice) = match start {
+            let (secret, gateway_key, from_keychain, ask, notice) = match start {
                 StartSecret::Ready {
                     secret,
+                    gateway_key,
                     from_keychain,
                 } => (
                     secret,
+                    gateway_key,
                     from_keychain,
                     if connect_screen {
                         Some(target.clone())
@@ -166,9 +168,11 @@ pub async fn run() -> ExitCode {
                     },
                     None,
                 ),
-                StartSecret::Ask { secret, notice } => {
-                    (secret, false, Some(target.clone()), notice)
-                }
+                StartSecret::Ask {
+                    secret,
+                    gateway_key,
+                    notice,
+                } => (secret, gateway_key, false, Some(target.clone()), notice),
             };
             // Nothing was collected from anybody to start this connection, so nothing new is kept for it; what
             // the keychain already holds stays there until this server says whether it is right. The hand-off is
@@ -181,7 +185,7 @@ pub async fn run() -> ExitCode {
                 Login::remembered(target.clone(), from_keychain)
             };
             (
-                Backend::start_remote(target.clone(), secret),
+                Backend::start_remote(target.clone(), secret, gateway_key),
                 Some(login),
                 ask,
                 notice,

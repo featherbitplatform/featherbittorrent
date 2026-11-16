@@ -180,7 +180,10 @@ fn offline_settings(config: &Config, offline: bool) -> fbt::Settings {
 fn config_for_serve(paths: &Paths) -> Result<(Config, Option<String>), Failure> {
     let startup_problem;
     let base = match Config::load(paths)? {
-        ConfigLoad::Loaded(config) if has_server_section(paths) => {
+        // A file that carries a server section has already been asked these questions; one that does not,
+        // which is what a settings save from the TUI writes, never has. Presence is in the parsed config:
+        // `Config` keeps no implicit server section to mistake for an answer.
+        ConfigLoad::Loaded(config) if config.server.is_some() => {
             return Ok((config.resolve(paths), None));
         }
         ConfigLoad::Loaded(config) => {
@@ -213,22 +216,6 @@ fn config_for_serve(paths: &Paths) -> Result<(Config, Option<String>), Failure> 
     )?;
     let _ = out.flush();
     Ok((config.resolve(paths), startup_problem))
-}
-
-/// Whether `config.yaml` already says something about the server. A file written by
-/// the TUI does not: it has no reason to name an address it never listens on, and
-/// `Config::save` drops a server section that only holds defaults.
-fn has_server_section(paths: &Paths) -> bool {
-    let text = match std::fs::read_to_string(paths.config_file()) {
-        Ok(text) => text,
-        Err(_) => return true,
-    };
-    match serde_norway::from_str::<serde_norway::Value>(&text) {
-        Ok(value) => value.get("server").is_some(),
-        // Not YAML at all: `Config::load` has its own answer for that, and this
-        // function only decides whether to ask questions.
-        Err(_) => true,
-    }
 }
 
 /// Waits for the cue to stop: Ctrl-C, or SIGTERM on Unix, or (debug builds) the

@@ -134,7 +134,8 @@ fn base_config(
 ) -> Config {
     Config {
         download_dir: scratch.join("downloads"),
-        server: ServerConfig {
+        // These tests are about serving, so their configs say so.
+        server: Some(ServerConfig {
             bind: "127.0.0.1:0".parse().expect("a loopback bind address"),
             auth: AuthConfig {
                 enabled: auth,
@@ -142,7 +143,7 @@ fn base_config(
                 devices,
             },
             ..ServerConfig::default()
-        },
+        }),
         ..Config::default()
     }
 }
@@ -1418,7 +1419,11 @@ async fn auth_off_allows_ip_literal_host() {
 async fn auth_off_allows_listed_host() {
     let served = Served::start("host-listed", |scratch| {
         let mut config = base_config(scratch, vec![alice()], Vec::new(), Some(false));
-        config.server.allowed_hosts = vec!["bit.local".to_string()];
+        config
+            .server
+            .as_mut()
+            .expect("a config that serves")
+            .allowed_hosts = vec!["bit.local".to_string()];
         config
     })
     .await;
