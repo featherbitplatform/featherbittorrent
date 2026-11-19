@@ -20,22 +20,32 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, model: &Model) {
     if area.is_empty() {
         return;
     }
+    let row_cells = usize::from(area.width);
     let line = if model.quit_armed() {
         confirmation()
     } else if let Some(notice) = model.notice() {
         notice_line(notice).unwrap_or_else(|| {
             if model.files_focused {
-                hints_from(keys::FILE_LIST_HINTS)
+                hints_from(&fit_hints(keys::FILE_LIST_HINTS, row_cells))
             } else {
                 hints_for(keys::FOOTER_KEYS)
             }
         })
     } else if model.files_focused {
-        hints_from(keys::FILE_LIST_HINTS)
+        hints_from(&fit_hints(keys::FILE_LIST_HINTS, row_cells))
     } else {
         hints_for(keys::FOOTER_KEYS)
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Cells the footer line has to hold: the hints, two cells between each of them.
+fn line_cells(described: &[(&'static str, &'static str)]) -> usize {
+    described
+        .iter()
+        .map(|(key, action)| key.chars().count() + action.chars().count() + 1)
+        .sum::<usize>()
+        + described.len().saturating_sub(1) * 2
 }
 
 /// The hints for one set of keys, in the order they are wanted. Everything on this line comes from
@@ -50,7 +60,40 @@ fn hints_for(wanted: &[&'static str]) -> Line<'static> {
                 .map(|(_, action)| (*key, *action))
         })
         .collect();
-    hints_from(&described)
+    // The row the footer draws into at eighty columns is eighty cells minus the two cells of
+    // padding a box over it would take. The order the list is in is the order its hints are
+    // wanted in, and what does not fit is dropped from the back, one at a time, but never the
+    // last hint: `q quit` is the one a person looks for when something goes wrong, and a
+    // footer that drops it is a footer that says nothing when it matters most.
+    let shown = fit_hints(&described, 78);
+    hints_from(&shown)
+}
+
+/// The hints that fit in `limit` cells: the longest prefix of `described` that fits, with
+/// the last hint kept at the end. The last hint is the one a person looks for most, so it
+/// stays; the hints that go are the ones just before it.
+fn fit_hints(
+    described: &[(&'static str, &'static str)],
+    limit: usize,
+) -> Vec<(&'static str, &'static str)> {
+    let n = described.len();
+    if n <= 1 || line_cells(described) <= limit {
+        return described.to_vec();
+    }
+    let last = n - 1;
+    for count in (0..=last).rev() {
+        let mut shown: Vec<(&'static str, &'static str)> = described[..count].to_vec();
+        if count < last {
+            shown.push(described[last]);
+        }
+        if shown.is_empty() {
+            break;
+        }
+        if line_cells(&shown) <= limit {
+            return shown;
+        }
+    }
+    vec![described[last]]
 }
 
 /// The hints given as a key and what it does: each key in the lifted accent, and its meaning beside
@@ -105,20 +148,38 @@ mod tests {
 
     #[test]
     fn the_hints_line_stays_one_line_of_its_own() {
-        // Seven hints is already tight on an eighty-column terminal: adding one more should mean
-        // moving one out of the list, not wrapping the footer.
-        let width: usize = keys::FOOTER_KEYS
+        // Nine hints does not all fit the row the footer draws into at eighty columns, and the
+        // rule for what does not fit is the order the list is in: drop from the back, one at a
+        // time, so what is drawn is a prefix of the list that no longer wraps the row.
+        let wanted: Vec<(&'static str, &'static str)> = keys::FOOTER_KEYS
             .iter()
-            .map(|key| {
-                let action = keys::KEYS
+            .filter_map(|key| {
+                keys::KEYS
                     .iter()
                     .find(|(name, _)| name == key)
-                    .map_or("", |(_, action)| *action);
-                key.chars().count() + action.chars().count() + 1
+                    .map(|(_, action)| (*key, *action))
             })
-            .sum::<usize>()
-            + (keys::FOOTER_KEYS.len() - 1) * 2;
-        assert!(width <= 80, "the footer needs {width} cells");
+            .collect();
+        let row_cells = 78; // eighty columns minus the help box's two borders
+        assert!(
+            line_cells(&wanted) > row_cells,
+            "all nine hints fit, so there is nothing to drop: {} cells",
+            line_cells(&wanted)
+        );
+        let mut shown = wanted.clone();
+        while line_cells(&shown) > row_cells && shown.len() > 1 {
+            shown.pop();
+        }
+        assert!(
+            line_cells(&shown) <= row_cells,
+            "the footer wrapped the row"
+        );
+        assert!(shown.len() < wanted.len(), "no hint needed dropping");
+        assert_eq!(
+            &wanted[..shown.len()],
+            shown.as_slice(),
+            "a dropped hint left a gap in the order"
+        );
     }
 
     #[test]

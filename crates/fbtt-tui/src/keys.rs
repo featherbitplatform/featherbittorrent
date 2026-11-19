@@ -6,9 +6,11 @@
 //! help screen cannot drift from what the keys actually do and the footer cannot promise a
 //! key that does nothing.
 
+use std::time::Instant;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fbtt_core::{
-    Command, Connection, Detail, DetailTab, DeviceCommand, FilePriority, FileRow, RowState,
+    Command, Connection, Detail, DetailTab, DeviceCommand, FilePriority, FileRow, Notice, RowState,
     Snapshot, TorrentRow,
 };
 
@@ -31,6 +33,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("o", "sort by the next column"),
     ("O", "reverse the sort"),
     ("p", "pause/resume"),
+    ("s", "stream in mpv or VLC"),
     ("/", "filter"),
     ("m", "minimal"),
     ("a", "add"),
@@ -52,7 +55,7 @@ pub const KEYS: &[(&str, &str)] = &[
 
 /// The hints the footer has room for, in the order it shows them. Each one is a key of
 /// [`KEYS`].
-pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "c", "?", "q"];
+pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "s", "/", "m", "c", "?", "q"];
 
 /// The hints the footer gives instead while the cursor is in the detail pane's file list, where
 /// `j` and `k` mean files rather than torrents, as the key and what it does there. Every key of it
@@ -60,6 +63,7 @@ pub const FOOTER_KEYS: &[&str] = &["a", "d", "p", "/", "m", "c", "?", "q"];
 /// because they describe where the cursor is: `Esc` in the list leaves the list, it does not close
 /// a dialog.
 pub const FILE_LIST_HINTS: &[(&str, &str)] = &[
+    ("s", "stream this file"),
     ("+", "raise the focused file's priority"),
     ("-", "lower the focused file's priority"),
     ("Esc", "leave the file list"),
@@ -132,14 +136,14 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<A
                 KeyCode::PageDown => model.step_by(PAGE_STEP, &rows),
                 KeyCode::PageUp => model.step_by(-PAGE_STEP, &rows),
                 KeyCode::Char('p') => return pause_or_resume(model.selected_row(&rows)),
+                KeyCode::Char('s') => return stream_press(model, &rows, snap),
                 KeyCode::Tab => model.step_detail_tab(true),
                 // Shift+Tab arrives as its own key on every terminal crossterm supports.
                 KeyCode::BackTab => model.step_detail_tab(false),
                 KeyCode::Char('o') => model.cycle_sort(),
                 KeyCode::Char('O') => model.reverse_sort(),
                 KeyCode::Char('m') => model.toggle_view(),
-                // These open a dialog, which then answers every key itself. `s` is reserved for
-                // a later milestone: stream.
+                // These open a dialog, which then answers every key itself.
                 KeyCode::Char('/') => model.modal = Some(Modal::Filter),
                 KeyCode::Char('a') => model.modal = Some(Modal::add(snap)),
                 KeyCode::Char('S') => model.modal = Some(Modal::settings(snap)),
@@ -174,6 +178,52 @@ fn devices_press(model: &mut Model, snap: &Snapshot) -> Vec<Action> {
     }
     model.modal = Some(Modal::devices());
     vec![Action::Command(Command::Devices(DeviceCommand::List))]
+}
+
+/// `s`: play the selected torrent's files. With the cursor in the file list the file under it is
+/// played, named by its index; in the table the torrent itself is named and the backend picks the
+/// largest non-pad file. A torrent whose metadata has not arrived has no files to play yet: the
+/// press says so on the footer rather than send a command that would only fail.
+fn stream_press(model: &mut Model, rows: &[&TorrentRow], snap: &Snapshot) -> Vec<Action> {
+    if model.files_focused {
+        let Some(file) = watched_files(model, snap)
+            .and_then(|files| files.get(model.file_cursor.min(files.len().saturating_sub(1))))
+        else {
+            model.push_notice(
+                Notice::Error("The torrent has no metadata yet".to_string()),
+                Instant::now(),
+            );
+            return Vec::new();
+        };
+        let Some(id) = model.selected.as_ref() else {
+            return Vec::new();
+        };
+        return vec![Action::Command(Command::Stream {
+            id: id.clone(),
+            file: Some(file.index),
+        })];
+    }
+    let Some(row) = model.selected_row(rows) else {
+        return Vec::new();
+    };
+    // A torrent whose metadata has not arrived has no files to play yet: the state says it
+    // is still waiting, or the snapshot has no file list for it because the detail request
+    // has not been answered.
+    let has_files = !matches!(row.state, RowState::Metadata | RowState::Checking(_))
+        && snap.detail.as_ref().is_some_and(|(id, detail)| {
+            *id == row.id && matches!(&detail, Detail::Files(files) if !files.is_empty())
+        });
+    if !has_files {
+        model.push_notice(
+            Notice::Error("The torrent has no metadata yet".to_string()),
+            Instant::now(),
+        );
+        return Vec::new();
+    }
+    vec![Action::Command(Command::Stream {
+        id: row.id.clone(),
+        file: None,
+    })]
 }
 
 /// `p` for the selected row: a stopped torrent is started and anything else is stopped.
@@ -271,6 +321,7 @@ fn file_list_keys(model: &mut Model, code: KeyCode, snap: &Snapshot) -> Vec<Acti
         KeyCode::Char('+') | KeyCode::Char('-') => {
             change_priority(model, snap, code == KeyCode::Char('+'))
         }
+        KeyCode::Char('s') => stream_press(model, &[], snap),
         _ => Vec::new(),
     }
 }

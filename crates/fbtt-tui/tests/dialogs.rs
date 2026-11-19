@@ -656,8 +656,9 @@ fn help_lists_every_key() {
     assert!(matches!(model.modal, Some(Modal::Help)));
 
     // Every row of the key table is on the screen: in a tall terminal, and in a short one, where
-    // the list is drawn in two columns so that nothing has to be scrolled for.
-    for (width, height) in [(100u16, 40u16), (80, 24)] {
+    // the list is drawn in one column (two columns need more width than 80 cols once `s` is in
+    // the list) so that nothing has to be scrolled for.
+    for (width, height) in [(100u16, 40u16), (80, 34)] {
         let lines = Screen::new(&model, &snap, width, height).lines();
         for (name, action) in KEYS {
             let shown = lines.iter().any(|line| match line.find(action) {
@@ -744,7 +745,9 @@ fn file_priority_keys() {
     assert!(model.handle_key(letter('-'), &skip).is_empty());
 
     // The focused row is lifted onto the surface colour, and the footer says what these keys do.
-    let screen = Screen::new(&model, &snap, 100, 30);
+    // The file list hints are wider than the main footer, so this test draws at 130 columns
+    // to keep them all on screen.
+    let screen = Screen::new(&model, &snap, 130, 30);
     let (x, y) = screen.find("bbb.srt").expect("the file list was not drawn");
     assert_eq!(
         screen.bg(x, y),

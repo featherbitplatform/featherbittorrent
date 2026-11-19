@@ -2,7 +2,10 @@
 //! actions out, and a buffer to read what a person would have seen.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use fbtt_core::{Command, DetailTab, LinkState, RowState, Snapshot, TorrentId};
+use fbtt_core::{
+    Command, Detail, DetailTab, FilePriority, FileRow, LinkState, Notice, RowState, Snapshot,
+    TorrentId,
+};
 use fbtt_tui::{Action, Descending, SortKey, theme, visible_rows};
 use ratatui::style::Color;
 
@@ -242,6 +245,117 @@ fn tiny_terminal_does_not_panic() {
         model.handle_key(letter('p'), &snap);
         model.handle_key(letter('O'), &snap);
     }
+}
+
+#[test]
+fn s_streams_selected_torrent() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    // The table's `s` names the torrent; the backend picks the file.
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: snap.torrents[0].id.clone(),
+            file: None,
+        })]
+    );
+
+    // Two rows down, the other torrent is what gets streamed. The snapshot's detail follows
+    // the selection in a real run (the model sends `Watch` and the backend answers), so the
+    // test updates it the same way.
+    model.handle_key(letter('j'), &snap);
+    model.handle_key(letter('j'), &snap);
+    let mut next = snap.clone();
+    next.detail = Some((
+        snap.torrents[1].id.clone(),
+        Detail::Files(vec![FileRow {
+            index: 0,
+            path: "debian-13.1-amd64.iso".to_string(),
+            size: 3_298_534_880,
+            done: 3_298_534_880,
+            priority: FilePriority::Normal,
+        }]),
+    ));
+    let actions = model.handle_key(letter('s'), &next);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: snap.torrents[1].id.clone(),
+            file: None,
+        })]
+    );
+}
+
+#[test]
+fn s_in_file_list_streams_focused_file() {
+    let snap = library();
+    let buck = snap.torrents[0].id.clone();
+    let mut model = model_of(&snap);
+
+    // Enter puts the cursor in the list, on the first file: `s` names it by index.
+    model.handle_key(key(KeyCode::Enter), &snap);
+    assert!(model.files_focused, "Enter did not focus the file list");
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: buck.clone(),
+            file: Some(0),
+        })]
+    );
+
+    // `j` moves the file cursor: the subtitle, not the film, is what gets streamed now.
+    model.handle_key(letter('j'), &snap);
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: buck.clone(),
+            file: Some(1),
+        })]
+    );
+}
+
+#[test]
+fn s_without_metadata_is_a_notice() {
+    // A torrent still fetching metadata: the backend keeps no file list for it, which the
+    // model can see in the snapshot. The press sends nothing and says why on the footer.
+    let mut snap = library();
+    snap.detail = None;
+    let mut model = model_of(&snap);
+    let id = snap.torrents[0].id.clone();
+
+    assert_eq!(model.handle_key(letter('s'), &snap), Vec::new());
+    assert_eq!(
+        model.notice(),
+        Some(&Notice::Error(
+            "The torrent has no metadata yet".to_string()
+        ))
+    );
+
+    // The cursor in the file list gets the same answer: without a list there is no file to
+    // name, and the same reason is the one worth showing.
+    let mut model = model_of(&snap);
+    model.selected = Some(id);
+    model.files_focused = true;
+    assert_eq!(model.handle_key(letter('s'), &snap), Vec::new());
+    assert_eq!(
+        model.notice(),
+        Some(&Notice::Error(
+            "The torrent has no metadata yet".to_string()
+        ))
+    );
+}
+
+#[test]
+fn s_with_nothing_selected_sends_nothing() {
+    let empty = Snapshot {
+        torrents: Vec::new(),
+        ..library()
+    };
+    let mut model = model_of(&empty);
+    assert_eq!(model.handle_key(letter('s'), &empty), Vec::new());
 }
 
 #[test]
@@ -711,4 +825,34 @@ fn header_shows_lost_link() {
         text.contains("connected to Local"),
         "the local engine's header changed: {text:?}"
     );
+}
+
+#[test]
+fn the_footer_at_eighty_columns_keeps_its_rule() {
+    // A footer line is what its row has room for, in the order the key table reads it: hints
+    // that do not fit are dropped from the back, and the `s` hint is part of that line rather
+    // than a second one. At eighty columns the row is eighty cells, so the hints that go are
+    // the ones furthest from the front; what stays is a prefix that fits, and `q quit` is
+    // always at the end.
+    let snap = library();
+    let screen = Screen::new(&model_of(&snap), &snap, 80, 24);
+    let lines = screen.lines();
+
+    let footer = lines.last().expect("a drawn screen has a last line");
+    // The `s` hint is there, and so is `q quit` at the end.
+    assert!(
+        footer.contains("s stream in mpv or VLC"),
+        "the new hint is missing from: {footer:?}"
+    );
+    assert!(
+        footer.trim_end().ends_with("q quit"),
+        "`q quit` is not at the end of: {footer:?}"
+    );
+    // The other front hints are there too.
+    for want in ["a add", "d delete", "p pause/resume", "/ filter"] {
+        assert!(
+            footer.contains(want),
+            "{want:?} is missing from: {footer:?}"
+        );
+    }
 }

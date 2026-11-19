@@ -63,13 +63,29 @@ fn wants_two_columns(area: Rect, left: &[(&str, &str)], right: &[(&str, &str)]) 
     if rows_available >= KEYS.len() {
         return false;
     }
-    let cells = |rows: &[(&str, &str)]| {
+    // A two-column row is the left key padded to the left column's width, the gap, the left
+    // action, the column gap, the right key padded to the right column's width, the gap and
+    // the right action. The box adds two cells of padding and two of border on top.
+    let key_width = |rows: &[(&str, &str)]| {
         rows.iter()
-            .map(|(key, action)| key.chars().count() + KEY_GAP + action.chars().count())
+            .map(|(key, _)| key.chars().count())
             .max()
             .unwrap_or_default()
     };
-    usize::from(area.width) >= cells(left) + COLUMN_GAP + cells(right) + 4
+    let widest_action = KEYS
+        .iter()
+        .map(|(_, action)| action.chars().count())
+        .max()
+        .unwrap_or_default();
+    let two_col_width = key_width(left)
+        + KEY_GAP
+        + widest_action
+        + COLUMN_GAP
+        + key_width(right)
+        + KEY_GAP
+        + widest_action
+        + 4;
+    usize::from(area.width) >= two_col_width
 }
 
 /// One row: the key in the accent, padded so the actions line up, and what it does beside it.
@@ -108,16 +124,30 @@ mod tests {
             "a tall screen did not list every key"
         );
 
-        let two = lines(Rect::new(0, 0, 80, 24));
+        // At 80 columns the two-column row is wider than the box, so the list is drawn in
+        // one column: every key on its own row, the close hint at the end.
+        let short = lines(Rect::new(0, 0, 80, 24));
         assert_eq!(
-            two.len(),
+            short.len(),
+            KEYS.len() + 1,
+            "a screen too narrow for two columns did not fall back to one"
+        );
+
+        // A wider short screen does split, because the two columns fit there.
+        let wide_short = lines(Rect::new(0, 0, 100, 24));
+        assert_eq!(
+            wide_short.len(),
             KEYS.len().div_ceil(2) + 1,
-            "a short screen did not split the list"
+            "a wide short screen did not split the list"
         );
 
         // Every action is on the screen either way, which is the point of splitting it.
         for name in ["quit", "raise the focused file's priority"] {
-            for area in [Rect::new(0, 0, 100, 40), Rect::new(0, 0, 80, 24)] {
+            for area in [
+                Rect::new(0, 0, 100, 40),
+                Rect::new(0, 0, 80, 24),
+                Rect::new(0, 0, 100, 24),
+            ] {
                 let text = lines(area)
                     .iter()
                     .map(|line| {
