@@ -54,13 +54,30 @@ zeroize.workspace = true
 # The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
 # it needs `macros`; `spawn_blocking` is `rt`, the state save's cadence is `time`, and
 # the queues are `sync`. `net` is for the ssh-agent socket the key login talks to (Task 6).
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+# `process` is for starting a media player without a shell in between (Task 5).
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]`, and a runtime with worker threads: each test runs two live
-# sessions, and a blocking call in one should not stall the other's timers.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# sessions, and a blocking call in one should not stall the other's timers. `time` is
+# for the waits a player test has to keep (`tests/play.rs`).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+# A stand-in for a media player (`testbin/fake_player.rs`): it records what it was handed and exits,
+# so no test needs a real mpv or VLC and none of them opens a window. The feature keeps it out of
+# every build that is not running these tests, and the release workflow builds `-p
+# featherbittorrent`, so it never reaches an archive either.
+[[bin]]
+name = "fbtt-fake-player"
+path = "testbin/fake_player.rs"
+required-features = ["test-support"]
 
 [[test]]
 name = "local"
+required-features = ["test-support"]
+
+# Launching a player, against the fake one above. `CARGO_BIN_EXE_fbtt-fake-player` is only set for a
+# test target that binary is built for, which is what this feature does here.
+[[test]]
+name = "play"
 required-features = ["test-support"]

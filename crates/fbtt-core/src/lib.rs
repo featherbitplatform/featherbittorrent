@@ -21,6 +21,7 @@ pub mod fs_list;
 pub mod local;
 pub mod lock;
 pub mod paths;
+pub mod player;
 pub mod remote;
 pub mod stream;
 pub mod ui_state;

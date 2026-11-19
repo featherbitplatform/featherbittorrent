@@ -26,6 +26,7 @@
 //! worth testing can be tested without any of it.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -39,13 +40,15 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::{Fill, Paragraph};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use fbtt_core::client::ClientParts;
+use fbtt_core::player::{self, SystemLookup};
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
 use fbtt_core::{
-    Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, Secret,
-    Snapshot,
+    Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, PlayTarget,
+    PlayerConfig, Secret, Snapshot,
 };
 use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, theme, view};
 
@@ -174,10 +177,10 @@ fn remembered_ui(login: &Login) -> Option<LastUsed> {
 /// macOS a keychain can be waiting for somebody to unlock it - so neither happens on the thread that draws
 /// the screen: each goes to this run's one worker thread (see [`Jobs`], [`send_work`]) and whatever it says
 /// arrives on this queue, which the loop reads whenever it turns up (see [`run_loop`]). What a job needs -
-/// this library's files, and where its connect passwords live - travels with the job because that is all
-/// this run ever sends away for. The config does not: a switch reads `config.yaml` again (see
-/// [`local_config`]) because it needs the answer in hand before it can start an engine on it, and that read
-/// happens between two turns of the loop, where nothing is drawing.
+/// this library's files, where its connect passwords live, and which media player a file opens in -
+/// travels with the job because that is all this run ever sends away for. The config does not: a switch
+/// reads `config.yaml` again (see [`local_config`]) because it needs the answer in hand before it can start
+/// an engine on it, and that read happens between two turns of the loop, where nothing is drawing.
 ///
 /// The worker thread holds the only sending end of that notice queue, which is what keeps it open for the
 /// run's whole life: a queue with no senders left reads as a closed one, and the loop would be told there is
@@ -188,6 +191,9 @@ fn remembered_ui(login: &Login) -> Option<LastUsed> {
 pub struct Work<'a> {
     /// Where this library's files are: `config.yaml`, `ui.yaml`, the lock.
     pub paths: &'a Paths,
+    /// Which media player this run opens a file in: the setting `config.yaml` had when this run started,
+    /// which is not re-read on the way (`play_file` in this module starts the player with it).
+    pub player: &'a PlayerConfig,
     /// Where a connect password lives between runs.
     pub store: &'a Arc<dyn SecretStore + Send + Sync>,
     rx: mpsc::Receiver<Notice>,
@@ -215,10 +221,15 @@ struct Jobs {
 impl<'a> Work<'a> {
     /// The queue for one run's off-screen work, with its two ends wired together and the thread that does
     /// the work already started.
-    pub fn new(paths: &'a Paths, store: &'a Arc<dyn SecretStore + Send + Sync>) -> Work<'a> {
-        // Eight lines is more than this run can have in flight at once - a sign-in's two writes and the
-        // delete that follows a refusal. A queue that did fill up would wait on the thread it was sent to,
-        // which is allowed to wait, rather than the screen, which is not.
+    pub fn new(
+        paths: &'a Paths,
+        player: &'a PlayerConfig,
+        store: &'a Arc<dyn SecretStore + Send + Sync>,
+    ) -> Work<'a> {
+        // Eight lines is more than this run can have in flight at once - a sign-in's two writes, the delete
+        // that follows a refusal, and the line about a file somebody asked to play. A queue that did fill up
+        // would wait on the thread it was sent to, which is allowed to wait, rather than the screen, which
+        // is not.
         let (tx, rx) = mpsc::channel(8);
         let (jobs_tx, mut waiting) = mpsc::unbounded_channel::<Job>();
         // A plain thread rather than a task: it spends its life waiting on another process, and being the
@@ -236,6 +247,7 @@ impl<'a> Work<'a> {
         });
         Work {
             paths,
+            player,
             store,
             rx,
             jobs: Jobs { tx: jobs_tx },
@@ -386,11 +398,11 @@ pub async fn run_session(
 /// (see [`Work`]), so a keychain that is asleep cannot hold this screen still. The channels arrive as separate
 /// parts so that no borrow of one can fight a use of another in the same `select!`.
 ///
-/// Three things read what arrives rather than only drawing it: the first snapshot that says this connection
+/// Four things read what arrives rather than only drawing it: the first snapshot that says this connection
 /// signed in sends off what that sign-in owes (see [`settle`]), a line saying the kept password was refused
-/// takes that entry out and asks again (see [`stored_password_refused`]), and the lines those jobs answer with
-/// go on the footer like any other news. The first two are once per connection, and neither touches the
-/// backend's channels.
+/// takes that entry out and asks again (see [`stored_password_refused`]), a request to open something hands
+/// it to the media player (see [`play_file`]), and the lines those jobs answer with go on the footer like
+/// any other news. The first two are once per connection, and neither touches the backend's channels.
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     screen: &mut Screen<'_>,
@@ -410,7 +422,12 @@ async fn run_loop(
     let jobs = work.jobs.clone();
     let rx = &mut work.rx;
     let paths = work.paths;
+    let player = work.player;
     let store = Arc::clone(work.store);
+    // The runtime this loop's off-screen work reaches back in through: starting a media player is a task,
+    // and the job that starts one waits for its one line from the thread it was sent to (see
+    // [`play_file`]). This function only ever runs inside one.
+    let runtime = Handle::current();
     // Nothing has been drawn yet, so the first tick draws.
     let mut dirty = true;
     let mut last_watch = model.watch();
@@ -498,7 +515,22 @@ async fn run_loop(
                         }
                     }
                     for notice in lines {
-                        model.push_notice(notice, Instant::now());
+                        match notice {
+                            // A file to play is not a line this screen draws: it is a job. Starting a player
+                            // is a conversation with another process, so it goes to this run's worker like
+                            // every other piece of off-screen work, and what comes back on the queue below is
+                            // the line about what was opened.
+                            Notice::Play(target) => {
+                                play_file(
+                                    &jobs,
+                                    runtime.clone(),
+                                    player.clone(),
+                                    paths.play_dir(),
+                                    target,
+                                );
+                            }
+                            other => model.push_notice(other, Instant::now()),
+                        }
                     }
                     if let Some(target) = refused {
                         // The keychain holds a password this server said no to. It goes, so the next run asks
@@ -873,6 +905,28 @@ fn forget(target: RemoteTarget, store: &Arc<dyn SecretStore + Send + Sync>, jobs
     });
 }
 
+/// Ask the media player to open one target, and send back the one line about it.
+///
+/// [`fbtt_core::player`] finds mpv or VLC, writes a private playlist when the file is an address rather
+/// than a file, and starts the player without that address ever reaching its command line (decision 3 of
+/// the milestone 3 plan). The player config is the one this run loaded at start, not the one a switch
+/// re-reads for its limits: one run does not change players halfway through.
+///
+/// This screen waits for none of it. A job on this run's worker thread is handed to that thread as
+/// `'static`, so the job carries the config, the target and a handle to the runtime rather than borrowing
+/// them, and `block_on` there drives the spawn: finding a player and writing a file cost about what
+/// reading a torrent file from the same queue already costs. The line back is what was opened, or the
+/// reason nothing was; a player that starts keeps running after this run ends.
+fn play_file(jobs: &Jobs, runtime: Handle, player: PlayerConfig, dir: PathBuf, target: PlayTarget) {
+    send_work(jobs, move || {
+        let opened = runtime.block_on(player::play(&player, target, &dir, &SystemLookup));
+        match opened {
+            Ok(line) => vec![Notice::Info(line)],
+            Err(problem) => vec![Notice::Error(problem.to_string())],
+        }
+    });
+}
+
 /// Whether one line from a connection says the password this run read out of the keychain was refused.
 ///
 /// The variant is the whole test: the remote backend puts `Notice::SignInRefused` on the queue when it is the
@@ -974,20 +1028,23 @@ impl<S: Stream> Future for OnceStream<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Login, Screen, Switched, Work, could_not_save, forget, local_config, remembered_ui, settle,
-        stored_password_refused, switch_onward,
+        Login, Screen, Switched, Work, could_not_save, forget, local_config, play_file,
+        remembered_ui, settle, stored_password_refused, switch_onward,
     };
     use crate::backend::{Backend, BackendKind};
     use crate::fake_store::FakeStore;
     use crate::secrets::{KeepPlan, KeepPlans, SecretStore};
     use fbtt_core::scratch::ScratchDir;
     use fbtt_core::ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
-    use fbtt_core::{Config, LibraryLock, Notice, Paths, Secret};
+    use fbtt_core::{
+        Config, LibraryLock, Notice, Paths, PlaySource, PlayTarget, PlayerConfig, Secret,
+    };
     use fbtt_tui::{ConnectRequest, ConnectTarget, Model, SecretInput};
     use std::fs;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use tokio::runtime::Handle;
     use tokio::sync::mpsc;
     use zeroize::Zeroizing;
 
@@ -1045,6 +1102,39 @@ mod tests {
         lines
     }
 
+    /// A request to open something is answered with the one line about what happened, and the request itself
+    /// is never drawn: it is how the screen asks for a player, not news for the footer. The name here carries
+    /// a path separator, so it fails before anything is started - which is what makes it testable on a
+    /// machine with no mpv and no VLC installed, where starting something real would not be.
+    #[tokio::test]
+    async fn a_play_request_answers_with_the_line_about_it() {
+        let (_dir, paths) = scratch_library("work_play_request");
+        let store: Arc<dyn SecretStore + Send + Sync> = Arc::new(FakeStore::new());
+        let missing = paths.data_dir.join("no-such-player");
+        let player = PlayerConfig {
+            program: missing.display().to_string(),
+            ..PlayerConfig::default()
+        };
+        let work = Work::new(&paths, &player, &store);
+
+        play_file(
+            &work.jobs,
+            Handle::current(),
+            player.clone(),
+            paths.play_dir(),
+            PlayTarget::new("A Film", PlaySource::Path(missing.clone())),
+        );
+
+        assert_eq!(
+            answered(work.into_reader()).await,
+            vec![Notice::Error(format!(
+                "The player in config.yaml was not found: {}",
+                missing.display()
+            ))],
+            "a play request answers with the line about what it could not open"
+        );
+    }
+
     /// The two writes one sign-in owes, and the delete that can follow them, land in the order they were
     /// asked for - whichever way round they were asked. On a pool of threads a save could arrive after the
     /// delete that was meant to undo it, leaving kept the very password the person had just refused; one
@@ -1070,7 +1160,8 @@ mod tests {
         let (_dir, paths) = scratch_library("work_keep_then_forget");
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
         let mut login = Login::answered(server.clone(), keep());
         settle(&mut login, work.store, work.paths, &work.jobs);
         forget(server.clone(), work.store, &work.jobs);
@@ -1096,7 +1187,8 @@ mod tests {
         let fake = Arc::new(FakeStore::new());
         fake.put(account, "stale");
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
         forget(server.clone(), work.store, &work.jobs);
         let mut login = Login::answered(server.clone(), keep());
         settle(&mut login, work.store, work.paths, &work.jobs);
@@ -1130,7 +1222,8 @@ mod tests {
         // engine on. It is not passed to `switch_onward` at all - the file is what it reads.
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
@@ -1219,7 +1312,8 @@ mod tests {
 
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
 
         let running = Backend::start_remote(before.clone(), Secret::None, None);
         let mut snap = running.initial_snapshot();
@@ -1275,7 +1369,8 @@ mod tests {
         fs::write(paths.config_file(), "listen_port: 6881\n").expect("a config");
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
 
         let server = RemoteTarget {
             url: "https://bit.example".to_string(),
@@ -1433,7 +1528,8 @@ mod tests {
 
         let fake = Arc::new(FakeStore::new());
         let store: Arc<dyn SecretStore + Send + Sync> = fake.clone();
-        let work = Work::new(&paths, &store);
+        let player = PlayerConfig::default();
+        let work = Work::new(&paths, &player, &store);
         let borrowed = RemoteTarget {
             url: "http://127.0.0.1:8090".to_string(),
             ..RemoteTarget::default()

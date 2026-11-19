@@ -31,6 +31,9 @@ const STATE_FILE_NAME: &str = "session.state";
 /// The lock that keeps a second featherbittorrent off the same library, in
 /// [`Paths::data_dir`].
 const LOCK_FILE_NAME: &str = "library.lock";
+/// Where a playlist for a media player is written, in [`Paths::data_dir`] (see
+/// [`crate::player`]).
+const PLAY_DIR_NAME: &str = "play";
 
 /// The two directories one library uses.
 ///
@@ -109,11 +112,20 @@ impl Paths {
     pub fn lock_file(&self) -> PathBuf {
         self.data_dir.join(LOCK_FILE_NAME)
     }
+
+    /// Where a playlist handed to a media player is written: `<data_dir>/play` (see
+    /// [`crate::player`]).
+    ///
+    /// Nothing here creates it, like nothing else here: the one that writes a playlist makes room
+    /// for it, private to this user.
+    pub fn play_dir(&self) -> PathBuf {
+        self.data_dir.join(PLAY_DIR_NAME)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CONFIG_FILE_NAME, LOCK_FILE_NAME, PROJECT, Paths, STATE_FILE_NAME};
+    use super::{CONFIG_FILE_NAME, LOCK_FILE_NAME, PLAY_DIR_NAME, PROJECT, Paths, STATE_FILE_NAME};
     use crate::config::ConfigError;
     use crate::scratch::ScratchDir;
     use directories::ProjectDirs;
@@ -140,6 +152,7 @@ mod tests {
         assert_eq!(paths.config_file(), config_dir.join(CONFIG_FILE_NAME));
         assert_eq!(paths.state_file(), data_dir.join(STATE_FILE_NAME));
         assert_eq!(paths.lock_file(), data_dir.join(LOCK_FILE_NAME));
+        assert_eq!(paths.play_dir(), data_dir.join(PLAY_DIR_NAME));
     }
 
     /// Without the debug variables the platform's own directories are used, so

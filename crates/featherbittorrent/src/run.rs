@@ -38,6 +38,15 @@ pub async fn run() -> ExitCode {
         Err(error) => return fail(&error),
     };
 
+    // A playlist is written for one player and taken out when that player exits, so anything still in the
+    // folder belongs to a run that never got to clean it up. Twelve hours of grace, then it goes. This is a
+    // directory walk rather than a wait, but it goes to the blocking pool anyway: nothing in setup holds the
+    // screen up over a file system, and everything about a sweep that fails is its own to ignore (see
+    // `fbtt_core::player::sweep_playlists`).
+    let play_dir = paths.play_dir();
+    let _ =
+        tokio::task::spawn_blocking(move || fbtt_core::player::sweep_playlists(&play_dir)).await;
+
     // Where a connect password lives between runs. Making this touches nothing: the keychain is only
     // reached by the calls below, and only for a target that signs in with a password.
     let store: Arc<dyn SecretStore + Send + Sync> = Arc::new(Keychain);
@@ -70,6 +79,12 @@ pub async fn run() -> ExitCode {
         }
         Err(error) => return fail(&error),
     };
+
+    // The media player this run opens a file in, taken out of that config before it is handed to the engine:
+    // a switch reads `config.yaml` again for its limits (see `crate::switch::local_config`), and a player is
+    // not a limit - one run does not change players halfway through. A file whose player setting was unusable
+    // came back with the default one in it, which is what this copies.
+    let player = config.player.clone();
 
     // Which backend the last run used is what decides everything after this: `ui.yaml`, beside
     // `config.yaml`. A missing file, or bytes this run could not make sense of, already answered "the local
@@ -224,7 +239,7 @@ pub async fn run() -> ExitCode {
     // write), and the delete that follows a refusal of a kept password. It is made here, before the screen,
     // because it lives as long as the screen does - every backend this run switches to sends its work on this
     // same queue, and the loop reads the answers whenever they turn up.
-    let mut work = Work::new(&paths, &store);
+    let mut work = Work::new(&paths, &player, &store);
 
     // The event stream is made once for the whole screen and let go before the last save: its reader owns
     // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
