@@ -23,7 +23,13 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, model: &Model) {
     let line = if model.quit_armed() {
         confirmation()
     } else if let Some(notice) = model.notice() {
-        notice_line(notice)
+        notice_line(notice).unwrap_or_else(|| {
+            if model.files_focused {
+                hints_from(keys::FILE_LIST_HINTS)
+            } else {
+                hints_for(keys::FOOTER_KEYS)
+            }
+        })
     } else if model.files_focused {
         hints_from(keys::FILE_LIST_HINTS)
     } else {
@@ -65,15 +71,18 @@ fn hints_from(described: &[(&'static str, &'static str)]) -> Line<'static> {
 /// The last thing the backend said, in the colour that says whether it was good news or bad news.
 /// How long it stays is the model's business; this line only shows it while it has one. A refused sign-in is
 /// bad news about the connection like any other error: who has to act on it is the run's business, not the
-/// footer's, so it is drawn in the same colour with the same text.
-fn notice_line(notice: &Notice) -> Line<'static> {
+/// footer's, so it is drawn in the same colour with the same text. A file to play is drawn as nothing at all:
+/// it is a job the run does, and the line that lands on the footer is the one the player reports.
+fn notice_line(notice: &Notice) -> Option<Line<'static>> {
     let (text, style) = match notice {
         Notice::Info(text) => (text, Style::new().fg(theme::INK_300)),
         Notice::Error(text) | Notice::SignInRefused(text) => {
             (text, Style::new().fg(theme::RED_500))
         }
+        // Not drawn; the player's own line is what the footer gets.
+        Notice::Play(_) => return None,
     };
-    Line::from(Span::styled(format::safe(text), style))
+    Some(Line::from(Span::styled(format::safe(text), style)))
 }
 
 /// A `q` that found something still downloading: what each answer means, in the warning colour so
@@ -115,7 +124,7 @@ mod tests {
     #[test]
     fn a_notice_is_drawn_as_one_line() {
         let text = "a tracker refused an announce";
-        let line = notice_line(&Notice::Error(text.to_string()));
+        let line = notice_line(&Notice::Error(text.to_string())).expect("an error is drawn");
         assert_eq!(line.width(), text.chars().count());
     }
 
@@ -124,8 +133,24 @@ mod tests {
     #[test]
     fn a_refused_sign_in_is_drawn_like_an_error() {
         let text = "sign-in was refused: the password was wrong";
-        let refusal = notice_line(&Notice::SignInRefused(text.to_string()));
-        assert_eq!(refusal, notice_line(&Notice::Error(text.to_string())));
+        let refusal =
+            notice_line(&Notice::SignInRefused(text.to_string())).expect("a refusal is drawn");
+        assert_eq!(
+            notice_line(&Notice::Error(text.to_string())).as_ref(),
+            Some(&refusal)
+        );
         assert_eq!(refusal.width(), text.chars().count());
+    }
+
+    /// A file to play is not a line the footer shows: the run does the opening, and the line that lands is
+    /// the player's. The footer falls back to its hints.
+    #[test]
+    fn a_play_notice_is_not_drawn() {
+        use fbtt_core::{PlaySource, PlayTarget, StreamUrl};
+        let play = Notice::Play(PlayTarget {
+            title: "a film".to_string(),
+            source: PlaySource::Url(StreamUrl::new("http://h/x?token=abc".into())),
+        });
+        assert!(notice_line(&play).is_none(), "a play notice draws nothing");
     }
 }

@@ -396,6 +396,8 @@ fn warn_notice(notice: &Notice) {
         Notice::Info(text) | Notice::Error(text) | Notice::SignInRefused(text) => {
             tracing::warn!(problem = %text, "the library reported a problem");
         }
+        // A file to play is not a report about the library: nothing to warn about.
+        Notice::Play(_) => {}
     }
 }
 

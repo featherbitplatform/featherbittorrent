@@ -31,15 +31,12 @@ use axum::http::{HeaderMap, Method, header};
 use fbt_api::{AuthRejection, AuthRequest, Authenticator};
 use fbtt_core::ServerConfig;
 
+/// The clock a store with a life keeps time by: the process's own in a run, whatever a test
+/// wants. The login stores and the core's stream tokens keep time by the same shape, so the
+/// alias lives in the core and is re-exported here, where the login stores were the first to
+/// need it.
+pub use fbtt_core::Clock;
 pub use fbtt_core::auth::LOGIN_NAMESPACE;
-
-/// The clock a login store keeps time by: the process's own in a run, whatever a test wants.
-///
-/// A session lives an hour and a challenge one minute. A test that waited for either would spend
-/// the waiting, and a suite made of those is a suite nobody runs twice. So every store here is
-/// handed its clock instead of reading one itself, and a test hands in a counter it moves forward
-/// by hand.
-pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// The clock a run uses: the monotonic clock, which no change to the wall clock moves.
 fn wall_clock() -> Clock {

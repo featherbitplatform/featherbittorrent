@@ -40,6 +40,11 @@ const TEMP_FILE_SUFFIX: &str = ".tmp";
 /// One KiB and one MiB, in the bytes per second and bytes the engine counts in.
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
+/// The most extra arguments a media player may be handed before the file is refused:
+/// a playlist's arguments, and the player's own, are one line a hostile file must not fill.
+const MAX_PLAYER_ARGS: usize = 32;
+/// The most bytes a single extra argument may be, for the same reason.
+const MAX_PLAYER_ARG_BYTES: usize = 1024;
 
 /// What can go wrong finding, reading or writing the config.
 #[derive(Debug, Error)]
@@ -81,6 +86,47 @@ pub enum ConfigLoad {
         /// user and to log.
         problem: String,
     },
+}
+
+/// The media player a library tells a file to open in, and the extra arguments it passes
+/// before the media.
+///
+/// `program` is `auto` (the run finds mpv, then VLC), `mpv`, `vlc`, or a path or command
+/// name; `args` are put before the media. Both are bounded, because they end up on a
+/// process's argument line, which a hostile or a merely careless file must not be able to
+/// fill: at most 32 arguments, each at most 1024 bytes, and a program that is not empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerConfig {
+    /// What to start. `auto` finds mpv or VLC; otherwise that program by name or path.
+    pub program: String,
+    /// Extra arguments put before the media.
+    pub args: Vec<String>,
+}
+
+impl Default for PlayerConfig {
+    /// Find a player by itself, with nothing to put before the media.
+    fn default() -> Self {
+        PlayerConfig {
+            program: "auto".to_string(),
+            args: Vec::new(),
+        }
+    }
+}
+
+/// Whether the header and help screen draw the image logo.
+///
+/// `Auto` (the default) shows it in terminals that speak one of the image protocols and
+/// leaves the text title everywhere else; `Off` is the way out for a terminal that
+/// misbehaves on the probe's queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogoSetting {
+    /// The terminal decides: an image where it can show one, the text title everywhere else.
+    #[default]
+    Auto,
+    /// The text title, wherever.
+    Off,
 }
 
 /// The running limits, in the units a person thinks in.
@@ -252,6 +298,10 @@ pub struct Config {
     /// `device` names one; a config the TUI saves for itself does not. See the module docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerConfig>,
+    /// The media player a file opens in, and its extra arguments.
+    pub player: PlayerConfig,
+    /// Whether the image logo is drawn.
+    pub logo: LogoSetting,
 }
 
 impl Default for Config {
@@ -313,6 +363,8 @@ impl Config {
             cache_size_mib: DEFAULT_CACHE_SIZE_MIB,
             // No server section: this config has not chosen to serve anything.
             server: None,
+            player: PlayerConfig::default(),
+            logo: LogoSetting::default(),
         }
     }
 
@@ -481,10 +533,46 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
             });
         }
     };
-    match serde_norway::from_slice::<Config>(&bytes) {
-        Ok(config) => Ok(Reading::Parsed(Box::new(config))),
-        Err(error) => Ok(Reading::Unparsable(error)),
+    let config = match serde_norway::from_slice::<Config>(&bytes) {
+        Ok(config) => config,
+        Err(error) => return Ok(Reading::Unparsable(error)),
+    };
+    // The player's program and arguments end up on a process's argument line, so a file that
+    // overruns them is refused the same way an unparsable one is, in the same one-line shape.
+    if let Some(problem) = player_problem(&config) {
+        return Ok(Reading::Unparsable(serde::de::Error::custom(problem)));
     }
+    Ok(Reading::Parsed(Box::new(config)))
+}
+
+/// What is wrong with a config's player setting, or `None` when the program and its arguments
+/// may be put on a player's line: an empty program names nothing to start, and more than
+/// [`MAX_PLAYER_ARGS`] arguments, or one longer than [`MAX_PLAYER_ARG_BYTES`] bytes, would fill
+/// the argument line a playlist or a file is handed in.
+fn player_problem(config: &Config) -> Option<String> {
+    let player = &config.player;
+    if player.program.is_empty() {
+        return Some(
+            "player.program is empty; it must be auto, mpv, vlc, or a program name or path"
+                .to_string(),
+        );
+    }
+    if player.args.len() > MAX_PLAYER_ARGS {
+        return Some(format!(
+            "player.args has {} entries; at most {MAX_PLAYER_ARGS} are allowed",
+            player.args.len()
+        ));
+    }
+    if player
+        .args
+        .iter()
+        .any(|arg| arg.len() > MAX_PLAYER_ARG_BYTES)
+    {
+        return Some(format!(
+            "an entry in player.args is longer than {MAX_PLAYER_ARG_BYTES} bytes"
+        ));
+    }
+    None
 }
 
 /// The host's own Downloads directory, when it has one.
@@ -574,8 +662,8 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, ServerConfig, UserEntry,
-        user_download_dir,
+        AuthConfig, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, LogoSetting, ServerConfig,
+        UserEntry, user_download_dir,
     };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
@@ -1163,6 +1251,115 @@ mod tests {
                 .expect("still there")
                 .allowed_roots,
             roots
+        );
+    }
+
+    /// What the media player is told to be: `auto` lets the run find mpv or VLC itself,
+    /// no extra arguments, and the logo is on. A config file that names none of these
+    /// gets these.
+    #[test]
+    fn player_config_defaults() {
+        let dir = ScratchDir::new("config_player_defaults");
+        let paths = library(&dir);
+
+        let loaded = match Config::load(&paths).expect("a missing file is still read") {
+            ConfigLoad::Missing => Config::default(),
+            ConfigLoad::Loaded(config) => config,
+            ConfigLoad::Bad { config, .. } => config,
+        };
+        assert_eq!(
+            loaded.player.program, "auto",
+            "a library nobody set up finds a player itself"
+        );
+        assert!(
+            loaded.player.args.is_empty(),
+            "no extra arguments until the config names some"
+        );
+        assert_eq!(
+            loaded.logo,
+            LogoSetting::Auto,
+            "the logo is drawn when the terminal can show it"
+        );
+
+        // A file that names only the program keeps the rest at the defaults above.
+        fs::write(paths.config_file(), "player:\n  program: vlc\nlogo: off\n")
+            .expect("write a player config");
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read the player config")
+        else {
+            panic!("a player config is still a config");
+        };
+        assert_eq!(config.player.program, "vlc");
+        assert!(config.player.args.is_empty());
+        assert_eq!(config.logo, LogoSetting::Off);
+    }
+
+    /// What the player is allowed to be told: at most 32 extra arguments, each at most
+    /// 1024 bytes, and a program that is not empty. Anything past that is a config the
+    /// run will not act on, and it is said in one line.
+    #[test]
+    fn player_config_rejects_oversized_args() {
+        let dir = ScratchDir::new("config_player_oversized");
+        let paths = library(&dir);
+
+        // One argument that is 1025 bytes is one byte too many to put on a player's line.
+        let long = "x".repeat(1025);
+        fs::write(
+            paths.config_file(),
+            format!("player:\n  program: mpv\n  args:\n    - {long}\n"),
+        )
+        .expect("write an oversized argument");
+        let ConfigLoad::Bad { problem, .. } =
+            Config::load(&paths).expect("an oversized argument is reported")
+        else {
+            panic!("a 1025-byte argument is refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+        assert!(
+            problem.contains("1024"),
+            "the limit is named in the line: {problem}"
+        );
+
+        // Thirty-three arguments are one too many to hold in a playlist's arguments.
+        let many = (0..33)
+            .map(|slot| format!("  - a{slot}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            paths.config_file(),
+            format!("player:\n  program: mpv\n  args:\n{many}\n"),
+        )
+        .expect("write too many arguments");
+        let ConfigLoad::Bad { problem, .. } =
+            Config::load(&paths).expect("too many arguments are reported")
+        else {
+            panic!("33 arguments are refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+        assert!(
+            problem.contains("32"),
+            "the limit is named in the line: {problem}"
+        );
+
+        // An empty program names no player at all, which is nothing to start.
+        fs::write(paths.config_file(), "player:\n  program: \"\"\n")
+            .expect("write an empty program");
+        let ConfigLoad::Bad { problem, .. } =
+            Config::load(&paths).expect("an empty program is reported")
+        else {
+            panic!("an empty program is refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
         );
     }
 

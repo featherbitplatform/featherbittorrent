@@ -62,6 +62,8 @@ async fn within<T>(what: impl std::future::Future<Output = T>) -> T {
 fn text(notice: Notice) -> String {
     match notice {
         Notice::Info(line) | Notice::Error(line) | Notice::SignInRefused(line) => line,
+        // A file to play is not a line of text a test reads; these tests never hand one out.
+        Notice::Play(_) => String::new(),
     }
 }
 

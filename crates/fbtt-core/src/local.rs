@@ -45,6 +45,8 @@ const NO_TORRENT: &str = "the torrent is not in this library";
 /// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
 /// them - not an empty one, none at all.
 const DEVICES_ON_A_SERVER: &str = "Devices are managed on a server";
+/// What the screen is told when it asks to play a file, before this release can.
+const NOT_YET: &str = "Streaming is not available yet";
 
 /// The backend that runs the torrents in this process.
 ///
@@ -406,6 +408,8 @@ impl Backend {
             // running its own engine has no device list to change, and says so rather than pretending
             // to have an empty one.
             Command::Devices(_) => self.notify(Notice::Error(DEVICES_ON_A_SERVER.to_owned())),
+            // Playing a file needs a path or a loopback stream, which arrive with the next tasks.
+            Command::Stream { .. } => self.notify(Notice::Error(NOT_YET.to_owned())),
             Command::Shutdown => {}
         }
     }

@@ -34,6 +34,9 @@ reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
+# The SHA-256 a stream token is stored as: the token itself is returned once on issue and
+# is a credential from then on, so what a store keeps is its hash and the compare is on it.
+sha2.workspace = true
 # The `Signer` trait ssh-key implements but does not re-export: it is how a device key signs a
 # gateway assertion over the exact bytes that are sent (see the workspace comment).
 signature.workspace = true

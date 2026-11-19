@@ -914,6 +914,8 @@ pub fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
                 format::safe(text).fg(theme::RED_500)
             }
             Some(Notice::Info(text)) => format::safe(text).fg(theme::INK_300),
+            // A file to play is not a line the saving screen shows either: it is a job the run does.
+            Some(Notice::Play(_)) => SAVING.fg(theme::INK_300),
             None => SAVING.fg(theme::INK_300),
         };
         let [_, middle, _] = Layout::vertical([
