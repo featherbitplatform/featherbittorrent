@@ -32,3 +32,9 @@ ssh-key.workspace = true
 # the same reading reqwest dials, so a backslash or a user name spelled into the authority cannot make the
 # screen call a remote host loopback.
 url.workspace = true
+# The logo's image work in `graphics`: `png` decodes the shipped mark and encodes the PNG an iTerm2
+# inline payload carries, `color_quant` chooses the 256-colour palette a sixel stream is allowed to
+# send, and `base64` spells the bytes both protocols transmit as text.
+png.workspace = true
+color_quant.workspace = true
+base64.workspace = true

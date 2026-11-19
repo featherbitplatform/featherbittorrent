@@ -129,6 +129,11 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    // The logo's capability probe (see `crate::probe`): one write of the queries and the answers that come
+    // back, asked here because it owns stdin until it is done and `EventStream` cannot share it. Nothing is
+    // drawn with the answer yet - Task 9 puts it in the screen state and draws with it.
+    let _graphics = crate::probe::detect(false); // Task 9 reads the logo setting here
+
     // Listened for before anything else can go wrong from here on: a listener made once
     // buffers a signal that lands between two turns of the loop, where one made per turn
     // would miss it entirely.
