@@ -290,13 +290,6 @@ pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placemen
     // The tallest mark the box can hold without growing past the screen, tried from tallest
     // first.
     logos_ref.large.iter().find_map(|prepared| {
-        // The mark has to fit the box's inner width: the box is padded one cell on each side,
-        // plus the two columns of border, so the inner width is the box's width minus four.
-        // The box's width is the widest of the list and the mark, so the mark fits when its
-        // own columns plus the padding do not exceed the screen.
-        if u32::from(prepared.dims.cols) + 4 > u32::from(area.width) {
-            return None;
-        }
         // The box as it will be drawn with this mark: the reserved rows plus the list, sized
         // and centred the way `draw_box` draws it.
         let lines = help_lines(area, logos, Some(prepared));
@@ -304,6 +297,13 @@ pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placemen
             return None;
         }
         let box_rect = box_rect(area, &lines);
+        // The mark has to fit the box's inner width: the box is padded one cell on each side
+        // inside its two border columns, so the inner width is the box's width minus four. This
+        // is checked against the box as built, not assumed from the mark being narrower than the
+        // key list, so a wider mark or a narrower list can never put the mark outside the box.
+        if u32::from(prepared.dims.cols) + 4 > u32::from(box_rect.width) {
+            return None;
+        }
         // The mark stands on the first row inside the border, and the key lines begin right
         // below it, after the blank row the list leaves.
         let x = box_rect.x + (box_rect.width.saturating_sub(prepared.dims.cols)) / 2;

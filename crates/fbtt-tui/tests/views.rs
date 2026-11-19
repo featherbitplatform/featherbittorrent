@@ -1129,7 +1129,8 @@ fn modal_over_header_drops_small_placement() {
     );
 }
 
-/// The minimal view never has a mark: its one line per torrent is all it is, at any size.
+/// The minimal view has no header mark: its one line per torrent is all it is, at any size. (The
+/// help dialog drawn over it has its own mark, see `minimal_view_help_places_the_mark`.)
 #[test]
 fn minimal_view_has_no_logo() {
     let snap = library();
@@ -1140,6 +1141,50 @@ fn minimal_view_has_no_logo() {
     assert!(
         drawn.placements.is_empty(),
         "the minimal view does not place a mark"
+    );
+}
+
+/// The help dialog over the minimal view: the dialog is the same box in either view, so its mark
+/// is placed the same way - once, on the row right below the box's top border, with every key and
+/// the close hint still on the screen. Without it the box would hold a blank band.
+#[test]
+fn minimal_view_help_places_the_mark() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.view = fbtt_tui::View::Minimal;
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
+    let larges: Vec<_> = drawn
+        .placements
+        .iter()
+        .filter(|placement| matches!(placement.size, LogoSize::Large(_)))
+        .collect();
+    assert_eq!(
+        larges.len(),
+        1,
+        "the help over the minimal view places exactly one large mark"
+    );
+    assert!(
+        drawn
+            .placements
+            .iter()
+            .all(|placement| placement.size != LogoSize::Small),
+        "the minimal view itself has no header mark"
+    );
+    let lines = drawn.screen.lines();
+    let top_row = lines
+        .iter()
+        .position(|line| line.contains('┌'))
+        .expect("the help box has a top border");
+    assert_eq!(
+        usize::from(larges[0].rect.y),
+        top_row + 1,
+        "the mark is on the row right below the box's top border"
+    );
+    assert!(
+        drawn.screen.text().contains("Esc close"),
+        "the close hint is still there"
     );
 }
 
