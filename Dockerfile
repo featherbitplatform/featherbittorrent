@@ -13,9 +13,10 @@
 # interactive terminal for the wizard (docs/server.md). Downloads go wherever the config's
 # download_dir points; in the example stack that is inside the /data volume.
 
-# Bookworm (Debian 12) on both sides: the binary built here needs exactly the glibc the release
-# archives promise (see .github/workflows/release.yml), and rust-toolchain.toml picks the stable
-# toolchain out of the builder image.
+# Bookworm (Debian 12) on both sides: this image builds its own binary on Debian 12 and runs that binary in
+# the Debian 12 image below, so it needs only the glibc it runs on. rust-toolchain.toml picks the stable
+# toolchain out of the builder image. The release archives are a separate build: their binary is built on
+# glibc 2.34, RHEL 9's, so that it runs on systems older than this one (see .github/workflows/release.yml).
 FROM rust:1-bookworm AS build
 WORKDIR /app
 

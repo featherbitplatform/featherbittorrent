@@ -40,6 +40,11 @@ const TEMP_FILE_SUFFIX: &str = ".tmp";
 /// One KiB and one MiB, in the bytes per second and bytes the engine counts in.
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
+/// The most extra arguments a media player may be handed before the file is refused:
+/// a playlist's arguments, and the player's own, are one line a hostile file must not fill.
+const MAX_PLAYER_ARGS: usize = 32;
+/// The most bytes a single extra argument may be, for the same reason.
+const MAX_PLAYER_ARG_BYTES: usize = 1024;
 
 /// What can go wrong finding, reading or writing the config.
 #[derive(Debug, Error)]
@@ -81,6 +86,62 @@ pub enum ConfigLoad {
         /// user and to log.
         problem: String,
     },
+    /// The file read as this config, but the player's setting is not something a run may act on:
+    /// an empty program, more than `MAX_PLAYER_ARGS` arguments, or an argument longer than
+    /// `MAX_PLAYER_ARG_BYTES` bytes. The file is left exactly where it is - it was read, and a
+    /// person fixing the line needs to see what was in it - and every setting but the player's is
+    /// kept as read. Only the player's comes back at its default, and the run works on that.
+    ///
+    /// The reset is in memory, not in the file: the next save of this config - for example the
+    /// first limits save the local engine makes while it runs - writes the default player over
+    /// the bad value, so the file is corrected on the next write, not before.
+    PlayerProblem {
+        /// The config as the file has it, with only the player's setting at its default.
+        config: Config,
+        /// One line saying what is wrong with the player's setting, fit to show the user and to log.
+        problem: String,
+    },
+}
+
+/// The media player a library tells a file to open in, and the extra arguments it passes
+/// before the media.
+///
+/// `program` is `auto` (the run finds mpv, then VLC), `mpv`, `vlc`, or a path or command
+/// name; `args` are put before the media. Both are bounded, because they end up on a
+/// process's argument line, which a hostile or a merely careless file must not be able to
+/// fill: at most 32 arguments, each at most 1024 bytes, and a program that is not empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerConfig {
+    /// What to start. `auto` finds mpv or VLC; otherwise that program by name or path.
+    pub program: String,
+    /// Extra arguments put before the media.
+    pub args: Vec<String>,
+}
+
+impl Default for PlayerConfig {
+    /// Find a player by itself, with nothing to put before the media.
+    fn default() -> Self {
+        PlayerConfig {
+            program: "auto".to_string(),
+            args: Vec::new(),
+        }
+    }
+}
+
+/// Whether the header and help screen draw the image logo.
+///
+/// `Auto` (the default) shows it in terminals that speak one of the image protocols and
+/// leaves the text title everywhere else; `Off` is the way out for a terminal that
+/// misbehaves on the probe's queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogoSetting {
+    /// The terminal decides: an image where it can show one, the text title everywhere else.
+    #[default]
+    Auto,
+    /// The text title, wherever.
+    Off,
 }
 
 /// The running limits, in the units a person thinks in.
@@ -252,6 +313,10 @@ pub struct Config {
     /// `device` names one; a config the TUI saves for itself does not. See the module docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerConfig>,
+    /// The media player a file opens in, and its extra arguments.
+    pub player: PlayerConfig,
+    /// Whether the image logo is drawn.
+    pub logo: LogoSetting,
 }
 
 impl Default for Config {
@@ -313,6 +378,8 @@ impl Config {
             cache_size_mib: DEFAULT_CACHE_SIZE_MIB,
             // No server section: this config has not chosen to serve anything.
             server: None,
+            player: PlayerConfig::default(),
+            logo: LogoSetting::default(),
         }
     }
 
@@ -322,15 +389,26 @@ impl Config {
     /// that is not valid YAML becomes [`ConfigLoad::Bad`] with this library's own
     /// defaults ([`Config::default_for`], with its download folder resolved), and
     /// it is renamed to `<file>.bad`: a run must not overwrite what it could not
-    /// read. A file that cannot be opened at all (no permission, a directory in
-    /// the way) is an error, because there is no way to tell "empty" from
-    /// "unavailable". The library comes in rather than the file for exactly this
-    /// reason: the defaults have to be rooted in it.
+    /// read. A file that reads as this config but overruns the player's bounds
+    /// becomes [`ConfigLoad::PlayerProblem`]: the file is left where it is, and
+    /// the config comes back with the player's setting at its default and a line
+    /// saying what is wrong. A file that cannot be opened at all (no permission,
+    /// a directory in the way) is an error, because there is no way to tell
+    /// "empty" from "unavailable". The library comes in rather than the file for
+    /// exactly this reason: the defaults have to be rooted in it.
     pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
         let path = paths.config_file();
         match read_and_parse(&path)? {
             Reading::Absent => Ok(ConfigLoad::Missing),
             Reading::Parsed(config) => Ok(ConfigLoad::Loaded(*config)),
+            Reading::PlayerProblem(config, problem) => {
+                // The file was read and is left exactly where it is: a person fixing the line needs to
+                // see what was in it, and the run keeps everything the file named but the player's.
+                Ok(ConfigLoad::PlayerProblem {
+                    config: (*config).resolve(paths),
+                    problem,
+                })
+            }
             Reading::Unparsable(error) => {
                 // The file moves out of the way before anything can take its place.
                 let aside = suffixed(&path, BAD_FILE_SUFFIX);
@@ -361,6 +439,11 @@ impl Config {
         match read_and_parse(path) {
             Ok(Reading::Absent) => Ok(None),
             Ok(Reading::Parsed(config)) => Ok(Some(*config)),
+            // The file read as this config; the player's setting is not what a run may act on, but a
+            // caller editing the file wants the bytes as written - including the bad line - to see and
+            // to fix. The one line names the file and says the player's setting is what to fix, so the
+            // person who got it knows where and what, and the edit is refused rather than rewritten.
+            Ok(Reading::PlayerProblem(_, problem)) => Err(player_problem_line(path, &problem)),
             Ok(Reading::Unparsable(error)) => Err(problem_line(path, &error)),
             // A file that cannot be opened at all: the same reason `load` calls it an error, put in one
             // line instead of carrying an enum a caller only formats anyway.
@@ -375,7 +458,15 @@ impl Config {
     /// cross a filesystem), are synced, and only then are renamed over the
     /// target: a crash leaves either the old config or the new one, never half
     /// of each. A failure before the rename removes the temp file; a failed
-    /// rename leaves it holding what we tried to save.
+    /// rename leaves it holding what we tried to save. A temp file left behind by
+    /// such a failure is removed before the next save writes, so its mode is never
+    /// the mode the config ends up with.
+    ///
+    /// On Unix the file and any directory this save makes are owner-only, because what goes in them
+    /// is Argon2 password hashes and device public keys: the temp file is created 0600 rather than
+    /// loosened after the write, and a new directory is 0700. A directory that was already there
+    /// keeps the mode its owner gave it. Windows permissions do not work this way, so nothing
+    /// changes there.
     ///
     /// What goes in is this config with `server.allowed_roots` unnamed when it is only the download
     /// folder [`resolve`] filled in: a run saves the config it resolved, and pinning the roots to
@@ -399,7 +490,7 @@ impl Config {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent).map_err(cannot_write)?;
+            create_private_dir(parent).map_err(cannot_write)?;
         }
         write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, text.as_bytes())
             .map_err(cannot_write)
@@ -454,22 +545,28 @@ impl Config {
 }
 
 /// What reading one config file gave, before anybody decides what to do about a bad one. A config is a few
-/// hundred bytes of everything the run works on, and the box keeps the two "there are bytes" cases the same
-/// size instead of making the empty one pay for both.
+/// hundred bytes of everything the run works on, and the box keeps the "there are bytes" cases the same
+/// size instead of making the empty one pay for all of them.
 enum Reading {
     /// Nothing at that path.
     Absent,
     /// Bytes that read as this config.
     Parsed(Box<Config>),
+    /// Bytes that read as this config, but the player's setting is not something a run may act on,
+    /// with the one line that says what is wrong.
+    PlayerProblem(Box<Config>, String),
     /// Bytes that are there and are not this config, with the parse failure that says so.
     Unparsable(serde_norway::Error),
 }
 
 /// Reads `path` and parses it: [`Reading::Absent`] for no file, [`Reading::Unparsable`] for bytes that
 /// are not this config, and [`ConfigError`] only for a file that cannot be opened at all (no permission,
-/// a directory in the way), where there is no way to tell "empty" from "unavailable". This is the one
-/// place a config file is read; [`Config::load`] and [`Config::load_for_edit`] differ in what they do
-/// with an unparsable file, not in how they find out about it.
+/// a directory in the way), where there is no way to tell "empty" from "unavailable". A file that reads
+/// as this config but overruns the player's bounds is a [`Reading::PlayerProblem`], not an
+/// [`Reading::Unparsable`]: the bytes were understood, so the file stays where it is and only the
+/// player's setting is the part the run does not act on. This is the one place a config file is read;
+/// [`Config::load`] and [`Config::load_for_edit`] differ in what they do with an unparsable file, not
+/// in how they find out about it.
 fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -481,10 +578,49 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
             });
         }
     };
-    match serde_norway::from_slice::<Config>(&bytes) {
-        Ok(config) => Ok(Reading::Parsed(Box::new(config))),
-        Err(error) => Ok(Reading::Unparsable(error)),
+    let config = match serde_norway::from_slice::<Config>(&bytes) {
+        Ok(config) => config,
+        Err(error) => return Ok(Reading::Unparsable(error)),
+    };
+    // The player's program and arguments end up on a process's argument line, so a file that overruns
+    // them is not acted on: the config comes back with the player's setting at its default, and the
+    // line saying why is the one the run shows. The file itself is read, and it stays where it is.
+    if let Some(problem) = player_problem(&config) {
+        let mut kept = config;
+        kept.player = PlayerConfig::default();
+        return Ok(Reading::PlayerProblem(Box::new(kept), problem));
     }
+    Ok(Reading::Parsed(Box::new(config)))
+}
+
+/// What is wrong with a config's player setting, or `None` when the program and its arguments
+/// may be put on a player's line: an empty program names nothing to start, and more than
+/// [`MAX_PLAYER_ARGS`] arguments, or one longer than [`MAX_PLAYER_ARG_BYTES`] bytes, would fill
+/// the argument line a playlist or a file is handed in.
+fn player_problem(config: &Config) -> Option<String> {
+    let player = &config.player;
+    if player.program.is_empty() {
+        return Some(
+            "player.program is empty; it must be auto, mpv, vlc, or a program name or path"
+                .to_string(),
+        );
+    }
+    if player.args.len() > MAX_PLAYER_ARGS {
+        return Some(format!(
+            "player.args has {} entries; at most {MAX_PLAYER_ARGS} are allowed",
+            player.args.len()
+        ));
+    }
+    if player
+        .args
+        .iter()
+        .any(|arg| arg.len() > MAX_PLAYER_ARG_BYTES)
+    {
+        return Some(format!(
+            "an entry in player.args is longer than {MAX_PLAYER_ARG_BYTES} bytes"
+        ));
+    }
+    None
 }
 
 /// The host's own Downloads directory, when it has one.
@@ -545,9 +681,22 @@ fn problem_line(path: &Path, error: &serde_norway::Error) -> String {
     }
 }
 
+/// One line about a config whose player's setting is not something a run may act on: the file's
+/// path, and the player's value is what to fix. Unlike [`problem_line`] (a file that cannot be
+/// read at all), this file *was* read and is left where it is, so the line says the file and the
+/// setting to fix rather than a parse failure.
+fn player_problem_line(path: &Path, problem: &str) -> String {
+    format!(
+        "{}: the player setting is not usable ({}); fix the player section and keep the file",
+        path.display(),
+        problem
+    )
+}
+
 /// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
-/// file beside the target, synced, then renamed over it. The session state save shares
-/// this so both files are replaced by the same rules ([`crate::LocalBackend`]).
+/// file beside the target, readable only by the owner on Unix, synced, then renamed over
+/// it. The session state save shares this so both files are replaced by the same rules
+/// ([`crate::LocalBackend`]).
 pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, bytes)
 }
@@ -557,7 +706,7 @@ pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// holding what we tried to save.
 fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(temp)?;
+        let mut file = create_private_file(temp)?;
         file.write_all(bytes)?;
         // The bytes are on disk before the rename makes them the config.
         file.sync_all()
@@ -571,11 +720,61 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
     }
 }
 
+/// Opens `temp` for writing so that the bytes are unreadable by anybody but the owner from the
+/// first byte: mode 0600 at creation rather than chmod'd after the write, because a hash that sat
+/// in a world-readable file was readable while it sat there. A leftover temp file is taken out of
+/// the way first - opening over an existing file keeps the mode that file already had - and
+/// `create_new` after the removal means the bytes land in a file this call made.
+#[cfg(unix)]
+fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::remove_file(temp) {
+        Ok(()) => {}
+        // No leftover is the normal case, not a failure.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        // A umask only clears bits, and 0600 has no group or other bit left to clear.
+        .mode(0o600)
+        .open(temp)
+}
+
+/// Opens `temp` for writing as it has always been opened on a platform whose permissions are not
+/// per-file modes: nothing here tightens, and nothing fails that used to succeed.
+#[cfg(not(unix))]
+fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(temp)
+}
+
+/// Makes `dir` and every missing directory above it, owner-only on Unix for the same reason the
+/// file inside it is: 0700 keeps another local user out of the folder holding the hashes. Only what
+/// this call creates gets that mode; a directory that was already there keeps whatever its owner
+/// chose for it.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)
+}
+
+/// Makes `dir` and every missing parent, as it always has on a platform where the mode a new
+/// directory gets is not something this call decides.
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, ServerConfig, UserEntry,
-        user_download_dir,
+        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, LogoSetting,
+        PlayerConfig, ServerConfig, UserEntry, suffixed, user_download_dir,
     };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
@@ -1166,6 +1365,172 @@ mod tests {
         );
     }
 
+    /// What the media player is told to be: `auto` lets the run find mpv or VLC itself,
+    /// no extra arguments, and the logo is on. A config file that names none of these
+    /// gets these.
+    #[test]
+    fn player_config_defaults() {
+        let dir = ScratchDir::new("config_player_defaults");
+        let paths = library(&dir);
+
+        let loaded = match Config::load(&paths).expect("a missing file is still read") {
+            ConfigLoad::Missing => Config::default(),
+            ConfigLoad::Loaded(config) => config,
+            ConfigLoad::PlayerProblem { config, .. } | ConfigLoad::Bad { config, .. } => config,
+        };
+        assert_eq!(
+            loaded.player.program, "auto",
+            "a library nobody set up finds a player itself"
+        );
+        assert!(
+            loaded.player.args.is_empty(),
+            "no extra arguments until the config names some"
+        );
+        assert_eq!(
+            loaded.logo,
+            LogoSetting::Auto,
+            "the logo is drawn when the terminal can show it"
+        );
+
+        // A file that names only the program keeps the rest at the defaults above.
+        fs::write(paths.config_file(), "player:\n  program: vlc\nlogo: off\n")
+            .expect("write a player config");
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read the player config")
+        else {
+            panic!("a player config is still a config");
+        };
+        assert_eq!(config.player.program, "vlc");
+        assert!(config.player.args.is_empty());
+        assert_eq!(config.logo, LogoSetting::Off);
+    }
+
+    /// What the player is allowed to be told: at most 32 extra arguments, each at most
+    /// 1024 bytes, and a program that is not empty. Anything past that is reported in one
+    /// line; the file itself is left exactly where it is, with everything else kept, and
+    /// only the player's setting comes back at its default.
+    #[test]
+    fn player_config_rejects_oversized_args() {
+        let dir = ScratchDir::new("config_player_oversized");
+        let paths = library(&dir);
+
+        // One argument that is 1025 bytes is one byte too many to put on a player's line.
+        let long = "x".repeat(1025);
+        fs::write(
+            paths.config_file(),
+            format!("player:\n  program: mpv\n  args:\n    - {long}\n"),
+        )
+        .expect("write an oversized argument");
+        let ConfigLoad::PlayerProblem { problem, .. } =
+            Config::load(&paths).expect("an oversized argument is reported")
+        else {
+            panic!("a 1025-byte argument is refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+        assert!(
+            problem.contains("1024"),
+            "the limit is named in the line: {problem}"
+        );
+
+        // Thirty-three arguments are one too many to hold in a playlist's arguments.
+        let many = (0..33)
+            .map(|slot| format!("  - a{slot}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            paths.config_file(),
+            format!("player:\n  program: mpv\n  args:\n{many}\n"),
+        )
+        .expect("write too many arguments");
+        let ConfigLoad::PlayerProblem { problem, .. } =
+            Config::load(&paths).expect("too many arguments are reported")
+        else {
+            panic!("33 arguments are refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+        assert!(
+            problem.contains("32"),
+            "the limit is named in the line: {problem}"
+        );
+
+        // An empty program names no player at all, which is nothing to start.
+        fs::write(paths.config_file(), "player:\n  program: \"\"\n")
+            .expect("write an empty program");
+        let ConfigLoad::PlayerProblem { problem, .. } =
+            Config::load(&paths).expect("an empty program is reported")
+        else {
+            panic!("an empty program is refused, not swallowed");
+        };
+        assert_eq!(
+            problem.lines().count(),
+            1,
+            "the problem is one line: {problem}"
+        );
+    }
+
+    /// A bad `player` setting is a problem with one value, not with the whole file: the server
+    /// section and every other setting stay as the file has them, the player's comes back at
+    /// its default, and the file itself is not renamed aside. A genuinely unparsable file is
+    /// still set aside, which is the point this test guards against.
+    #[test]
+    fn a_player_problem_keeps_the_config() {
+        let dir = ScratchDir::new("config_player_problem_keeps");
+        let paths = library(&dir);
+
+        // A server that names a bind, and a player whose program is empty.
+        fs::write(
+            paths.config_file(),
+            "server:\n  bind: 127.0.0.1:8099\nplayer:\n  program: \"\"\n",
+        )
+        .expect("write a config with a bad player");
+
+        let ConfigLoad::PlayerProblem { config, problem } =
+            Config::load(&paths).expect("the file is read, not refused")
+        else {
+            panic!("a player problem keeps the config, it does not set it aside");
+        };
+
+        // The server section is exactly as the file has it.
+        let server = config
+            .server
+            .as_ref()
+            .expect("the server section survives a bad player");
+        assert_eq!(
+            server.bind,
+            "127.0.0.1:8099"
+                .parse()
+                .expect("the address the file named"),
+            "the server's bind is kept as the file named it"
+        );
+
+        // The player's setting is at its default: the default program, no extra arguments.
+        assert_eq!(
+            config.player,
+            PlayerConfig::default(),
+            "only the player's setting is reset"
+        );
+
+        // One line saying what is wrong with the player's setting.
+        assert_eq!(problem.lines().count(), 1, "one line: {problem}");
+
+        // The file itself is where it started: nothing was renamed.
+        assert!(
+            paths.config_file().exists(),
+            "the config file is still there"
+        );
+        assert!(
+            !suffixed(&paths.config_file(), BAD_FILE_SUFFIX).exists(),
+            "no .bad file was created"
+        );
+    }
+
     /// A password hash is a secret: nothing that prints a config may show it. `Debug` names the
     /// field and hides its value, so a log line or a panic message carries the name only.
     #[test]
@@ -1205,5 +1570,113 @@ mod tests {
         assert!(shown.contains("<hash>"), "and says so: {shown}");
         let shown = format!("{:?}", vec![user]);
         assert!(!shown.contains("argon2"), "so does a list of them: {shown}");
+    }
+
+    /// The config file holds Argon2 password hashes and device public keys, so another local user
+    /// must not be able to read it. Owner-only from the first byte: 0600 is whatever the umask is,
+    /// because a umask only clears bits and 0600 has no group or other bits left to clear.
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_owner_only");
+        let path = dir.path().join("config.yaml");
+
+        Config::default().save(&path).expect("save the defaults");
+
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the file holds the hashes: {:o}",
+            mode & 0o777
+        );
+    }
+
+    /// A `<file>.tmp` left by a save that failed halfway may carry looser permissions, and opening
+    /// over it keeps the mode the leftover already had. The save takes the leftover out of the way
+    /// first, so the file the hashes land in is one this save created.
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_a_loose_leftover_tmp() {
+        use super::TEMP_FILE_SUFFIX;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_loose_tmp");
+        let path = dir.path().join("config.yaml");
+        let temp = suffixed(&path, TEMP_FILE_SUFFIX);
+        fs::write(&temp, "leftover from a save that failed\n").expect("leave a temp file behind");
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))
+            .expect("loosen it, as an older run's umask would have");
+
+        Config::default()
+            .save(&path)
+            .expect("save over the leftover temp file");
+
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a loose leftover must not set the mode of the config: {:o}",
+            mode & 0o777
+        );
+        assert!(
+            !temp.exists(),
+            "the leftover is gone rather than renamed onto the target: {}",
+            temp.display()
+        );
+    }
+
+    /// The directory a first save makes holds that file, so it is made owner-only too: 0700, which
+    /// also keeps another local user from listing the name. A directory that was already there
+    /// keeps the mode its owner gave it; this only decides the mode of what it creates.
+    #[cfg(unix)]
+    #[test]
+    fn new_config_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_new_dir_mode");
+        let nested = dir.path().join("nested");
+        let path = nested.join("config.yaml");
+
+        Config::default()
+            .save(&path)
+            .expect("save into a directory that does not exist yet");
+
+        let mode = fs::metadata(&nested)
+            .expect("the directory was made")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the config directory holds the hashes: {:o}",
+            mode & 0o777
+        );
+
+        // A directory that was already there is left as its owner set it, even when that is looser.
+        let chosen = dir.path().join("chosen");
+        fs::create_dir(&chosen).expect("make the directory first");
+        fs::set_permissions(&chosen, fs::Permissions::from_mode(0o755)).expect("loosen it");
+        Config::default()
+            .save(&chosen.join("config.yaml"))
+            .expect("save into a directory that exists already");
+        let mode = fs::metadata(&chosen)
+            .expect("the directory is still there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "an existing directory's own mode stands: {:o}",
+            mode & 0o777
+        );
     }
 }

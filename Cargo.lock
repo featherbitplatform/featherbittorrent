@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -558,6 +564,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a35200383f20018d41c14d1ab19c1727c697f544492143f7d93aa39f0187848"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -576,10 +591,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "clap_mangen"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3b6a8907b1723f211693e27b9af5899b86a9512ef5b08bd4a15b6bceb30da6d"
+dependencies = [
+ "clap",
+ "roff",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
+name = "color_quant"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00c1c79b421ca69d94677a49b2ccf389dab3409952aed790594de8fa03b07989"
 
 [[package]]
 name = "colorchoice"
@@ -669,6 +700,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -1161,8 +1201,8 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbt"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -1173,8 +1213,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-api"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "axum",
  "fbt",
@@ -1194,16 +1234,16 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fbt-core"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "rand 0.10.3",
  "sha1",
@@ -1214,8 +1254,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "fbt-bencode",
@@ -1230,8 +1270,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -1243,8 +1283,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-net"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -1258,8 +1298,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-session"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "bitflags",
  "bytes",
@@ -1285,8 +1325,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -1307,8 +1347,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-utp"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -1320,8 +1360,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-wire"
-version = "0.9.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.9.0#89424a4d712b90b018008d08ea01fe3988ab9515"
+version = "0.10.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.10.0#82330632be7a4281bfdaf3f3b310be0346db0f09"
 dependencies = [
  "bitflags",
  "bytes",
@@ -1338,17 +1378,21 @@ dependencies = [
 
 [[package]]
 name = "fbtt-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "axum",
  "base64 0.23.1",
  "directories",
  "fbt",
+ "fbt-api",
  "futures-core",
+ "futures-util",
  "getrandom 0.4.3",
  "reqwest",
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "ssh-agent-lib",
  "ssh-key 0.7.0-rc.12",
@@ -1359,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1367,6 +1411,8 @@ dependencies = [
  "fbt",
  "fbt-api",
  "fbtt-core",
+ "futures",
+ "futures-util",
  "getrandom 0.4.3",
  "p256 0.14.0",
  "reqwest",
@@ -1382,12 +1428,15 @@ dependencies = [
 
 [[package]]
 name = "fbtt-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64 0.23.1",
+ "color_quant",
  "crossterm",
  "directories",
  "fbt",
  "fbtt-core",
+ "png",
  "ratatui",
  "ssh-key 0.7.0-rc.12",
  "url",
@@ -1395,10 +1444,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdeflate"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
 name = "featherbittorrent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
+ "clap_complete",
+ "clap_mangen",
  "crossterm",
  "fbt",
  "fbtt-core",
@@ -1408,6 +1468,7 @@ dependencies = [
  "keyring",
  "ratatui",
  "rpassword",
+ "rustix",
  "serde_norway",
  "tokio",
  "tracing",
@@ -1453,6 +1514,17 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "flate2"
+version = "1.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
+]
 
 [[package]]
 name = "foldhash"
@@ -2169,6 +2241,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2521,6 +2613,19 @@ checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der 0.7.10",
  "spki",
+]
+
+[[package]]
+name = "png"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
+dependencies = [
+ "bitflags",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -2977,6 +3082,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
 name = "rpassword"
 version = "7.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3381,6 +3492,12 @@ dependencies = [
  "digest 0.11.3",
  "rand_core 0.10.1",
 ]
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "slab"
@@ -4486,6 +4603,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

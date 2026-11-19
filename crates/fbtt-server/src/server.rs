@@ -171,12 +171,6 @@ impl Server {
             None
         };
 
-        let shared = Arc::new(Shared::new(
-            config,
-            paths.clone(),
-            roots,
-            dummy_password_hash,
-        ));
         let (mut engine, start_problems) = Engine::start(settings, paths, lock)
             .await
             .map_err(ServerError::Engine)?;
@@ -185,6 +179,18 @@ impl Server {
         for problem in start_problems {
             warn_notice(&problem);
         }
+
+        // What the routes know, built on the library they answer about: the torrent routes - the one that
+        // hands out an address to stream a file from included - read the same session fbt-api is handed
+        // below, and every clone of a session is the same session. It comes after the engine for that
+        // reason: a route cannot be given a library that does not exist yet.
+        let shared = Arc::new(Shared::new(
+            config,
+            paths.clone(),
+            roots,
+            dummy_password_hash,
+            engine.session().clone(),
+        ));
 
         // Per-torrent reports from the saves this task makes: a torrent whose resume data would not come
         // back is worth a line every time it is left out, and the queue is bounded on purpose - the save
@@ -195,8 +201,8 @@ impl Server {
         // What fbt-api is configured with: our bind address, our authenticator and the same folders this
         // server's own routes may name. `ApiConfig` is non-exhaustive, so its fields are set one by one
         // rather than named in a literal; everything it does not hear about keeps fbt-api's own default -
-        // including the 32 MiB body limit, which is for uploading a `.torrent` and which the login routes
-        // cut down to their own far smaller one.
+        // including the 32 MiB body limit, which is for uploading a `.torrent` and which the login routes and
+        // the stream-token route cut down to their own far smaller ones.
         let mut api_config = ApiConfig::default();
         api_config.bind = bind;
         // Always our own authenticator, auth on or off: with `Auth::Disabled` fbt-api would decide who is
@@ -396,6 +402,8 @@ fn warn_notice(notice: &Notice) {
         Notice::Info(text) | Notice::Error(text) | Notice::SignInRefused(text) => {
             tracing::warn!(problem = %text, "the library reported a problem");
         }
+        // A file to play is not a report about the library: nothing to warn about.
+        Notice::Play(_) => {}
     }
 }
 

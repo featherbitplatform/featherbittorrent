@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod format;
+pub mod graphics;
 pub mod keys;
 pub mod modal;
 pub mod model;

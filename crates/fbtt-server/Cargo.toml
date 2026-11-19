@@ -40,6 +40,8 @@ sha2.workspace = true
 ssh-key.workspace = true
 # The request and response bodies of our own routes.
 serde.workspace = true
+# `StreamExt::next`, for the stream-token route reading its body chunk by chunk under its own caps.
+futures-util.workspace = true
 # The login route parses a body it took as bytes. Already in the tree through axum's `json`.
 serde_json.workspace = true
 thiserror.workspace = true
@@ -69,6 +71,9 @@ p256.workspace = true
 # blocking-pool Argon2 verify at once. `net` is for the two servers `tests/remote.rs` puts up of its own -
 # a hostile one and a gateway one - beside the real one.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+# The relay's bound test puts nine requests in flight at once: `join_all` is the one
+# combinator that does that without naming nine.
+futures.workspace = true
 
 [[test]]
 name = "server"

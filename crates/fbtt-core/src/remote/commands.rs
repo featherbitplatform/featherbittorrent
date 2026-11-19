@@ -42,6 +42,9 @@ impl Backend {
             }
             Command::ListDirs(path) => self.dirs = Some(self.list_dirs(path).await),
             Command::Devices(command) => self.devices(command).await,
+            // Playing a file: a stream address from the server's token route, checked
+            // before it reaches a player, through the relay for a gateway target.
+            Command::Stream { id, file } => self.stream(&id, file).await,
             Command::Shutdown => {}
         }
     }

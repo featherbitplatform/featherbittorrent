@@ -214,10 +214,71 @@ impl Auth {
         }
     }
 
+    /// Says only the gateway's token is no good, so the next gateway call renews it. This is what the
+    /// relay's `401` path calls (see [`super::http::Api::invalidate_gateway`]): a `Kind::Server` session
+    /// is the TUI's, and the relay never sent it, so a `401` on the relay's forward must not throw it
+    /// away.
+    pub(crate) fn invalidate_gateway(&mut self) {
+        if let Kind::Gateway(gateway) = &mut self.kind {
+            gateway.live = None;
+        }
+    }
+
+    /// Whether the gateway token held right now is exactly `token`. The relay's `401` path uses it as the
+    /// compare of a compare-and-swap: only the request that sent the token still held invalidates it.
+    pub(crate) fn gateway_token_is(&self, token: &str) -> bool {
+        match &self.kind {
+            Kind::Gateway(gateway) => gateway
+                .live
+                .as_ref()
+                .is_some_and(|live| live.token == token),
+            _ => false,
+        }
+    }
+
     /// Whether this target signs to a gateway rather than to the server itself, which changes what a `403`
     /// means (see [`super::http::Api::refused`]) and what a notice about a refusal should say.
     pub(crate) fn signs_for_a_gateway(&self) -> bool {
         matches!(self.kind, Kind::Gateway(_) | Kind::Basic { .. })
+    }
+
+    /// Whether this login's relay credential can be renewed after a `401`: only `Kind::Gateway`
+    /// holds a bearer the gateway can re-issue. A `Kind::Server` session is the TUI's, and the relay
+    /// never sent it, so a `401` on the relay's forward cannot be about the session.
+    pub(crate) fn gateway_token_kind(&self) -> bool {
+        matches!(self.kind, Kind::Gateway(_))
+    }
+
+    /// The credential the relay may send on a stream forward: only the gateway's proof, never the
+    /// server's session bearer. The stream token is already in the query the relay forwards, so a
+    /// password or device login behind a gateway that checks only its key header sends that header
+    /// alone, and a `GatewayBasic` login sends its `Authorization`. [`Credential::Open`] when the
+    /// target has no gateway credential of its own.
+    ///
+    /// This is what keeps the relay from carrying the TUI's session bearer onto every player seek:
+    /// a `Kind::Server` credential is the session, and the relay is not where a session goes. A
+    /// `Kind::Gateway` login's bearer is a gateway token earned from the gateway's own endpoint, and
+    /// that one the relay may send: earning it is what the gateway checks.
+    pub(crate) async fn relay_credential(&mut self) -> Result<Credential, String> {
+        match &mut self.kind {
+            // A server login's credential is the session bearer: the relay never sends it. The
+            // gateway header still goes on the request beside it (see [`super::http::gateway_headers`]).
+            Kind::Server(_) | Kind::Open => Ok(Credential::Open),
+            Kind::Basic { user, password } => Ok(Credential::Basic(user.clone(), password.clone())),
+            // The gateway's own bearer token, earning it when the one held is missing or stale.
+            // `Gateway::fetch` signs an assertion the gateway checks against this client's public
+            // key, so it needs nothing from the server - and no gateway key (see its own docs).
+            Kind::Gateway(gateway) => {
+                if let Some(live) = &gateway.live
+                    && live.still_good()
+                {
+                    return Ok(Credential::Bearer(live.token.clone()));
+                }
+                let live = gateway.fetch(&self.client).await?;
+                gateway.live = Some(live.clone());
+                Ok(Credential::Bearer(live.token))
+            }
+        }
     }
 
     /// The credential in hand right now, without signing in: what the event stream is allowed to send, and

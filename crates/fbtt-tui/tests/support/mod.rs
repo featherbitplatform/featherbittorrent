@@ -130,6 +130,12 @@ impl Screen {
         Screen { terminal }
     }
 
+    /// A screen from a terminal a test drew into itself, for a frame drawn with something `new`
+    /// cannot - the prepared logos the binary gives it.
+    pub fn from_terminal(terminal: Terminal<TestBackend>) -> Screen {
+        Screen { terminal }
+    }
+
     /// Every buffer line as text, left to right and top to bottom.
     pub fn lines(&self) -> Vec<String> {
         let buffer = self.terminal.backend().buffer();

@@ -1,4 +1,5 @@
-//! The routes featherbittorrent adds in front of fbt-api: logins, devices and folder browsing.
+//! The routes featherbittorrent adds in front of fbt-api: logins, devices, folder browsing and the address
+//! to stream one file from.
 //!
 //! Every one of them answers JSON, and every error has the body fbt-api's own errors have
 //! (`{"error": {"code": ..., "message": ...}}`), so a client parses one shape for the whole API. They
@@ -16,6 +17,7 @@ mod devices;
 // [`Root`]s before fbt-api is handed any of them, and it has to name the type to do that.
 pub(crate) mod fs;
 mod login;
+mod stream;
 
 use std::collections::BTreeMap;
 // Only the test-support counters and the hold they update need these; the fields they belong to exist only
@@ -68,9 +70,9 @@ fn parallel_verifies() -> usize {
     cores.clamp(1, MAX_PARALLEL_VERIFIES)
 }
 
-/// Who may log in, which devices the login route recognises, which folders the file routes may name,
-/// and where the file all of that came from. One of these is built per server and shared by every
-/// handler.
+/// Who may log in, which devices the login route recognises, which folders the file routes may name, which
+/// library the torrent routes answer about, and where the file all of that came from. One of these is built
+/// per server and shared by every handler.
 pub(crate) struct Shared {
     /// The session, challenge and limiter stores - the same ones the [`fbt_api::Authenticator`] fbt-api
     /// calls reads, because exactly one thing knows who is signed in.
@@ -96,6 +98,12 @@ pub(crate) struct Shared {
     /// answers to itself. See [`fs`]. An `Arc<[..]>` rather than a `Vec` because listing a folder runs on
     /// the blocking pool and hands the roots no ownership it should not have to share.
     roots: Arc<[fs::Root]>,
+    /// The library being served, for the routes that answer about a torrent ([`stream`]): which torrents
+    /// there are, whether one's metadata has arrived, which files it has. fbt-api holds its own clone of the
+    /// same session ([`crate::Server`]), and every clone is the same session, so the address this route
+    /// hands out and the stream route that serves it look at one library. Not in the `Debug` printing below:
+    /// what a session prints is every torrent in it, which is not what a `Debug` line here is for.
+    session: fbt::Session,
     /// The hash an unknown user name is verified against, so that answering "no such account" costs
     /// what answering "wrong password" costs. `None` when no account could have been found anyway -
     /// with no users, or with nobody signing in, there is no name worth hiding. See [`login`].
@@ -127,16 +135,19 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// The state for one server: its own login stores, its devices, and the folders `config` names.
+    /// The state for one server: its own login stores, its devices, the folders `config` names and the
+    /// library it is serving.
     ///
     /// `roots` are those folders as canonicalised directories - the same list
     /// [`fbt_api::ApiConfig::allowed_roots`] is handed - and `dummy_password_hash` is the hash computed
     /// once at startup for the accounts this config has, or `None` when it has none worth hiding behind.
+    /// `session` is the engine's own session, cloned: what the torrent routes answer about.
     pub(crate) fn new(
         config: Config,
         paths: Paths,
         roots: Vec<fs::Root>,
         dummy_password_hash: Option<String>,
+        session: fbt::Session,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
         // what `Server::build` serves on in the same case.
@@ -150,6 +161,7 @@ impl Shared {
             base_config: config,
             paths,
             roots: roots.into(),
+            session,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             #[cfg(feature = "test-support")]
@@ -168,6 +180,13 @@ impl Shared {
     /// token issued here is accepted there and nowhere else.
     pub(crate) fn authenticator(&self) -> Arc<FbttAuth> {
         Arc::clone(&self.auth)
+    }
+
+    /// The library being served: what [`stream`] answers a torrent question about. A clone of it is another
+    /// handle on the same session, which is how this route and fbt-api's own routes agree about which
+    /// torrents exist.
+    pub(crate) fn session(&self) -> &fbt::Session {
+        &self.session
     }
 
     /// The device named by `fingerprint`: the name to give a successful login, and the public key from
@@ -610,5 +629,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/api/v1/auth/devices/{name}", delete(devices::remove))
         .route("/api/v1/fs/roots", get(fs::roots))
         .route("/api/v1/fs/list", get(fs::list))
+        // The one route here that hands out a credential, so it needs a session exactly like everything else
+        // that is not a login. Its body is two short fields and fbt-api's 32 MiB is room for uploading a
+        // `.torrent`, so it gets a cap of its own: with logins off this route answers whoever reaches the
+        // address, and a megabyte of JSON naming one file is not a request worth buffering.
+        .route(
+            "/api/v1/stream-tokens",
+            post(stream::issue).layer(DefaultBodyLimit::max(stream::MAX_TOKEN_BODY)),
+        )
         .with_state(shared)
 }

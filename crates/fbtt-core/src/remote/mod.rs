@@ -30,9 +30,11 @@ pub(crate) mod gateway;
 pub(crate) mod http;
 pub(crate) mod login;
 pub(crate) mod map;
+pub(crate) mod relay;
 mod routes;
 mod sse;
 mod stopping;
+mod stream;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -196,6 +198,11 @@ impl RemoteBackend {
                     watching: None,
                     dirs: None,
                     devices: None,
+                    // The relay starts on the first `Stream` a gateway target is asked
+                    // for, and is kept for the run. A plain field: commands are answered
+                    // one at a time by the loop, so a second `Stream` cannot race the
+                    // bind, and there is no lock to take.
+                    relay: None,
                     torrents: Vec::new(),
                     totals: initial.totals,
                     limits: initial.limits,
@@ -315,6 +322,13 @@ struct Backend {
     dirs: Option<DirListing>,
     /// The devices this server lets sign in, from the last `Devices` command; `None` until one is asked for.
     devices: Option<Vec<DeviceRow>>,
+    /// The loopback relay a gateway target streams through: started on the first
+    /// `Stream` that needs it and kept for the run, the same arrangement as the local
+    /// endpoint (see [`crate::stream::local::LocalEndpoint`]). A plain field rather than
+    /// a lock: commands are answered one at a time by the loop, so a second `Stream`
+    /// cannot race the bind onto the loopback, and there is no await the lock would have
+    /// to be dropped for.
+    relay: Option<relay::Relay>,
     /// What the last good round of reads said, reused whole when the link is down so the screen keeps
     /// showing something rather than nothing.
     torrents: Vec<TorrentRow>,

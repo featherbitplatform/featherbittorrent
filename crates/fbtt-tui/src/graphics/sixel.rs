@@ -1,0 +1,359 @@
+//! Sixel: a DCS string carrying a palette and bands of six pixel rows.
+//!
+//! Sixel is the oldest of the three protocols here and the only one with no image id to keep, so it
+//! gets the simplest treatment: quantize to at most 256 colours, then write the palette and one band at
+//! a time. A terminal that answers DA1 with `4` understands this (foot, fbterm, xterm built with sixel
+//! graphics), and nothing else in the plan needs it.
+//!
+//! Sixel has no alpha channel, so [`quantize`] reads the RGB of each pixel and ignores its alpha;
+//! [`crate::graphics::image::render`] hands it an opaque image anyway.
+
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use super::image::Rgba;
+
+/// The most colours a sixel palette holds.
+const MAX_COLORS: usize = 256;
+
+/// How many pixel rows a sixel band carries.
+const BAND_ROWS: usize = 6;
+
+/// The shortest run worth writing with `!`, and the longest count that field can hold.
+const RUN_MIN: usize = 4;
+const RUN_MAX: usize = 255;
+
+/// `ST`: the two bytes that end a sixel string.
+const ST: &str = "\x1b\\";
+
+/// An image in the form sixel is written from: a palette of at most 256 colours and one palette index
+/// per pixel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Indexed {
+    /// Width in pixels.
+    pub w: u32,
+    /// Height in pixels.
+    pub h: u32,
+    /// The palette, in the order the encoder numbers it: entry `i` is `#i`.
+    pub palette: Vec<[u8; 3]>,
+    /// `w * h` indices into `palette`, rows in order.
+    pub idx: Vec<u8>,
+}
+
+/// `img` reduced to at most 256 colours.
+///
+/// An image that already has no more than 256 distinct colours keeps them exactly, in the order they
+/// first appear - which is what a logo drawn from five theme colours deserves, and it costs one pass
+/// over the pixels. Anything with more goes through NeuQuant (the algorithm `pngquant` uses) at its
+/// usual study factor of 10.
+///
+/// An image whose byte count disagrees with its dimensions quantizes to nothing: an `Indexed` whose
+/// indices do not match its size would have `encode` read colours that are not there.
+#[must_use]
+pub fn quantize(img: &Rgba) -> Indexed {
+    let Some(need) = usize::try_from(u64::from(img.w) * u64::from(img.h) * 4).ok() else {
+        return Indexed::default();
+    };
+    if img.px.len() != need {
+        return Indexed::default();
+    }
+
+    // One pass over the pixels, numbering each colour the first time it appears. A mark drawn from a
+    // handful of theme colours keeps those exact values this way, which is what it deserves; an image
+    // with more colours than a palette holds throws this away and goes through NeuQuant.
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    let mut index_of: HashMap<[u8; 3], u8> = HashMap::new();
+    let mut idx: Vec<u8> = Vec::with_capacity(img.px.len() / 4);
+    for pixel in img.px.as_chunks::<4>().0 {
+        let rgb = [pixel[0], pixel[1], pixel[2]];
+        let index = match index_of.entry(rgb) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                // Past 256 the number no longer fits a palette entry, but that only matters for the
+                // result this function is about to throw away.
+                let fresh = u8::try_from(palette.len()).unwrap_or(0);
+                palette.push(rgb);
+                *entry.insert(fresh)
+            }
+        };
+        idx.push(index);
+    }
+    if palette.len() <= MAX_COLORS {
+        return Indexed {
+            w: img.w,
+            h: img.h,
+            palette,
+            idx,
+        };
+    }
+
+    // More colours than a palette holds. `10` is the study factor `pngquant` uses too: every tenth
+    // pixel trains the net well enough on an image this size.
+    let net = color_quant::NeuQuant::new(10, MAX_COLORS, &img.px);
+    let palette: Vec<[u8; 3]> = (0..MAX_COLORS)
+        .map(|i| {
+            let [r, g, b, _a] = net.lookup(i).unwrap_or([0, 0, 0, 255]);
+            [r, g, b]
+        })
+        .collect();
+    let idx: Vec<u8> = img
+        .px
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| u8::try_from(net.index_of(pixel)).unwrap_or(0))
+        .collect();
+    Indexed {
+        w: img.w,
+        h: img.h,
+        palette,
+        idx,
+    }
+}
+
+/// `img` as a sixel stream: the header, the palette, then one band of six pixel rows at a time.
+///
+/// Within a band each colour present gets the bits of the columns it paints as sixel characters (`63`
+/// plus the bits, bit 0 being the band's top row), four or more identical characters in a row collapse
+/// to `!<count><char>`, colours are separated by `$` and bands by `-`. The palette is written in full at
+/// the start because a sixel stream has no way to say "the colours you already know". An index past the
+/// end of `idx` reads as no colour at all, so a hand-built `Indexed` cannot read out of bounds.
+#[must_use]
+pub fn encode(img: &Indexed) -> Vec<u8> {
+    // Everything written here is ASCII, so a `String` is just a buffer that grows itself.
+    let mut out = String::new();
+    // The header: sixel graphics with no background colour specified, and the image's own size so the
+    // terminal knows how much of it to draw.
+    out.push_str(&format!("\x1bP0;1;0q\"1;1;{};{}", img.w, img.h));
+    for (i, rgb) in img.palette.iter().enumerate() {
+        // `2` is the direct-RGB spelling of a palette entry; channels are percentages, because that is
+        // all this format carries.
+        out.push_str(&format!(
+            "#{};2;{};{};{}",
+            i,
+            percent(rgb[0]),
+            percent(rgb[1]),
+            percent(rgb[2])
+        ));
+    }
+
+    let width = usize::try_from(img.w).unwrap_or(0);
+    let bands = usize::try_from(u64::from(img.h).div_ceil(BAND_ROWS as u64)).unwrap_or(0);
+    let mut masks: Vec<u8> = vec![0u8; width];
+    for band in 0..bands {
+        let rows = usize::try_from(
+            img.h
+                .saturating_sub(u32::try_from(band * BAND_ROWS).unwrap_or(u32::MAX))
+                .min(BAND_ROWS as u32),
+        )
+        .unwrap_or(0);
+        // Colours in palette order, each with the columns it paints in this band. `written` is what
+        // keeps the `$` a separator rather than a terminator.
+        let mut written = false;
+        for i in 0..img.palette.len() {
+            let colour = u8::try_from(i).unwrap_or(u8::MAX);
+            masks[..width].fill(0);
+            let mut present = false;
+            for row in 0..rows {
+                let base = (band * BAND_ROWS + row) * width;
+                // One bit per row of the band: bit 0 is its top row, which is how a sixel character
+                // stacks vertically down the screen.
+                let bit = 1u8 << row;
+                for (col, mask) in masks.iter_mut().enumerate().take(width) {
+                    if img.idx.get(base + col).copied() == Some(colour) {
+                        *mask |= bit;
+                        present = true;
+                    }
+                }
+            }
+            if !present {
+                continue;
+            }
+            if written {
+                out.push('$');
+            }
+            written = true;
+            out.push_str(&format!("#{i}"));
+            push_runs(&mut out, &masks[..width]);
+        }
+        if band + 1 < bands {
+            out.push('-');
+        }
+    }
+
+    out.push_str(ST);
+    out.into_bytes()
+}
+
+/// The sixel percentage for one 8-bit channel: `round(v * 100 / 255)`, which is all this format can
+/// express. 255 becomes 100 and 0 stays 0.
+fn percent(v: u8) -> u32 {
+    (u32::from(v) * 100 + 127) / 255
+}
+
+/// `masks` as sixel characters, with runs of [`RUN_MIN`] or more written `!<count><char>`.
+///
+/// The count field holds at most [`RUN_MAX`], so a longer run is written as several of them; the short
+/// tail that leaves goes out as plain characters, because `!1`, `!2` and `!3` save nothing over
+/// repeating the character.
+fn push_runs(out: &mut String, masks: &[u8]) {
+    let mut at = 0usize;
+    while at < masks.len() {
+        let value = masks[at];
+        let mut end = at + 1;
+        while end < masks.len() && masks[end] == value {
+            end += 1;
+        }
+        let run = end - at;
+        // `63` plus the bits: `?` for no rows of this colour, `~` for all six.
+        let ch = char::from(63 + value);
+        if run < RUN_MIN {
+            for _ in 0..run {
+                out.push(ch);
+            }
+            at = end;
+            continue;
+        }
+        let mut left = run;
+        while left > RUN_MAX {
+            out.push_str("!255");
+            out.push(ch);
+            left -= RUN_MAX;
+        }
+        if left >= RUN_MIN {
+            out.push('!');
+            out.push_str(&left.to_string());
+            out.push(ch);
+        } else {
+            for _ in 0..left {
+                out.push(ch);
+            }
+        }
+        at = end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphics::caps::CellPx;
+    use crate::graphics::image::{logo_dims, mark, render};
+
+    /// A vertical strip: `top` pixels of red above `bottom` pixels of blue, one column wide.
+    fn strip(top: usize, bottom: usize) -> Rgba {
+        let mut px = Vec::new();
+        for _ in 0..top {
+            px.extend([255, 0, 0, 255]);
+        }
+        for _ in 0..bottom {
+            px.extend([0, 0, 255, 255]);
+        }
+        Rgba {
+            w: 1,
+            h: u32::try_from(top + bottom).expect("a test strip fits"),
+            px,
+        }
+    }
+
+    #[test]
+    fn sixel_two_colours() {
+        // One column, six rows: the red half is bits 0..2 of the band's only column (`63 + 7` is `F`)
+        // and the blue half is bits 3..5 (`63 + 56` is `w`). Red appears first, so it is `#0`.
+        let img = strip(3, 3);
+        assert_eq!(
+            encode(&quantize(&img)),
+            b"\x1bP0;1;0q\"1;1;1;6#0;2;100;0;0#1;2;0;0;100#0F$#1w\x1b\\".to_vec()
+        );
+    }
+
+    #[test]
+    fn sixel_runs() {
+        // Eight columns of one colour across a full band: the same character eight times in a row is
+        // written as `!8` plus that character, which is all six rows set (`63 + 63` is `~`).
+        let img = Rgba {
+            w: 8,
+            h: 6,
+            px: [255u8, 0, 0, 255].repeat(48),
+        };
+        let out = encode(&quantize(&img));
+        assert!(
+            out.windows(5).any(|w| w == b"#0!8~"),
+            "a run of eight is written as `!8`: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn sixel_two_bands() {
+        // Twelve rows is two bands, and bands are separated - not terminated - by one `-`.
+        let img = strip(6, 6);
+        let out = encode(&quantize(&img));
+        assert_eq!(
+            out.iter().filter(|b| **b == b'-').count(),
+            1,
+            "two bands are separated by one '-': {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(out.starts_with(b"\x1bP0;1;0q\"1;1;1;12"));
+        assert!(out.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn quantize_keeps_small_palettes_exact() {
+        // Three colours keep their exact values, in the order they first appeared, and every pixel
+        // points at its own entry.
+        let img = Rgba {
+            w: 4,
+            h: 1,
+            px: vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 10, 20, 30, 255, 70, 80, 90, 255,
+            ],
+        };
+        let q = quantize(&img);
+        assert_eq!((q.w, q.h), (4, 1));
+        assert_eq!(q.palette, vec![[10, 20, 30], [40, 50, 60], [70, 80, 90]]);
+        assert_eq!(q.idx, vec![0, 1, 0, 2]);
+        // Alpha is not part of a sixel palette: the same colour at two opacities is one entry.
+        let faded = Rgba {
+            w: 2,
+            h: 1,
+            px: vec![10, 20, 30, 0, 10, 20, 30, 255],
+        };
+        assert_eq!(quantize(&faded).palette, vec![[10, 20, 30]]);
+        // Exactly 256 colours is still the exact palette, and an index is its entry's number.
+        let mut px = Vec::new();
+        for i in 0..=255u8 {
+            px.extend([i, 0, 0, 255]);
+        }
+        let many = Rgba { w: 256, h: 1, px };
+        let q = quantize(&many);
+        assert_eq!(q.palette.len(), 256);
+        assert_eq!(q.palette[255], [255, 0, 0]);
+        assert_eq!(q.idx, (0..=255u8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn quantize_caps_at_256() {
+        // The mark at the help screen's twelve rows has far more colours than a palette allows: the
+        // anti-aliased edges and the gradient over the canvas are thousands of them.
+        let src = mark();
+        let dims =
+            logo_dims(12, CellPx { w: 8, h: 16 }, 1, (src.w, src.h)).expect("twelve rows fits");
+        let img = render(&src, &dims, [0x0b, 0x0b, 0x0e]);
+        assert!(
+            img.w * img.h > 256,
+            "the rendered mark has room for many colours"
+        );
+        let q = quantize(&img);
+        assert!(
+            q.palette.len() <= 256,
+            "a sixel palette is at most 256 entries: {}",
+            q.palette.len()
+        );
+        assert_eq!(
+            q.idx.len(),
+            usize::try_from(img.w * img.h).expect("a logo fits")
+        );
+        assert!(q.idx.iter().all(|i| usize::from(*i) < q.palette.len()));
+    }
+}

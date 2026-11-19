@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Example launchd agent for `featherbittorrent serve`, run as the person logged in.
+     Nothing installs or loads this file: copy it to ~/Library/LaunchAgents/, replace the /Users/YOU
+     placeholder below with your home directory, and load it with `launchctl bootstrap` yourself.
+     docs/autostart.md has the commands, and the LaunchDaemon variant for a machine nobody logs in to. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.featherbit.featherbittorrent</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/featherbittorrent</string>
+		<string>serve</string>
+	</array>
+
+	<!-- Start it as soon as this user's session starts. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Restart after a crash, and not after a clean stop: `launchctl bootout` stops the server for
+	     good instead of launchd bringing it straight back. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<!-- The grace between SIGTERM and the kill: SIGTERM is what runs the last save, and a large library
+	     takes a while to write. -->
+	<key>ExitTimeOut</key>
+	<integer>90</integer>
+
+	<!-- Closed stdin, so the setup wizard can never wait for an answer a background agent has nobody to
+	     give: with no config.yaml this run takes every default rather than blocking. Run `serve` once in a
+	     terminal first, or write the file, and the questions do not come up at all. -->
+	<key>StandardInPath</key>
+	<string>/dev/null</string>
+
+	<!-- serve says everything on stderr, one line per event; both paths below are the same file so the
+	     rare stdout line lands in it too. Replace /Users/YOU with your own home directory. -->
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/featherbittorrent.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/featherbittorrent.log</string>
+
+	<!-- Ask the system for background scheduling: no priority boost, and App Nap rules apply. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>

@@ -5,11 +5,25 @@ featherbittorrent is a BitTorrent client built on [fbt-lib](https://github.com/f
 The clients that came before it (uTorrent, Deluge, qBittorrent) work, and their shape is the one people expect: a torrent list with a detail pane, a daemon and a thin client. featherbittorrent wants that shape snappier and lighter: keypresses that feel instant, redraws that stay smooth with hundreds of torrents, and memory and CPU use small enough for the server to run comfortably on a Raspberry Pi 2B.
 
 Status: milestone 1, the local client, is complete: `featherbittorrent` in a terminal is a whole
-client, the engine runs in that process, and there is nothing to install beside the binary.
-Milestone 2, the server role (`serve`), the remote backend, authentication and streaming, lives on
-the `feature/m2-server` branch and carries the first release, 0.1.0; [docs/server.md](docs/server.md)
-and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release archives for macOS, Linux and
-Windows are built by the release workflow on a `v*` tag. Nothing is released yet.
+client, the engine runs in that process, and there is nothing to install beside the binary. Milestone 2,
+the server role (`serve`), the remote backend, authentication and streaming, shipped the first release,
+[0.1.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0);
+[docs/server.md](docs/server.md) and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release
+[0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4.
+Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
+that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
+files, each carrying man pages, shell completions, the licenses and the docs. Every artifact is built and
+smoke tested in a clean container or runner before anything is published, and the release workflow publishes
+them all on a `v*` tag.
+
+## Install
+
+Downloads are on the [releases page](https://github.com/featherbitplatform/featherbittorrent/releases), each
+file beside its own `.sha256`. [docs/install.md](docs/install.md) says which file is for your system, how to
+check it and where installing puts its files. Installing never starts anything: no package installs or enables
+a service, none creates an account, and nothing runs after the install. To have `serve` start at boot under
+systemd, launchd or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a
+time, all of it opt-in.
 
 ## Build and run
 
@@ -45,6 +59,7 @@ own guide is [docs/server.md](docs/server.md).
 | `o` | sort by the next column |
 | `O` | reverse the sort |
 | `p` | pause/resume |
+| `s` | stream in mpv or VLC |
 | `/` | filter |
 | `m` | minimal |
 | `a` | add |
@@ -62,6 +77,12 @@ own guide is [docs/server.md](docs/server.md).
 | `q` | quit |
 
 The arrow keys do what `j` and `k` do, and Ctrl-C means the same as `q`. A key is an action, not a shortcut for whichever widget has focus: `p` stops or starts the torrent under the cursor wherever the cursor is. A dialog owns the keyboard while it is up, so a `q` typed into a magnet field adds a letter instead of quitting; `Esc` closes the dialog. `q` asks before leaving when something is still downloading: press `q` again or `y` to confirm, any other key to cancel.
+
+### Streaming to a player
+
+`s` opens a file in mpv or VLC while it is still downloading: the file under the cursor with the file list focused, otherwise the selected torrent's largest file. A file that is already whole on this machine plays by its own path; anything else is streamed, over loopback from the local engine, or from a server through a short-lived token that opens exactly that one file. The player is handed a private playlist file rather than the address, so the token never shows in a process list, and mpv and VLC are found by themselves unless `player:` in `config.yaml` names one or adds arguments. Tokens, gateways and what keeps playing after you quit are in [docs/streaming.md](docs/streaming.md).
+
+The header and the help screen draw the featherbit mark as an image in terminals that speak the kitty graphics protocol, iTerm2 inline images or sixel, and keep the text title everywhere else; `logo: off` in `config.yaml` turns the image off ([docs/streaming.md](docs/streaming.md)).
 
 ### The config file
 
@@ -106,7 +127,11 @@ Two environment variables point the app at a different library, which is how you
 FBTT_CONFIG_DIR=/tmp/fbtt-config FBTT_DATA_DIR=/tmp/fbtt-data cargo run -p featherbittorrent
 ```
 
-Each one replaces one of the two directories above, and both together mean no home directory is needed at all. They are the only debug knobs, and an empty value counts as unset rather than as "use whatever directory the app happens to run in".
+Each one replaces one of the two directories above, and both together mean no home directory is needed at
+all. That is also what services and containers use them for, not only experiments: the systemd system unit and
+the LaunchDaemon variant in [docs/autostart.md](docs/autostart.md) keep a service's library under
+`/var/lib/featherbittorrent`, and the `Dockerfile`'s run line points both directories at the `/data` volume. An
+empty value counts as unset rather than as "use whatever directory the app happens to run in".
 
 ### Two instances on one library
 

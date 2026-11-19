@@ -1,0 +1,36 @@
+# Example systemd user service for `featherbittorrent serve`: one per login, started by you and not by
+# the system. Nothing installs or enables this file either; copy it to ~/.config/systemd/user/ and run
+# `systemctl --user enable` yourself, as docs/autostart.md describes.
+#
+# No account of its own and no library of its own on purpose: this unit runs as the person logged in and
+# keeps the platform's config and data directories, which is what lets a TUI opened on the same machine
+# find the library held by the running server and offer to connect to it instead of starting an engine.
+# A system service wants the opposite (see ../system/featherbittorrent.service), which is why it names its
+# own directories under /var/lib and runs as a user nobody logs in as.
+[Unit]
+Description=featherbittorrent server
+Documentation=man:featherbittorrent-serve(1) file:///usr/share/doc/featherbittorrent/autostart.md
+Wants=network-online.target
+After=network-online.target remote-fs.target
+# Uncomment this (and name your mount) when downloads go to a network share, so the server starts once
+# the mount is up instead of finding a missing folder. It pairs with `_netdev` in /etc/fstab.
+# RequiresMountsFor=/mnt/nas/torrents
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/featherbittorrent serve
+# Closed stdin, so the setup wizard can never wait for an answer a service has nobody to give: with no
+# config.yaml this run takes every default rather than blocking. Run `serve` once by hand first, or
+# write the file, and the questions do not come up at all.
+StandardInput=null
+Restart=on-failure
+RestartSec=10
+# How long SIGTERM gets before systemd sends SIGKILL. SIGTERM is what runs the last save, and a large
+# library on a NAS is the case that takes a while, so this says the grace out loud instead of leaving it
+# to whatever the default happens to be on the systemd in front of it.
+TimeoutStopSec=90
+
+[Install]
+# Only used by `systemctl --user enable`. `loginctl enable-linger` is what keeps this running when
+# nobody is logged in; see docs/autostart.md.
+WantedBy=default.target

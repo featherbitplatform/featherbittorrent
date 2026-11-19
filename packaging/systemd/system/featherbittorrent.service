@@ -1,0 +1,66 @@
+# Example systemd system service for `featherbittorrent serve`.
+# Nothing installs or enables this file: it ships as documentation under
+# /usr/share/doc/featherbittorrent/examples/, and copying it to /etc/systemd/system/ and running
+# `systemctl enable` yourself is the whole installation. docs/autostart.md walks through it, including
+# the user account this unit expects (`useradd --system ... featherbittorrent`) and what to do on a
+# machine whose downloads live on a NAS.
+[Unit]
+Description=featherbittorrent server
+Documentation=man:featherbittorrent-serve(1) file:///usr/share/doc/featherbittorrent/autostart.md
+Wants=network-online.target
+After=network-online.target remote-fs.target
+# Uncomment this (and name your mount) when downloads go to a network share, so the server starts once
+# the mount is up instead of finding a missing folder. It pairs with `_netdev` in /etc/fstab.
+# RequiresMountsFor=/mnt/nas/torrents
+
+[Service]
+Type=exec
+User=featherbittorrent
+Group=featherbittorrent
+# The library this service owns, apart from any person's own directories on the same machine: a server
+# rewrites its own config.yaml when a device is added from a laptop, so it lives where that account can
+# write. A user service leaves both unnamed and shares the platform's directories with the TUI instead.
+Environment=FBTT_CONFIG_DIR=/var/lib/featherbittorrent/config
+Environment=FBTT_DATA_DIR=/var/lib/featherbittorrent/library
+# Created files stay readable by others so a media server on the same share can read them; set UMask=0077 if the library must stay private.
+UMask=0022
+ExecStart=/usr/bin/featherbittorrent serve
+# Closed stdin, so the setup wizard can never wait for an answer a service has nobody to give: with no
+# config.yaml this run takes every default rather than blocking. Run `serve` once by hand first, or
+# write the file, and the questions do not come up at all.
+StandardInput=null
+Restart=on-failure
+RestartSec=10
+# How long SIGTERM gets before systemd sends SIGKILL. SIGTERM is what runs the last save, and a large
+# library on a NAS is the case that takes a while, so this says the grace out loud instead of leaving it
+# to whatever the default happens to be on the systemd in front of it.
+TimeoutStopSec=90
+StateDirectory=featherbittorrent
+# The library's parent stays this account's alone. systemd documents 0755 for these directories, so 0700 is a
+# tightening rather than a default, and spelling it out keeps it true: other accounts cannot traverse in to
+# reach config.yaml or session.state, whatever modes the files inside get.
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# Reads of /proc/sys and /sys/fs/cgroup stay open, writes do not: nothing here tunes a kernel switch or a
+# cgroup.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# Only these three socket families may be opened. Peers, the API and every outbound connection are IPv4 or
+# IPv6, and neither featherbittorrent nor fbt-lib opens another family (no netlink, no packet sockets).
+# AF_UNIX stays available because a name lookup can go over a Unix socket on the way to nscd or D-Bus without
+# this program asking for one. Blocking a family does not cost DNS anything: when glibc's own probe for which
+# address families have interfaces cannot open its netlink socket, it assumes both are usable rather than
+# fail the lookup (sysdeps/unix/sysv/linux/check_pf.c), so tracker hostnames still resolve.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/featherbittorrent
+# Uncomment this too, with the same mount point as RequiresMountsFor above: ProtectSystem=strict makes
+# everything outside the paths below read-only, and a download folder on a NAS is one of them.
+# ReadWritePaths=/mnt/nas/torrents
+
+[Install]
+# Only used by `systemctl enable`. Installing the package writes nothing here.
+WantedBy=multi-user.target

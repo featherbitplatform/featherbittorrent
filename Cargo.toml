@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 # Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -32,6 +32,12 @@ fbtt-tui = { path = "crates/fbtt-tui" }
 # Joins the table now that the binary depends on it for `serve`.
 fbtt-server = { path = "crates/fbtt-server" }
 clap = { version = "4.6", features = ["derive"] }
+# The man pages and shell completions the packages install, written by the hidden `generate-assets`
+# subcommand from the same `Command` that prints `--help`, so they cannot drift from the flags.
+# Both ask for clap `^4.6.6`, the workspace's 4.6 line, so the tree keeps one `clap` and one
+# `clap_builder` (`cargo tree -d` shows no duplicate).
+clap_complete = "4"
+clap_mangen = "0.3"
 # The TUI stack. crossterm is the version ratatui's own backend uses (its default),
 # so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
 # one tree means a `KeyEvent` that does not match the terminal driving it.
@@ -44,14 +50,19 @@ ratatui = { version = "0.30", default-features = false, features = [
     "layout-cache",
 ] }
 directories = "6"
-fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.9.0", features = ["serde"] }
+fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.10.0", features = ["serde"] }
 # The control API the server serves, on the same tag as the engine it drives: the two come from one
 # repository and one release, so they move together or not at all.
-fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.9.0" }
+fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.10.0" }
 # The `Stream` trait only: `std::stream::Stream` is still unstable, and this is the
 # same futures tree crossterm's `EventStream` implements it from. Already in the tree
 # through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# The test that proves the relay's bound needs nine requests in flight at once:
+# `futures::join_all` is the one combinator that names a list rather than nine names.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+# The relay's body stream: `StreamExt` to map a response's chunks into an axum body.
+futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # serde_yaml is unmaintained (RUSTSEC-2024-0340); this is its maintained fork.
 serde_norway = "0.9"
@@ -134,3 +145,13 @@ rpassword = "7"
 # (`crypto-rust`, which keyring itself asks for), so no system D-Bus or OpenSSL library is needed to
 # build it. The macOS half links the Security framework the platform already provides.
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
+# The logo (milestone 3): `png` decodes the shipped mark and encodes the image an iTerm2 inline
+# payload carries, `color_quant` picks the 256-colour palette a sixel stream is allowed. Neither
+# is default-features-off because neither has features to name: what they do is decode and encode.
+png = "0.18"
+color_quant = "2"
+# The logo probe (Task 8): `poll` and `read` on stdin, which a buffered `std::io::stdin()` would keep for
+# itself. Already in the tree through crossterm 0.29, which resolves to rustix 1.1.6 - named at that exact
+# version so this adds no versions to Cargo.lock. Unix only: see the binary's
+# `[target.'cfg(unix)'.dependencies]`.
+rustix = "1.1.6"
