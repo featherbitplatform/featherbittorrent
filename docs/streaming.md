@@ -42,11 +42,12 @@ are the same there and on the local endpoint:
 - Never longer than 8 hours from the issue, however much it is used.
 
 A player re-requests its address on every seek, so a single-use token cannot work: that is why keeping
-it alive is the player's seeking. At most 64 tokens are live per server; when the store fills, the least
-recently used token goes, never one a player is still on. Only a hash of each token is stored, and a
-token opens exactly one file: another file, another spelling of the same file, or any other route is
-refused. With logins off on the server there is no credential to hand out, and the address comes back
-with nothing on it (see [docs/server.md](server.md)).
+it alive is the player's seeking. At most 64 tokens are live per server. Once 64 are live, issuing a new
+one evicts the least recently used token; tokens that have already expired are dropped first, so they do
+not count against 64. Only a hash of each token is stored, and a token opens exactly one file: another
+file, another spelling of the same file, or any other route is refused. With logins off on the server
+there is no credential to hand out, and the address comes back with nothing on it (see
+[docs/server.md](server.md)).
 
 ## Why the player gets a playlist file
 
@@ -58,10 +59,11 @@ mpv --no-terminal --playlist=<data dir>/play/<random>.m3u
 
 While a token lives it is a credential, and on every platform this product runs on another user can
 read another process's arguments (`ps`). A playlist path names nothing secret. The file holds three
-lines, the middle one being the address; its folder is `<data dir>/play`, made `0700` so only this user
-can see the names in it, and each file is `0600`, readable only by this user (the two modes are Unix:
-other platforms have no such bits). Its name is random, so two plays of one torrent are two files and
-nothing about a name says which torrent it came from.
+lines: `#EXTM3U`, then `#EXTINF:-1,<title>`, then the address as the last line. Its folder is
+`<data dir>/play`, made `0700` so only this user can see the names in it, and each file is `0600`,
+readable only by this user (the two modes are Unix: other platforms have no such bits). Its name is
+random, so two plays of one torrent are two files and nothing about a name says which torrent it came
+from.
 
 The file goes when the player exits, or 30 s after the launch, whichever comes first: 30 s is longer
 than any player takes to read three lines and shorter than a pause at the start of a film. A run that
@@ -175,7 +177,7 @@ three rows tall, with the three text lines beside it, and only when the header h
 the help screen it stands centred above the key list, ten rows tall, or eight, or six, whichever fits.
 The minimal view has no logo, and a dialog opened over the header takes the mark away for that frame.
 
-The probe is skipped, and the text title stays, inside tmux and GNU screen (their answers belong to the
-multiplexer, which rewrites or swallows them), with `TERM=dumb`, when stdin is not a terminal, on
-Windows, and with `logo: off`. A terminal that never answers costs 300 ms of startup; once its answer
-has started arriving the wait extends to one second.
+The probe is skipped, and the text title stays, inside tmux and other terminal multiplexers (their
+answers belong to the multiplexer, which rewrites or swallows them), with `TERM=dumb`, when stdin is not
+a terminal, on Windows, and with `logo: off`. A terminal that never answers costs 300 ms of startup; once
+its answer has started arriving the wait extends to one second.

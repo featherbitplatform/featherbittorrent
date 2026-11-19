@@ -168,10 +168,11 @@ not 40 or 64 hex digits gets `400 invalid_id`. All in this API's error shape.
 
 The token's life: it must be used within 60 s of being issued; after that it stays alive while a request
 arrives at least every 30 minutes, since a player re-requests its address on every seek and a paused
-film must survive; and never beyond 8 hours from the issue. At most 64 are live on one server, and a
-full store evicts the least recently used token rather than one a player is still on. Only a hash of
-each token is stored, it opens exactly the one file its address names, and log lines name the subject,
-the torrent and the file but never the token.
+film must survive; and never beyond 8 hours from the issue. At most 64 are live on one server; once 64
+are live, issuing a new token evicts the least recently used one, and tokens that have already expired
+are dropped first so they do not count against 64. Only a hash of each token is stored, a token opens
+exactly the one file its address names, and log lines name the subject, the torrent and the file but
+never the token.
 
 With logins on, a request for the file-stream route may carry that token in `?token=` instead of a
 session token: the guard tries a query token as a stream token first, only on the two methods of that
