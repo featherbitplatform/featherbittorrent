@@ -249,12 +249,15 @@ pub async fn run() -> ExitCode {
         logos: &mut logos,
         placer: &mut placer,
     };
+    let startup_cell = graphics.cell.map(|cell| (cell.w, cell.h));
     let screen = crate::switch::Screen {
         model: &mut model,
         snap: &mut snap,
         mark: &mut mark,
         wanted: None,
         in_flight: None,
+        protocol: graphics.protocol,
+        scale: graphics.scale,
     };
     let (quit, screen, running) = run_session(
         terminal.get_mut(),
@@ -265,6 +268,7 @@ pub async fn run() -> ExitCode {
         &mut stream,
         &mut signal,
         prepare_fut,
+        startup_cell,
     )
     .await;
 

@@ -95,14 +95,26 @@ pub fn draw_with(
     // The marks, when the screen has any to place. They are applied last, after the dialog:
     // a mark the open dialog covers is dropped rather than drawn under it, and the ones that
     // survive are the placements the binary's placer writes the image around.
-    let placements = match model.view {
+    let mut placements = match model.view {
         View::Full => draw_full(frame, area, model, snap, logos),
-        // The minimal view draws its one line per torrent and nothing else: it never has a mark.
+        // The minimal view draws its one line per torrent and nothing else: it has no header
+        // mark, but the help screen's mark is the dialog's, and the dialog is drawn over either
+        // view, so it is decided here and placed for both.
         View::Minimal => {
             minimal::draw(frame, area, model, snap);
             Vec::new()
         }
     };
+
+    // The help screen's mark, when the help dialog is open and the box has room for it: it is
+    // decided once here, over either view, so the lines the dialog builds (which reserve the
+    // mark's rows) and the placement that stands in them are the same decision. The minimal
+    // view places it too, because the dialog is drawn over the minimal view as well.
+    if model.modal.as_ref() == Some(&crate::modal::Modal::Help)
+        && let Some(large) = modal::help_placement(area, logos)
+    {
+        placements.push(large);
+    }
 
     // The dialog is drawn last so that it covers what it is meant to cover, and over either
     // view: the box a person gets for `a` in minimal mode is the same one they get anywhere.
@@ -143,15 +155,9 @@ fn draw_full(
     detail::draw(frame, areas.detail, model, snap);
     frame.render_widget(rule(), areas.rule_bottom);
     footer::draw(frame, areas.footer, model);
-    // The help screen's mark: the one the dialog draws above its keys, when there is room and
-    // the help dialog is what is open.
-    let mut placements = header_placement.into_iter().collect::<Vec<_>>();
-    if model.modal.as_ref() == Some(&crate::modal::Modal::Help)
-        && let Some(large) = modal::help_placement(area, logos)
-    {
-        placements.push(large);
-    }
-    placements
+    // The help screen's mark is decided once in `draw_with`, over both views, so it is not
+    // decided here as well: a mark decided twice would be placed twice.
+    header_placement.into_iter().collect::<Vec<_>>()
 }
 
 /// A rule: one line of the border colour.

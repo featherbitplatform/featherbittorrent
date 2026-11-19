@@ -46,13 +46,32 @@ fn drawn_with<'a>(
     width: u16,
     height: u16,
 ) -> Drawn<'a> {
+    drawn_with_view(
+        model,
+        snap,
+        logos,
+        LogoView { logos: Some(logos) },
+        width,
+        height,
+    )
+}
+
+/// The same draw, with the view a test spells out: the help's mark-free reference is the same
+/// screen drawn with the text title, no marks at all.
+fn drawn_with_view<'a>(
+    model: &fbtt_tui::Model,
+    snap: &Snapshot,
+    logos: &'a PreparedLogos,
+    view: LogoView<'a>,
+    width: u16,
+    height: u16,
+) -> Drawn<'a> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
     let mut placements = Vec::new();
     let frame = terminal
         .draw(|frame| {
-            placements =
-                fbtt_tui::view::draw_with(frame, model, snap, LogoView { logos: Some(logos) });
+            placements = fbtt_tui::view::draw_with(frame, model, snap, view);
         })
         .expect("a drawn frame");
     // The frame's buffer is the one that carries the view's marks: the diff the backend saw
@@ -980,68 +999,91 @@ fn help_drops_logo_when_short() {
     }
 }
 
-/// The help screen's mark, at every screen size from 20 to 60 rows and at 60, 80 and 100
-/// columns: the mark never covers a key line, and a key line is never lost to it. This is the
-/// test that catches a mark placed a row too low (which lands on the first key when the box's
-/// centring has the wrong parity) and a mark that is only placed when the box actually has room
-/// for it and for every key.
+/// The help screen's mark, at every screen size from 20 to 60 rows and from 10 to 100 columns,
+/// at both cell sizes the probe answers: the mark never covers a key line, and a key line is
+/// never lost to it. This is the test that catches a mark placed a row too low (which lands on
+/// the first key when the box's centring has the wrong parity) and a mark that is only placed
+/// when the box actually has room for it and for every key.
 ///
 /// A screen too short for the whole list in either shape loses keys with or without the mark -
-/// that is the box's own size, not the mark's - so a key is checked only where the box actually
-/// draws it, and the mark's rect is checked against the rows that hold key text.
+/// that is the box's own size, not the mark's - so a key is checked only where the mark-free
+/// draw of the same size actually draws it, and the mark's rect is checked against the box's own
+/// top border: the mark stands on the row right below it, never on it.
 #[test]
 fn the_help_mark_never_covers_a_key_line() {
     use fbtt_tui::keys::KEYS;
     let snap = library();
-    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
-    for height in 20..=60u16 {
-        for width in [60u16, 80, 100] {
-            let mut model = model_of(&snap);
-            model.modal = Some(fbtt_tui::modal::Modal::Help);
-            let drawn = drawn_with(&model, &snap, &logos, width, height);
-            // The screen a person sees: the backend's buffer, clean of the frame's residue
-            // from the full view drawn behind the dialog.
-            let lines = drawn.screen.lines();
-            // Every key the box draws is on the screen with its action: the mark never took a
-            // key line from the list. A key is "present" only if some line has it at the key
-            // column, not as a prefix of a longer key ("K" is not present in "Page Up").
-            for (key, action) in KEYS {
-                let kb = key.len();
-                let present = lines.iter().any(|line| {
-                    let after_border = line.split('│').nth(1).unwrap_or(line);
-                    let trimmed = after_border.trim_start();
-                    trimmed.starts_with(key)
-                        && trimmed
-                            .get(kb..)
-                            .is_some_and(|rest| rest.starts_with(' ') || rest.is_empty())
-                });
-                if present {
-                    let with_action = lines
+    // Both cell sizes the probe answers: 8x16 is the one the help suite has always used, and
+    // 4x16 is the narrow cell that makes the mark's own width, not the list's, the limit.
+    for cell in [CellPx { w: 8, h: 16 }, CellPx { w: 4, h: 16 }] {
+        let logos = logos(Protocol::Sixel, cell);
+        for height in 20..=60u16 {
+            for width in 10..=100u16 {
+                let mut model = model_of(&snap);
+                model.modal = Some(fbtt_tui::modal::Modal::Help);
+                let drawn = drawn_with(&model, &snap, &logos, width, height);
+                // The same screen without the mark: the same box, the text title, no mark.
+                // The keys it draws at this size are the ones the marked screen must not lose -
+                // a screen too short for the whole list in either shape loses keys with or
+                // without the mark, and that is the box's own size, not the mark's.
+                let mark_free =
+                    drawn_with_view(&model, &snap, &logos, LogoView::text(), width, height);
+                // The screen a person sees: the backend's buffer, clean of the frame's residue
+                // from the full view drawn behind the dialog.
+                let lines = drawn.screen.lines();
+                let free_lines = mark_free.screen.lines();
+                // Every key the mark-free box draws with its action, the marked screen draws with
+                // it too: the mark never took a key line from the list. The check reads only the
+                // help box's key lines - the lines from its first `│` border down to its bottom
+                // border - not the whole screen: the full view behind the modal shows a `c`
+                // (in "connected") that is not a key line, and would be a false match. A screen
+                // too small for a whole line in either shape clips the line's tail with or
+                // without the mark - that is the box's own size, not the mark's - so the
+                // reference is the mark-free draw's own key lines, and the mark is judged against
+                // it.
+                let key_lines = |lines: &[String]| -> Vec<String> {
+                    let start = lines
                         .iter()
-                        .any(|line| line.contains(key) && line.contains(action));
-                    assert!(
-                        with_action,
-                        "{width}x{height}: the key {key:?} lost its action {action:?}"
-                    );
-                }
-            }
-            // And the mark's rect does not sit on a row that holds key text: the frame skips
-            // the mark's cells, so they are blank in the frame buffer, and the list left the
-            // rows the mark stands in empty.
-            let buffer = drawn.buffer.clone();
-            if let Some(large) = drawn
-                .placements
-                .iter()
-                .find(|placement| matches!(placement.size, LogoSize::Large(_)))
-            {
-                for y in large.rect.top()..large.rect.bottom() {
-                    for x in large.rect.x..large.rect.x + large.rect.width {
+                        .position(|line| line.starts_with('┌'))
+                        .unwrap_or(0);
+                    let end = lines
+                        .iter()
+                        .rposition(|line| line.starts_with('└'))
+                        .unwrap_or_else(|| lines.len().saturating_sub(1));
+                    lines[start..=end.min(lines.len().saturating_sub(1))].to_vec()
+                };
+                let free_keys = key_lines(&free_lines);
+                let marked_keys = key_lines(&lines);
+                for (key, action) in KEYS {
+                    let present = |lines: &[String]| {
+                        lines
+                            .iter()
+                            .any(|line| line.contains(key) && line.contains(action))
+                    };
+                    if present(&free_keys) {
                         assert!(
-                            buffer[(x, y)].symbol().trim().is_empty(),
-                            "{width}x{height}: the mark covers a cell with text at ({x}, {y}): {:?}",
-                            buffer[(x, y)].symbol()
+                            present(&marked_keys),
+                            "{width}x{height} cell {cell:?}: the mark took the key line of {key:?}"
                         );
                     }
+                }
+                // And the mark stands on the row right below the box's own top border, never on
+                // it: a rect one row too high would sit on the border's row, and one too low
+                // would land on the first key.
+                if let Some(large) = drawn
+                    .placements
+                    .iter()
+                    .find(|placement| matches!(placement.size, LogoSize::Large(_)))
+                {
+                    let top_row = lines
+                        .iter()
+                        .position(|line| line.contains('┌'))
+                        .expect("the help box has a top border");
+                    assert_eq!(
+                        usize::from(large.rect.y),
+                        top_row + 1,
+                        "{width}x{height} cell {cell:?}: the mark is on the row right below the box's top border, not on it"
+                    );
                 }
             }
         }

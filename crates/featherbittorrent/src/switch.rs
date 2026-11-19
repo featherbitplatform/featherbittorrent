@@ -48,7 +48,7 @@ use fbtt_core::{
     Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, Secret,
     Snapshot,
 };
-use fbtt_tui::graphics::place::{LogoView, Placement, Placer, PreparedLogos};
+use fbtt_tui::graphics::place::{AfterDraw, LogoView, Placement, Placer, PreparedLogos};
 use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, theme, view};
 
 use crate::backend::{Backend, BackendKind, LockOutcome, SwitchPlan, plan_switch};
@@ -328,6 +328,12 @@ pub struct Screen<'a> {
     /// The cell size the running prepare was made for: the answer it gives back is matched
     /// against `wanted`, not against whatever the window says now.
     pub in_flight: Option<(u16, u16)>,
+    /// The image protocol the screen was probed with: every prepare this run makes is for this
+    /// protocol, so a resize that re-prepares before the first answer keeps the protocol the
+    /// terminal can draw, not a `None` the mark would die on.
+    pub protocol: fbtt_tui::graphics::caps::Protocol,
+    /// The cell scale the screen was probed with: the same reason, kept beside the protocol.
+    pub scale: u16,
 }
 
 /// The mark's bookkeeping for one screen: what the screen last drew, and the placer that remembers
@@ -356,10 +362,15 @@ pub async fn run_session<'a>(
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
     prepare_fut: Option<tokio::task::JoinHandle<PreparedLogos>>,
+    startup_cell: Option<(u16, u16)>,
 ) -> (Quit, Screen<'a>, Backend) {
     // The prepared logos arrive on this oneshot; the screen draws the text title until they do.
+    // The startup prepare is remembered as in flight for the cell it was probed for, so a resize
+    // that arrives before it answers is matched against that size rather than against `(0, 0)`,
+    // and the answer it gives back is the one the screen was set up to wait for.
     let mut logos_rx: Option<tokio::sync::oneshot::Receiver<PreparedLogos>> =
         prepare_fut.map(|handle| {
+            screen.in_flight = startup_cell;
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let result = handle.await;
@@ -462,6 +473,10 @@ async fn run_loop(
     // Nothing has been drawn yet, so the first tick draws.
     let mut dirty = true;
     let mut last_watch = model.watch();
+    // The placements the last frame put on the screen: the reference `before_draw` compares
+    // against before a new frame is drawn, so the pixels a frame's placeholders reference are
+    // already transmitted when the diff writes them.
+    let mut last_placements: Vec<Placement> = Vec::new();
     let mut frame = tokio::time::interval(FRAME_TICK);
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -496,13 +511,15 @@ async fn run_loop(
                 PrepareAction::Prepare { cell } => {
                     // The answer is stale: drop it, and prepare the size `wanted` remembers.
                     // The screen keeps the mark it is showing until the fresh prepare answers.
+                    // The protocol and scale are the ones the screen was probed with, so a
+                    // re-prepare never swaps the terminal's protocol for another.
                     let graphics = fbtt_tui::graphics::caps::Graphics {
-                        protocol: logos.graphics.protocol,
+                        protocol: screen.protocol,
                         cell: Some(fbtt_tui::graphics::caps::CellPx {
                             w: cell.0,
                             h: cell.1,
                         }),
-                        scale: logos.graphics.scale,
+                        scale: screen.scale,
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     tokio::spawn(async move {
@@ -574,53 +591,52 @@ async fn run_loop(
                         let w = ws.width / cols;
                         let h = ws.height / rows;
                         if w > 0 && h > 0 {
-                            // The reference is what the screen is drawing now: the logos' cell
-                            // size, or the latest estimate when no logos exist yet.
-                            let reference = screen
+                            // The decision is one pure function, so the reference choice and the
+                            // spawn rule are tested without a terminal. The reference is `wanted`
+                            // while a prepare is in flight, so a zoom back out counts as a change
+                            // and the stale answer is discarded.
+                            let logos_cell = screen
                                 .mark
                                 .logos
                                 .as_ref()
                                 .and_then(|logos| logos.graphics.cell)
-                                .map(|cell| (cell.w, cell.h))
-                                .or(screen.wanted)
-                                .unwrap_or((0, 0));
-                            if cell_size_changed(reference, (w, h)) {
-                                screen.wanted = Some((w, h));
-                                if screen.in_flight.is_none() {
-                                    // Nothing in flight: start a prepare for the new size. The
-                                    // protocol and scale come from the logos, or from the last
-                                    // prepare's answer when the logos do not exist yet.
-                                    let (protocol, scale) = screen
-                                        .mark
-                                        .logos
-                                        .as_ref()
-                                        .map(|logos| (logos.graphics.protocol, logos.graphics.scale))
-                                        .unwrap_or_else(|| {
-                                            // No logos yet: the first prepare's protocol and scale
-                                            // are the ones the screen was set up with.
-                                            (
-                                                fbtt_tui::graphics::caps::Protocol::None,
-                                                1,
-                                            )
+                                .map(|cell| (cell.w, cell.h));
+                            match on_resize(
+                                logos_cell,
+                                screen.wanted,
+                                screen.in_flight,
+                                (w, h),
+                            ) {
+                                ResizeAction::Nothing => {}
+                                ResizeAction::SetWanted { cell, spawn } => {
+                                    screen.wanted = Some(cell);
+                                    if spawn {
+                                        // Nothing in flight: start a prepare for the new size,
+                                        // for the protocol and scale the screen was probed with,
+                                        // so a resize before the first answer does not swap the
+                                        // terminal's protocol for `None`.
+                                        let graphics = fbtt_tui::graphics::caps::Graphics {
+                                            protocol: screen.protocol,
+                                            cell: Some(fbtt_tui::graphics::caps::CellPx {
+                                                w: cell.0,
+                                                h: cell.1,
+                                            }),
+                                            scale: screen.scale,
+                                        };
+                                        let (tx, rx) = tokio::sync::oneshot::channel();
+                                        tokio::spawn(async move {
+                                            let result =
+                                                tokio::task::spawn_blocking(move || {
+                                                    fbtt_tui::graphics::prepare(graphics)
+                                                })
+                                                .await;
+                                            if let Ok(logos) = result {
+                                                let _ = tx.send(logos);
+                                            }
                                         });
-                                    let graphics = fbtt_tui::graphics::caps::Graphics {
-                                        protocol,
-                                        cell: Some(fbtt_tui::graphics::caps::CellPx { w, h }),
-                                        scale,
-                                    };
-                                    let (tx, rx) = tokio::sync::oneshot::channel();
-                                    tokio::spawn(async move {
-                                        let result =
-                                            tokio::task::spawn_blocking(move || {
-                                                fbtt_tui::graphics::prepare(graphics)
-                                            })
-                                            .await;
-                                        if let Ok(logos) = result {
-                                            let _ = tx.send(logos);
-                                        }
-                                    });
-                                    *logos_rx = Some(rx);
-                                    screen.in_flight = Some((w, h));
+                                        *logos_rx = Some(rx);
+                                        screen.in_flight = Some(cell);
+                                    }
                                 }
                             }
                         }
@@ -719,16 +735,26 @@ async fn run_loop(
                     last_watch = watch;
                 }
                 // The frame: the view draws the mark's placeholder or skip cells into the buffer, and
-                // the placements come back for the placer to write the image around. The buffer the frame
-                // just drew is only valid until the next draw, so it is cloned out before anything else
-                // touches the terminal - but only when there are cells to repaint, which is the only
-                // reason the frame's buffer is needed after the draw.
+                // the placements come back for the placer to write the image around. For kitty, the
+                // pixels the placeholders reference are transmitted before the frame is drawn, so the
+                // diff never writes a placeholder for an id the terminal does not hold yet.
                 let logos_view = screen
                     .mark
                     .logos
                     .as_ref()
                     .map(|logos| LogoView { logos: Some(logos) })
                     .unwrap_or(LogoView::text());
+                if let Some(logos) = screen.mark.logos.as_ref() {
+                    // The pixels the frame owes the terminal before it is drawn: for kitty that is
+                    // the small mark and the large size the last frame placed, decided from the
+                    // last frame's placements, so the placeholders the diff is about to write find
+                    // their pixels already in place.
+                    let pre_bytes = screen.mark.placer.before_draw(logos, &last_placements);
+                    if !pre_bytes.is_empty() {
+                        let backend = terminal.backend_mut();
+                        let _ = std::io::Write::write_all(backend, &pre_bytes);
+                    }
+                }
                 let mut placements = Vec::new();
                 let done = match terminal.draw(|frame| {
                     placements = view::draw_with(frame, model, snap, logos_view);
@@ -740,19 +766,15 @@ async fn run_loop(
                 };
                 let area = done.area.into();
                 if let Some(logos) = screen.mark.logos.as_ref() {
-                    // The frame's buffer, cloned only when a repaint is owed: the cells a removed
-                    // placement used to cover are repainted from it, and a frame with nothing to
-                    // repaint does not need the clone.
-                    let screen_buffer = done.buffer.clone();
-                    write_logo_bytes(
-                        terminal,
-                        screen.mark.placer,
-                        logos,
-                        &placements,
-                        area,
-                        &screen_buffer,
-                    );
+                    // The frame's after-draw answer: which cells are owed a repaint, and the
+                    // image bytes the image protocols write. The repaint cells are copied out of
+                    // the frame's buffer before the terminal is written to, because the buffer is
+                    // borrowed from it; a frame with nothing to repaint copies nothing.
+                    let after = screen.mark.placer.after_draw(&placements, area, logos);
+                    let cells = repaint_cells(done.buffer, &after);
+                    write_logo_bytes(terminal, &cells, &after.bytes);
                 }
+                last_placements = placements;
             },
             _ = once(signal.wait.as_mut()) => return Outcome::Quit(Quit::Ok),
         }
@@ -1130,62 +1152,76 @@ fn cell_size_changed(current: (u16, u16), estimated: (u16, u16)) -> bool {
     // cell that is 10 percent bigger than the current one is a change, and so is one that is 10
     // percent smaller. Using the smaller as the denominator means a cell that is 10 percent of
     // the current one (a tenth of the size) is not a change, which is right: that is rounding.
-    let w_diff = cw.abs_diff(ew);
-    let w_min = cw.min(ew);
-    let h_diff = ch.abs_diff(eh);
-    let h_min = ch.min(eh);
+    // Widened to u32 before the multiplication: a cell estimate a terminal answers can differ
+    // from the current one by more than 655 pixels, and a u16 multiplication overflows (a panic
+    // in debug, a wrong decision in release).
+    let w_diff = u32::from(cw.abs_diff(ew));
+    let w_min = u32::from(cw.min(ew));
+    let h_diff = u32::from(ch.abs_diff(eh));
+    let h_min = u32::from(ch.min(eh));
     (w_min > 0 && w_diff * 100 > w_min * 10) || (h_min > 0 && h_diff * 100 > h_min * 10)
 }
 
-/// The logo's bytes around a frame: what the placer transmits before the cells are drawn (kitty's
-/// pixels), the cells a removed placement used to cover, repainted from the frame's own buffer, and
-/// the image the protocols write after the frame. Every frame that leaves a mark behind, and every
-/// frame that takes one down - the frame the `Saving...` screen draws is one of those - goes
-/// through this, so the screen never has the ghost of a mark its last frame did not draw.
+/// The logo's bytes after a frame is drawn: the cells a removed placement used to cover, repainted
+/// from the frame's own buffer, and the image the image protocols write over the skipped cells.
+/// Every frame that leaves a mark behind, and every frame that takes one down - the frame the
+/// `Saving...` screen draws is one of those - goes through this, so the screen never has the ghost
+/// of a mark its last frame did not draw.
 ///
-/// Kitty transmits in `before_draw`, before the frame is drawn: the pixels of the small mark and
-/// the large size this frame places go out first, so the placeholders the diff writes find them
-/// already in place. Only when the help's chosen large size changes - the one case where the
-/// pixels go out after the frame - does the transmit cost a frame, because the size is not known
-/// until the frame has decided to place it.
+/// The pixels the frame's placeholders reference are transmitted before the frame is drawn (see the
+/// frame tick, which calls [`Placer::before_draw`] with the previous frame's placements), so this
+/// writes only what a frame owes after it is drawn: for kitty that is the one case where the help's
+/// chosen large size changed this frame, because the size is not known until the frame has decided
+/// to place it; for the image protocols it is the image itself, written over the skipped cells.
+///
+/// `repaint_cells` are the cells a removed placement used to cover, copied out of the frame's
+/// buffer by the caller, which is where the decision of which cells are owed a repaint lives - the
+/// frame's buffer is borrowed from the terminal, so the cells are read out before the terminal is
+/// written to. The buffer is never cloned for the frame as a whole: only the cells that are owed a
+/// repaint are copied, and a frame with nothing to repaint copies nothing.
 fn write_logo_bytes(
     terminal: &mut DefaultTerminal,
-    placer: &mut Placer,
-    logos: &PreparedLogos,
-    placements: &[Placement],
-    area: ratatui::layout::Size,
-    buffer: &ratatui::buffer::Buffer,
+    repaint_cells: &[(u16, u16, ratatui::buffer::Cell)],
+    bytes: &[u8],
 ) {
-    // The pixels the frame owes the terminal, decided from the placements this frame draws: for
-    // kitty that is the transmission of whatever the terminal does not already hold under its ids,
-    // and the help mark's pixels are the ones for the size this frame places. Written before the
-    // cells are repainted, so the placeholders the diff writes find their pixels already in place.
-    let pre_bytes = placer.before_draw(logos, placements);
-    if !pre_bytes.is_empty() {
-        let backend = terminal.backend_mut();
-        let _ = std::io::Write::write_all(backend, &pre_bytes);
-    }
     // The image protocols write the image over the skipped cells, and the cells a removed placement
     // used to cover are repainted from the buffer the frame just drew - before the image, so a cell
     // that is text again shows the text and not the ghost of an image.
-    let after = placer.after_draw(placements, area, logos);
-    if !after.repaint.is_empty() {
-        let mut cells: Vec<(u16, u16, ratatui::buffer::Cell)> = Vec::new();
-        for rect in &after.repaint {
-            for y in rect.top()..rect.bottom() {
-                for x in rect.left()..rect.right() {
-                    cells.push((x, y, buffer[(x, y)].clone()));
-                }
-            }
-        }
+    if !repaint_cells.is_empty() {
         let backend = terminal.backend_mut();
-        let _ = backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)));
+        let _ = backend.draw(
+            repaint_cells
+                .iter()
+                .map(|(x, y, c)| (*x, *y, c as &ratatui::buffer::Cell)),
+        );
     }
-    if !after.bytes.is_empty() {
+    if !bytes.is_empty() {
         let backend = terminal.backend_mut();
-        let _ = std::io::Write::write_all(backend, &after.bytes);
+        let _ = std::io::Write::write_all(backend, bytes);
     }
     let _ = std::io::Write::flush(terminal.backend_mut());
+}
+
+/// The cells a removed placement used to cover, copied out of the frame's buffer: the answer to
+/// "which cells are owed a repaint" comes from [`Placer::after_draw`], and the cells themselves are
+/// read out of the buffer before the terminal is written to, because the buffer is borrowed from it.
+/// A frame with nothing to repaint copies nothing.
+fn repaint_cells(
+    buffer: &ratatui::buffer::Buffer,
+    after: &AfterDraw,
+) -> Vec<(u16, u16, ratatui::buffer::Cell)> {
+    if after.repaint.is_empty() {
+        return Vec::new();
+    }
+    let mut cells = Vec::new();
+    for rect in &after.repaint {
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                cells.push((x, y, buffer[(x, y)].clone()));
+            }
+        }
+    }
+    cells
 }
 
 /// The `Saving...` screen, with the newest notice still on its footer: a run that was
@@ -1229,8 +1265,11 @@ pub fn draw_saving(
     };
     if let Some(logos) = logos {
         let area = done.area.into();
-        let buffer = done.buffer.clone();
-        write_logo_bytes(terminal, placer, logos, &[], area, &buffer);
+        // The saving screen draws no mark, so the placements are empty: any mark the last frame
+        // put on the screen is owed a repaint, and the image protocols write nothing new.
+        let after = placer.after_draw(&[], area, logos);
+        let cells = repaint_cells(done.buffer, &after);
+        write_logo_bytes(terminal, &cells, &after.bytes);
     }
 }
 
@@ -1309,12 +1348,45 @@ pub(crate) fn on_prepared(
     }
 }
 
+/// What a resize is worth: the other half of the mark's resize state machine, beside
+/// [`on_prepared`]. A resize only ever sets `wanted` and starts a prepare when none is in flight;
+/// it never invalidates the placer on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeAction {
+    /// Nothing changed: the estimate is within ten percent of the reference.
+    Nothing,
+    /// Set `wanted` to the estimate, and start a prepare for it when none is in flight.
+    SetWanted { cell: (u16, u16), spawn: bool },
+}
+
+/// The decision a resize leads to. The reference the estimate is compared against is the size the
+/// screen is currently preparing toward: `wanted` when a prepare is in flight or `wanted` is set,
+/// otherwise the cell the logos on screen were made for, and with neither, the in-flight size.
+/// Comparing against `wanted` while a prepare is in flight is what makes a zoom-in-then-zoom-back
+/// out count as a change, so the stale answer is discarded and re-prepared for the size the window
+/// is back at.
+pub(crate) fn on_resize(
+    logos_cell: Option<(u16, u16)>,
+    wanted: Option<(u16, u16)>,
+    in_flight: Option<(u16, u16)>,
+    estimate: (u16, u16),
+) -> ResizeAction {
+    let reference = wanted.or(logos_cell).or(in_flight).unwrap_or((0, 0));
+    if !cell_size_changed(reference, estimate) {
+        return ResizeAction::Nothing;
+    }
+    ResizeAction::SetWanted {
+        cell: estimate,
+        spawn: in_flight.is_none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Login, Mark, PrepareAction, Screen, Switched, Work, cell_size_changed, could_not_save,
-        forget, local_config, on_prepared, remembered_ui, settle, stored_password_refused,
-        switch_onward,
+        Login, Mark, PrepareAction, ResizeAction, Screen, Switched, Work, cell_size_changed,
+        could_not_save, forget, local_config, on_prepared, on_resize, remembered_ui, settle,
+        stored_password_refused, switch_onward,
     };
     use crate::backend::{Backend, BackendKind};
     use crate::fake_store::FakeStore;
@@ -1469,6 +1541,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_huge_cell_estimate_does_not_overflow_the_change_check() {
+        // A terminal that answers a whole-screen pixel size against a tiny grid produces a
+        // cell estimate that differs from the current one by more than 655 pixels. The
+        // comparison must widen to u32 before multiplying, or it panics in debug and wraps
+        // in release.
+        assert!(
+            cell_size_changed((16, 34), (800, 34)),
+            "a cell a hundred times wider is a change"
+        );
+        assert!(
+            cell_size_changed((u16::MAX, u16::MAX), (1, 1)),
+            "a cell from the maximum to the minimum is a change"
+        );
+        // And the other direction: a tiny current cell against a huge estimate.
+        assert!(
+            cell_size_changed((1, 1), (u16::MAX, u16::MAX)),
+            "a tiny cell against a huge estimate is a change"
+        );
+    }
+
+    #[test]
+    fn a_resize_before_the_first_answer_leads_to_a_prepare_for_the_new_size() {
+        // The first prepare is in flight for 16x34, `wanted` is `None`. A resize to 18x34
+        // (a real change) sets `wanted` to 18 and does not spawn (the first prepare is in
+        // flight). When the first prepare answers for 16, it is stale against `wanted` 18:
+        // discard it and prepare 18 instead.
+        let in_flight = (16, 34);
+        let estimate = (18, 34);
+        // The resize: no logos yet, `wanted` is `None`, the first prepare is in flight.
+        assert_eq!(
+            on_resize(None, None, Some(in_flight), estimate),
+            ResizeAction::SetWanted {
+                cell: estimate,
+                spawn: false
+            }
+        );
+        // The first prepare answers for 16, but `wanted` is now 18: a change, so prepare 18.
+        let wanted = estimate;
+        assert_eq!(
+            on_prepared(Some(wanted), Some(in_flight), in_flight),
+            PrepareAction::Prepare { cell: wanted }
+        );
+    }
+
+    #[test]
+    fn a_zoom_in_and_back_out_during_a_prepare_leads_to_a_prepare_for_the_original() {
+        // Logos at 16x34. A zoom to 18 starts a prepare (18 in flight, `wanted` 18). Before
+        // it answers, a zoom back to 16: the reference is `wanted` 18 (a prepare is in
+        // flight), so 16 is a change, and `wanted` returns to 16. When the 18-prepare
+        // answers, it is stale against `wanted` 16: discard it and prepare 16.
+        let logos = (16, 34);
+        // Zoom in to 18: a change from the logos, and nothing in flight yet, so spawn.
+        assert_eq!(
+            on_resize(Some(logos), None, None, (18, 34)),
+            ResizeAction::SetWanted {
+                cell: (18, 34),
+                spawn: true
+            }
+        );
+        // The 18-prepare is now in flight; `wanted` is 18. Zoom back to 16: the reference is
+        // `wanted` 18, so 16 is a change, and no spawn (the 18-prepare is in flight).
+        assert_eq!(
+            on_resize(Some(logos), Some((18, 34)), Some((18, 34)), (16, 34)),
+            ResizeAction::SetWanted {
+                cell: (16, 34),
+                spawn: false
+            }
+        );
+        // The 18-prepare answers for 18, but `wanted` is now 16: a change, so prepare 16.
+        assert_eq!(
+            on_prepared(Some((16, 34)), Some((18, 34)), (18, 34)),
+            PrepareAction::Prepare { cell: (16, 34) }
+        );
+    }
+
+    #[test]
+    fn a_resize_with_no_real_change_before_the_first_answer_changes_nothing() {
+        // The first prepare is in flight for 16x34, `wanted` is `None`. A resize that only
+        // wobbles by one pixel is not a change: `wanted` stays `None` and nothing spawns.
+        let in_flight = (16, 34);
+        assert_eq!(
+            on_resize(None, None, Some(in_flight), (17, 34)),
+            ResizeAction::Nothing
+        );
+        // And the first prepare answers for 16, with `wanted` still `None`: swap it in.
+        assert_eq!(
+            on_prepared(None, Some(in_flight), in_flight),
+            PrepareAction::Swap
+        );
+    }
+
     /// An engine start, in the shape `switch_onward` takes it: boxed, so that a test can hand in a starter
     /// of its own - one that fails on purpose - where production hands in `Backend::start_local`.
     type Starter = Pin<Box<dyn Future<Output = Result<Backend, String>>>>;
@@ -1616,6 +1780,8 @@ mod tests {
             mark: &mut mark,
             wanted: None,
             in_flight: None,
+            protocol: fbtt_tui::graphics::caps::Protocol::None,
+            scale: 1,
         };
         let switched = switch_onward(
             &work,
@@ -1701,6 +1867,8 @@ mod tests {
             mark: &mut mark,
             wanted: None,
             in_flight: None,
+            protocol: fbtt_tui::graphics::caps::Protocol::None,
+            scale: 1,
         };
         let switched = switch_onward(
             &work,
@@ -1773,6 +1941,8 @@ mod tests {
             mark: &mut mark,
             wanted: None,
             in_flight: None,
+            protocol: fbtt_tui::graphics::caps::Protocol::None,
+            scale: 1,
         };
         let switched = switch_onward(
             &work,

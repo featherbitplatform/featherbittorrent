@@ -157,13 +157,25 @@ fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims) -> Vec<u8> {
     }
 }
 
+/// The ink the theme's ground is, for the canvas a mark is composited over when the token it is
+/// given is not an `Rgb` the theme would draw a canvas in. Derived from the theme's own token
+/// rather than a hard-coded hex, so the two cannot drift.
+const GROUND: [u8; 3] = ground_rgb(theme::INK_950);
+
+const fn ground_rgb(color: Color) -> [u8; 3] {
+    match color {
+        Color::Rgb(r, g, b) => [r, g, b],
+        // A token the theme did not keep as `Rgb` is not a ground this palette draws a canvas in:
+        // fall back to the ink the theme's ground is, rather than invent a colour.
+        _ => [0, 0, 0],
+    }
+}
+
 /// The RGB of one of the theme's tokens, for the canvas a mark is composited over.
 ///
 /// The theme keeps every token as `Rgb`, so this is a match on the theme's own type: a token that
 /// is not `Rgb` is not a ground this palette would draw a canvas in, and rather than invent a
 /// colour for it, the canvas falls back to the ink the theme's ground is.
-const GROUND: [u8; 3] = [0x0b, 0x0b, 0x0e];
-
 fn rgb(color: Color) -> [u8; 3] {
     match color {
         Color::Rgb(r, g, b) => [r, g, b],
@@ -361,17 +373,18 @@ impl Placer {
         self.transmit(logos, placements)
     }
 
-    /// The pixels a kitty frame owes the terminal: every mark it places that the terminal does not
-    /// already hold under its id, in the order the screen will show them - the header's first, the
-    /// help screen's after. A new cell size is a new bitmap under the same id, so the first frame
-    /// after one transmits everything it draws again.
+    /// The pixels a kitty frame owes the terminal: every mark the frame will show that the terminal
+    /// does not already hold under its id, in the order the screen will show them - the header's
+    /// first, the help screen's after. The small mark is transmitted whenever the terminal can draw
+    /// one, because the frame's placeholders for it reference the id before the frame is drawn, and
+    /// the placements this frame places are not known until it is drawn: a frame that does not place
+    /// the mark this time still needs its pixels held for the next one that does. A new cell size is
+    /// a new bitmap under the same id, so the first frame after one transmits everything again.
     fn transmit(&mut self, logos: &PreparedLogos, placements: &[Placement]) -> Vec<u8> {
         let mut out = Vec::new();
-        let small = placements
-            .iter()
-            .any(|placement| placement.size == LogoSize::Small)
-            .then(|| logos.small.clone())
-            .flatten();
+        // The header's mark: transmitted whenever the terminal can draw it, so the placeholders the
+        // frame is about to write find their pixels already in place.
+        let small = logos.small.clone();
         let large = placements
             .iter()
             .find(|placement| matches!(placement.size, LogoSize::Large(_)))
@@ -392,7 +405,7 @@ impl Placer {
     /// The bytes to write after a frame is drawn, and the cells the frame no longer covers.
     ///
     /// For kitty this is always nothing: the frame's placeholder cells *are* the placement, and
-    /// [`before_draw`] has already made sure the pixels are on their way.
+    /// [`Placer::before_draw`] has already made sure the pixels are on their way.
     ///
     /// For iTerm2 and sixel, an image is written for every placement that is new - a different rect, a
     /// different image, or a screen of a different size, which is the one ratatui cleared - and the
@@ -518,6 +531,7 @@ fn wrapped_at(rect: Rect, logos: &PreparedLogos, placement: &Placement) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     /// A terminal with a protocol, cells of `cell`, scale 1.
     fn graphics(protocol: Protocol, cell: CellPx) -> Graphics {
@@ -802,21 +816,34 @@ mod tests {
     fn kitty_resends_the_large_mark_when_its_size_changes() {
         let logos = kitty_logos();
         let mut placer = Placer::new(Protocol::Kitty);
+        // The small mark's payload, transmitted first: the header's mark is transmitted whenever
+        // the terminal can draw it, before the help screen's large mark.
+        let small_payload = logos
+            .small
+            .as_ref()
+            .expect("this terminal draws the header's mark")
+            .payload
+            .clone();
 
-        // A frame with the help screen open at the ten-row mark: the ten-row pixels go out.
+        // A frame with the help screen open at the ten-row mark: the small mark and the ten-row
+        // mark go out.
         let ten = large_placement(&logos, 10);
         let first = placer.before_draw(&logos, std::slice::from_ref(&ten));
-        assert!(!first.is_empty(), "the ten-row mark transmits");
-        let expected = logos
+        assert!(!first.is_empty(), "the frame transmits");
+        let ten_expected = logos
             .large
             .iter()
             .find(|prepared| prepared.dims.rows == 10)
             .expect("the ten-row bitmap")
             .payload
-            .as_ref();
+            .clone();
+        assert!(
+            first.len() >= small_payload.len() + ten_expected.len(),
+            "the transmit holds both the small and the ten-row marks"
+        );
         assert_eq!(
-            &first[..],
-            expected,
+            &first[small_payload.len()..][..ten_expected.len()],
+            &ten_expected[..],
             "the ten-row pixels, not another size's"
         );
         // The same frame again: nothing.
@@ -828,16 +855,17 @@ mod tests {
         // pixels would crop them to six rows.
         let six = large_placement(&logos, 6);
         let changed = placer.before_draw(&logos, std::slice::from_ref(&six));
-        let expected = logos
+        let six_expected = logos
             .large
             .iter()
             .find(|prepared| prepared.dims.rows == 6)
             .expect("the six-row bitmap")
             .payload
-            .as_ref();
+            .clone();
+        // The small mark is already sent, so only the six-row mark goes out.
         assert_eq!(
             &changed[..],
-            expected,
+            &six_expected[..],
             "a different size of the same mark transmits that size's pixels"
         );
         let again = placer.before_draw(&logos, std::slice::from_ref(&six));
@@ -965,6 +993,96 @@ mod tests {
             placer
                 .before_draw(&logos, std::slice::from_ref(&small))
                 .is_empty()
+        );
+    }
+
+    /// A writer that records what it is handed, so a test can assert the order the bytes go out in.
+    struct RecordingWriter {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl RecordingWriter {
+        fn new() -> Self {
+            RecordingWriter { chunks: Vec::new() }
+        }
+        /// Everything written, in order.
+        fn all(&self) -> Vec<u8> {
+            self.chunks.concat()
+        }
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.chunks.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The frame tick's order, checked against a recording writer: the kitty transmit bytes (the
+    /// pixels the placeholders reference) go out before the first placeholder cell is written, on
+    /// the first frame and on the first frame after `invalidate()`. The frame tick transmits with
+    /// the previous frame's placements before `terminal.draw`, and writes the placeholders
+    /// (the frame's buffer) after it; this asserts that order.
+    #[test]
+    fn kitty_transmits_before_the_first_placeholder_cell() {
+        let logos = kitty_logos();
+        let mut placer = Placer::new(Protocol::Kitty);
+        // The header's placeholder cell: the symbol the view writes into the buffer for row 0,
+        // column 0 of the mark, which is what the diff writes to the terminal.
+        let placeholder = kitty::placeholder(0, 0);
+
+        // The first frame: nothing placed last frame, so `before_draw` transmits the small mark
+        // unconditionally. The transmit goes out before the placeholders are written.
+        let mut writer = RecordingWriter::new();
+        let pre = placer.before_draw(&logos, &[]);
+        writer.write_all(&pre).expect("the transmit");
+        // The frame is drawn: the diff writes the placeholder cells.
+        writer
+            .write_all(placeholder.as_bytes())
+            .expect("the placeholders");
+        let out = writer.all();
+        assert!(
+            out.len() > placeholder.len(),
+            "the transmit goes out at all on the first frame"
+        );
+        // The placeholder's first byte is the mark's character; the transmit is a sequence of
+        // bytes that begins with the kitty escape, not the mark's character. The transmit ends
+        // where the placeholder begins, so every byte before the placeholder is a transmit byte.
+        let placeholder_start = out.len() - placeholder.len();
+        let first_placeholder_byte = placeholder.as_bytes()[0];
+        assert!(
+            !out[..placeholder_start].contains(&first_placeholder_byte),
+            "the transmit bytes come before the first placeholder cell byte"
+        );
+
+        // A swap invalidates the placer; the first frame after it transmits again, before the
+        // placeholders.
+        placer.invalidate();
+        let mut writer = RecordingWriter::new();
+        let pre = placer.before_draw(&logos, &[]);
+        writer
+            .write_all(&pre)
+            .expect("the transmit after invalidate");
+        writer
+            .write_all(placeholder.as_bytes())
+            .expect("the placeholders after invalidate");
+        let out = writer.all();
+        assert!(
+            !pre.is_empty(),
+            "the first frame after invalidate transmits"
+        );
+        assert!(
+            out.len() > placeholder.len(),
+            "the transmit goes out at all after invalidate"
+        );
+        let placeholder_start = out.len() - placeholder.len();
+        let first_placeholder_byte = placeholder.as_bytes()[0];
+        assert!(
+            !out[..placeholder_start].contains(&first_placeholder_byte),
+            "the transmit bytes come before the first placeholder cell byte after invalidate"
         );
     }
 
