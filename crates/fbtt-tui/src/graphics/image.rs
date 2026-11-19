@@ -89,9 +89,10 @@ fn decode_mark() -> Option<Rgba> {
 ///
 /// `cell` is device pixels and `scale` is the factor that turns a cell into device pixels, so both are
 /// only interesting together for a caller whose cells are in some other unit. A [`CellPx`] from
-/// [`choose`] has already been converted - including iTerm2's points times its own pixels-per-point
-/// factor - so pass `1` with it; passing [`Graphics::scale`] here as well would count that factor twice
-/// and build a bitmap larger than the cells it is placed over.
+/// [`crate::graphics::caps::choose`] has already been converted - including iTerm2's points times
+/// its own pixels-per-point factor - so pass `1` with it; passing
+/// [`crate::graphics::caps::Graphics::scale`] here as well would count that factor twice and build
+/// a bitmap larger than the cells it is placed over.
 ///
 /// The height is the cell area's height, capped at the source's own height so a small terminal gets
 /// a downsampled mark rather than an upscaled blurry one; the width follows the source's ratio. The

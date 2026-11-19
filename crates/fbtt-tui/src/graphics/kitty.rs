@@ -2,7 +2,7 @@
 //!
 //! Three things happen here: an image is transmitted once and kept under an id, a placement says
 //! where that id goes, and - the part that makes this protocol worth using - a virtual placement is
-//! drawn by printing ordinary text. A cell of a virtual placement carries [`PLACEHOLDER_CHAR`] with
+//! drawn by printing ordinary text. A cell of a virtual placement carries `PLACEHOLDER_CHAR` with
 //! two combining marks that encode its row and column inside the image and a foreground colour that
 //! encodes the image id, so an image becomes cells in the grid ratatui already diffs. No cursor
 //! positioning around the picture, no flicker when the table next to it changes (decision 10).

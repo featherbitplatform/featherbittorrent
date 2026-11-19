@@ -87,8 +87,8 @@ pub enum ConfigLoad {
         problem: String,
     },
     /// The file read as this config, but the player's setting is not something a run may act on:
-    /// an empty program, more than [`MAX_PLAYER_ARGS`] arguments, or an argument longer than
-    /// [`MAX_PLAYER_ARG_BYTES`] bytes. The file is left exactly where it is - it was read, and a
+    /// an empty program, more than `MAX_PLAYER_ARGS` arguments, or an argument longer than
+    /// `MAX_PLAYER_ARG_BYTES` bytes. The file is left exactly where it is - it was read, and a
     /// person fixing the line needs to see what was in it - and every setting but the player's is
     /// kept as read. Only the player's comes back at its default, and the run works on that.
     ///
