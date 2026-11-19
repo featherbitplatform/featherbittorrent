@@ -57,10 +57,10 @@ pub struct Graphics {
     /// What this terminal multiplies a point by to get a device pixel, rounded and clamped to 1..=4: 1
     /// for every protocol except iTerm2, which reports the factor in its `ReportCellSize` answer.
     ///
-    /// `choose` has already multiplied that factor into [`cell`] when it needed it, so this is a fact
-    /// about the terminal rather than something to apply to `cell`: sizing a logo from `cell` alone is
-    /// right for every protocol, and multiplying by this as well would build a bitmap twice the size of
-    /// the cells it is placed over.
+    /// `choose` has already multiplied that factor into [`Graphics::cell`] when it needed it, so
+    /// this is a fact about the terminal rather than something to apply to `cell`: sizing a logo
+    /// from `cell` alone is right for every protocol, and multiplying by this as well would build a
+    /// bitmap twice the size of the cells it is placed over.
     pub scale: u16,
 }
 

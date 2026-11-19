@@ -442,7 +442,7 @@ const MAX_TITLE_CHARS: usize = 200;
 /// What is to be played, and where it is.
 ///
 /// `title` is what a player's playlist entry and any line about the opening say, so it is fit to
-/// draw already: display-safe, with no line breaks, at most [`MAX_TITLE_CHARS`] characters.
+/// draw already: display-safe, with no line breaks, at most `MAX_TITLE_CHARS` characters.
 /// `source` is what the player is handed: a file that is already whole, or a stream address
 /// that is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,7 +456,7 @@ pub struct PlayTarget {
 impl PlayTarget {
     /// Makes a play target whose title is fit to draw: it is run through
     /// [`fbt::display_safe`], every carriage return and line break is removed, and the
-    /// result is cut to at most [`MAX_TITLE_CHARS`] characters on a char boundary.
+    /// result is cut to at most `MAX_TITLE_CHARS` characters on a char boundary.
     pub fn new(title: &str, source: PlaySource) -> Self {
         let safe = fbt::display_safe(title, fbt::MAX_DISPLAY_CHARS);
         let cleaned: String = safe.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();

@@ -87,8 +87,8 @@ pub enum ConfigLoad {
         problem: String,
     },
     /// The file read as this config, but the player's setting is not something a run may act on:
-    /// an empty program, more than [`MAX_PLAYER_ARGS`] arguments, or an argument longer than
-    /// [`MAX_PLAYER_ARG_BYTES`] bytes. The file is left exactly where it is - it was read, and a
+    /// an empty program, more than `MAX_PLAYER_ARGS` arguments, or an argument longer than
+    /// `MAX_PLAYER_ARG_BYTES` bytes. The file is left exactly where it is - it was read, and a
     /// person fixing the line needs to see what was in it - and every setting but the player's is
     /// kept as read. Only the player's comes back at its default, and the run works on that.
     ///
@@ -458,7 +458,15 @@ impl Config {
     /// cross a filesystem), are synced, and only then are renamed over the
     /// target: a crash leaves either the old config or the new one, never half
     /// of each. A failure before the rename removes the temp file; a failed
-    /// rename leaves it holding what we tried to save.
+    /// rename leaves it holding what we tried to save. A temp file left behind by
+    /// such a failure is removed before the next save writes, so its mode is never
+    /// the mode the config ends up with.
+    ///
+    /// On Unix the file and any directory this save makes are owner-only, because what goes in them
+    /// is Argon2 password hashes and device public keys: the temp file is created 0600 rather than
+    /// loosened after the write, and a new directory is 0700. A directory that was already there
+    /// keeps the mode its owner gave it. Windows permissions do not work this way, so nothing
+    /// changes there.
     ///
     /// What goes in is this config with `server.allowed_roots` unnamed when it is only the download
     /// folder [`resolve`] filled in: a run saves the config it resolved, and pinning the roots to
@@ -482,7 +490,7 @@ impl Config {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent).map_err(cannot_write)?;
+            create_private_dir(parent).map_err(cannot_write)?;
         }
         write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, text.as_bytes())
             .map_err(cannot_write)
@@ -686,8 +694,9 @@ fn player_problem_line(path: &Path, problem: &str) -> String {
 }
 
 /// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
-/// file beside the target, synced, then renamed over it. The session state save shares
-/// this so both files are replaced by the same rules ([`crate::LocalBackend`]).
+/// file beside the target, readable only by the owner on Unix, synced, then renamed over
+/// it. The session state save shares this so both files are replaced by the same rules
+/// ([`crate::LocalBackend`]).
 pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, bytes)
 }
@@ -697,7 +706,7 @@ pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// holding what we tried to save.
 fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(temp)?;
+        let mut file = create_private_file(temp)?;
         file.write_all(bytes)?;
         // The bytes are on disk before the rename makes them the config.
         file.sync_all()
@@ -709,6 +718,56 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
             Err(source)
         }
     }
+}
+
+/// Opens `temp` for writing so that the bytes are unreadable by anybody but the owner from the
+/// first byte: mode 0600 at creation rather than chmod'd after the write, because a hash that sat
+/// in a world-readable file was readable while it sat there. A leftover temp file is taken out of
+/// the way first - opening over an existing file keeps the mode that file already had - and
+/// `create_new` after the removal means the bytes land in a file this call made.
+#[cfg(unix)]
+fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::remove_file(temp) {
+        Ok(()) => {}
+        // No leftover is the normal case, not a failure.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        // A umask only clears bits, and 0600 has no group or other bit left to clear.
+        .mode(0o600)
+        .open(temp)
+}
+
+/// Opens `temp` for writing as it has always been opened on a platform whose permissions are not
+/// per-file modes: nothing here tightens, and nothing fails that used to succeed.
+#[cfg(not(unix))]
+fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(temp)
+}
+
+/// Makes `dir` and every missing directory above it, owner-only on Unix for the same reason the
+/// file inside it is: 0700 keeps another local user out of the folder holding the hashes. Only what
+/// this call creates gets that mode; a directory that was already there keeps whatever its owner
+/// chose for it.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)
+}
+
+/// Makes `dir` and every missing parent, as it always has on a platform where the mode a new
+/// directory gets is not something this call decides.
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 #[cfg(test)]
@@ -1511,5 +1570,113 @@ mod tests {
         assert!(shown.contains("<hash>"), "and says so: {shown}");
         let shown = format!("{:?}", vec![user]);
         assert!(!shown.contains("argon2"), "so does a list of them: {shown}");
+    }
+
+    /// The config file holds Argon2 password hashes and device public keys, so another local user
+    /// must not be able to read it. Owner-only from the first byte: 0600 is whatever the umask is,
+    /// because a umask only clears bits and 0600 has no group or other bits left to clear.
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_owner_only");
+        let path = dir.path().join("config.yaml");
+
+        Config::default().save(&path).expect("save the defaults");
+
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the file holds the hashes: {:o}",
+            mode & 0o777
+        );
+    }
+
+    /// A `<file>.tmp` left by a save that failed halfway may carry looser permissions, and opening
+    /// over it keeps the mode the leftover already had. The save takes the leftover out of the way
+    /// first, so the file the hashes land in is one this save created.
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_a_loose_leftover_tmp() {
+        use super::TEMP_FILE_SUFFIX;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_loose_tmp");
+        let path = dir.path().join("config.yaml");
+        let temp = suffixed(&path, TEMP_FILE_SUFFIX);
+        fs::write(&temp, "leftover from a save that failed\n").expect("leave a temp file behind");
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))
+            .expect("loosen it, as an older run's umask would have");
+
+        Config::default()
+            .save(&path)
+            .expect("save over the leftover temp file");
+
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a loose leftover must not set the mode of the config: {:o}",
+            mode & 0o777
+        );
+        assert!(
+            !temp.exists(),
+            "the leftover is gone rather than renamed onto the target: {}",
+            temp.display()
+        );
+    }
+
+    /// The directory a first save makes holds that file, so it is made owner-only too: 0700, which
+    /// also keeps another local user from listing the name. A directory that was already there
+    /// keeps the mode its owner gave it; this only decides the mode of what it creates.
+    #[cfg(unix)]
+    #[test]
+    fn new_config_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("config_new_dir_mode");
+        let nested = dir.path().join("nested");
+        let path = nested.join("config.yaml");
+
+        Config::default()
+            .save(&path)
+            .expect("save into a directory that does not exist yet");
+
+        let mode = fs::metadata(&nested)
+            .expect("the directory was made")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the config directory holds the hashes: {:o}",
+            mode & 0o777
+        );
+
+        // A directory that was already there is left as its owner set it, even when that is looser.
+        let chosen = dir.path().join("chosen");
+        fs::create_dir(&chosen).expect("make the directory first");
+        fs::set_permissions(&chosen, fs::Permissions::from_mode(0o755)).expect("loosen it");
+        Config::default()
+            .save(&chosen.join("config.yaml"))
+            .expect("save into a directory that exists already");
+        let mode = fs::metadata(&chosen)
+            .expect("the directory is still there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "an existing directory's own mode stands: {:o}",
+            mode & 0o777
+        );
     }
 }
