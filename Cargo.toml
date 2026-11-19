@@ -139,3 +139,7 @@ keyring = { version = "4.2", default-features = false, features = ["v1"] }
 # is default-features-off because neither has features to name: what they do is decode and encode.
 png = "0.18"
 color_quant = "2"
+# The logo probe (Task 8): `poll` and `read` on stdin, which a buffered `std::io::stdin()` would keep for
+# itself. Already in the tree through crossterm 0.29, which resolves to rustix 1.1.6, so naming it here adds
+# no versions to Cargo.lock. Unix only: see the binary's `[target.'cfg(unix)'.dependencies]`.
+rustix = "1.1"

@@ -1441,6 +1441,7 @@ dependencies = [
  "keyring",
  "ratatui",
  "rpassword",
+ "rustix",
  "serde_norway",
  "tokio",
  "tracing",

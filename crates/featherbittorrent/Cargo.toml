@@ -58,6 +58,12 @@ futures-core.workspace = true
 # must not stall the event read; `signal` for SIGTERM and Ctrl-C off Unix.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
+# The logo probe's tty read (see `probe.rs`): `poll` and `read` on stdin, so the bytes answering the queries
+# are never held in a buffer crossterm cannot see. Unix only: a Windows console is not a byte stream
+# crossterm leaves to us, and there the probe never runs at all (decision 9 of the milestone 3 plan).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "stdio", "event"] }
+
 [dev-dependencies]
 # The test process holds `LibraryLock` to make the binary's second acquire lose, and `fbtt_core::scratch`
 # gives the pure decisions above a library directory of their own to read.
