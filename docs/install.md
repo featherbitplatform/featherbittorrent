@@ -126,7 +126,7 @@ and macOS drops it once you say so:
 xattr -d com.apple.quarantine /usr/local/bin/featherbittorrent 2>/dev/null || true
 ```
 
-A binary that came out of an archive unpacked in a Terminal does not carry that attribute, and the line is
+A binary that came out of an archive unpacked in a shell does not carry that attribute, and the line is
 harmless when there is nothing to clear.
 
 The archive also holds `man/` (gzipped pages), `completions/` (bash, zsh, fish and PowerShell) and this
@@ -168,7 +168,7 @@ ship here (Windows has no `man`), and installing is only copying files: nothing 
 registered. For tab completion in PowerShell, dot-source the completion the archive carries from your profile:
 
 ```powershell
-# In $PROFILE ($env:PROFILEPath prints where it lives; create the file if it does not exist):
+# Add this line to your profile ($PROFILE holds its path; create the file if it does not exist):
 . 'C:\Tools\featherbittorrent-<version>-x86_64-pc-windows-msvc\completions\_featherbittorrent.ps1'
 ```
 
@@ -187,12 +187,15 @@ The `.deb` and the `.rpm` install these files, and nothing else:
 | The example systemd units | `/usr/share/doc/featherbittorrent/examples/systemd/system/` and `.../user/` | the same |
 
 Nothing lands in `/etc`, `/lib/systemd`, `/usr/lib/systemd` or `/etc/systemd`: the example units live inside
-the documentation folder, where no service manager looks at them. The archives hold the same files under
-different names: the Linux `.tar.gz` unpacks to `featherbittorrent`, `LICENSE`, `NOTICE`, `README.md`,
-`man/`, `completions/`, `docs/autostart.md`, `docs/server.md` and `examples/systemd/`; the macOS archive adds
-the PowerShell completion and this guide; the Windows `.zip` holds the binary, the licenses, `README.md`,
-`completions\_featherbittorrent.ps1`, `docs\autostart.md`, `docs\server.md`, this guide and
-`examples\windows\register-task.ps1`.
+the documentation folder, where no service manager looks at them. Every archive unpacks to one folder with the
+binary at its top beside `LICENSE`, `NOTICE` and `README.md`. The Linux `.tar.gz` and the macOS archive copy the
+whole asset directory the binary generates, so each holds `man/` (gzipped) and `completions/` for bash, zsh, fish
+and PowerShell; the Windows `.zip` carries only the PowerShell completion, because Windows has no `man`. What
+differs is the example each one carries and whether this guide comes along: the Linux archive holds
+`docs/autostart.md`, `docs/server.md` and `examples/systemd/` with its system and user units, and no
+`docs/install.md`; the macOS archive holds those two docs plus this one, and
+`examples/launchd/io.featherbit.featherbittorrent.plist` instead of a systemd unit; the Windows `.zip` holds
+`docs\autostart.md`, `docs\server.md`, this guide and `examples\windows\register-task.ps1`.
 
 ## What installing never does
 
@@ -246,6 +249,6 @@ removes package files, and your library was never a package file.
 ## Running it at boot
 
 Nothing above starts featherbittorrent for you. If you want `serve` running before anyone logs in, or
-restart itself after a crash, [docs/autostart.md](autostart.md) walks through systemd (a system unit and a
+restarting itself after a crash, [docs/autostart.md](autostart.md) walks through systemd (a system unit and a
 user one), launchd and Windows Task Scheduler one command at a time, with the example file for each in
 `packaging/` and inside every artifact as documentation.

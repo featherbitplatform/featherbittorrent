@@ -122,6 +122,7 @@ bash dev/sast.sh
 # Scratch config and data directories (added with the config code in Task 2). They win over the
 # platform's config and data dirs, and they are what services and containers use as well: the systemd
 # system unit and the LaunchDaemon variant keep a library under /var/lib/featherbittorrent with them,
-# and the Dockerfile points both at the /data volume.
+# and the Dockerfile's documented run line passes them with -e (FBTT_CONFIG_DIR=/data/config and
+# FBTT_DATA_DIR=/data/library); the image itself sets no ENV for either.
 FBTT_CONFIG_DIR=/tmp/fbtt-config FBTT_DATA_DIR=/tmp/fbtt-data cargo run -p featherbittorrent
 ```
