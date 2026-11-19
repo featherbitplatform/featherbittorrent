@@ -143,7 +143,7 @@ home="$(mktemp -d)" || { rm -rf "$extract"; fail "could not make a scratch home 
 trap 'rm -rf "$extract" "$home"' EXIT
 tar -xzf "$dist/$targz.tar.gz" -C "$extract" || fail "tar could not extract $dist/$targz.tar.gz"
 
-# The plist as the archive carries it (Review Focus 1: an example, in examples/, not a loaded agent).
+# The plist as the archive carries it: an example in examples/, nothing this archive installs or starts.
 plutil -lint "$extract/$targz/examples/launchd/$plist" >/dev/null \
   || fail "plutil -lint refused examples/launchd/$plist as archived"
 echo "ok: plutil -lint accepts examples/launchd/$plist"

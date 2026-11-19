@@ -4,8 +4,8 @@
 # glibc (2.34, RHEL 9's) is the oldest of the supported systems, so the binary runs on all of them, and
 # dev/check-linux-binary.sh refuses one that asks for more. The man pages and completions come from the
 # binary itself (`generate-assets`), gzipped here; the service examples ship as documentation only. No
-# maintainer scripts and nothing a service manager would pick up: check_no_service below is Review Focus
-# 1 of the milestone 4 plan, enforced at build time. Needs cargo-deb and cargo-generate-rpm (the
+# package installs or starts a service: no maintainer scripts and nothing a service manager would pick up,
+# which check_no_service below enforces at build time. Needs cargo-deb and cargo-generate-rpm (the
 # versions pinned in .github/workflows/release.yml).
 # Usage: bash dev/package-linux.sh <version> <x86_64|aarch64>   e.g. bash dev/package-linux.sh 0.1.0 aarch64
 # Output: target/dist/featherbittorrent-<version>-linux-<arch>.{deb,rpm} and
@@ -172,13 +172,13 @@ for f in "${want_tar[@]}"; do
   grep -qx "$targz/$f" <<<"$tar_files" || fail "the tarball is missing $f"
 done
 
-# Review Focus 1: no service is installed or enabled. Nothing may sit where a unit or init drop-in
-# would be picked up, the .deb control member may hold no maintainer script, and the .rpm may carry no
-# scriptlet. The example units live under usr/share/doc/featherbittorrent/examples/ instead.
+# No package installs or starts a service. Nothing may sit where a unit or init drop-in would be picked
+# up, the .deb control member may hold no maintainer script, and the .rpm may carry no scriptlet. The
+# example units live under usr/share/doc/featherbittorrent/examples/ instead.
 check_no_service() { # <what the list is of> <one path per line>
   local what="$1" files="$2" hit
   hit="$(grep -nE '(^|/)etc/|(^|/)lib/systemd/' <<<"$files" | head -1)" || true
-  [[ -z "$hit" ]] || fail "$what ships a path in a unit or init directory (Review Focus 1): $hit"
+  [[ -z "$hit" ]] || fail "$what ships a path in a unit or init directory, and no package may ship one: $hit"
 }
 check_no_service "the .deb" "$deb_files"
 check_no_service "the .rpm" "$rpm_files"
@@ -190,11 +190,11 @@ while IFS= read -r entry; do
   [[ -z "$entry" ]] && continue
   case "${entry#./}" in
     control|md5sums) ;;
-    *) fail "the .deb control member holds $entry, which is a maintainer script or its data (Review Focus 1: no scripts)" ;;
+    *) fail "the .deb control member holds $entry, which is a maintainer script or its data, and packages run none" ;;
   esac
 done <<<"$control_files"
 if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --scripts could not read $dist/$pkg.rpm: $(head -1 <<<"$scripts")"; fi
-[[ -z "${scripts//[[:space:]]/}" ]] || fail "the .rpm carries scriptlets, and packages must run none (Review Focus 1): $(head -1 <<<"$scripts")"
+[[ -z "${scripts//[[:space:]]/}" ]] || fail "the .rpm carries scriptlets, and no package installs or starts a service: $(head -1 <<<"$scripts")"
 
 # The requirements cargo-generate-rpm derived from the binary, printed for the release log and held to
 # the same allow list dev/check-linux-binary.sh greps: they come from the binary's own DT_NEEDED, so a

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Smoke-tests one Linux artifact in a clean container, which is what the release workflow's smoke jobs do
 # before anything is published: check the artifact's .sha256, install it with no recommended or weak
-# dependencies, look at where its files landed, prove that nothing a service manager would pick up was
-# installed or enabled and that no system account appeared (Review Focus 1), run the shared CLI smoke
-# (dev/smoke-cli.sh) against the binary in front of us, ask systemd itself whether the example unit is
-# valid on Debian images, then remove the package and assert that the package's own files are gone while
-# the config.yaml the smoke wrote is still there (Review Focus 2). The .tar.gz installs nothing, so it gets
-# the checksum, the extraction, the same no-service grep over its file list and the CLI smoke. Ubuntu's and
+# dependencies, look at where its files landed, and prove that no package installs or starts a service:
+# nothing a service manager would pick up was installed or enabled, and no system account appeared. Then
+# run the shared CLI smoke (dev/smoke-cli.sh) against the binary in front of us, ask systemd itself
+# whether the example unit is valid on Debian images, then remove the package and assert that every file
+# it owns is gone while the config.yaml the smoke wrote is still there, because removal owns nothing of
+# the user's. The .tar.gz installs nothing, so it gets the checksum, the extraction, the same no-service
+# grep over its file list and the CLI smoke. Ubuntu's and
 # Fedora's container images skip documentation files by default (dpkg path-excludes, dnf tsflags=nodocs), so
 # this script clears both before installing: a check about a man page or a doc file has to be about the
 # package, not about how the image was shaved down for download.
@@ -76,14 +77,15 @@ pretty_name="${PRETTY_NAME:-unknown}"
   || fail "$(basename "$file") does not match $(basename "$file").sha256"
 echo "ok: $(basename "$file") matches its sha256"
 
-# Step 4, first half, Review Focus 1: the grep dev/package-linux.sh applies to the artifact at build time,
-# now applied to what the package manager says it installed. No path in /etc (packages own none) and none in
-# a directory a service manager reads. Paths arrive absolute from dpkg -L and rpm -ql, and relative to the
-# extraction from tar; a leading-slash-or-segment boundary matches either spelling.
+# Step 4, first half: the grep dev/package-linux.sh applies to the artifact at build time, now applied to
+# what the package manager says it installed. No package installs or starts a service, so no path may land
+# in /etc (packages own none) and none in a directory a service manager reads. Paths arrive absolute from
+# dpkg -L and rpm -ql, and relative to the extraction from tar; a leading-slash-or-segment boundary matches
+# either spelling.
 check_no_service_paths() { # <what the list is of> <one path per line>
   local what="$1" files="$2" hit
   hit="$(grep -nE '(^|/)etc/|(^|/)lib/systemd/' <<<"$files" | head -1)" || true
-  [[ -z "$hit" ]] || fail "$what names a path in /etc or in a unit directory (Review Focus 1): $hit"
+  [[ -z "$hit" ]] || fail "$what names a path in /etc or in a unit directory, and no package may install one: $hit"
 }
 
 # Step 4, second half: the two things a file list cannot show. An enable leaves a link in a *.wants/
@@ -92,10 +94,10 @@ check_no_service_state() {
   local wants
   wants="$(ls /etc/systemd/system/*.wants/ 2>/dev/null || true)"
   if grep -qi featherbittorrent <<<"$wants"; then
-    fail "something under /etc/systemd/system enabled featherbittorrent (Review Focus 1): $(head -1 <<<"$wants")"
+    fail "something under /etc/systemd/system enabled featherbittorrent, and no package enables one: $(head -1 <<<"$wants")"
   fi
   if getent passwd featherbittorrent >/dev/null 2>&1; then
-    fail "a featherbittorrent account exists, and no package may create one (Review Focus 1)"
+    fail "a featherbittorrent account exists, and no package may create one"
   fi
   echo 'ok: nothing installed or enabled a service, nothing landed in /etc, no system user was created'
 }
@@ -213,7 +215,8 @@ config_path="$(sed -n 's/^config: //p' "$cli_log" | tail -1)"
 rm -f "$cli_log"
 
 # 6. On the Debian images, systemd itself has to accept the example unit, because that is the file a person
-# copies into /etc/systemd/system (Review Focus 5). man-db comes with systemd rather than as a Recommends:
+# copies into /etc/systemd/system to run serve at boot; no package does that by itself. man-db comes with
+# systemd rather than as a Recommends:
 # verify resolves the unit's Documentation=man: entry by running man, and without it the check would fail on
 # an unindexed page instead of on anything about the unit (task-2-report.md concern 1). The account the unit
 # names is created only for this check and removed right after it; the package created none, as step 4 saw.
@@ -226,15 +229,15 @@ if [[ "$distro_id" == debian && "$format" != tar.gz ]]; then
   userdel featherbittorrent
   [[ $status -eq 0 ]] || fail "systemd-analyze verify $unit exited $status: $(head -1 <<<"$verify_out")"
   [[ -z "${verify_out//[[:space:]]/}" ]] \
-    || fail "systemd-analyze verify $unit printed something (Review Focus 5): $(head -1 <<<"$verify_out")"
+    || fail "systemd-analyze verify $unit printed something, and the example unit has to pass as shipped: $(head -1 <<<"$verify_out")"
   echo 'ok: systemd-analyze verify accepts the example unit and says nothing'
 fi
 
 # 7. Removal. purge rather than remove for the .deb, because it is the stronger case: it also drops
 # conffiles, so if the package had dared to put a file in /etc this would show it. dnf has one form. What
-# must survive is the user's own config under the scratch home, which the package never owned (Review Focus
-# 2), and what must be gone is every file the package did own, which is the list captured at step 3 rather
-# than a handful of remembered paths.
+# must survive is the user's own config under the scratch home, which the package never owned; what must
+# be gone is every file the package did own, the list captured at step 3 rather than a handful of paths
+# anyone remembered.
 case "$format" in
   deb) apt-get purge -y -qq featherbittorrent ;;
   rpm) dnf remove -y -q featherbittorrent ;;
@@ -249,7 +252,7 @@ if [[ "$format" != tar.gz ]]; then
     fail "purge left /usr/share/doc/featherbittorrent behind, and the .deb owns that directory"
   fi
   [[ -f "$config_path" ]] \
-    || fail "removal took away the user's config at $config_path (Review Focus 2)"
+    || fail "removal took away the user's config at $config_path, which the package never owned"
   if ! grep -qF 'smoke' "$config_path"; then
     fail "$config_path no longer names the smoke user, so removal rewrote what it never owned: $(head -1 "$config_path")"
   fi
