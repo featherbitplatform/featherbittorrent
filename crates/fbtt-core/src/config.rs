@@ -86,6 +86,17 @@ pub enum ConfigLoad {
         /// user and to log.
         problem: String,
     },
+    /// The file read as this config, but the player's setting is not something a run may act on:
+    /// an empty program, more than [`MAX_PLAYER_ARGS`] arguments, or an argument longer than
+    /// [`MAX_PLAYER_ARG_BYTES`] bytes. The file is left exactly where it is - it was read, and a
+    /// person fixing the line needs to see what was in it - and every setting but the player's is
+    /// kept as read. Only the player's comes back at its default, and the run works on that.
+    PlayerProblem {
+        /// The config as the file has it, with only the player's setting at its default.
+        config: Config,
+        /// One line saying what is wrong with the player's setting, fit to show the user and to log.
+        problem: String,
+    },
 }
 
 /// The media player a library tells a file to open in, and the extra arguments it passes
@@ -374,15 +385,26 @@ impl Config {
     /// that is not valid YAML becomes [`ConfigLoad::Bad`] with this library's own
     /// defaults ([`Config::default_for`], with its download folder resolved), and
     /// it is renamed to `<file>.bad`: a run must not overwrite what it could not
-    /// read. A file that cannot be opened at all (no permission, a directory in
-    /// the way) is an error, because there is no way to tell "empty" from
-    /// "unavailable". The library comes in rather than the file for exactly this
-    /// reason: the defaults have to be rooted in it.
+    /// read. A file that reads as this config but overruns the player's bounds
+    /// becomes [`ConfigLoad::PlayerProblem`]: the file is left where it is, and
+    /// the config comes back with the player's setting at its default and a line
+    /// saying what is wrong. A file that cannot be opened at all (no permission,
+    /// a directory in the way) is an error, because there is no way to tell
+    /// "empty" from "unavailable". The library comes in rather than the file for
+    /// exactly this reason: the defaults have to be rooted in it.
     pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
         let path = paths.config_file();
         match read_and_parse(&path)? {
             Reading::Absent => Ok(ConfigLoad::Missing),
             Reading::Parsed(config) => Ok(ConfigLoad::Loaded(*config)),
+            Reading::PlayerProblem(config, problem) => {
+                // The file was read and is left exactly where it is: a person fixing the line needs to
+                // see what was in it, and the run keeps everything the file named but the player's.
+                Ok(ConfigLoad::PlayerProblem {
+                    config: (*config).resolve(paths),
+                    problem,
+                })
+            }
             Reading::Unparsable(error) => {
                 // The file moves out of the way before anything can take its place.
                 let aside = suffixed(&path, BAD_FILE_SUFFIX);
@@ -413,6 +435,10 @@ impl Config {
         match read_and_parse(path) {
             Ok(Reading::Absent) => Ok(None),
             Ok(Reading::Parsed(config)) => Ok(Some(*config)),
+            // The file read as this config; the player's setting is not what a run may act on, but a
+            // caller editing the file wants the bytes as written - including the bad line - to see and
+            // to fix. The one line comes back as an `Err`, the same as an unparsable file.
+            Ok(Reading::PlayerProblem(_, problem)) => Err(problem),
             Ok(Reading::Unparsable(error)) => Err(problem_line(path, &error)),
             // A file that cannot be opened at all: the same reason `load` calls it an error, put in one
             // line instead of carrying an enum a caller only formats anyway.
@@ -506,22 +532,28 @@ impl Config {
 }
 
 /// What reading one config file gave, before anybody decides what to do about a bad one. A config is a few
-/// hundred bytes of everything the run works on, and the box keeps the two "there are bytes" cases the same
-/// size instead of making the empty one pay for both.
+/// hundred bytes of everything the run works on, and the box keeps the "there are bytes" cases the same
+/// size instead of making the empty one pay for all of them.
 enum Reading {
     /// Nothing at that path.
     Absent,
     /// Bytes that read as this config.
     Parsed(Box<Config>),
+    /// Bytes that read as this config, but the player's setting is not something a run may act on,
+    /// with the one line that says what is wrong.
+    PlayerProblem(Box<Config>, String),
     /// Bytes that are there and are not this config, with the parse failure that says so.
     Unparsable(serde_norway::Error),
 }
 
 /// Reads `path` and parses it: [`Reading::Absent`] for no file, [`Reading::Unparsable`] for bytes that
 /// are not this config, and [`ConfigError`] only for a file that cannot be opened at all (no permission,
-/// a directory in the way), where there is no way to tell "empty" from "unavailable". This is the one
-/// place a config file is read; [`Config::load`] and [`Config::load_for_edit`] differ in what they do
-/// with an unparsable file, not in how they find out about it.
+/// a directory in the way), where there is no way to tell "empty" from "unavailable". A file that reads
+/// as this config but overruns the player's bounds is a [`Reading::PlayerProblem`], not an
+/// [`Reading::Unparsable`]: the bytes were understood, so the file stays where it is and only the
+/// player's setting is the part the run does not act on. This is the one place a config file is read;
+/// [`Config::load`] and [`Config::load_for_edit`] differ in what they do with an unparsable file, not
+/// in how they find out about it.
 fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -537,10 +569,13 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
         Ok(config) => config,
         Err(error) => return Ok(Reading::Unparsable(error)),
     };
-    // The player's program and arguments end up on a process's argument line, so a file that
-    // overruns them is refused the same way an unparsable one is, in the same one-line shape.
+    // The player's program and arguments end up on a process's argument line, so a file that overruns
+    // them is not acted on: the config comes back with the player's setting at its default, and the
+    // line saying why is the one the run shows. The file itself is read, and it stays where it is.
     if let Some(problem) = player_problem(&config) {
-        return Ok(Reading::Unparsable(serde::de::Error::custom(problem)));
+        let mut kept = config;
+        kept.player = PlayerConfig::default();
+        return Ok(Reading::PlayerProblem(Box::new(kept), problem));
     }
     Ok(Reading::Parsed(Box::new(config)))
 }
@@ -662,8 +697,8 @@ fn write_then_rename(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, LogoSetting, ServerConfig,
-        UserEntry, user_download_dir,
+        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, LogoSetting,
+        PlayerConfig, ServerConfig, UserEntry, suffixed, user_download_dir,
     };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
@@ -1265,7 +1300,7 @@ mod tests {
         let loaded = match Config::load(&paths).expect("a missing file is still read") {
             ConfigLoad::Missing => Config::default(),
             ConfigLoad::Loaded(config) => config,
-            ConfigLoad::Bad { config, .. } => config,
+            ConfigLoad::PlayerProblem { config, .. } | ConfigLoad::Bad { config, .. } => config,
         };
         assert_eq!(
             loaded.player.program, "auto",
@@ -1294,8 +1329,9 @@ mod tests {
     }
 
     /// What the player is allowed to be told: at most 32 extra arguments, each at most
-    /// 1024 bytes, and a program that is not empty. Anything past that is a config the
-    /// run will not act on, and it is said in one line.
+    /// 1024 bytes, and a program that is not empty. Anything past that is reported in one
+    /// line; the file itself is left exactly where it is, with everything else kept, and
+    /// only the player's setting comes back at its default.
     #[test]
     fn player_config_rejects_oversized_args() {
         let dir = ScratchDir::new("config_player_oversized");
@@ -1308,7 +1344,7 @@ mod tests {
             format!("player:\n  program: mpv\n  args:\n    - {long}\n"),
         )
         .expect("write an oversized argument");
-        let ConfigLoad::Bad { problem, .. } =
+        let ConfigLoad::PlayerProblem { problem, .. } =
             Config::load(&paths).expect("an oversized argument is reported")
         else {
             panic!("a 1025-byte argument is refused, not swallowed");
@@ -1333,7 +1369,7 @@ mod tests {
             format!("player:\n  program: mpv\n  args:\n{many}\n"),
         )
         .expect("write too many arguments");
-        let ConfigLoad::Bad { problem, .. } =
+        let ConfigLoad::PlayerProblem { problem, .. } =
             Config::load(&paths).expect("too many arguments are reported")
         else {
             panic!("33 arguments are refused, not swallowed");
@@ -1351,7 +1387,7 @@ mod tests {
         // An empty program names no player at all, which is nothing to start.
         fs::write(paths.config_file(), "player:\n  program: \"\"\n")
             .expect("write an empty program");
-        let ConfigLoad::Bad { problem, .. } =
+        let ConfigLoad::PlayerProblem { problem, .. } =
             Config::load(&paths).expect("an empty program is reported")
         else {
             panic!("an empty program is refused, not swallowed");
@@ -1360,6 +1396,62 @@ mod tests {
             problem.lines().count(),
             1,
             "the problem is one line: {problem}"
+        );
+    }
+
+    /// A bad `player` setting is a problem with one value, not with the whole file: the server
+    /// section and every other setting stay as the file has them, the player's comes back at
+    /// its default, and the file itself is not renamed aside. A genuinely unparsable file is
+    /// still set aside, which is the point this test guards against.
+    #[test]
+    fn a_player_problem_keeps_the_config() {
+        let dir = ScratchDir::new("config_player_problem_keeps");
+        let paths = library(&dir);
+
+        // A server that names a bind, and a player whose program is empty.
+        fs::write(
+            paths.config_file(),
+            "server:\n  bind: 127.0.0.1:8099\nplayer:\n  program: \"\"\n",
+        )
+        .expect("write a config with a bad player");
+
+        let ConfigLoad::PlayerProblem { config, problem } =
+            Config::load(&paths).expect("the file is read, not refused")
+        else {
+            panic!("a player problem keeps the config, it does not set it aside");
+        };
+
+        // The server section is exactly as the file has it.
+        let server = config
+            .server
+            .as_ref()
+            .expect("the server section survives a bad player");
+        assert_eq!(
+            server.bind,
+            "127.0.0.1:8099"
+                .parse()
+                .expect("the address the file named"),
+            "the server's bind is kept as the file named it"
+        );
+
+        // The player's setting is at its default: the default program, no extra arguments.
+        assert_eq!(
+            config.player,
+            PlayerConfig::default(),
+            "only the player's setting is reset"
+        );
+
+        // One line saying what is wrong with the player's setting.
+        assert_eq!(problem.lines().count(), 1, "one line: {problem}");
+
+        // The file itself is where it started: nothing was renamed.
+        assert!(
+            paths.config_file().exists(),
+            "the config file is still there"
+        );
+        assert!(
+            !suffixed(&paths.config_file(), BAD_FILE_SUFFIX).exists(),
+            "no .bad file was created"
         );
     }
 

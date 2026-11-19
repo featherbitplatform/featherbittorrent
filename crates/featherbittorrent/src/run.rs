@@ -58,9 +58,15 @@ pub async fn run() -> ExitCode {
             }
             config
         }
+        // The file was read and is left where it is: the run keeps everything it named but the
+        // player's, which comes back at its default, and the line saying why is the first notice.
+        Ok(ConfigLoad::PlayerProblem { config, problem }) => {
+            first_notice = Some(Notice::Error(problem));
+            config
+        }
         Ok(ConfigLoad::Bad { config, problem }) => {
             first_notice = Some(Notice::Error(problem));
-            config.resolve(&paths)
+            config
         }
         Err(error) => return fail(&error),
     };

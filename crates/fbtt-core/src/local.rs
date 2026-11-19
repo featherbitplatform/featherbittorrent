@@ -508,6 +508,9 @@ impl Backend {
                 // A file we could not parse is already kept aside as `.bad`; the
                 // library's own defaults it came with are what to write on.
                 Ok(ConfigLoad::Bad { config, .. }) => config,
+                // The file was read and is left where it is: its settings, the player's at
+                // its default, are what to write on.
+                Ok(ConfigLoad::PlayerProblem { config, .. }) => config,
                 // No file yet, or one that could not be opened at all: keep what this run
                 // started with, which is what the file would have said - its download
                 // folder included, already rooted in the library.

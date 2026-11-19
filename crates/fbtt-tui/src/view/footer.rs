@@ -147,10 +147,10 @@ mod tests {
     #[test]
     fn a_play_notice_is_not_drawn() {
         use fbtt_core::{PlaySource, PlayTarget, StreamUrl};
-        let play = Notice::Play(PlayTarget {
-            title: "a film".to_string(),
-            source: PlaySource::Url(StreamUrl::new("http://h/x?token=abc".into())),
-        });
+        let play = Notice::Play(PlayTarget::new(
+            "a film",
+            PlaySource::Url(StreamUrl::new("http://h/x?token=abc".into())),
+        ));
         assert!(notice_line(&play).is_none(), "a play notice draws nothing");
     }
 }

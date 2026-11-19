@@ -776,7 +776,10 @@ fn local_config(paths: &Paths) -> Result<(Config, Option<String>), String> {
                 .map(|problem| problem.to_string());
             Ok((config, problem))
         }
-        Ok(ConfigLoad::Bad { config, problem }) => Ok((config.resolve(paths), Some(problem))),
+        // The file was read and is left where it is: everything it named is kept but the player's, which
+        // is at its default, and the line saying why is the one the screen shows.
+        Ok(ConfigLoad::PlayerProblem { config, problem }) => Ok((config, Some(problem))),
+        Ok(ConfigLoad::Bad { config, problem }) => Ok((config, Some(problem))),
         Err(problem) => Err(problem.to_string()),
     }
 }

@@ -190,6 +190,12 @@ fn config_for_serve(paths: &Paths) -> Result<(Config, Option<String>), Failure> 
             startup_problem = None;
             config
         }
+        ConfigLoad::PlayerProblem { config, problem } => {
+            // The file was read and is left where it is: its settings, the player's at its
+            // default, are what the wizard starts from.
+            startup_problem = Some(problem);
+            config
+        }
         ConfigLoad::Bad { config, problem } => {
             // The unreadable bytes are already kept aside under `.bad`, so asking
             // again loses nothing.

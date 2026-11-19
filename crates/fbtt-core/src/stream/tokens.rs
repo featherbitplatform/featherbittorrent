@@ -83,6 +83,11 @@ impl StreamTokens {
     }
 
     /// Issues a token that opens `scope` and returns it: the one copy a caller keeps.
+    ///
+    /// Before deciding whether the store is full, every expired entry is dropped: a token
+    /// that has already died by its first-use window, its idle limit, or its eight-hour cap
+    /// does not count against the cap, so a live token is never evicted to make room for
+    /// one that is already gone.
     pub fn issue(&self, scope: String) -> String {
         let bytes = fresh_token_bytes();
         let token = BASE64_URL_SAFE_NO_PAD.encode(bytes);
@@ -91,6 +96,8 @@ impl StreamTokens {
         let hash = sha256(token.as_bytes());
         let now = self.now();
         let mut inner = self.locked();
+        // Drop whatever has died before counting against the cap: the same rule `check` uses.
+        inner.entries.retain(|entry| !expired(entry, now));
         if inner.entries.len() >= self.cap {
             inner.entries.pop_front();
         }
@@ -151,9 +158,13 @@ impl StreamTokens {
         true
     }
 
-    /// How many live tokens the store holds.
+    /// How many live tokens the store holds: expired entries are dropped before counting,
+    /// so the number is the one that matters for the cap.
     pub fn len(&self) -> usize {
-        self.locked().entries.len()
+        let now = self.now();
+        let mut inner = self.locked();
+        inner.entries.retain(|entry| !expired(entry, now));
+        inner.entries.len()
     }
 
     /// Whether the store holds no live tokens.
@@ -270,7 +281,8 @@ mod tests {
         );
 
         // A used token is renewed by its use: a request inside the idle limit keeps it alive,
-        // and a silence past the limit ends it.
+        // and a silence past the limit ends it. The same token that passed at 29 minutes must
+        // fail at 31: this is what pins the idle limit itself.
         let alive = tokens.issue(path.clone());
         assert!(tokens.check(&alive, &path), "first use counts as one");
         *handle.lock().expect("the test clock") += Duration::from_secs(29 * 60);
@@ -278,26 +290,37 @@ mod tests {
             tokens.check(&alive, &path),
             "29 minutes of silence is inside the limit"
         );
-        let renewed = tokens.issue(path.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(31 * 60);
         assert!(
-            !tokens.check(&renewed, &path),
+            !tokens.check(&alive, &path),
             "31 minutes of silence is past the limit"
         );
 
         // The eight-hour cap runs from the issue, not from the last use: a film that seeks
         // every ten minutes keeps its token alive by the idle limit, and still ends at eight
-        // hours.
+        // hours. At 7 h 50 m from the issue the token is still inside the cap; at 8 h 1 m
+        // it is past it, even though the film kept seeking.
         let film = tokens.issue(path.clone());
-        // Seeking every ten minutes keeps the idle clock running, so the token lives until the
-        // eight-hour cap from the issue ends it: alive at 7 h 50 m, gone at 8 h 1 m.
-        for minute in 0..482 {
-            if minute % 10 == 0 && minute < 481 {
+        // Advance minute by minute to 7 h 50 m, seeking every ten minutes. Each seeking check
+        // renews the idle clock, so the only thing that can end the token is the cap itself.
+        for minute in 0..470 {
+            if minute % 10 == 0 {
                 assert!(
                     tokens.check(&film, &path),
                     "still inside the cap at {minute} minutes"
                 );
             }
+            *handle.lock().expect("the test clock") += Duration::from_secs(60);
+        }
+        // Exactly 7 h 50 m from the issue: inside the cap, still alive.
+        assert!(
+            tokens.check(&film, &path),
+            "7 h 50 m is inside the eight-hour cap"
+        );
+        // Advance the remaining 11 minutes to 8 h 1 m. The film seeks once more at 7 h 50 m
+        // + 10 m = 8 h 0 m, which renews the idle clock, but the cap is checked first and
+        // ends the token.
+        for _ in 0..11 {
             *handle.lock().expect("the test clock") += Duration::from_secs(60);
         }
         // 8 h 1 m from the issue: past the cap, even though the film kept seeking.
@@ -329,5 +352,71 @@ mod tests {
         let shown = format!("{tokens:?}");
         assert!(!shown.contains(&path), "the scope is not printed: {shown}");
         assert!(shown.contains("64"), "the count is: {shown}");
+    }
+
+    /// `issue` prunes expired entries before counting against the cap, so a live token is
+    /// never evicted to make room for one that is already gone. With a cap of 2, token A
+    /// expires unused after 61 s; issuing token C then must not evict the still-live B.
+    #[test]
+    fn an_expired_entry_does_not_count_against_the_cap() {
+        let (handle, clock) = clock_at(Instant::now());
+        let tokens = StreamTokens::with_clock(2, clock);
+
+        let path_a = stream_path(&id(), 0);
+        let path_b = stream_path(&id(), 1);
+
+        // Issue A, then use B right away so its idle clock starts and it is not in the
+        // fragile first-use window. The store is at its cap: A (unused) and B (used).
+        let a = tokens.issue(path_a.clone());
+        let b = tokens.issue(path_b.clone());
+        assert!(
+            tokens.check(&b, &path_b),
+            "B is used and its idle clock starts"
+        );
+        assert_eq!(tokens.len(), 2, "the store is full at its cap");
+
+        // Advance 61 s: A, which was never used, is past its first-use window and is gone.
+        // B was used at the issue, so 61 s is well inside its 30-minute idle limit.
+        *handle.lock().expect("the test clock") += Duration::from_secs(61);
+        assert!(!tokens.check(&a, &path_a), "A is past its first-use window");
+        assert!(
+            tokens.check(&b, &path_b),
+            "B is still inside its idle limit"
+        );
+
+        // A has expired. Issuing C must not evict B: the store prunes A first, sees one
+        // live entry, and has room for C.
+        let c = tokens.issue(path_a.clone());
+        assert_eq!(tokens.len(), 2, "A is gone, B and C are live");
+        assert!(tokens.check(&b, &path_b), "B survived the issue of C");
+        assert!(
+            tokens.check(&c, &path_a),
+            "C opens the file it was issued for"
+        );
+    }
+
+    /// `len` counts only live entries: expired ones are dropped before the count.
+    #[test]
+    fn len_counts_live_entries_only() {
+        let (handle, clock) = clock_at(Instant::now());
+        let tokens = StreamTokens::with_clock(16, clock);
+
+        let path_a = stream_path(&id(), 0);
+        let path_b = stream_path(&id(), 1);
+        // Issue A (never used) and B (used right away, so it is not in the first-use window).
+        let a = tokens.issue(path_a.clone());
+        let b = tokens.issue(path_b.clone());
+        assert!(
+            tokens.check(&b, &path_b),
+            "B is used and its idle clock starts"
+        );
+        assert_eq!(tokens.len(), 2, "two tokens issued, two live");
+
+        // 61 s later: A, which was never used, is past its first-use window.
+        *handle.lock().expect("the test clock") += Duration::from_secs(61);
+        assert!(!tokens.check(&a, &path_a), "A is past its first-use window");
+        // `len` drops A and counts only B.
+        assert_eq!(tokens.len(), 1, "only B is live");
+        assert!(tokens.check(&b, &path_b), "B is still alive");
     }
 }

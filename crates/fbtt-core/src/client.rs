@@ -436,17 +436,43 @@ pub enum Notice {
     Play(PlayTarget),
 }
 
+/// The longest a play target's title keeps, in characters.
+const MAX_TITLE_CHARS: usize = 200;
+
 /// What is to be played, and where it is.
 ///
 /// `title` is what a player's playlist entry and any line about the opening say, so it is fit to
-/// draw already: display-safe, with no line breaks, at most 200 characters. `source` is what the
-/// player is handed: a file that is already whole, or a stream address that is not.
+/// draw already: display-safe, with no line breaks, at most [`MAX_TITLE_CHARS`] characters.
+/// `source` is what the player is handed: a file that is already whole, or a stream address
+/// that is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayTarget {
     /// What to call it, fit to draw.
-    pub title: String,
+    title: String,
     /// Where it is.
-    pub source: PlaySource,
+    source: PlaySource,
+}
+
+impl PlayTarget {
+    /// Makes a play target whose title is fit to draw: it is run through
+    /// [`fbt::display_safe`], every carriage return and line break is removed, and the
+    /// result is cut to at most [`MAX_TITLE_CHARS`] characters on a char boundary.
+    pub fn new(title: &str, source: PlaySource) -> Self {
+        let safe = fbt::display_safe(title, fbt::MAX_DISPLAY_CHARS);
+        let cleaned: String = safe.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+        let cut: String = cleaned.chars().take(MAX_TITLE_CHARS).collect();
+        Self { title: cut, source }
+    }
+
+    /// What to call it, fit to draw.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Where it is.
+    pub fn source(&self) -> &PlaySource {
+        &self.source
+    }
 }
 
 /// Where a file to be played is.
@@ -640,7 +666,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamUrl;
+    use super::{PlaySource, PlayTarget, StreamUrl};
 
     /// A stream address is a credential while it lives, so a `Debug` that could end up in a log line
     /// or a panic message must not carry it out. The host, the path and the token all stay out of it.
@@ -657,14 +683,56 @@ mod tests {
         // The same through a notice that carries the address, which is where one is printed.
         let shown = format!(
             "{:?}",
-            super::Notice::Play(super::PlayTarget {
-                title: "a film".to_string(),
-                source: super::PlaySource::Url(StreamUrl::new("http://h/x?token=abc".into())),
-            })
+            super::Notice::Play(super::PlayTarget::new(
+                "a film",
+                super::PlaySource::Url(StreamUrl::new("http://h/x?token=abc".into())),
+            ))
         );
         assert!(
             !shown.contains("abc"),
             "a notice that carries it hides it too: {shown}"
         );
+    }
+
+    /// A title that came from a peer or a tracker is not trusted text: it may carry bidi
+    /// overrides, zero-width characters, control characters, line breaks, and a length that
+    /// would grow whatever holds it. [`PlayTarget::new`] drops all of that.
+    #[test]
+    fn a_hostile_title_is_fit_to_draw() {
+        // 1000 characters, with carriage returns, line breaks, and control characters mixed in.
+        let hostile = format!(
+            "{}{}{}{}",
+            "A".repeat(500),
+            "\r\n",
+            "\x01\x02\x03",
+            "B".repeat(500)
+        );
+        assert_eq!(hostile.len(), 1000 + 2 + 3);
+
+        let target = PlayTarget::new(
+            &hostile,
+            PlaySource::Path(std::path::PathBuf::from("/tmp/f")),
+        );
+        let title = target.title();
+
+        // No line breaks, no control characters.
+        assert!(
+            !title.contains('\r') && !title.contains('\n'),
+            "no line breaks: {title:?}"
+        );
+        assert!(
+            !title.contains('\x01') && !title.contains('\x02') && !title.contains('\x03'),
+            "no control characters: {title:?}"
+        );
+
+        // Cut to at most 200 characters, on a char boundary.
+        assert!(
+            title.chars().count() <= 200,
+            "at most 200 chars: {} chars",
+            title.chars().count()
+        );
+
+        // The source is handed through.
+        assert!(matches!(target.source(), PlaySource::Path(_)));
     }
 }
