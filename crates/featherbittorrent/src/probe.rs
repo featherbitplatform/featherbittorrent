@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::terminal::WindowSize;
 use fbtt_tui::graphics::{Graphics, PROBE_QUERY, choose, da1_complete, parse_replies};
+// Only [`readable`] and the Unix tty need `poll`'s flags, and a build with no Unix tty has no rustix at all
+// (see the binary's `[target.'cfg(unix)'.dependencies]`).
+#[cfg(unix)]
+use rustix::event::PollFlags;
 
 /// The wait a terminal that has not started answering is given: decision 9's 300 ms. Long enough for a
 /// local terminal to answer six short queries, short enough that a terminal which never answers - a pipe, a
@@ -80,7 +84,7 @@ impl Tty for StdinTty {
     }
 
     fn read_byte(&mut self, wait: Duration) -> io::Result<Option<u8>> {
-        use rustix::event::{PollFd, PollFlags, Timespec};
+        use rustix::event::{PollFd, Timespec};
 
         // `Timespec` because `poll`'s timeout is relative to now. The wait can only ever be a second or
         // less (see `probe`), so the conversion cannot overflow; anything longer is refused rather than
@@ -97,9 +101,14 @@ impl Tty for StdinTty {
         let stdin = rustix::stdio::stdin();
         let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
         // `0` is the wait running out with nothing on the wire. An error here - a signal interrupting the
-        // wait, a tty that went away - goes out as an error, which ends the round with whatever was already
-        // read rather than restarting it: `probe` owns the deadline, not this call.
+        // wait goes out as an error for `probe` to retry or stop on: this call does not keep its own clock,
+        // `probe` owns the deadline.
         if rustix::event::poll(&mut fds, Some(&timeout))? == 0 {
+            return Ok(None);
+        }
+        // A ready count is not yet a reason to read; see [`readable`]. The flags are what decides, because
+        // reading after a `POLLNVAL` or a `POLLHUP` blocks until somebody types.
+        if !readable(fds[0].revents())? {
             return Ok(None);
         }
         let mut buf = [0u8; 1];
@@ -110,6 +119,34 @@ impl Tty for StdinTty {
             _ => Ok(Some(buf[0])),
         }
     }
+}
+
+/// Whether what `poll` reported about fd 0 says there is a byte to read now, and what to say when it says
+/// this tty is finished with us.
+///
+/// The flags are the answer, not the ready count. macOS reports `POLLNVAL` for a `/dev/tty` fd - which a
+/// person reaches for with `featherbittorrent < /dev/tty` - and a read after that blocks until somebody
+/// types: past the deadline, eating a keystroke, worse than no logo. `IN` is the only flag that says bytes
+/// are there; a `HUP` that arrives alongside it is a tty that closed with its answer still in the buffer,
+/// and that answer gets read. `NVAL`, `ERR` or `HUP` on their own say nothing more can ever come, so they
+/// answer with an error and the round ends with whatever was already read - for a run on `/dev/tty`,
+/// nothing at all. A count naming no flag anyone could act on is treated as nothing having arrived rather
+/// than as permission to block.
+#[cfg(unix)]
+fn readable(revents: PollFlags) -> io::Result<bool> {
+    if revents.contains(PollFlags::IN) {
+        return Ok(true);
+    }
+    if revents.intersects(PollFlags::NVAL | PollFlags::ERR | PollFlags::HUP) {
+        // `BrokenPipe` because all three mean the same thing to this caller: nothing more is coming from
+        // this fd. The flags themselves go in the message, since which one it was is what a person reading
+        // the reason wants to know.
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("the tty gave no bytes ({revents:?})"),
+        ));
+    }
+    Ok(false)
 }
 
 /// The tty the probe uses where stdin is not a byte stream: writes go nowhere and nothing ever arrives.
@@ -165,9 +202,16 @@ pub fn probe(tty: &mut dyn Tty, now: impl Fn() -> Instant) -> Vec<u8> {
         }
         match tty.read_byte(left) {
             Ok(Some(byte)) => answers.push(byte),
-            // The wait ran out, or the read went wrong: a signal interrupted it, or the tty closed. Either
-            // way what is in hand is all there is, and this does not repeat a read that failed.
-            Ok(None) | Err(_) => break,
+            // The wait ran out with nothing on the wire, or this tty is not going to answer (see
+            // [`readable`]): either way what is in hand is all there is.
+            Ok(None) => break,
+            // A signal - a resize sends SIGWINCH - interrupted the wait. Nothing was taken from the tty and
+            // nothing more can be learned by giving up, so ask again: stopping here would lose the logo and
+            // leave the terminal's answer to arrive after the round ended, as keystrokes nobody pressed.
+            // Each retry costs a syscall pair, so real time still moves and the deadline above still bounds
+            // the round however often it is interrupted.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
     answers
@@ -287,7 +331,9 @@ mod tests {
     /// Each segment lands whole at its offset from the start, and `read_byte` moves the shared clock the way
     /// a real wait would: to the moment the next answer is due when that falls inside `wait`, and by the
     /// whole `wait` when nothing does. A byte already due at the current instant is handed over without
-    /// moving the clock, which is how every byte of a burst that has arrived gets read.
+    /// moving the clock, which is how every byte of a burst that has arrived gets read. A wait can also be
+    /// scheduled to fail instead - [`FakeTty::interrupted_at`] and [`FakeTty::unreadable_at`] - which is how
+    /// a test reaches the errors only a real signal or a bad fd produces.
     struct FakeTty {
         /// The instant every offset is measured from.
         start: Instant,
@@ -300,6 +346,11 @@ mod tests {
         offset: usize,
         /// The byte a terminal that never stops answering keeps handing out once the script runs out.
         endless: Option<u8>,
+        /// One wait that answers with an error instead of bytes: `(ms from the start it lands at, what kind
+        /// of error)`. It is answered before any arrival that is not due yet, so a script that uses it keeps
+        /// its bytes after it. The clock moves to the moment it landed, because an interrupted wait spends
+        /// the time up to the signal and no more.
+        failure: Option<(u64, io::ErrorKind)>,
         /// What was written to this tty, one entry per write.
         writes: Vec<Vec<u8>>,
         /// Every `wait` this tty was asked for, in order.
@@ -319,6 +370,20 @@ mod tests {
             Self::build(Vec::new(), Some(byte))
         }
 
+        /// The wait that reaches `at_ms` is interrupted by a signal instead of answered: the clock moves to
+        /// that moment and the read comes back as an interrupted error, which is what `probe` retries after.
+        fn interrupted_at(mut self, at_ms: u64) -> Self {
+            self.failure = Some((at_ms, io::ErrorKind::Interrupted));
+            self
+        }
+
+        /// The wait that reaches `at_ms` finds a tty that will give no more bytes - what macOS reports for a
+        /// `/dev/tty` fd - which is not something a retry fixes.
+        fn unreadable_at(mut self, at_ms: u64) -> Self {
+            self.failure = Some((at_ms, io::ErrorKind::BrokenPipe));
+            self
+        }
+
         fn build(script: Vec<(u64, &'static [u8])>, endless: Option<u8>) -> Self {
             let start = Instant::now();
             FakeTty {
@@ -328,6 +393,7 @@ mod tests {
                 segment: 0,
                 offset: 0,
                 endless,
+                failure: None,
                 writes: Vec::new(),
                 waits: Vec::new(),
                 reads: 0,
@@ -399,6 +465,22 @@ mod tests {
             if let Some(byte) = self.take_ready(elapsed) {
                 self.reads += 1;
                 return Ok(Some(byte));
+            }
+            // A scheduled failure lands inside this wait: the clock moves to where it landed and the read
+            // answers with its error, which is what `probe` then decides about - an interrupted wait gets
+            // retried, an unreadable tty ends the round.
+            if let Some((at_ms, kind)) = self.failure.take()
+                && u128::from(at_ms) <= elapsed + wait.as_millis()
+            {
+                if u128::from(at_ms) > elapsed {
+                    *self.clock.borrow_mut() = self.start + Duration::from_millis(at_ms);
+                }
+                let message = if kind == io::ErrorKind::Interrupted {
+                    "a signal interrupted the wait"
+                } else {
+                    "the tty gave no bytes"
+                };
+                return Err(io::Error::new(kind, message));
             }
             // The next answer is due inside this wait: move the clock to it and hand over its first byte.
             // `take_ready` skipped the spent and empty segments above, so there is a byte here to take.
@@ -510,6 +592,65 @@ mod tests {
         assert!(answers.iter().all(|byte| *byte == b'a'));
         // The cap is a stop rather than an overshoot: one read per byte and no 4097th.
         assert_eq!(fake.reads, MAX_BYTES);
+    }
+
+    #[test]
+    fn probe_retries_after_an_interrupted_wait() {
+        // A resize sends SIGWINCH, and a signal that arrives during a wait interrupts it. Nothing was taken
+        // from the tty and nothing more can be learned by giving up, so this asks again: stopping here would
+        // lose the logo and leave DA1 to arrive after the round ended, through `EventStream`, as keystrokes
+        // nobody pressed.
+        let mut fake = FakeTty::new(vec![(250, DA1)]).interrupted_at(50);
+        let clock = fake.clock();
+        let answers = probe(&mut fake, clock);
+        assert_eq!(answers, DA1, "an interrupted wait costs the answer nothing");
+        // The retry asks for what the deadline still has rather than for a fresh budget: 300 ms, then the
+        // 250 left after the signal spent 50 of them. The round ends inside the base budget it started with.
+        assert_eq!(fake.waits[0], Duration::from_millis(300));
+        assert_eq!(fake.waits[1], Duration::from_millis(250));
+        assert!(
+            fake.elapsed_ms() <= 300,
+            "the round ran to {:?}",
+            fake.elapsed_ms()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tty_ends_the_round() {
+        // What `featherbittorrent < /dev/tty` does on macOS: the poll answers with a flag that says this fd
+        // is not usable, and no amount of waiting changes that. The round stops there rather than blocking
+        // in a read, so an answer this tty was never going to give stays unread.
+        let mut fake = FakeTty::new(vec![(100, DA1)]).unreadable_at(0);
+        let clock = fake.clock();
+        let answers = probe(&mut fake, clock);
+        assert!(answers.is_empty(), "an unreadable tty gives nothing");
+        assert_eq!(fake.reads, 0, "and it is not read from either");
+        assert_eq!(fake.pending(), DA1);
+    }
+
+    /// What `readable` decides from what `poll` reported: the one rule inside the Unix tty that is worth
+    /// testing on its own, because getting it wrong blocks in a read instead of losing the logo.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_readable_tty_is_read() {
+        assert!(
+            readable(PollFlags::IN).expect("`IN` says there are bytes to read"),
+            "`IN` is read"
+        );
+        // A tty that hung up with its answer still in the buffer reports both flags, and that answer gets
+        // read: `IN` is the flag that says there are bytes.
+        assert!(readable(PollFlags::IN | PollFlags::HUP).is_ok_and(|read| read));
+        // These three on their own say nothing more can ever come, and reading anyway is what would block
+        // past the deadline and eat a keystroke. `NVAL` is what macOS reports for a `/dev/tty` fd.
+        for revents in [PollFlags::NVAL, PollFlags::ERR, PollFlags::HUP] {
+            assert!(readable(revents).is_err(), "{revents:?} is not readable");
+        }
+        // A ready count naming nothing actionable is treated as nothing having arrived, not as permission to
+        // block: no error, and no read.
+        assert!(
+            !readable(PollFlags::empty()).expect("nothing actionable is not an error"),
+            "nothing to read"
+        );
     }
 
     #[test]
