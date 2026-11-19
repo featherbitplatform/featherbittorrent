@@ -234,6 +234,9 @@ impl Model {
                 // Success: the dialog has done its job and comes down. The line still goes on
                 // the footer, where the rest of the screen's news lands.
                 Notice::Info(_) => {}
+                // A file to play is never a dialog answer: it is a line the footer shows, nothing
+                // that belongs inside the box that is waiting for an answer.
+                Notice::Play(_) => {}
             },
             other => self.modal = other,
         }

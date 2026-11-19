@@ -16,6 +16,8 @@ use ratatui::widgets::Fill;
 use fbtt_core::{RowState, Snapshot};
 
 use crate::format;
+use crate::graphics::{LogoSize, LogoView, Placement};
+use crate::modal;
 use crate::model::{Model, View};
 use crate::theme;
 
@@ -57,34 +59,105 @@ struct Areas {
 
 /// Draws the whole screen into `frame`: the model says what it wants shown, the snapshot
 /// says what is true, and neither of them is waited on.
+///
+/// No image marks are drawn: this is the text title, and what the screen shows until the
+/// terminal's own logos are prepared (see [`LogoView::text`]).
 pub fn draw(frame: &mut Frame, model: &Model, snap: &Snapshot) {
+    draw_with(frame, model, snap, LogoView::text());
+}
+
+/// The whole screen with the image marks the terminal prepared, when it has them.
+///
+/// `logos` is the prepared marks behind a [`LogoView`]: `LogoView::text()` while the
+/// blocking pool is still working them out, the real one when it answers. The marks go
+/// on the full view's header and on the help screen, and nowhere else - the minimal
+/// view never has one (decision 12) - and they are applied last, after any dialog, so
+/// a dialog over a mark is what covers it: a mark the open dialog intersects is not
+/// placed that frame.
+///
+/// The placements that end up drawn come back, because the binary's placer needs them:
+/// that is the only reason this returns, and `draw` does not care.
+pub fn draw_with(
+    frame: &mut Frame,
+    model: &Model,
+    snap: &Snapshot,
+    logos: LogoView<'_>,
+) -> Vec<Placement> {
     let area = frame.area();
     if area.is_empty() {
-        return;
+        return Vec::new();
     }
 
     // The canvas goes down first. A terminal with a light default background would show
     // through every cell the widgets leave empty otherwise.
     frame.render_widget(Fill::new(" ").bg(theme::INK_950), area);
 
-    match model.view {
-        View::Full => draw_full(frame, area, model, snap),
-        View::Minimal => minimal::draw(frame, area, model, snap),
+    // The marks, when the screen has any to place. They are applied last, after the dialog:
+    // a mark the open dialog covers is dropped rather than drawn under it, and the ones that
+    // survive are the placements the binary's placer writes the image around.
+    let mut placements = match model.view {
+        View::Full => draw_full(frame, area, model, snap, logos),
+        // The minimal view draws its one line per torrent and nothing else: it has no header
+        // mark, but the help screen's mark is the dialog's, and the dialog is drawn over either
+        // view, so it is decided here and placed for both.
+        View::Minimal => {
+            minimal::draw(frame, area, model, snap);
+            Vec::new()
+        }
+    };
+
+    // The help screen's mark, when the help dialog is open and the box has room for it: it is
+    // decided once here, over either view, so the lines the dialog builds (which reserve the
+    // mark's rows) and the placement that stands in them are the same decision. The minimal
+    // view places it too, because the dialog is drawn over the minimal view as well.
+    if model.modal.as_ref() == Some(&crate::modal::Modal::Help)
+        && let Some(large) = modal::help_placement(area, logos)
+    {
+        placements.push(large);
     }
 
     // The dialog is drawn last so that it covers what it is meant to cover, and over either
     // view: the box a person gets for `a` in minimal mode is the same one they get anywhere.
-    crate::modal::draw(frame, model, snap);
+    let open_box = modal::draw(frame, model, snap, logos);
+
+    // The marks go on top, applied after the dialog: a mark the open box covers is dropped
+    // rather than drawn under it, and the ones that survive are the placements the binary's
+    // placer writes the image around. The help screen's mark is the exception: it belongs to the
+    // help box, standing at its top above the keys, so a box that is its own does not drop it.
+    let mut shown = Vec::new();
+    for placement in placements {
+        let is_help_mark = matches!(placement.size, LogoSize::Large(_));
+        if !is_help_mark
+            && open_box
+                .as_ref()
+                .is_some_and(|box_area| box_area.intersects(placement.rect))
+        {
+            continue;
+        }
+        logos.draw_into(&placement, frame.buffer_mut());
+        shown.push(placement);
+    }
+    shown
 }
 
-fn draw_full(frame: &mut Frame, area: Rect, model: &Model, snap: &Snapshot) {
+fn draw_full(
+    frame: &mut Frame,
+    area: Rect,
+    model: &Model,
+    snap: &Snapshot,
+    logos: LogoView<'_>,
+) -> Vec<Placement> {
     let areas = full_areas(area);
-    header::draw(frame, areas.header, snap);
+    // The header's mark, when there is one: the header draws the three lines in the space it leaves.
+    let header_placement = header::draw(frame, areas.header, snap, logos);
     table::draw(frame, areas.table, model, snap);
     frame.render_widget(rule(), areas.rule_top);
     detail::draw(frame, areas.detail, model, snap);
     frame.render_widget(rule(), areas.rule_bottom);
     footer::draw(frame, areas.footer, model);
+    // The help screen's mark is decided once in `draw_with`, over both views, so it is not
+    // decided here as well: a mark decided twice would be placed twice.
+    header_placement.into_iter().collect::<Vec<_>>()
 }
 
 /// A rule: one line of the border colour.

@@ -12,7 +12,7 @@
 //! hanging the test job.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -190,10 +190,13 @@ fn sign(nonce: &str, key: &PrivateKey) -> String {
 }
 
 /// The client every request goes through. Redirects are left un-followed so a test sees the answer the
-/// server actually gave, and there is no per-request timeout: [`within`] is what bounds a test.
+/// server actually gave, there is no per-request timeout ([`within`] is what bounds a test), and nothing is
+/// sent through a proxy: every URL here is `127.0.0.1`, and an `HTTP_PROXY` in the environment of whoever
+/// ran `cargo test` must not turn a loopback request into one that leaves the machine.
 fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .expect("an http client")
 }
@@ -374,6 +377,186 @@ async fn log_in_with_key(served: &Served, key: &PrivateKey) -> (String, String, 
 /// A directory, and its parents, made.
 fn make_dirs(path: &Path) {
     fs::create_dir_all(path).expect("make a test folder");
+}
+
+/// Deterministic bytes, so a test can compare what it streamed with what it seeded without a random seed.
+fn sample(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state: u32 = 0x2545_f491;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Writes `bytes` to `<dir>/<name>` and returns the path.
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    make_dirs(dir);
+    let path = dir.join(name);
+    fs::write(&path, bytes).expect("write a test file");
+    path
+}
+
+/// A folder `name` under `dir` holding `files` - `(name, bytes)` for each - and its path. Two files is what
+/// a test that tells file indices apart needs; the names sort in the order the list is written in.
+fn write_folder(dir: &Path, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    let folder = dir.join(name);
+    make_dirs(&folder);
+    for (file, bytes) in files {
+        fs::write(folder.join(file), bytes).expect("write a test file");
+    }
+    folder
+}
+
+/// The `.torrent` for the file or folder at `path`, hashed off this thread: a v1 torrent, so its file list
+/// is the files themselves. A hybrid one (what [`fbt::CreateTorrent`] makes by default) puts a BEP 47 pad
+/// between them, and then index 1 is not the second file anybody wrote.
+async fn torrent_for(path: &Path) -> Vec<u8> {
+    let path = path.to_path_buf();
+    within(tokio::task::spawn_blocking(move || {
+        fbt::CreateTorrent::new(path)
+            .version(fbt::TorrentVersion::V1)
+            .build(&mut |_done, _total| std::ops::ControlFlow::Continue(()))
+            .expect("hash the test torrent")
+    }))
+    .await
+    .expect("the hashing task ran")
+}
+
+/// The `.torrent` for the single file at `path`, hashed off this thread, in the version
+/// [`fbt::CreateTorrent`] makes by default: hybrid, so it carries its 40-hex v1 hash and its 64-hex v2 hash
+/// and a client may name the torrent either way. Only a test about hash spellings wants that, and only for
+/// one file: a multi-file hybrid puts a BEP 47 pad between its files, which is what moves indices around.
+async fn hybrid_torrent_for(path: &Path) -> Vec<u8> {
+    let path = path.to_path_buf();
+    within(tokio::task::spawn_blocking(move || {
+        fbt::CreateTorrent::new(path)
+            .build(&mut |_done, _total| std::ops::ControlFlow::Continue(()))
+            .expect("hash the test torrent")
+    }))
+    .await
+    .expect("the hashing task ran")
+}
+
+/// The id of a torrent `served` is seeding: `path_in_root` (a file, or a folder whose files the torrent
+/// names) was written inside this server's own root before this, so its add - through fbt-api's own route,
+/// exactly as any client's arrives - has nothing to download, only to check. Seeded rather than downloaded
+/// because the routes under test answer about a file that is there.
+async fn seed_torrent(served: &Served, token: Option<&str>, path_in_root: &Path) -> String {
+    let bytes = torrent_for(path_in_root).await;
+    seed_bytes(served, token, &bytes).await
+}
+
+/// The same add for `.torrent` bytes a test hashed itself, which is what a test that wants the torrent in
+/// another spelling has - [`hybrid_torrent_for`] builds the one carrying both spellings of the id.
+async fn seed_bytes(served: &Served, token: Option<&str>, bytes: &[u8]) -> String {
+    let mut request = http()
+        .post(served.url("/api/v1/torrents"))
+        .query(&[("save_path", served.root().to_string_lossy().as_ref())])
+        .header(reqwest::header::CONTENT_TYPE, "application/x-bittorrent")
+        .body(bytes.to_vec());
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = within(request.send())
+        .await
+        .expect("the add reached the server");
+    if !response.status().is_success() {
+        let (status, code) = error_of(response).await;
+        panic!("the test torrent was not added: {status} {code}");
+    }
+    let info = body(response).await;
+    let id = info["id"]
+        .as_str()
+        .expect("the answer names the torrent by its 40-hex wire hash")
+        .to_string();
+    wait_until_seeding(served, token, &id).await;
+    id
+}
+
+/// Waits until this server says torrent `id` is seeding - every piece of what was already on disk checked -
+/// so that a stream request after it reads bytes rather than waiting for pieces nobody has.
+async fn wait_until_seeding(served: &Served, token: Option<&str>, id: &str) {
+    let client = http();
+    let until = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let info = body(
+            get(
+                &client,
+                &served.url(&format!("/api/v1/torrents/{id}")),
+                token,
+            )
+            .await,
+        )
+        .await;
+        if info["state"].as_str() == Some("seeding") {
+            return;
+        }
+        if tokio::time::Instant::now() >= until {
+            panic!(
+                "torrent {id} was not seeding within {} seconds: {info}",
+                DEADLINE.as_secs(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// One request on a stream address, which carries its own credential in its query: `HEAD` or `GET`, and a
+/// `Range` header with it when the test asks for part of the file.
+async fn open_stream(
+    client: &reqwest::Client,
+    head: bool,
+    url: &str,
+    range: Option<&str>,
+) -> Response {
+    let mut request = if head {
+        client.head(url)
+    } else {
+        client.get(url)
+    };
+    if let Some(range) = range {
+        request = request.header(reqwest::header::RANGE, range);
+    }
+    within(request.send()).await.expect("the server answered")
+}
+
+/// What `POST /api/v1/stream-tokens` answers for file `file` of torrent `id`: the 201 checked while it is
+/// still news, and the path it names - with `?token=` on it on a server that hands tokens out at all.
+async fn stream_address(served: &Served, token: Option<&str>, id: &str, file: usize) -> String {
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/stream-tokens"),
+        serde_json::json!({ "torrent": id, "file": file }),
+        token,
+    )
+    .await;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "no stream address for {id} file {file}"
+    );
+    let answer = body(response).await;
+    assert_eq!(
+        answer["expires_in"].as_u64(),
+        Some(60),
+        "the token's first-use window is what the answer says: {answer}",
+    );
+    answer["path"]
+        .as_str()
+        .expect("the answer names the path to stream")
+        .to_string()
+}
+
+/// The path part of a stream address - everything before any `?token=` - so that two answers for one file
+/// can be compared without comparing the tokens in them, which differ every time one is issued.
+fn stream_target(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(target, _token)| target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,11 +1953,136 @@ async fn verify_concurrency_is_bounded() {
     served.stop().await;
 }
 
+/// The config lives on the server's own disk, where its path means something to its owner. A browser
+/// only needs to know a setting is in the way; where the file sits is for the server log.
+#[tokio::test]
+async fn a_setting_problem_names_the_server_log_not_the_config_file() {
+    let served = Served::start("player-problem", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let config_path = served.paths.config_file();
+    fs::create_dir_all(config_path.parent().expect("the config directory"))
+        .expect("make the config directory");
+    fs::write(&config_path, "player:\n  program: \"\"\n")
+        .expect("write a config whose player cannot be used");
+
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/auth/devices"),
+        serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a setting this server cannot apply is still not its to repair",
+    );
+
+    let text = within(response.text()).await.expect("an answer");
+    let file_name = config_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let directory = config_path.parent().unwrap().to_string_lossy().into_owned();
+    assert!(!text.is_empty());
+    assert!(
+        !text.contains(&file_name),
+        "the browser was told the config file's name: {text}"
+    );
+    assert!(
+        !text.contains(directory.as_str()),
+        "the browser was told where the config lives: {text}"
+    );
+
+    // The file is still left for its owner to fix, with nothing written over it.
+    let left = fs::read_to_string(&config_path).unwrap();
+    assert!(left.contains("program: \"\""), "{left}");
+}
+
+/// A folder made unwritable for the length of one test and put back however that test ends: a scratch
+/// directory holding a `0o555` folder cannot be deleted, which would leave the run littered and every later
+/// test in it sharing the mess.
+#[cfg(unix)]
+struct ReadOnlyFolder(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReadOnlyFolder {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A config this server cannot write is a disk problem for whoever runs the server, not news for a browser:
+/// the answer says it could not save and points at the log, and it holds no path. `ConfigError::Write` names
+/// the file it tried to put in place, so answering with that error printed the server's own directory to a
+/// stranger - which is what the read side used to do, and for the same reason.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_config_that_cannot_be_saved_keeps_its_path_in_the_server_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let served = Served::start("unwritable-config", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let file = served.paths.config_file();
+    let dir = file.parent().expect("the config directory");
+    fs::create_dir_all(dir).expect("make the config directory");
+
+    // Nothing is in the folder yet - serving a library does not write a config file - so the read succeeds
+    // and only the save fails. Then the folder goes read-only, which is how an ownership change or a
+    // permissions mistake looks to this server.
+    let unwritable = ReadOnlyFolder(dir.to_path_buf());
+    fs::set_permissions(&unwritable.0, fs::Permissions::from_mode(0o555))
+        .expect("make the config folder read-only");
+    if fs::write(dir.join("probe"), "").is_ok() {
+        // Running as root, or on a filesystem that does not enforce folder permissions: the save would have
+        // succeeded, so there is nothing here to test.
+        eprintln!("skipped: this host let a read-only folder be written to");
+        drop(unwritable);
+        served.stop().await;
+        return;
+    }
+
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/auth/devices"),
+        serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a config this server cannot write is not its to repair",
+    );
+
+    let text = within(response.text()).await.expect("an answer");
+    let directory = dir.to_string_lossy().into_owned();
+    assert!(
+        !text.contains(&directory),
+        "the browser was told where the config lives: {text}"
+    );
+    assert!(
+        !text.contains("config.yaml"),
+        "the browser was told the config file's name: {text}"
+    );
+
+    drop(unwritable);
+    served.stop().await;
+}
+
 /// A `config.yaml` this server cannot read is somebody's hand-edited file, and a request that cannot parse it
-/// has no business rearranging it: adding a device answers that it cannot be read and says to fix it by hand,
-/// writes nothing, and leaves the bytes under the name they had. It used to move them aside as
-/// `config.yaml.bad` and write a config of its own in their place - from inside a `POST`, on the strength of
-/// YAML it could not understand.
+/// has no business rearranging it: adding a device answers that the config needs its owner's attention, points
+/// at the server log for what is wrong, writes nothing, and leaves the bytes under the name they had. It used
+/// to move them aside as `config.yaml.bad` and write a config of its own in their place - from inside a
+/// `POST`, on the strength of YAML it could not understand.
 #[tokio::test]
 async fn an_unreadable_config_is_left_for_its_owner() {
     let served = Served::start("bad-config", |scratch| {
@@ -1809,9 +2117,9 @@ async fn an_unreadable_config_is_left_for_its_owner() {
         "a file this server cannot read is not its to repair",
     );
     assert_eq!(code, "internal");
-    assert!(
-        message.starts_with("config.yaml cannot be read; fix it by hand"),
-        "the answer says what to do: {message}"
+    assert_eq!(
+        message, "the server's config has a setting to fix; see the server log",
+        "the answer says what to do without saying where the file lives: {message}",
     );
 
     // The bytes are where they were, under the name they had, with nothing beside them: no `.bad` left behind
@@ -1886,6 +2194,548 @@ async fn logout_revokes() {
         StatusCode::UNAUTHORIZED,
         "the new token is spent too",
     );
+
+    served.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Stream tokens
+// ---------------------------------------------------------------------------
+
+/// Asking for an address to stream a file from is not free: it is the one route that hands out a credential,
+/// so it needs the session every other non-login route needs. With nobody signed in it answers `401` before
+/// it looks at which torrent was named - and once signed in, the route is there to be answered (an unknown
+/// id gets `404`, not another `401`).
+#[tokio::test]
+async fn stream_token_route_needs_login() {
+    let served = Served::start("stream-token-login", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let body = serde_json::json!({ "torrent": "ab".repeat(20), "file": 0 });
+
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            body.clone(),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream address is a credential, so it is not free",
+    );
+    assert_eq!(code, "unauthorized");
+
+    // Signed in, the route answers: this id is well-formed and simply not in the library.
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            body,
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the route is reached");
+    assert_eq!(code, "not_found");
+
+    served.stop().await;
+}
+
+/// One token opens one file. A token issued for file 0 of one torrent does not open file 1 of the same
+/// torrent, nor file 0 of another one, and it is not a session token either: `GET /api/v1/events` - the
+/// other route fbt-api takes a `?token=` on - refuses it, and so does an `Authorization: Bearer` header that
+/// carries it. The path it was issued for is the scope, byte for byte: this is Review Focus item 1.
+#[tokio::test]
+async fn stream_token_is_scoped_to_one_file() {
+    let served = Served::start("stream-scope", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+
+    // A two-file torrent - a v1 torrent's file list is its files, so 0 and 1 are both real ones - and a
+    // second torrent beside it.
+    let folder = write_folder(
+        served.root(),
+        "set",
+        &[("a.bin", &sample(100)), ("b.bin", &sample(200))],
+    );
+    let first = seed_torrent(&served, Some(&session), &folder).await;
+    let second = seed_torrent(
+        &served,
+        Some(&session),
+        &write_file(served.root(), "other.bin", &sample(150)),
+    )
+    .await;
+
+    let path = stream_address(&served, Some(&session), &first, 0).await;
+    assert!(
+        path.starts_with(&format!("/api/v1/torrents/{first}/files/0/stream?token=")),
+        "the address is the file it was issued for, with its token on it: {path}",
+    );
+    let token = path.rsplit("token=").next().expect("a token in the path");
+
+    // The file it was issued for.
+    assert_eq!(
+        open_stream(&client, true, &served.url(&path), None)
+            .await
+            .status(),
+        StatusCode::OK,
+        "the token opens its own file",
+    );
+
+    // Another file of the same torrent, and another torrent's first file. The first is asked for with `HEAD`
+    // like the one above - a refusal answers that with no body at all, so only the status is there to read -
+    // and the second with `GET`, which carries this API's error body like every other refusal does.
+    let head = open_stream(
+        &client,
+        true,
+        &served.url(&format!(
+            "/api/v1/torrents/{first}/files/1/stream?token={token}"
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(
+        head.status(),
+        StatusCode::UNAUTHORIZED,
+        "the token does not open the other file of the same torrent",
+    );
+    let (status, code) = error_of(
+        open_stream(
+            &client,
+            false,
+            &served.url(&format!(
+                "/api/v1/torrents/{second}/files/0/stream?token={token}"
+            )),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "nor another torrent's file",
+    );
+    assert_eq!(code, "unauthorized");
+
+    // The event stream takes a `?token=` too, and this one is not a session token: refused.
+    let (status, code) = error_of(
+        get(
+            &client,
+            &served.url(&format!("/api/v1/events?token={token}")),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token is not a session token",
+    );
+    assert_eq!(code, "unauthorized");
+    // The control: this server's session token does open the event stream, so the answer above is about
+    // which credential arrived and not about the route refusing everything.
+    assert_eq!(
+        get(&client, &served.url("/api/v1/events"), Some(&session))
+            .await
+            .status(),
+        StatusCode::OK,
+        "a session token opens the event stream",
+    );
+
+    // And never as a bearer header: `/api/v1/torrents` does not take a query token at all, and a stream
+    // token is not in the session store either.
+    let (status, code) =
+        error_of(get(&client, &served.url("/api/v1/torrents"), Some(token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token is not a bearer credential",
+    );
+    assert_eq!(code, "unauthorized");
+
+    served.stop().await;
+}
+
+/// The address the route hands out is fbt-api's own stream route on this server: one range comes back as
+/// `206` with `Content-Range` and exactly the bytes the file holds. What the token opens is a real stream,
+/// not a promise about one. And the torrent is named in three spellings - its 40-hex hash lower-case, the
+/// same upper-case, and its 64-hex v2 hash - because the answer always names the torrent by the lowercase
+/// wire hash, which is the string a token's scope is cut from: an address asked for in upper case streams
+/// with the token it came back with, whatever spelling asked for it.
+#[tokio::test]
+async fn stream_token_streams_a_range() {
+    let served = Served::start("stream-range", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let bytes = sample(200);
+    // One file, hashed hybrid: a single-file torrent holds no BEP 47 pad in any version, so index 0 is still
+    // the file itself, and a hybrid torrent carries both spellings of its id.
+    let payload = write_file(served.root(), "payload.bin", &bytes);
+    let torrent = hybrid_torrent_for(&payload).await;
+    let hashes = fbt::Metainfo::from_bytes(&torrent)
+        .expect("read the test torrent back")
+        .info_hashes;
+    let v1 = hashes
+        .v1
+        .expect("a hybrid torrent carries its 40-hex v1 hash")
+        .to_string();
+    let v2 = hashes
+        .v2
+        .expect("a hybrid torrent carries its 64-hex v2 hash")
+        .to_string();
+    let id = seed_bytes(&served, Some(&session), &torrent).await;
+    assert_eq!(id, v1, "the add answers with the wire hash");
+
+    let path = stream_address(&served, Some(&session), &id, 0).await;
+    let response = open_stream(&client, false, &served.url(&path), Some("bytes=4-9")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{path}");
+    assert_eq!(
+        response.headers()["content-range"],
+        "bytes 4-9/200",
+        "the range the answer says it served",
+    );
+    let body = within(response.bytes()).await.expect("a body");
+    assert_eq!(body.as_ref(), &bytes[4..10], "the six bytes asked for");
+
+    // Asked for in upper case, and by the other hash: the path is the same string either way, down to the
+    // spelling of the id, because a token's scope has to match what fbt-api's stream route compares.
+    let spelled = stream_address(&served, Some(&session), &v1.to_uppercase(), 0).await;
+    assert_eq!(
+        stream_target(&spelled),
+        format!("/api/v1/torrents/{v1}/files/0/stream"),
+        "the answer spells the id as 40 lower-case hex whatever was asked for",
+    );
+    let by_v2 = stream_address(&served, Some(&session), &v2, 0).await;
+    assert_eq!(
+        stream_target(&by_v2),
+        stream_target(&spelled),
+        "the 64-hex spelling names the same torrent by its wire hash",
+    );
+
+    let response = open_stream(&client, false, &served.url(&spelled), Some("bytes=4-9")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{spelled}");
+    let body = within(response.bytes()).await.expect("a body");
+    assert_eq!(
+        body.as_ref(),
+        &bytes[4..10],
+        "the six bytes from an address asked for in upper case",
+    );
+
+    served.stop().await;
+}
+
+/// A film outlives the terminal that started it: logging the session out leaves the stream address working,
+/// because a stream token is its own credential and not a second name for the session. The session token
+/// stops working at the same moment, which is what makes this an independence proof rather than a test of a
+/// server that never revoked anything.
+#[tokio::test]
+async fn stream_token_survives_logout() {
+    let served = Served::start("stream-logout", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let bytes = sample(120);
+    let id = seed_torrent(
+        &served,
+        Some(&session),
+        &write_file(served.root(), "payload.bin", &bytes),
+    )
+    .await;
+
+    let path = stream_address(&served, Some(&session), &id, 0).await;
+    let response = delete(&client, &served.url("/api/v1/auth/session"), Some(&session)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "signed out");
+
+    let (status, _) =
+        error_of(get(&client, &served.url("/api/v1/torrents"), Some(&session)).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the session is spent");
+
+    let response = open_stream(&client, false, &served.url(&path), Some("bytes=0-3")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "the stream address is not the session's",
+    );
+    let body = within(response.bytes()).await.expect("a body");
+    assert_eq!(body.as_ref(), &bytes[0..4], "the first four bytes");
+
+    served.stop().await;
+}
+
+/// With nobody signing in there is no credential to hand out, so the address comes back with no `?token=` on
+/// it and the stream route answers from loopback on its own. This is the shape the local endpoint uses too,
+/// and a client that has no token of its own still gets a playable URL.
+#[tokio::test]
+async fn stream_token_route_auth_off() {
+    let served = Served::start("stream-auth-off", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+    let bytes = sample(120);
+    let id = seed_torrent(
+        &served,
+        None,
+        &write_file(served.root(), "payload.bin", &bytes),
+    )
+    .await;
+
+    let path = stream_address(&served, None, &id, 0).await;
+    assert_eq!(
+        path,
+        format!("/api/v1/torrents/{id}/files/0/stream"),
+        "with logins off nothing is issued, so the answer carries no token",
+    );
+
+    let response = open_stream(&client, false, &served.url(&path), Some("bytes=10-13")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "the address streams from loopback with no credential at all",
+    );
+    let body = within(response.bytes()).await.expect("a body");
+    assert_eq!(body.as_ref(), &bytes[10..14], "the four bytes asked for");
+
+    served.stop().await;
+}
+
+/// A body over the stream-token route's cap is read to its end - within a bound - before the `413` goes out,
+/// so a client still sending when the server decides gets the answer rather than a reset. Spelled out over a
+/// raw socket so the timing is the test's own: half the body, a pause in which an answer would arrive if the
+/// server had stopped reading at the cap, then the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_stream_token_body_is_read_before_the_answer() {
+    use std::io::{ErrorKind, Read as _, Write as _};
+
+    let served = Served::start("stream-refused-body", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let addr = served.server.local_addr();
+
+    // 32 KiB: four times the route's cap, half the bound on what it reads of a refused body.
+    let body =
+        serde_json::json!({ "torrent": "0".repeat(40), "file": 0, "junk": "x".repeat(32 * 1024) })
+            .to_string();
+    let head = format!(
+        "POST /api/v1/stream-tokens HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let half = body.len() / 2;
+
+    let answer = within(tokio::task::spawn_blocking(move || {
+        let mut socket = std::net::TcpStream::connect(addr).expect("connect to the server");
+        socket.write_all(head.as_bytes()).expect("send the head");
+        socket
+            .write_all(&body.as_bytes()[..half])
+            .expect("send the first half");
+        socket.flush().expect("flush the first half");
+
+        // Past the cap already, and nothing comes back while the rest is still owed.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("a read timeout");
+        let mut early = [0u8; 1];
+        match socket.read(&mut early) {
+            Err(problem)
+                if matches!(problem.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            other => panic!("the server answered before the body was in: {other:?}"),
+        }
+
+        socket
+            .write_all(&body.as_bytes()[half..])
+            .expect("the rest of the body is still taken");
+        socket.set_read_timeout(None).expect("no read timeout");
+        let mut answer = Vec::new();
+        socket
+            .read_to_end(&mut answer)
+            .expect("the whole answer, not a reset");
+        String::from_utf8_lossy(&answer).into_owned()
+    }))
+    .await
+    .expect("the raw client");
+
+    assert!(
+        answer.starts_with("HTTP/1.1 413"),
+        "a body this route has no use for: {answer}"
+    );
+    assert!(answer.contains("body_too_large"), "{answer}");
+
+    served.stop().await;
+}
+
+/// What a request can get wrong: an id that is not this library's (`404`), an index past the end of the file
+/// list (`404`, the same answer fbt-api's own stream route gives for one), an id that is not hex at all
+/// (`400 invalid_id`, the same code fbt-api uses), and a body far bigger than two short fields (`413`).
+#[tokio::test]
+async fn stream_token_bad_requests() {
+    let served = Served::start("stream-bad-requests", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let id = seed_torrent(
+        &served,
+        Some(&session),
+        &write_file(served.root(), "payload.bin", &sample(64)),
+    )
+    .await;
+
+    // A well-formed hash of a torrent this library does not have.
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            serde_json::json!({ "torrent": "0".repeat(40), "file": 0 }),
+            Some(&session),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not this library's torrent");
+    assert_eq!(code, "not_found");
+
+    // An index past the end of the file list: `usize::MAX` is the widest one a client can name.
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            serde_json::json!({ "torrent": id, "file": usize::MAX }),
+            Some(&session),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no file with that index");
+    assert_eq!(code, "not_found");
+
+    // Not hex, so not an id: fbt-api's own code for that.
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            serde_json::json!({ "torrent": "not-a-hash", "file": 0 }),
+            Some(&session),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{status} {code}");
+    assert_eq!(code, "invalid_id");
+
+    // A body far bigger than the two fields this route takes: refused for its size, in this API's error
+    // shape. The server reads a refused body to its end, within a bound, before it answers: a client that is
+    // still writing when the connection closes under it gets a reset instead of the answer (on Windows the
+    // write fails with `ConnectionAborted`), and a real player or TUI should see the `413`.
+    let junk = "x".repeat(32 * 1024);
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            serde_json::json!({ "torrent": id, "file": 0, "junk": junk }),
+            Some(&session),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body this route has no use for"
+    );
+    assert_eq!(code, "body_too_large");
+
+    // Past that bound the server stops reading and closes, so a megabyte gets either the `413` (when the
+    // client had written it all before the close) or a failed send: both are a refusal, and which one depends
+    // only on the operating system's timing. What may not happen is the server reading it all, or falling over.
+    let junk = "x".repeat(1024 * 1024);
+    let sent = within(
+        http()
+            .post(served.url("/api/v1/stream-tokens"))
+            .json(&serde_json::json!({ "torrent": id, "file": 0, "junk": junk }))
+            .bearer_auth(&session)
+            .send(),
+    )
+    .await;
+    // Only the status is looked at: the reset that may follow it can take the body with it.
+    if let Ok(response) = sent {
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a megabyte of JSON"
+        );
+    }
+
+    // The bad requests above all carry bodies far below the cap, which the server reads in full before it
+    // answers, so none of them can race the connection's close the way an oversized one did.
+
+    // And the route still answers a normal request afterwards: this was a cap, not a broken route.
+    let path = stream_address(&served, Some(&session), &id, 0).await;
+    assert!(path.contains("/files/0/stream?token="), "{path}");
+
+    served.stop().await;
+}
+
+/// A torrent whose metadata has not arrived has no file list to name a file from: the answer is `409` with
+/// fbt-api's own code for "no metadata yet", which is what the stream route itself answers too. Nothing here
+/// can bring its metadata - DHT, LSD and peers are all absent - so it stays true for the length of the test.
+#[tokio::test]
+async fn a_torrent_without_metadata_has_no_stream_address() {
+    let served = Served::start("stream-no-metadata", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let id = "cd".repeat(20);
+
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/torrents"),
+        serde_json::json!({
+            "magnet": format!("magnet:?xt=urn:btih:{id}"),
+            "save_path": served.root().to_string_lossy(),
+        }),
+        Some(&session),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a magnet is added before its metadata is known"
+    );
+
+    let (status, code) = error_of(
+        post_json(
+            &http(),
+            &served.url("/api/v1/stream-tokens"),
+            serde_json::json!({ "torrent": id, "file": 0 }),
+            Some(&session),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "no file list to name yet");
+    assert_eq!(code, "no_metadata");
 
     served.stop().await;
 }

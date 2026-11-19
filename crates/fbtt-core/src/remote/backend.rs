@@ -78,6 +78,14 @@ impl Backend {
             self.publish();
         }
 
+        // The relay goes before the session ends: its streams read through this client's
+        // credential, so the relay must be done before the credential is gone, the same
+        // order the local endpoint and its engine go in (see `crate::local`). A relay
+        // that was never started is nothing, and its stop signal is the one this
+        // connection already asked to stop on.
+        if let Some(relay) = self.relay.take() {
+            relay.shutdown().await;
+        }
         // End this client's own session before going: a device that is not connected any more should stop
         // being listed as one. This is the only thing on the way out with a timeout of its own - two seconds,
         // and then the task ends whatever the server did with it (see `Api::log_out`).

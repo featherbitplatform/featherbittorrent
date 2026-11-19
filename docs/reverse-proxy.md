@@ -12,7 +12,7 @@ the featherbit gateway and translates directly to the others.
 Two kinds of response must reach the client as it is produced, not collected first:
 
 - `GET /api/v1/events`, the server-sent-events stream the TUI watches for updates; and
-- per-file streams (`.../stream`), which serve byte ranges while pieces arrive.
+- file streams (`/api/v1/torrents/*/files/*/stream`), which serve byte ranges while pieces arrive.
 
 A proxy that buffers them turns a live view into a hang: nothing completes, so nothing is ever sent.
 Switch response buffering off for these paths (nginx: `proxy_buffering off;`, plus a long
@@ -184,6 +184,34 @@ A warning that belongs here, not in a footnote: with logins off the server alway
 address as the host name, and no gateway sits in front of an address someone types straight into the
 browser at the server's port. If the bind is reachable beyond loopback, firewall that port to the
 gateway (and any machines you mean to share it with), or turn logins back on.
+
+## Streaming to a player
+
+`s` opens a file in mpv or VLC ([docs/streaming.md](streaming.md)), and a media player sends no headers:
+the only credential such a request can carry is the token in its address, issued by
+`POST /api/v1/stream-tokens` ([docs/server.md](server.md)).
+
+- **Setup 1**, the gateway for TLS and rate limits without a login of its own: the address works through
+  the gateway exactly as it is. The player arrives with a token the server issued, the gateway asks
+  nothing of it, and the server checks that token against the one file the address names. Two things to
+  keep in mind: a player re-requests its address on every seek, so a `limit-count` counts seeks rather
+  than plays; and nothing in this route's policy chain may buffer or read the response, exactly as for
+  the events stream above.
+- **Setups where the gateway authenticates** (2 and 3): the player has no gateway credential to send, so
+  an address on your public host would be turned away at the gateway before its token was ever looked
+  at. For those setups the TUI relays these requests itself: it listens on `127.0.0.1`, and what the
+  player is given is `http://127.0.0.1:<port>/relay/<token>`, an address on the machine the TUI runs.
+  The relay adds the gateway's credential to the server address it forwards to, passes one `Range`
+  header through, and copies back only what a player needs to seek. It sends the gateway's proof, never
+  the server's session token. What reaches your gateway is an ordinary API request carrying that
+  credential; no route or host rule of yours applies to the loopback address itself.
+- With logins off (setup 3) the issued address carries no token at all, and it is the relay that supplies
+  the gateway's credential; the server then sees the host name your `upstream` node rewrites the request
+  to, as above.
+
+A relayed request whose answer is not a status a player understands (`200`, `206`, `404` or `416`) comes
+back as a `502`: the relay does not follow redirects, so a proxy that would answer these paths with a
+redirect should be set to pass them through instead.
 
 ## The TUI's two gateway login methods
 

@@ -19,6 +19,7 @@ mod backend;
 mod exit;
 #[cfg(test)]
 mod fake_store;
+mod probe;
 mod run;
 mod secrets;
 mod serve;

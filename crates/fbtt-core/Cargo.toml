@@ -20,11 +20,22 @@ test-support = []
 [dependencies]
 # The nonce a challenge gives is base64url, and so is a JWT's header and payload.
 base64.workspace = true
+# Only for the `http` types the local stream endpoint's authenticator reads (the method
+# and the `Host` header), which fbt-api does not re-export: the same reason the workspace
+# names axum rather than `http` - one crate with the `HeaderMap` fbt-api hands us.
+axum.workspace = true
 directories.workspace = true
 fbt.workspace = true
+# The control API the local stream endpoint serves: fbt-api's own file-stream route, on the
+# same tag as the engine it drives, so the streaming implementation is the one fbt-api
+# already tests for ranges, permits and stalls.
+fbt-api.workspace = true
 # Only the `Stream` trait, polled by hand in the event stream reader: reqwest's body stream is one,
 # and this adds no version to the lock (see the workspace comment).
 futures-core.workspace = true
+# The relay's body stream: `StreamExt` to map a response's chunks into an axum body.
+# Already in the lock through axum, so this adds no version to the tree.
+futures-util = { workspace = true, default-features = false }
 # The JWT assertion's `jti`: a fresh random id per attempt.
 getrandom.workspace = true
 # The remote backend (Task 6): rustls with the `ring` provider, which is what `fbt`'s own `tls`
@@ -34,6 +45,9 @@ reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
+# The SHA-256 a stream token is stored as: the token itself is returned once on issue and
+# is a credential from then on, so what a store keeps is its hash and the compare is on it.
+sha2.workspace = true
 # The `Signer` trait ssh-key implements but does not re-export: it is how a device key signs a
 # gateway assertion over the exact bytes that are sent (see the workspace comment).
 signature.workspace = true
@@ -51,13 +65,37 @@ zeroize.workspace = true
 # The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
 # it needs `macros`; `spawn_blocking` is `rt`, the state save's cadence is `time`, and
 # the queues are `sync`. `net` is for the ssh-agent socket the key login talks to (Task 6).
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+# `process` is for starting a media player without a shell in between (Task 5).
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]`, and a runtime with worker threads: each test runs two live
-# sessions, and a blocking call in one should not stall the other's timers.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# sessions, and a blocking call in one should not stall the other's timers. `time` is
+# for the waits a player test has to keep (`tests/play.rs`).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# The streaming tests' client: plain http to loopback, which needs no TLS and
+# speaks HTTP/1.1, so the workspace's default-features-off reqwest is enough.
+reqwest.workspace = true
+
+# A stand-in for a media player (`testbin/fake_player.rs`): it records what it was handed and exits,
+# so no test needs a real mpv or VLC and none of them opens a window. The feature keeps it out of
+# every build that is not running these tests, and the release workflow builds `-p
+# featherbittorrent`, so it never reaches an archive either.
+[[bin]]
+name = "fbtt-fake-player"
+path = "testbin/fake_player.rs"
+required-features = ["test-support"]
 
 [[test]]
 name = "local"
+required-features = ["test-support"]
+
+[[test]]
+name = "stream"
+required-features = ["test-support"]
+
+# Launching a player, against the fake one above. `CARGO_BIN_EXE_fbtt-fake-player` is only set for a
+# test target that binary is built for, which is what this feature does here.
+[[test]]
+name = "play"
 required-features = ["test-support"]

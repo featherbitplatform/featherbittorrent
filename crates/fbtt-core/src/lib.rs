@@ -21,17 +21,21 @@ pub mod fs_list;
 pub mod local;
 pub mod lock;
 pub mod paths;
+pub mod player;
 pub mod remote;
+pub mod stream;
 pub mod ui_state;
 
 pub use auth::LOGIN_NAMESPACE;
 pub use client::{
-    AddSource, Client, ClientParts, Command, Commands, Connection, Detail, DetailTab,
+    AddSource, Client, ClientParts, Clock, Command, Commands, Connection, Detail, DetailTab,
     DeviceCommand, DeviceRow, DirListing, FilePriority, FileRow, LinkState, LiveLimits, Notice,
-    PeerRow, RowState, Snapshot, TorrentId, TorrentRow, Totals, TrackerRow,
+    PeerRow, PlaySource, PlayTarget, RowState, Snapshot, StreamUrl, TorrentId, TorrentRow, Totals,
+    TrackerRow,
 };
 pub use config::{
-    AuthConfig, Config, ConfigError, ConfigLoad, DeviceEntry, ServerConfig, UserEntry,
+    AuthConfig, Config, ConfigError, ConfigLoad, DeviceEntry, LogoSetting, PlayerConfig,
+    ServerConfig, UserEntry,
 };
 pub use engine::Engine;
 pub use local::LocalBackend;

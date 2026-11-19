@@ -19,7 +19,8 @@ use std::time::Instant;
 use fbtt_core::client::{ClientParts, Command, Commands};
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
 use fbtt_core::{
-    Config, LibraryLock, LocalBackend, LockError, Paths, RemoteBackend, Secret, Snapshot,
+    Config, ConfigLoad, LibraryLock, LocalBackend, LockError, Paths, RemoteBackend, Secret,
+    Snapshot,
 };
 use fbtt_tui::{ConnectTarget, Model};
 use tokio::task::JoinHandle;
@@ -301,10 +302,25 @@ fn loopback_target(bind: SocketAddr) -> RemoteTarget {
 /// `server:` line with nothing under it names no server - there is nothing in it to serve on, and
 /// `serve` asks its questions again. Bytes this run cannot read as a config answer `None`: a file it
 /// could not read cannot have told anybody about a server either.
+///
+/// The read is the run's own lenient one, [`Config::load`], not the edit path: a config whose only
+/// problem is the player's setting still names a server, and this run must offer it - the player's
+/// value is the one thing a run does not act on, and a held library that runs a server is worth the
+/// question about it, not a dead end. `load_for_edit` would refuse such a file, and the hand-off
+/// would never see the server.
 pub fn named_server(paths: &Paths) -> Option<SocketAddr> {
-    Config::load_for_edit(&paths.config_file())
-        .ok()?
-        .and_then(|config| config.server.map(|server| server.bind))
+    match Config::load(paths) {
+        // The file read as a config: its server section, if it has one, is the answer.
+        Ok(ConfigLoad::Loaded(config)) => config.server.map(|server| server.bind),
+        // The file read as a config, but the player's setting is not something a run may act on: the
+        // config came back with the player's at its default, and its server section is still the answer.
+        Ok(ConfigLoad::PlayerProblem { config, .. }) => config.server.map(|server| server.bind),
+        // No file yet, or one the run set aside as unreadable (already done by the startup load that
+        // precedes this): nothing in it names a server, so there is nothing to offer.
+        Ok(ConfigLoad::Missing) | Ok(ConfigLoad::Bad { .. }) => None,
+        // The file cannot be opened at all: no way to tell "empty" from "unavailable", so no server.
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +533,35 @@ mod tests {
         fs::write(paths.config_file(), "server: [unterminated\n")
             .expect("write bytes that are not YAML");
         assert_eq!(named_server(&paths), None, "not YAML at all");
+    }
+
+    /// A config whose only problem is the player's setting still names a server, and the hand-off must
+    /// see it: `serve` running on such a file holds the library lock and listens on the address the file
+    /// named, so a TUI on the same library is offered that local server rather than told the library is
+    /// taken and left with nothing. This is what `load_for_edit` used to get wrong: it refused the file,
+    /// so `named_server` answered `None` and the offer never happened.
+    #[test]
+    fn named_server_reads_a_config_whose_only_problem_is_the_player() {
+        let dir = ScratchDir::new("named_server_player_problem");
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        fs::create_dir_all(&paths.config_dir).expect("the config directory");
+
+        // A valid server section and a player whose program is empty: the one thing a run does not act on,
+        // and nothing else wrong. The file still names the address `serve` would listen on.
+        fs::write(
+            paths.config_file(),
+            "server:\n  bind: \"127.0.0.1:8090\"\nplayer:\n  program: \"\"\n",
+        )
+        .expect("write a server config with a bad player");
+
+        assert_eq!(
+            named_server(&paths),
+            some_bind("127.0.0.1:8090"),
+            "a player-only problem does not hide the server the config named"
+        );
     }
 
     /// The decision milestone 1's exit code 3 hangs on, made from a real file rather than from an address

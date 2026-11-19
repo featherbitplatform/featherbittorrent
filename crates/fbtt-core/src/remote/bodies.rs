@@ -10,6 +10,7 @@ use std::pin::Pin;
 // Named rather than imported anonymously: the stream reader below bounds a body with `poll_next`, and a
 // generic bound has to name the trait it is bounding.
 use futures_core::Stream;
+use futures_util::StreamExt;
 use reqwest::Response;
 
 use crate::client::Notice;
@@ -36,6 +37,11 @@ pub(crate) enum ApiError {
     /// outside the server's roots, a body the server could not parse. The link is fine; one line tells
     /// the person what the server said.
     Answer(String),
+    /// The relay's head wait ran out: the upstream opened the connection and then never sent a
+    /// response head within [`super::http::RELAY_HEAD_TIMEOUT`]. It is its own variant rather than
+    /// [`Transport`](Self::Transport) or [`Answer`](Self::Answer) because the relay answers it with
+    /// `504` - the upstream is slow, not unreachable, and it is not an answer the server gave.
+    HeadTimeout,
 }
 
 impl ApiError {
@@ -48,6 +54,7 @@ impl ApiError {
             ApiError::Transport(problem) => format!("the server could not be reached: {problem}"),
             ApiError::Refused(reason) => format!("{SIGN_IN_REFUSED}: {reason}"),
             ApiError::Answer(message) => message.clone(),
+            ApiError::HeadTimeout => "the server did not answer the stream request".to_string(),
         }
     }
 
@@ -68,6 +75,12 @@ impl ApiError {
     /// asked for something the server does not have.
     pub(crate) fn breaks_the_link(&self) -> bool {
         matches!(self, ApiError::Transport(_) | ApiError::Refused(_))
+    }
+
+    /// Whether this is the relay's own head timeout, as opposed to a transport failure or a
+    /// refusal. The relay answers it with `504` rather than `502`.
+    pub(crate) fn is_head_timeout(&self) -> bool {
+        matches!(self, ApiError::HeadTimeout)
     }
 }
 
@@ -118,6 +131,22 @@ where
     S: Stream,
 {
     std::future::poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// The response's body as a stream of its own, with the error type named: axum's
+/// `Body::from_stream` needs a `TryStream`, and a response's chunks are one. The relay
+/// serves its upstream's body this way, so the memory a stream holds is one chunk -
+/// whatever the upstream does; an error mid-body ends the stream, which is how a
+/// relayed response ends.
+pub(crate) fn stream<S>(
+    upstream: S,
+) -> impl futures_core::Stream<Item = Result<axum::body::Bytes, axum::Error>>
+where
+    S: Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
+{
+    upstream.map(|chunk| {
+        chunk.map_err(|_| axum::Error::new(std::io::Error::other("the upstream closed mid-body")))
+    })
 }
 
 /// Parses a body this client has already bounded. A server that answers JSON-shaped nonsense, or not

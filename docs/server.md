@@ -147,6 +147,50 @@ product adds:
 | `POST /api/v1/auth/session` / `DELETE` | Turns a signed challenge or a good password into a session token; DELETE drops the token. |
 | `GET /api/v1/auth/devices`, `POST`, `DELETE /api/v1/auth/devices/<name>` | A signed-in client manages device logins over the API, so the TUI's devices screen (`K`) works against a remote server. |
 | `GET /api/v1/fs/roots`, `GET /api/v1/fs/list` | Browse inside `server.allowed_roots` while adding a torrent: the folder picker (`Ctrl+O`) and the add dialog read this instead of the client's own disk, which is not where the server saves. |
+| `POST /api/v1/stream-tokens` | Asks for an address to stream one file from, for a media player that cannot send headers; its own section below. |
+
+### A stream address
+
+A player cannot carry a session token, so this route puts the credential in the address it hands out.
+The request names a torrent by either of its hashes in either case (the way fbt-api's own routes take an
+id) and a file by its index:
+
+```
+POST /api/v1/stream-tokens    { "torrent": "<40 or 64 hex digits>", "file": 0 }
+
+201 Created                   { "path": "/api/v1/torrents/<40 hex>/files/0/stream?token=<t>",
+                                "expires_in": 60 }
+```
+
+The id in the answer is always the torrent's wire hash in 40 lowercase hex digits, whatever spelling
+named it, and the index is plain decimal: that string is what the token is scoped to, byte for byte, so
+re-spelling it would hand out an address its own token could not open. `expires_in` is how long the
+token may go before somebody uses it. The body is capped at 8 KiB (a bigger one is `413`), because with
+logins off this route answers whoever reaches the address and a megabyte of JSON naming one file is not
+a request worth buffering. A torrent this library does not have, an index past the end of its list, or
+an index naming a pad file gets `404`; a torrent whose metadata has not arrived gets fbt-api's own
+`409 no_metadata`, which is what the stream route itself answers for the same torrent; anything that is
+not 40 or 64 hex digits gets `400 invalid_id`. All in this API's error shape.
+
+The token's life: it must be used within 60 s of being issued; after that it stays alive while a request
+arrives at least every 30 minutes, since a player re-requests its address on every seek and a paused
+film must survive; and never beyond 8 hours from the issue. At most 64 are live on one server; once 64
+are live, issuing a new token evicts the least recently used one, and tokens that have already expired
+are dropped first so they do not count against 64. Only a hash of each token is stored, a token opens
+exactly the one file its address names, and log lines name the subject, the torrent and the file but
+never the token.
+
+With logins on, a request for the file-stream route may carry that token in `?token=` instead of a
+session token: the guard tries a query token as a stream token first, only on the two methods of that
+route, only when no `Authorization` header is present, and then as a session token. A stream token is
+never accepted as a bearer header, and never on `GET /api/v1/events`. It is not the session either:
+signing out (`DELETE /api/v1/auth/session`) does not end a stream that was already handed out.
+
+With logins off there is no credential to hand out: the answer's `path` carries nothing on it and
+nothing is stored, because the host-name guard that stands in for a login has already accepted this
+request, and the stream route accepts it on the same terms. See [docs/streaming.md](streaming.md) for
+what a client does with these addresses, and [docs/reverse-proxy.md](reverse-proxy.md) for playing
+through a gateway.
 
 ## One library, one run: the lock and the hand-off
 

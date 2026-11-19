@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Press `s` to open a file in mpv or VLC while it downloads: the file under the cursor with the file list focused, otherwise the selected torrent's largest file. A file that is already whole plays by its path; anything else streams, over loopback from the local engine or from a server through a short-lived token scoped to that one file (`POST /api/v1/stream-tokens`). Behind a gateway that checks a credential of its own, the stream goes through a loopback relay that adds it. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+- `player:` in `config.yaml`: `player.program` (`auto`, `mpv`, `vlc`, or a program name or path) and `player.args` for extra arguments put before the media. `auto` finds mpv, then VLC: `PATH` first, then where each is usually installed. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+- The featherbit mark drawn as an image in the header and on the help screen in terminals that speak the kitty graphics protocol, iTerm2 inline images or sixel; the text title stays everywhere else, and `logo: off` in `config.yaml` turns the image off. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
 - `.deb` and `.rpm` packages for x86_64 and aarch64: Debian, Ubuntu and Raspberry Pi OS 64-bit take the `.deb`, Fedora and the RHEL 9 family the `.rpm`. Each carries gzipped man pages for every command, bash, zsh and fish completions, `LICENSE` and `NOTICE` and the docs, all generated from the same command definition as `--help` so they cannot drift from the flags, and installs nothing that starts by itself: no maintainer script, no service installed or enabled, no account created. ([#5](https://github.com/featherbitplatform/featherbittorrent/pull/5))
 - The Windows `.zip` and the macOS and Linux `.tar.gz` archives now carry those completions, the docs and the service examples beside the binary, where 0.1.0's held only the binary with `LICENSE`, `NOTICE` and `README.md`. ([#5](https://github.com/featherbitplatform/featherbittorrent/pull/5))
 - `docs/autostart.md` shows how to run `serve` at boot under systemd (a system unit and a user one), launchd or Windows Task Scheduler, with the example files for each under `packaging/`. Nothing installs or enables any of them: they ship as documentation, in `/usr/share/doc/featherbittorrent/examples/` inside the Linux packages and under `examples/` inside the archives. ([#5](https://github.com/featherbitplatform/featherbittorrent/pull/5))
@@ -16,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The engine is fbt-lib `v0.10.0`: a custom authenticator now sees the request path as it was received, which is what lets a stream token open exactly one file. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
 - Linux binaries now need glibc 2.34 or newer rather than 2.36: they are built inside an AlmaLinux 9 container instead of Debian 12, so the same binary runs on Ubuntu 22.04 and the RHEL 9 family as it did on Debian 12, Debian 13 and Raspberry Pi OS 12 and 13. ([#5](https://github.com/featherbitplatform/featherbittorrent/pull/5))
 
 ## [0.1.0] - 2026-11-16

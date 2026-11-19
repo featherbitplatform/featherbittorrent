@@ -202,7 +202,10 @@ pub fn list_devices(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
 
 /// The config file as it is now, or this library's defaults when there is no file
 /// yet. `load_for_edit` rather than `load`: an editor must not overwrite bytes it
-/// could not read, and nothing here wants the `.bad` rename either.
+/// could not read, and nothing here wants the `.bad` rename either. A file that reads
+/// as a config but whose player's setting is not usable is refused with one line naming
+/// the file and the player's setting to fix: a user or device command must never rewrite
+/// a file holding a bad value it would silently reset.
 fn read(paths: &Paths) -> Result<Config, Failure> {
     match Config::load_for_edit(&paths.config_file())? {
         Some(config) => Ok(config),
@@ -228,4 +231,83 @@ fn edit_config(paths: &Paths, change: impl FnOnce(&mut Config)) -> Result<(), Fa
     config.save(&paths.config_file())?;
     drop(lock);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list_users, remove_user};
+    use fbtt_core::Paths;
+    use fbtt_core::scratch::ScratchDir;
+    use std::fs;
+
+    /// A user command that finds a config whose only problem is the player's setting is refused, and
+    /// the line it prints names the config file's path and says the player's setting is what to fix.
+    /// The refusal must not rewrite the file: the bad value stays where the person can see and fix it,
+    /// and nothing is renamed aside. The write command is the one that would otherwise rewrite the file
+    /// (removing a user, and in doing so silently resetting the player to its default), so it is the
+    /// clearest case the refusal has to hold.
+    #[test]
+    fn a_player_problem_refuses_with_the_path() {
+        let dir = ScratchDir::new("admin_player_problem");
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        fs::create_dir_all(&paths.config_dir).expect("the config directory");
+
+        // A valid server section and a player whose program is empty: the one thing a run does not act
+        // on, and nothing else wrong. The command must refuse rather than rewrite this file.
+        let written = "server:\n  bind: \"127.0.0.1:8090\"\nplayer:\n  program: \"\"\n";
+        fs::write(paths.config_file(), written).expect("write a server config with a bad player");
+
+        // The write command: it would remove a user and, in rewriting the file, reset the player's
+        // value to its default. It must refuse instead, with the line naming the file and the player.
+        let mut out = Vec::new();
+        let problem = remove_user(&paths, &mut out, "alice")
+            .expect_err("a player-only problem is refused, not rewritten");
+        assert_eq!(
+            problem.code,
+            1,
+            "a refusal is a problem, not a lock: {message}",
+            message = problem.message
+        );
+        // The line names the config file's path, so the person knows which file to fix.
+        let path = paths.config_file().display().to_string();
+        assert!(
+            problem.message.contains(&path),
+            "the line names the config file's path: {path}, {message}",
+            message = problem.message
+        );
+        // ...and says the player's setting is what to fix.
+        assert!(
+            problem.message.to_lowercase().contains("player"),
+            "the line names the player's setting: {message}",
+            message = problem.message
+        );
+
+        // The read command refuses with the same line, for the same reason.
+        let mut out = Vec::new();
+        let problem = list_users(&paths, &mut out)
+            .expect_err("a player-only problem is refused on a read too");
+        assert!(
+            problem.message.contains(&path),
+            "the read command's line names the path too: {message}",
+            message = problem.message
+        );
+
+        // The refusal left the file exactly where it was: the bad value is still there, and nothing
+        // was renamed aside under `.bad`.
+        assert_eq!(
+            fs::read_to_string(paths.config_file()).expect("the file is still where it was"),
+            written,
+            "the bad value stays for the person to fix"
+        );
+        // The `.bad` name `Config::load` would use, `config.yaml.bad`: nothing was renamed to it.
+        let config_name = paths.config_file().file_name().unwrap().to_os_string();
+        let aside = paths
+            .config_dir
+            .join(config_name)
+            .with_extension("yaml.bad");
+        assert!(!aside.exists(), "nothing was renamed aside: {aside:?}");
+    }
 }

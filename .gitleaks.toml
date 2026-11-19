@@ -16,9 +16,22 @@ paths = [
 
 [[allowlists]]
 # A throwaway P-384 key in a test, generated for the test and never used anywhere
-# else. Scoped to the line that names the constant, so a real key added to this
+# else. Scoped to the line that names the constant (`condition = "AND"`: the file AND the
+# line must both match, as the default is either), so a real key added to this
 # file later is still reported.
 description = "Throwaway P-384 fixture key in device.rs's tests"
 paths = ['''crates/fbtt-core/src/remote/device\.rs''']
+condition = "AND"
 regexTarget = "line"
 regexes = ['''const P384_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----''']
+
+[[allowlists]]
+# A made-up query token in a stream-path unit test: it only has to look like a token so the
+# test can check that `?token=` is accepted and stripped; it opens nothing. Scoped to the
+# line that holds the literal (`condition = "AND"`: the file AND the line must both match, as
+# the default is either), so a real token added to this file later is still reported.
+description = "Fake stream token in stream.rs's tests"
+paths = ['''crates/fbtt-core/src/remote/stream\.rs''']
+condition = "AND"
+regexTarget = "line"
+regexes = ['''format!\("\{bare\}\?token=abc-DEF_0123"\)''']

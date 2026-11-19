@@ -57,6 +57,7 @@ own guide is [docs/server.md](docs/server.md).
 | `o` | sort by the next column |
 | `O` | reverse the sort |
 | `p` | pause/resume |
+| `s` | stream in mpv or VLC |
 | `/` | filter |
 | `m` | minimal |
 | `a` | add |
@@ -74,6 +75,12 @@ own guide is [docs/server.md](docs/server.md).
 | `q` | quit |
 
 The arrow keys do what `j` and `k` do, and Ctrl-C means the same as `q`. A key is an action, not a shortcut for whichever widget has focus: `p` stops or starts the torrent under the cursor wherever the cursor is. A dialog owns the keyboard while it is up, so a `q` typed into a magnet field adds a letter instead of quitting; `Esc` closes the dialog. `q` asks before leaving when something is still downloading: press `q` again or `y` to confirm, any other key to cancel.
+
+### Streaming to a player
+
+`s` opens a file in mpv or VLC while it is still downloading: the file under the cursor with the file list focused, otherwise the selected torrent's largest file. A file that is already whole on this machine plays by its own path; anything else is streamed, over loopback from the local engine, or from a server through a short-lived token that opens exactly that one file. The player is handed a private playlist file rather than the address, so the token never shows in a process list, and mpv and VLC are found by themselves unless `player:` in `config.yaml` names one or adds arguments. Tokens, gateways and what keeps playing after you quit are in [docs/streaming.md](docs/streaming.md).
+
+The header and the help screen draw the featherbit mark as an image in terminals that speak the kitty graphics protocol, iTerm2 inline images or sixel, and keep the text title everywhere else; `logo: off` in `config.yaml` turns the image off ([docs/streaming.md](docs/streaming.md)).
 
 ### The config file
 
