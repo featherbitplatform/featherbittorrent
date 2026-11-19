@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
 ### Added
 
 - Press `s` to open a file in mpv or VLC while it downloads: the file under the cursor with the file list focused, otherwise the selected torrent's largest file. A file that is already whole plays by its path; anything else streams, over loopback from the local engine or from a server through a short-lived token scoped to that one file (`POST /api/v1/stream-tokens`). Behind a gateway that checks a credential of its own, the stream goes through a loopback relay that adds it. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
@@ -39,4 +41,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.2.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0
 [0.1.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0
