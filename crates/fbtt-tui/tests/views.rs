@@ -1266,6 +1266,7 @@ fn the_help_mark_never_covers_a_key_line() {
     let snap = library();
     // Both cell sizes the probe answers: 8x16 is the one the help suite has always used, and
     // 4x16 is the narrow cell that makes the mark's own width, not the list's, the limit.
+    let (mut marks_placed, mut exact_checked) = (0usize, 0usize);
     for cell in [CellPx { w: 8, h: 16 }, CellPx { w: 4, h: 16 }] {
         let logos = logos(Protocol::Sixel, cell);
         for height in 20..=60u16 {
@@ -1364,10 +1365,7 @@ fn the_help_mark_never_covers_a_key_line() {
                     .iter()
                     .find(|placement| matches!(placement.size, LogoSize::Large(_)))
                 {
-                    let top_row = lines
-                        .iter()
-                        .position(|line| line.contains('┌'))
-                        .expect("the help box has a top border");
+                    let (top_row, _, _, _) = box_of(&lines);
                     assert_eq!(
                         usize::from(large.rect.y),
                         top_row + 1,
@@ -1391,46 +1389,54 @@ fn the_help_mark_never_covers_a_key_line() {
                         inner.trim().is_empty(),
                         "{width}x{height} cell {cell:?}: the row under the mark is not the blank separator: {inner:?}"
                     );
-                    // The first key line inside this box (between its top and bottom borders)
-                    // stands on the row right after the one blank separator below the mark's bottom edge. Where the mark-free reference draws a
-                    // key line in its box, the marked box must draw one too: a mark that reserves
-                    // so many rows that every key is pushed out fails here. Only a reference with
-                    // no key line at all, a box too short for any, excuses it.
-                    let first_key_row = (top_row + 1..end).find(|&i| {
-                        let boxed: String = lines[i]
-                            .chars()
-                            .skip(first)
-                            .take(last + 1 - first)
-                            .collect();
-                        KEYS.iter()
-                            .any(|(k, a)| boxed.contains(k) && boxed.contains(a))
-                    });
-                    // The reference's first key row, counted from its own top border.
-                    let reference_row = free_keys.iter().position(|line| {
-                        KEYS.iter()
-                            .any(|(k, a)| line.contains(k) && line.contains(a))
-                    });
-                    if let Some(reference_row) = reference_row {
-                        let row = first_key_row.unwrap_or_else(|| {
-                            panic!("{width}x{height} cell {cell:?}: the mark pushed every key line out of the box")
+                    // The first row with anything on it inside this box, between its top and
+                    // bottom borders and counted from its top border, stands on the row right
+                    // after the one blank separator below the mark: the mark's own rows and
+                    // that one blank row are all it adds above the list, so the first content
+                    // row sits that far below where the mark-free box has it. That is the key
+                    // line at full width, and at a width too narrow for a whole key line (the
+                    // box clips each line, and no row holds a key with its action) it is the
+                    // first clipped row of the list. Too few and too many reserved rows both
+                    // fail, and a mark that pushes the whole list out of the box fails too.
+                    let content_row = |rows: &[String]| -> Option<usize> {
+                        rows.iter().enumerate().skip(1).find_map(|(i, row)| {
+                            if row.starts_with('└') {
+                                return None;
+                            }
+                            let inner: String = row
+                                .chars()
+                                .skip(1)
+                                .take(row.chars().count().saturating_sub(2))
+                                .collect();
+                            (!inner.trim().is_empty()).then_some(i)
+                        })
+                    };
+                    if let Some(reference_row) = content_row(&free_keys) {
+                        let row = content_row(&marked_keys).unwrap_or_else(|| {
+                            panic!("{width}x{height} cell {cell:?}: the mark pushed every line of the list out of the box")
                         });
-                        // The mark's own rows and the one blank separator are all it adds above
-                        // the keys: the first key sits that far below where the mark-free box
-                        // has it, so too few and too many reserved rows both fail.
                         assert_eq!(
-                            row - top_row,
+                            row,
                             reference_row + usize::from(large.rect.height) + 1,
-                            "{width}x{height} cell {cell:?}: the first key line is not on the row right after the one blank separator under the mark (too few or too many rows reserved)"
+                            "{width}x{height} cell {cell:?}: the first content row is not on the row right after the one blank separator under the mark (too few or too many rows reserved)"
                         );
                         assert!(
-                            row > below,
-                            "{width}x{height} cell {cell:?}: a key line stands at or above the mark's bottom edge"
+                            top_row + row > below,
+                            "{width}x{height} cell {cell:?}: a list line stands at or above the mark's bottom edge"
                         );
+                        exact_checked += 1;
                     }
+                    marks_placed += 1;
                 }
             }
         }
     }
+    eprintln!("help sweep: {marks_placed} placed marks, {exact_checked} exact-row checks");
+    assert!(marks_placed > 0, "the sweep never placed a mark");
+    assert_eq!(
+        marks_placed, exact_checked,
+        "every placed mark gets the exact-row check"
+    );
 }
 
 /// The help screen's mark is not dropped by the modal-overlap rule: it belongs to the help box,
