@@ -441,8 +441,9 @@ impl Config {
             Ok(Reading::Parsed(config)) => Ok(Some(*config)),
             // The file read as this config; the player's setting is not what a run may act on, but a
             // caller editing the file wants the bytes as written - including the bad line - to see and
-            // to fix. The one line comes back as an `Err`, the same as an unparsable file.
-            Ok(Reading::PlayerProblem(_, problem)) => Err(problem),
+            // to fix. The one line names the file and says the player's setting is what to fix, so the
+            // person who got it knows where and what, and the edit is refused rather than rewritten.
+            Ok(Reading::PlayerProblem(_, problem)) => Err(player_problem_line(path, &problem)),
             Ok(Reading::Unparsable(error)) => Err(problem_line(path, &error)),
             // A file that cannot be opened at all: the same reason `load` calls it an error, put in one
             // line instead of carrying an enum a caller only formats anyway.
@@ -670,6 +671,18 @@ fn problem_line(path: &Path, error: &serde_norway::Error) -> String {
     } else {
         format!("{name}: {message}")
     }
+}
+
+/// One line about a config whose player's setting is not something a run may act on: the file's
+/// path, and the player's value is what to fix. Unlike [`problem_line`] (a file that cannot be
+/// read at all), this file *was* read and is left where it is, so the line says the file and the
+/// setting to fix rather than a parse failure.
+fn player_problem_line(path: &Path, problem: &str) -> String {
+    format!(
+        "{}: the player setting is not usable ({}); fix the player section and keep the file",
+        path.display(),
+        problem
+    )
 }
 
 /// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
