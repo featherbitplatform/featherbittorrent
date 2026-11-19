@@ -427,17 +427,38 @@ async fn torrent_for(path: &Path) -> Vec<u8> {
     .expect("the hashing task ran")
 }
 
+/// The `.torrent` for the single file at `path`, hashed off this thread, in the version
+/// [`fbt::CreateTorrent`] makes by default: hybrid, so it carries its 40-hex v1 hash and its 64-hex v2 hash
+/// and a client may name the torrent either way. Only a test about hash spellings wants that, and only for
+/// one file: a multi-file hybrid puts a BEP 47 pad between its files, which is what moves indices around.
+async fn hybrid_torrent_for(path: &Path) -> Vec<u8> {
+    let path = path.to_path_buf();
+    within(tokio::task::spawn_blocking(move || {
+        fbt::CreateTorrent::new(path)
+            .build(&mut |_done, _total| std::ops::ControlFlow::Continue(()))
+            .expect("hash the test torrent")
+    }))
+    .await
+    .expect("the hashing task ran")
+}
+
 /// The id of a torrent `served` is seeding: `path_in_root` (a file, or a folder whose files the torrent
 /// names) was written inside this server's own root before this, so its add - through fbt-api's own route,
 /// exactly as any client's arrives - has nothing to download, only to check. Seeded rather than downloaded
 /// because the routes under test answer about a file that is there.
 async fn seed_torrent(served: &Served, token: Option<&str>, path_in_root: &Path) -> String {
     let bytes = torrent_for(path_in_root).await;
+    seed_bytes(served, token, &bytes).await
+}
+
+/// The same add for `.torrent` bytes a test hashed itself, which is what a test that wants the torrent in
+/// another spelling has - [`hybrid_torrent_for`] builds the one carrying both spellings of the id.
+async fn seed_bytes(served: &Served, token: Option<&str>, bytes: &[u8]) -> String {
     let mut request = http()
         .post(served.url("/api/v1/torrents"))
         .query(&[("save_path", served.root().to_string_lossy().as_ref())])
         .header(reqwest::header::CONTENT_TYPE, "application/x-bittorrent")
-        .body(bytes);
+        .body(bytes.to_vec());
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -530,6 +551,12 @@ async fn stream_address(served: &Served, token: Option<&str>, id: &str, file: us
         .as_str()
         .expect("the answer names the path to stream")
         .to_string()
+}
+
+/// The path part of a stream address - everything before any `?token=` - so that two answers for one file
+/// can be compared without comparing the tokens in them, which differ every time one is issued.
+fn stream_target(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(target, _token)| target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,6 +2003,81 @@ async fn a_setting_problem_names_the_server_log_not_the_config_file() {
     assert!(left.contains("program: \"\""), "{left}");
 }
 
+/// A folder made unwritable for the length of one test and put back however that test ends: a scratch
+/// directory holding a `0o555` folder cannot be deleted, which would leave the run littered and every later
+/// test in it sharing the mess.
+#[cfg(unix)]
+struct ReadOnlyFolder(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReadOnlyFolder {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A config this server cannot write is a disk problem for whoever runs the server, not news for a browser:
+/// the answer says it could not save and points at the log, and it holds no path. `ConfigError::Write` names
+/// the file it tried to put in place, so answering with that error printed the server's own directory to a
+/// stranger - which is what the read side used to do, and for the same reason.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_config_that_cannot_be_saved_keeps_its_path_in_the_server_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let served = Served::start("unwritable-config", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let file = served.paths.config_file();
+    let dir = file.parent().expect("the config directory");
+    fs::create_dir_all(dir).expect("make the config directory");
+
+    // Nothing is in the folder yet - serving a library does not write a config file - so the read succeeds
+    // and only the save fails. Then the folder goes read-only, which is how an ownership change or a
+    // permissions mistake looks to this server.
+    let unwritable = ReadOnlyFolder(dir.to_path_buf());
+    fs::set_permissions(&unwritable.0, fs::Permissions::from_mode(0o555))
+        .expect("make the config folder read-only");
+    if fs::write(dir.join("probe"), "").is_ok() {
+        // Running as root, or on a filesystem that does not enforce folder permissions: the save would have
+        // succeeded, so there is nothing here to test.
+        eprintln!("skipped: this host let a read-only folder be written to");
+        drop(unwritable);
+        served.stop().await;
+        return;
+    }
+
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/auth/devices"),
+        serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a config this server cannot write is not its to repair",
+    );
+
+    let text = within(response.text()).await.expect("an answer");
+    let directory = dir.to_string_lossy().into_owned();
+    assert!(
+        !text.contains(&directory),
+        "the browser was told where the config lives: {text}"
+    );
+    assert!(
+        !text.contains("config.yaml"),
+        "the browser was told the config file's name: {text}"
+    );
+
+    drop(unwritable);
+    served.stop().await;
+}
+
 /// A `config.yaml` this server cannot read is somebody's hand-edited file, and a request that cannot parse it
 /// has no business rearranging it: adding a device answers that the config needs its owner's attention, points
 /// at the server log for what is wrong, writes nothing, and leaves the bytes under the name they had. It used
@@ -2269,7 +2371,10 @@ async fn stream_token_is_scoped_to_one_file() {
 
 /// The address the route hands out is fbt-api's own stream route on this server: one range comes back as
 /// `206` with `Content-Range` and exactly the bytes the file holds. What the token opens is a real stream,
-/// not a promise about one.
+/// not a promise about one. And the torrent is named in three spellings - its 40-hex hash lower-case, the
+/// same upper-case, and its 64-hex v2 hash - because the answer always names the torrent by the lowercase
+/// wire hash, which is the string a token's scope is cut from: an address asked for in upper case streams
+/// with the token it came back with, whatever spelling asked for it.
 #[tokio::test]
 async fn stream_token_streams_a_range() {
     let served = Served::start("stream-range", |scratch| {
@@ -2279,12 +2384,23 @@ async fn stream_token_streams_a_range() {
     let client = http();
     let session = log_in_with_password(&served, "alice", "hunter2").await;
     let bytes = sample(200);
-    let id = seed_torrent(
-        &served,
-        Some(&session),
-        &write_file(served.root(), "payload.bin", &bytes),
-    )
-    .await;
+    // One file, hashed hybrid: a single-file torrent holds no BEP 47 pad in any version, so index 0 is still
+    // the file itself, and a hybrid torrent carries both spellings of its id.
+    let payload = write_file(served.root(), "payload.bin", &bytes);
+    let torrent = hybrid_torrent_for(&payload).await;
+    let hashes = fbt::Metainfo::from_bytes(&torrent)
+        .expect("read the test torrent back")
+        .info_hashes;
+    let v1 = hashes
+        .v1
+        .expect("a hybrid torrent carries its 40-hex v1 hash")
+        .to_string();
+    let v2 = hashes
+        .v2
+        .expect("a hybrid torrent carries its 64-hex v2 hash")
+        .to_string();
+    let id = seed_bytes(&served, Some(&session), &torrent).await;
+    assert_eq!(id, v1, "the add answers with the wire hash");
 
     let path = stream_address(&served, Some(&session), &id, 0).await;
     let response = open_stream(&client, false, &served.url(&path), Some("bytes=4-9")).await;
@@ -2296,6 +2412,30 @@ async fn stream_token_streams_a_range() {
     );
     let body = within(response.bytes()).await.expect("a body");
     assert_eq!(body.as_ref(), &bytes[4..10], "the six bytes asked for");
+
+    // Asked for in upper case, and by the other hash: the path is the same string either way, down to the
+    // spelling of the id, because a token's scope has to match what fbt-api's stream route compares.
+    let spelled = stream_address(&served, Some(&session), &v1.to_uppercase(), 0).await;
+    assert_eq!(
+        stream_target(&spelled),
+        format!("/api/v1/torrents/{v1}/files/0/stream"),
+        "the answer spells the id as 40 lower-case hex whatever was asked for",
+    );
+    let by_v2 = stream_address(&served, Some(&session), &v2, 0).await;
+    assert_eq!(
+        stream_target(&by_v2),
+        stream_target(&spelled),
+        "the 64-hex spelling names the same torrent by its wire hash",
+    );
+
+    let response = open_stream(&client, false, &served.url(&spelled), Some("bytes=4-9")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{spelled}");
+    let body = within(response.bytes()).await.expect("a body");
+    assert_eq!(
+        body.as_ref(),
+        &bytes[4..10],
+        "the six bytes from an address asked for in upper case",
+    );
 
     served.stop().await;
 }

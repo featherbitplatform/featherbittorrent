@@ -187,7 +187,10 @@ pub(super) struct NewDevice {
 /// fail - and doing that from inside one would mean an ordinary `POST` renaming somebody's config file, then
 /// writing a different file in its place, on the strength of YAML it could not read. So this reads with
 /// [`Config::load_for_edit`], which renames nothing: the answer is `500` and the person's own bytes stay
-/// where they can fix them.
+/// where they can fix them. A folder this server cannot write to is answered the same way, and neither
+/// answer names the file: the path and the reason for the failure go to the log, where whoever runs this
+/// server reads such things, and a browser that has never seen this machine gets one sentence with no
+/// directory in it.
 async fn change(
     shared: &Arc<Shared>,
     change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError>,
@@ -195,13 +198,22 @@ async fn change(
     let _guard = shared.changing_devices.lock().await;
     // Read on the blocking pool, like every other disk call here, and with nothing written on the way: a
     // file this server cannot parse is somebody's hand-edited file, and the only honest answer is to say so
-    // and leave it where they can fix it. The path is cloned because the copy for saving has to stay here.
+    // and leave it where they can fix it. Each disk call takes a copy of the path of its own and `file`
+    // stays here, because the log line about a failure wants the file this request actually used.
     let file = shared.paths.config_file();
     let reading = file.clone();
     let read = tokio::task::spawn_blocking(move || Config::load_for_edit(&reading))
         .await
         .map_err(|problem| {
-            RouteError::internal(format!("the config could not be read ({problem})"))
+            // The task failing at all - a panic in the read, or a runtime on its way out - is this program's
+            // own failure, and it goes where whoever runs the server reads such things rather than into an
+            // answer that cannot act on it.
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config read task failed",
+            );
+            RouteError::internal("the server could not read its config; see the server log")
         })?;
     let mut config = match read {
         Ok(Some(config)) => config,
@@ -228,13 +240,29 @@ async fn change(
     change(&mut server.auth.devices)?;
     let devices = server.auth.devices.clone();
     // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`), so a
-    // crash leaves either the old list or the new one and never half of each.
-    tokio::task::spawn_blocking(move || config.save(&file))
+    // crash leaves either the old list or the new one and never half of each. A folder this server has no
+    // write permission on, or a disk with no room left on it, is news for whoever runs this server and not
+    // for the browser: `ConfigError::Write` prints the absolute path it tried to put in place, so the reason
+    // goes to the log and the answer keeps one sentence with no path in it.
+    let saving = file.clone();
+    tokio::task::spawn_blocking(move || config.save(&saving))
         .await
         .map_err(|problem| {
-            RouteError::internal(format!("the config could not be written ({problem})"))
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config save task failed",
+            );
+            RouteError::internal("the server could not save its config; see the server log")
         })?
-        .map_err(|problem| RouteError::internal(format!("cannot write the config ({problem})")))?;
+        .map_err(|problem| {
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config could not be saved",
+            );
+            RouteError::internal("the server could not save its config; see the server log")
+        })?;
     // What logins check against becomes what was just written, so from here the file and this run agree.
     // A key in it that cannot be used says so here too, where a person who has just edited the list by
     // hand would want to hear it.
