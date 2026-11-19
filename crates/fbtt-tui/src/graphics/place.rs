@@ -18,7 +18,8 @@ use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Style};
 
 use super::caps::{CellPx, Graphics, Protocol};
-use super::image::{self, LogoDims, Rgba};
+use super::image::{self};
+pub(crate) use super::image::{LogoDims, Rgba};
 use super::iterm2;
 use super::kitty;
 use super::sixel;
@@ -40,7 +41,7 @@ pub enum LogoSize {
 ///
 /// The payload is what [`Placer`] writes: the transmit-plus-place for kitty, the inline image for
 /// iTerm2, the encoded sixel for sixel. It is built once per cell size and reused until that changes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
     /// What this mark is.
     pub size: LogoSize,
@@ -160,7 +161,11 @@ fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims) -> Vec<u8> {
 fn rgb(color: Color) -> [u8; 3] {
     match color {
         Color::Rgb(r, g, b) => [r, g, b],
-        _ => [0x0b, 0x0b, 0x0e],
+        // The theme never leaves a token undecided, and a ground that is not `Rgb` is not a ground
+        // this palette would ever draw a canvas in: rather than invent a colour for it, stop.
+        other => panic!(
+            "the canvas is a theme colour, and the theme keeps every token as Rgb: {other:?}"
+        ),
     }
 }
 
@@ -174,6 +179,17 @@ pub struct Placement {
     pub rect: Rect,
     /// The bitmap the placement carries, so a frame can tell a moved image from a different one.
     pub dims: LogoDims,
+    /// The prepared mark this is, so the bytes that put it on the screen come with it: the help
+    /// screen's mark has three sizes that share one id, and the one the frame placed is the one
+    /// whose pixels the terminal must hold.
+    pub prepared: Option<Arc<Prepared>>,
+}
+
+impl Placement {
+    /// The prepared mark this placement is, or `None` for a placement the view built without one.
+    pub fn prepared(&self) -> Option<Arc<Prepared>> {
+        self.prepared.clone()
+    }
 }
 
 /// The marks to draw, or nothing.
@@ -224,13 +240,12 @@ impl LogoView<'_> {
                         });
                     }
                     Protocol::Iterm2 | Protocol::Sixel => {
-                        // The cell is the canvas, and it is not written: the image goes over it.
+                        // The cell is the canvas, and it is not written: the image goes over it. The
+                        // style is left as the frame drew it - a `Reset` here would ask the terminal
+                        // for a colour this palette never named - with only the canvas's ground
+                        // named, since the ground is what shows while the image is being sent.
                         cell.set_symbol(" ")
-                            .set_style(Style {
-                                fg: Some(Color::Reset),
-                                bg: Some(theme::INK_950),
-                                ..Style::default()
-                            })
+                            .set_bg(theme::INK_950)
                             .set_diff_option(CellDiffOption::Skip);
                     }
                     Protocol::None => {}
@@ -277,26 +292,19 @@ pub struct Placer {
     /// The cell size the `sent` below was sent for: the same pixels under a new cell size are a new
     /// bitmap, so a change here is a change in `dims`.
     cell: Option<CellPx>,
-    /// The payloads already written to the terminal, per id and size. Kitty writes its pixels once per
-    /// id and size; a new cell size transmits them again under the same id, which is the only time `sent`
-    /// is reset for anything but [`invalidate`].
-    sent: [Option<DimKey>; 2],
+    /// The payload last transmitted under `SMALL_ID`, for this cell size. The header's mark has one
+    /// size - three rows - so one slot is the whole question.
+    sent_small: Option<Arc<Prepared>>,
+    /// The payload last transmitted under `LARGE_ID`, for this cell size. The help screen's mark has
+    /// three sizes - ten, eight and six rows - and the one on the screen is whichever the frame
+    /// placed, so what was sent last is what the next frame is compared against: a frame that
+    /// places the six-row mark sends the six-row pixels, not the ten-row ones it sent before.
+    sent_large: Option<Arc<Prepared>>,
     /// The placements the last frame put on the screen: the answer to "is this placement new?".
     last: Vec<Placed>,
     /// The screen `last` was placed on: a different one is a cleared screen for the protocols that write
     /// images at a cursor, and cleared screens do not keep images.
     last_screen: Option<Size>,
-}
-
-/// What `sent` remembers per id and size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DimKey {
-    /// The rows the bitmap was built for.
-    rows: u16,
-    /// The cell width the bitmap was built for.
-    cell_w: u16,
-    /// The cell height the bitmap was built for.
-    cell_h: u16,
 }
 
 /// A placement and the image it carried, as the last frame left it on the screen.
@@ -315,7 +323,8 @@ impl Placer {
         Placer {
             protocol,
             cell: None,
-            sent: [None, None],
+            sent_small: None,
+            sent_large: None,
             last: Vec::new(),
             last_screen: None,
         }
@@ -323,45 +332,54 @@ impl Placer {
 
     /// The bytes to write before a frame is drawn.
     ///
-    /// For kitty this is the transmission: the pixels of every mark not yet sent for this cell size, each
-    /// followed by its placement. The terminal keeps them under their ids from here on, and the frame's
-    /// own placeholder cells are what ratatui writes - so the image is never written once per frame.
+    /// For kitty this is the transmission: the pixels of every mark this frame draws that the terminal
+    /// does not already hold for this cell size, each followed by its placement. The terminal keeps
+    /// them under their ids from here on, and the frame's own placeholder cells are what ratatui
+    /// writes, so an image is never written once per frame.
     ///
-    /// For the other two protocols there is nothing to write before the frame: their image goes out after
-    /// it, because it goes where the frame has decided to put it.
-    pub fn before_draw(&mut self, logos: &PreparedLogos) -> Vec<u8> {
-        if logos.graphics.protocol != self.protocol {
-            return Vec::new();
-        }
-        // A new cell size is a new bitmap under the same id: nothing sent before it is a bitmap the
-        // terminal still has in the size it drew it.
-        if self.cell != logos.graphics.cell {
+    /// `placements` is what the frame will draw: for the help screen's mark, whose three sizes share
+    /// one id, the pixels that go out are the ones for the size the frame places, so a frame that
+    /// places the six-row mark sends the six-row bitmap and never the ten-row one.
+    ///
+    /// For the other two protocols there is nothing to write before the frame: their image goes out
+    /// after it, because it goes where the frame has decided to put it.
+    pub fn before_draw(&mut self, logos: &PreparedLogos, placements: &[Placement]) -> Vec<u8> {
+        // The cell size is remembered here even for the protocols that write nothing before the
+        // frame, because a cell change is what resets `sent` when kitty answers later.
+        if logos.graphics.protocol == self.protocol && self.cell != logos.graphics.cell {
             self.cell = logos.graphics.cell;
-            self.sent = [None, None];
+            self.sent_small = None;
+            self.sent_large = None;
         }
-        if self.protocol != Protocol::Kitty {
+        if self.protocol != Protocol::Kitty || logos.graphics.protocol != self.protocol {
             return Vec::new();
         }
-        let Some(cell) = self.cell else {
-            return Vec::new();
-        };
+        self.transmit(logos, placements)
+    }
+
+    /// The pixels a kitty frame owes the terminal: every mark it places that the terminal does not
+    /// already hold under its id, in the order the screen will show them - the header's first, the
+    /// help screen's after. A new cell size is a new bitmap under the same id, so the first frame
+    /// after one transmits everything it draws again.
+    fn transmit(&mut self, logos: &PreparedLogos, placements: &[Placement]) -> Vec<u8> {
         let mut out = Vec::new();
-        // The header's mark first, then the help screen's, so the ids arrive in the order the screen
-        // will show them.
-        for (index, prepared) in [logos.small.as_ref(), logos.large.first()]
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, prepared)| prepared.map(|prepared| (index, prepared)))
-        {
-            let key = DimKey {
-                rows: prepared.dims.rows,
-                cell_w: cell.w,
-                cell_h: cell.h,
+        let small = placements
+            .iter()
+            .any(|placement| placement.size == LogoSize::Small)
+            .then(|| logos.small.clone())
+            .flatten();
+        let large = placements
+            .iter()
+            .find(|placement| matches!(placement.size, LogoSize::Large(_)))
+            .and_then(|placement| logos.logo(placement).cloned());
+        for prepared in [small, large].into_iter().flatten() {
+            let slot = match prepared.size {
+                LogoSize::Small => &mut self.sent_small,
+                LogoSize::Large(_) => &mut self.sent_large,
             };
-            let slot = &mut self.sent[index];
-            if *slot != Some(key) {
+            if slot.as_ref().map(|sent| &sent.payload) != Some(&prepared.payload) {
                 out.extend_from_slice(&prepared.payload);
-                *slot = Some(key);
+                *slot = Some(Arc::new(prepared));
             }
         }
         out
@@ -385,18 +403,35 @@ impl Placer {
         logos: &PreparedLogos,
     ) -> AfterDraw {
         if logos.graphics.protocol != self.protocol || self.protocol == Protocol::Kitty {
+            // Kitty needs no bookkeeping after the frame - its bytes went out before it - but the
+            // frame still tells the placer what the screen is now, so a next frame of a different
+            // protocol knows the screen changed.
+            self.last_screen = Some(screen);
+            self.last.clear();
             return AfterDraw::default();
         }
 
+        // A screen of a different size is a cleared screen: ratatui has already redrawn every cell of
+        // it, so no cells are owed a repaint from the just-drawn buffer.
+        let screen_changed = self.last_screen != Some(screen);
+
         // The previous placements that are gone now: their cells still hold their image on the screen, so
-        // they are repainted from the drawn buffer instead of left as ghosts.
+        // they are repainted from the drawn buffer instead of left as ghosts. Each rect is clipped to the
+        // screen it is painted on, because a rect from a larger screen is not a rect of this one, and the
+        // cells beyond this screen's edge are not cells the drawn buffer holds.
         let mut repaint = Vec::new();
-        for placed in &self.last {
-            if !placements
-                .iter()
-                .any(|p| p.rect == placed.rect && p.dims == placed.dims)
-            {
-                repaint.push(placed.rect);
+        if !screen_changed {
+            let screen_rect = Rect::new(0, 0, screen.width, screen.height);
+            for placed in &self.last {
+                if !placements
+                    .iter()
+                    .any(|p| p.rect == placed.rect && p.dims == placed.dims)
+                {
+                    let clipped = placed.rect.intersection(screen_rect);
+                    if !clipped.is_empty() {
+                        repaint.push(clipped);
+                    }
+                }
             }
         }
 
@@ -431,7 +466,8 @@ impl Placer {
     /// forgotten; the next frame sends what it draws again. The placements are forgotten too, for the
     /// same reason, which is also what repaints a screen the terminal cleared while it was resizing.
     pub fn invalidate(&mut self) {
-        self.sent = [None, None];
+        self.sent_small = None;
+        self.sent_large = None;
         self.last.clear();
         self.last_screen = None;
     }
@@ -494,11 +530,13 @@ mod tests {
         let small = logos
             .small
             .as_ref()
-            .expect("this terminal can draw the header's mark");
+            .expect("this terminal can draw the header's mark")
+            .clone();
         Placement {
             size: LogoSize::Small,
             rect: Rect::new(0, 0, small.dims.cols, 3),
             dims: small.dims,
+            prepared: Some(Arc::new(small)),
         }
     }
 
@@ -523,6 +561,17 @@ mod tests {
         prepare(graphics(Protocol::Kitty, CellPx { w: 8, h: 16 }))
     }
 
+    /// The iTerm2 case: a terminal that reports its cells in points, at its own pixels-per-point.
+    fn iterm2_scaled() -> Graphics {
+        Graphics {
+            protocol: Protocol::Iterm2,
+            // 8.5 x 17 points at scale 2: the device pixels the terminal draws, which `choose`
+            // has already multiplied in before it hands the verdict over.
+            cell: Some(CellPx { w: 17, h: 34 }),
+            scale: 2,
+        }
+    }
+
     /// A `PreparedLogos` whose `Protocol::None` terminal draws no marks at all: the text title's case.
     fn none_logos() -> PreparedLogos {
         // A `None` terminal is one that never proved a protocol: `Graphics::none()` has no cell size
@@ -533,11 +582,16 @@ mod tests {
     #[test]
     fn iterm2_logo_is_device_pixels() {
         // The terminal reports its cells in points and its own pixels-per-point: 17 points at scale 2 is
-        // the 34 device pixels its cells draw, which `choose` has already multiplied in.
-        let logos = iterm2_logos();
+        // the 34 device pixels its cells draw, which `choose` has already multiplied in. The scale is
+        // 2 on the verdict - a scale-1 terminal would not catch a `prepare` that multiplied it in again.
+        let logos = prepare(iterm2_scaled());
         let Some(cell) = logos.graphics.cell else {
             panic!("the cell size is there");
         };
+        assert_eq!(
+            logos.graphics.scale, 2,
+            "the terminal's own scale, which `choose` has applied"
+        );
         let small = logos.small.as_ref().expect("the header's mark");
         // The bitmap is the cells it is placed over, in device pixels: cols by the cell's width, rows by
         // its height. Passing the scale into `logo_dims` as well would double these.
@@ -553,7 +607,7 @@ mod tests {
         );
         assert_eq!(
             cell,
-            CellPx { w: 16, h: 34 },
+            CellPx { w: 17, h: 34 },
             "the cells the logo is built for"
         );
         // And a help mark: the same rule at ten rows.
@@ -565,6 +619,17 @@ mod tests {
         assert_eq!(
             large.dims.px_h,
             u32::from(large.dims.rows) * u32::from(cell.h)
+        );
+        // The regression the scale-1 verdict could not catch: passing the scale into `logo_dims` as
+        // well would count it twice and build a bitmap wider than its cells - which this terminal
+        // would rescale, and which is the blurry mark the whole module exists to avoid.
+        let src = image::mark();
+        let doubled = image::logo_dims(3, cell, logos.graphics.scale, (src.w, src.h));
+        let doubled = doubled.expect("the doubled size still fits a header");
+        assert_ne!(
+            small.dims.px_w, doubled.px_w,
+            "a scale-2 cell doubled by the scale again is a different width, so the prepared size \
+             must not have been made that way"
         );
     }
 
@@ -652,6 +717,7 @@ mod tests {
             size: LogoSize::Small,
             rect: Rect::new(2, 0, first.rect.width, first.rect.height),
             dims: first.dims,
+            prepared: first.prepared.clone(),
         };
         let moved_answered = placer.after_draw(std::slice::from_ref(&moved), SCREEN, &logos);
         assert!(
@@ -679,15 +745,34 @@ mod tests {
         );
     }
 
+    /// The help screen's placement at `rows` of a 100-column box: the widest bitmap the mark has,
+    /// centred, is where the view draws it.
+    fn large_placement(logos: &PreparedLogos, rows: u16) -> Placement {
+        let prepared = logos
+            .large
+            .iter()
+            .find(|prepared| prepared.dims.rows == rows)
+            .expect("the help mark at these rows")
+            .clone();
+        let x = 100u16.saturating_sub(prepared.dims.cols) / 2;
+        Placement {
+            size: LogoSize::Large(rows),
+            rect: Rect::new(x, 4, prepared.dims.cols, rows),
+            dims: prepared.dims,
+            prepared: Some(Arc::new(prepared)),
+        }
+    }
+
     #[test]
     fn kitty_transmits_before_first_frame_and_after_cell_change() {
         let logos = kitty_logos();
         let mut placer = Placer::new(Protocol::Kitty);
 
-        // The first frame transmits the marks it draws: the header's, and the help screen's.
-        let first = placer.before_draw(&logos);
+        // The first frame transmits the mark it draws: the header's.
+        let small = small_placement(&logos);
+        let first = placer.before_draw(&logos, std::slice::from_ref(&small));
         assert!(!first.is_empty(), "the first frame transmits");
-        let second = placer.before_draw(&logos);
+        let second = placer.before_draw(&logos, std::slice::from_ref(&small));
         assert!(
             second.is_empty(),
             "the second frame transmits nothing: the pixels are already there"
@@ -695,19 +780,72 @@ mod tests {
 
         // A cell change is a new bitmap under the same id.
         let big = prepare(graphics(Protocol::Kitty, CellPx { w: 16, h: 34 }));
-        let resized = placer.before_draw(&big);
+        let moved = small_placement(&big);
+        let resized = placer.before_draw(&big, std::slice::from_ref(&moved));
         assert!(
             !resized.is_empty(),
             "a new cell size transmits the marks again"
         );
-        assert!(placer.before_draw(&big).is_empty(), "and only once");
+        assert!(
+            placer
+                .before_draw(&big, std::slice::from_ref(&moved))
+                .is_empty(),
+            "and only once"
+        );
+    }
+
+    #[test]
+    fn kitty_resends_the_large_mark_when_its_size_changes() {
+        let logos = kitty_logos();
+        let mut placer = Placer::new(Protocol::Kitty);
+
+        // A frame with the help screen open at the ten-row mark: the ten-row pixels go out.
+        let ten = large_placement(&logos, 10);
+        let first = placer.before_draw(&logos, std::slice::from_ref(&ten));
+        assert!(!first.is_empty(), "the ten-row mark transmits");
+        let expected = logos
+            .large
+            .iter()
+            .find(|prepared| prepared.dims.rows == 10)
+            .expect("the ten-row bitmap")
+            .payload
+            .as_ref();
+        assert_eq!(
+            &first[..],
+            expected,
+            "the ten-row pixels, not another size's"
+        );
+        // The same frame again: nothing.
+        let again = placer.before_draw(&logos, std::slice::from_ref(&ten));
+        assert!(again.is_empty(), "the same size does not resend");
+
+        // The terminal shrank, and the help screen's mark is the six-row one now. The id is the
+        // same, but the bitmap under it must be the six-row one - a terminal that kept the ten-row
+        // pixels would crop them to six rows.
+        let six = large_placement(&logos, 6);
+        let changed = placer.before_draw(&logos, std::slice::from_ref(&six));
+        let expected = logos
+            .large
+            .iter()
+            .find(|prepared| prepared.dims.rows == 6)
+            .expect("the six-row bitmap")
+            .payload
+            .as_ref();
+        assert_eq!(
+            &changed[..],
+            expected,
+            "a different size of the same mark transmits that size's pixels"
+        );
+        let again = placer.before_draw(&logos, std::slice::from_ref(&six));
+        assert!(again.is_empty(), "and only once, for the size it is now");
     }
 
     #[test]
     fn kitty_on_exit_deletes_both_ids() {
         let mut placer = Placer::new(Protocol::Kitty);
         let logos = kitty_logos();
-        placer.before_draw(&logos);
+        let small = small_placement(&logos);
+        placer.before_draw(&logos, std::slice::from_ref(&small));
         let exit = placer.on_exit();
         // Both ids, small first: which one the screen showed is not the exit's question.
         assert_eq!(
@@ -724,6 +862,65 @@ mod tests {
         assert!(Placer::new(Protocol::None).on_exit().is_empty());
     }
 
+    #[test]
+    fn a_shrunk_screen_needs_no_repaint_outside_it() {
+        let logos = sixel_logos();
+        let mut placer = Placer::new(Protocol::Sixel);
+
+        // A frame on the big screen: the header's mark at the top-left.
+        let first = small_placement(&logos);
+        let answered = placer.after_draw(std::slice::from_ref(&first), SCREEN, &logos);
+        assert!(
+            !answered.bytes.is_empty(),
+            "the first frame writes the image"
+        );
+
+        // The terminal shrank to 60 x 20: the screen is cleared, the buffer is 60 x 20, and the
+        // mark's old rect (cols x 3 at 0, 0) still sits inside it, so nothing is owed a repaint -
+        // ratatui has already redrawn every cell of the smaller screen. The placement is new on the
+        // new screen, so the image goes out once more.
+        let shrunk = Size::new(60, 20);
+        let placement = small_placement(&logos);
+        let shrunken = placer.after_draw(std::slice::from_ref(&placement), shrunk, &logos);
+        assert!(
+            shrunken.repaint.is_empty(),
+            "a cleared screen owes no repaint: {shrunken:?}"
+        );
+        assert!(
+            !shrunken.bytes.is_empty(),
+            "the mark is placed on the new screen, so the image goes out for it"
+        );
+
+        // The other half of the rule: a placement that was on this screen and is gone now, with
+        // the screen still the same, is repainted from the drawn buffer.
+        let mut placer = Placer::new(Protocol::Sixel);
+        let first = small_placement(&logos);
+        let _ = placer.after_draw(std::slice::from_ref(&first), SCREEN, &logos);
+        let removed = placer.after_draw(&[], SCREEN, &logos);
+        assert_eq!(removed.repaint, vec![first.rect]);
+    }
+
+    #[test]
+    fn a_shrunk_screen_does_not_panic_on_a_removed_placement() {
+        // The old bug, directly: a placement from a 100 x 42 frame is gone on a 60 x 20 frame,
+        // and the cells beyond 60 x 20 are not cells the drawn buffer holds.
+        let logos = sixel_logos();
+        let mut placer = Placer::new(Protocol::Sixel);
+        let first = Placement {
+            size: LogoSize::Small,
+            rect: Rect::new(0, 0, 80, 3),
+            dims: logos.small.as_ref().expect("the header's mark").dims,
+            prepared: None,
+        };
+        let big = Size::new(100, 42);
+        let _ = placer.after_draw(std::slice::from_ref(&first), big, &logos);
+        let shrunk = Size::new(60, 20);
+        let removed = placer.after_draw(&[], shrunk, &logos);
+        // The screen changed, so no repaint at all: ratatui has redrawn every cell of it, and no
+        // rect from the old screen is indexed into the new one's buffer.
+        assert!(removed.repaint.is_empty());
+        assert!(removed.bytes.is_empty());
+    }
     #[test]
     fn iterm2_bytes_are_wrapped_in_cursor_save() {
         let logos = iterm2_logos();
@@ -751,10 +948,20 @@ mod tests {
         // iTerm2 and sixel write nothing before the frame: their image goes out after it.
         let mut placer = Placer::new(Protocol::Sixel);
         let logos = sixel_logos();
-        assert!(placer.before_draw(&logos).is_empty());
+        let small = small_placement(&logos);
+        assert!(
+            placer
+                .before_draw(&logos, std::slice::from_ref(&small))
+                .is_empty()
+        );
         let mut placer = Placer::new(Protocol::Iterm2);
         let logos = iterm2_logos();
-        assert!(placer.before_draw(&logos).is_empty());
+        let small = small_placement(&logos);
+        assert!(
+            placer
+                .before_draw(&logos, std::slice::from_ref(&small))
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! The lines above the table: what this is, what is running the torrents, and what is
 //! moving right now.
 
+use std::sync::Arc;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -148,19 +150,21 @@ pub(crate) fn draw(
         (_, Some(rect)) => {
             // The lines stand in the rest of the header, where their first column is what the
             // mark's blank column leaves behind.
-            let rest = Rect::new(rect.right(), area.y, area.right() - rect.right(), 3);
+            let rest = Rect::new(rect.right() + 1, area.y, area.right() - rect.right() - 1, 3);
             let lines = vec![title_line(), connection_line(snap), totals_line(snap)];
             frame.render_widget(Paragraph::new(lines), rest);
+            let small = logos
+                .logos
+                .expect("a rect came from a prepared mark")
+                .small
+                .as_ref()
+                .expect("the same mark")
+                .clone();
             return Some(Placement {
                 size: LogoSize::Small,
                 rect,
-                dims: logos
-                    .logos
-                    .expect("a rect came from a prepared mark")
-                    .small
-                    .as_ref()
-                    .expect("the same mark")
-                    .dims,
+                dims: small.dims,
+                prepared: Some(Arc::new(small)),
             });
         }
         _ => vec![title_line(), connection_line(snap), totals_line(snap)],

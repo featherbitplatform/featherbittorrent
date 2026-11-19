@@ -48,7 +48,7 @@ use fbtt_core::{
     Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, Secret,
     Snapshot,
 };
-use fbtt_tui::graphics::place::{LogoView, Placer, PreparedLogos};
+use fbtt_tui::graphics::place::{LogoView, Placement, Placer, PreparedLogos};
 use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, theme, view};
 
 use crate::backend::{Backend, BackendKind, LockOutcome, SwitchPlan, plan_switch};
@@ -321,8 +321,19 @@ impl ShutdownSignal {
 pub struct Screen<'a> {
     pub model: &'a mut Model,
     pub snap: &'a mut Arc<Snapshot>,
-    pub logos: Option<Arc<PreparedLogos>>,
-    pub placer: Placer,
+    pub mark: &'a mut Mark<'a>,
+    /// The cell size a prepare in flight was made for: when the answer arrives, if the latest
+    /// estimate differs from this, the answer is stale and a new prepare is needed.
+    pub prepare_cell: Option<(u16, u16)>,
+}
+
+/// The mark's bookkeeping for one screen: what the screen last drew, and the placer that remembers
+/// it. Kept apart from [`Screen`] so the `Saving...` frame a switch draws on its way - which is a
+/// frame like any other and goes through the same logo path - can borrow it while the screen it
+/// belongs to is busy elsewhere.
+pub struct Mark<'a> {
+    pub logos: &'a mut Option<Arc<PreparedLogos>>,
+    pub placer: &'a mut Placer,
 }
 
 /// The screen over `backend`, through every backend this run switches to, until the person is finished.
@@ -333,16 +344,16 @@ pub struct Screen<'a> {
 /// was still owed, because an answer that never signed in is not worth remembering - which is the whole
 /// reason it was waited for.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_session(
+pub async fn run_session<'a>(
     terminal: &mut DefaultTerminal,
-    mut screen: Screen<'_>,
+    mut screen: Screen<'a>,
     mut backend: Backend,
     mut login: Option<Login>,
-    work: &mut Work<'_>,
+    work: &mut Work<'a>,
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
     prepare_fut: Option<tokio::task::JoinHandle<PreparedLogos>>,
-) -> (Quit, Backend) {
+) -> (Quit, Screen<'a>, Backend) {
     // The prepared logos arrive on this oneshot; the screen draws the text title until they do.
     let mut logos_rx: Option<tokio::sync::oneshot::Receiver<PreparedLogos>> =
         prepare_fut.map(|handle| {
@@ -372,13 +383,26 @@ pub async fn run_session(
         // *next*, not that this one has stopped.
         backend = Backend::from_parts(parts, task);
         match outcome {
-            Outcome::Quit(quit) => return (quit, backend),
+            Outcome::Quit(quit) => return (quit, screen, backend),
             Outcome::Connect(request) => {
-                match switch(work, backend, *request, &mut screen, &mut |model| {
-                    draw_saving(terminal, model)
-                })
-                .await
-                {
+                // The `Saving...` screen the switch draws on its way is the same logo path as every
+                // other frame: the cells a removed mark used to cover are repainted rather than left
+                // as a ghost. The show borrows the screen's mark, so the switch's frame is not the
+                // one frame the screen does not clean up after.
+                let mut show = |model: &mut Model| {
+                    let logos = screen.mark.logos.as_deref();
+                    draw_saving(terminal, model, logos, screen.mark.placer)
+                };
+                let result = switch(
+                    work,
+                    backend,
+                    *request,
+                    screen.model,
+                    screen.snap,
+                    &mut show,
+                )
+                .await;
+                match result {
                     Switched::Now {
                         backend: next,
                         login: next_login,
@@ -423,11 +447,11 @@ async fn run_loop(
 ) -> Outcome {
     // The screen's two halves are used apart all through the loop - a key press reads one and writes the
     // other - so they are taken out here, once, rather than reached through `screen` in every branch.
-    let model = &mut *screen.model;
-    let snap = &mut *screen.snap;
     // The same for the queue's two ends: this loop reads one while the worker it sends jobs to writes the
     // other, and a branch cannot hold the reading end open if an arm body is reaching through `work` at the
     // same time. What a job needs travels as its own handle for the same reason.
+    let model = &mut *screen.model;
+    let snap = &mut *screen.snap;
     let jobs = work.jobs.clone();
     let rx = &mut work.rx;
     let paths = work.paths;
@@ -446,9 +470,26 @@ async fn run_loop(
         if let Some(rx) = logos_rx.as_mut()
             && let Ok(logos) = rx.try_recv()
         {
-            screen.logos = Some(Arc::new(logos));
+            // The prepare was made for the cell size it was asked for. If the window answered a
+            // different one while it was in flight, this bitmap is the wrong size under the right
+            // ids: not worth showing, and the screen keeps the mark it was drawing. The first
+            // prepare, asked for before any resize, is never stale.
+            let current = screen
+                .mark
+                .logos
+                .as_ref()
+                .and_then(|logos| logos.graphics.cell)
+                .map(|cell| (cell.w, cell.h));
+            let matches = match screen.prepare_cell {
+                None => true,
+                Some(asked_for) => current.is_some_and(|cell| !cell_size_changed(asked_for, cell)),
+            };
+            if matches {
+                *screen.mark.logos = Some(Arc::new(logos));
+                dirty = true;
+            }
+            screen.prepare_cell = None;
             *logos_rx = None;
-            dirty = true;
         }
         tokio::select! {
             // Every branch is a `once`: each wakes on one event, and re-arming the next
@@ -486,8 +527,12 @@ async fn run_loop(
                 Some(Ok(Event::Resize(cols, rows))) => {
                     dirty = true;
                     // A resize may have changed the cell's pixel size: the window's pixel size divided by
-                    // the new grid. If it did, the bitmaps the placer sent are the wrong size, so the
-                    // placer forgets them and the screen asks for new ones.
+                    // the new grid. What that division answers is an estimate, and the estimate wobbles by
+                    // a pixel or two as the window is dragged; only a real change, a font or zoom that
+                    // moved the cells, is worth preparing the mark for again. A changed cell is a new
+                    // bitmap under the same ids, so the placer forgets what it sent - but the screen keeps
+                    // the mark it is showing: the answer for the new size arrives on the queue, and the
+                    // old mark is not a smudge, only the wrong size.
                     if cols > 0
                         && rows > 0
                         && let Ok(ws) = crossterm::terminal::window_size()
@@ -498,11 +543,12 @@ async fn run_loop(
                         let h = ws.height / rows;
                         if w > 0
                             && h > 0
-                            && let Some(logos) = &screen.logos
+                            && let Some(logos) = screen.mark.logos.as_ref()
                             && let Some(old_cell) = logos.graphics.cell
-                            && (old_cell.w != w || old_cell.h != h)
+                            && cell_size_changed((old_cell.w, old_cell.h), (w, h))
                         {
-                            screen.placer.invalidate();
+                            screen.mark.placer.invalidate();
+                            screen.prepare_cell = Some((w, h));
                             let graphics = fbtt_tui::graphics::caps::Graphics {
                                 protocol: logos.graphics.protocol,
                                 cell: Some(fbtt_tui::graphics::caps::CellPx { w, h }),
@@ -520,7 +566,6 @@ async fn run_loop(
                                 }
                             });
                             *logos_rx = Some(rx);
-                            screen.logos = None;
                         }
                     }
                 }
@@ -616,23 +661,12 @@ async fn run_loop(
                     parts.commands.send(Command::Watch(watch.clone()));
                     last_watch = watch;
                 }
-                // The logo's bytes, before the frame: kitty transmits the pixels it has not sent yet for
-                // this cell size. The other protocols write nothing before the frame.
-                let pre_bytes = screen
-                    .logos
-                    .as_ref()
-                    .map(|logos| screen.placer.before_draw(logos))
-                    .unwrap_or_default();
-                if !pre_bytes.is_empty() {
-                    let backend = terminal.backend_mut();
-                    let _ = std::io::Write::write_all(backend, &pre_bytes);
-                    let _ = std::io::Write::flush(backend);
-                }
                 // The frame: the view draws the mark's placeholder or skip cells into the buffer, and
                 // the placements come back for the placer to write the image around. The buffer the frame
                 // just drew is only valid until the next draw, so the repaint cells are copied out before
                 // anything else touches the terminal.
                 let logos_view = screen
+                    .mark
                     .logos
                     .as_ref()
                     .map(|logos| LogoView { logos: Some(logos) })
@@ -646,30 +680,20 @@ async fn run_loop(
                         return Outcome::Quit(Quit::Failed(format!("the terminal failed: {error}")));
                     }
                 };
-                // The logo's bytes, after the frame: the image protocols write the image over the
-                // skipped cells, and the cells a removed placement used to cover are repainted from
-                // the buffer the frame just drew.
-                if let Some(logos) = screen.logos.as_ref() {
-                    let after = screen.placer.after_draw(&placements, done.area.into(), logos);
-                    if !after.repaint.is_empty() {
-                        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = after
-                            .repaint
-                            .iter()
-                            .flat_map(|rect| {
-                                (rect.top()..rect.bottom()).flat_map(move |y| {
-                                    (rect.left()..rect.right())
-                                        .map(move |x| (x, y, done.buffer[(x, y)].clone()))
-                                })
-                            })
-                            .collect();
-                        let backend = terminal.backend_mut();
-                        let _ = backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)));
-                    }
-                    let backend = terminal.backend_mut();
-                    if !after.bytes.is_empty() {
-                        let _ = std::io::Write::write_all(backend, &after.bytes);
-                    }
-                    let _ = std::io::Write::flush(backend);
+                // The area the frame drew into, and the cells it left there, out of the completed
+                // frame before anything else borrows the terminal: the buffer it points at is only
+                // valid until the next draw.
+                let area = done.area.into();
+                let screen_buffer = done.buffer.clone();
+                if let Some(logos) = screen.mark.logos.as_ref() {
+                    write_logo_bytes(
+                        terminal,
+                        screen.mark.placer,
+                        logos,
+                        &placements,
+                        area,
+                        &screen_buffer,
+                    );
                 }
             },
             _ = once(signal.wait.as_mut()) => return Outcome::Quit(Quit::Ok),
@@ -692,7 +716,8 @@ async fn switch(
     work: &Work<'_>,
     backend: Backend,
     request: ConnectRequest,
-    screen: &mut Screen<'_>,
+    model: &mut Model,
+    snap: &mut Arc<Snapshot>,
     show: &mut dyn FnMut(&mut Model),
 ) -> Switched {
     // The lock check comes first, and only of the switch that needs it: a server connection asks nothing of
@@ -717,7 +742,17 @@ async fn switch(
             Switched::Kept(backend, Notice::Error(cannot_lock(work.paths, &problem)))
         }
         SwitchPlan::Go => {
-            switch_onward(work, backend, request, new_lock, screen, show, start_engine).await
+            switch_onward(
+                work,
+                backend,
+                request,
+                new_lock,
+                model,
+                snap,
+                show,
+                start_engine,
+            )
+            .await
         }
     }
 }
@@ -728,20 +763,20 @@ async fn switch(
 /// `show` is what the caller wants drawn while the old backend is stopped - the `Saving...` screen in a run,
 /// nothing at all in a test - and `start_engine` is the engine start itself, handed in so that the case this
 /// function exists to get right (an engine that will not start) can be tested without an engine.
+#[allow(clippy::too_many_arguments)]
 async fn switch_onward<F>(
     work: &Work<'_>,
     backend: Backend,
     request: ConnectRequest,
     new_lock: Option<LibraryLock>,
-    screen: &mut Screen<'_>,
+    model: &mut Model,
+    snap: &mut Arc<Snapshot>,
     show: &mut dyn FnMut(&mut Model),
     start_engine: impl FnOnce(Config, Paths, LibraryLock) -> F,
 ) -> Switched
 where
     F: Future<Output = Result<Backend, String>>,
 {
-    let model = &mut *screen.model;
-    let snap = &mut *screen.snap;
     // The credential the new backend signs with is chosen from the answer before either backend is touched,
     // so a target and a secret that do not go together never cost anybody their running backend. What the
     // keychain should hold is decided here too but *done* later: nothing is stored until this connection has
@@ -1023,10 +1058,84 @@ fn could_not_save(paths: &Paths, problem: &str) -> String {
     format!("Could not save {}: {problem}", paths.ui_file().display())
 }
 
+/// Whether a new cell size estimate is a real change from the current one: a font or zoom change,
+/// not the rounding noise of a window pixel size divided by a grid. A dimension that differs by
+/// more than 10 percent is a change; within that, the terminal draws the same cell and the
+/// bitmaps are still the right size.
+fn cell_size_changed(current: (u16, u16), estimated: (u16, u16)) -> bool {
+    let (cw, ch) = current;
+    let (ew, eh) = estimated;
+    if cw == 0 || ch == 0 {
+        return true;
+    }
+    // |a - b| / min(a, b) > 10% means a change: the smaller of the two is the baseline, so a
+    // cell that is 10 percent bigger than the current one is a change, and so is one that is 10
+    // percent smaller. Using the smaller as the denominator means a cell that is 10 percent of
+    // the current one (a tenth of the size) is not a change, which is right: that is rounding.
+    let w_diff = cw.abs_diff(ew);
+    let w_min = cw.min(ew);
+    let h_diff = ch.abs_diff(eh);
+    let h_min = ch.min(eh);
+    (w_min > 0 && w_diff * 100 > w_min * 10) || (h_min > 0 && h_diff * 100 > h_min * 10)
+}
+
+/// The logo's bytes around a frame: what the placer transmits before the cells are drawn (kitty's
+/// pixels), the cells a removed placement used to cover, repainted from the frame's own buffer, and
+/// the image the protocols write after the frame. Every frame that leaves a mark behind, and every
+/// frame that takes one down - the frame the `Saving...` screen draws is one of those - goes
+/// through this, so the screen never has the ghost of a mark its last frame did not draw.
+fn write_logo_bytes(
+    terminal: &mut DefaultTerminal,
+    placer: &mut Placer,
+    logos: &PreparedLogos,
+    placements: &[Placement],
+    area: ratatui::layout::Size,
+    buffer: &ratatui::buffer::Buffer,
+) {
+    // The pixels the frame owes the terminal, decided from the placements this frame draws: for
+    // kitty that is the transmission of whatever the terminal does not already hold under its ids,
+    // and the help mark's pixels are the ones for the size this frame places. Written before the
+    // cells are repainted, so the placeholders the diff writes find their pixels already in place.
+    let pre_bytes = placer.before_draw(logos, placements);
+    if !pre_bytes.is_empty() {
+        let backend = terminal.backend_mut();
+        let _ = std::io::Write::write_all(backend, &pre_bytes);
+    }
+    // The image protocols write the image over the skipped cells, and the cells a removed placement
+    // used to cover are repainted from the buffer the frame just drew - before the image, so a cell
+    // that is text again shows the text and not the ghost of an image.
+    let after = placer.after_draw(placements, area, logos);
+    if !after.repaint.is_empty() {
+        let mut cells: Vec<(u16, u16, ratatui::buffer::Cell)> = Vec::new();
+        for rect in &after.repaint {
+            for y in rect.top()..rect.bottom() {
+                for x in rect.left()..rect.right() {
+                    cells.push((x, y, buffer[(x, y)].clone()));
+                }
+            }
+        }
+        let backend = terminal.backend_mut();
+        let _ = backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)));
+    }
+    let backend = terminal.backend_mut();
+    if !after.bytes.is_empty() {
+        let _ = std::io::Write::write_all(backend, &after.bytes);
+    }
+    let _ = std::io::Write::flush(backend);
+}
+
 /// The `Saving...` screen, with the newest notice still on its footer: a run that was
 /// told it will not save must not read as one that did.
-pub fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
-    let _ = terminal.draw(|frame| {
+pub fn draw_saving(
+    terminal: &mut DefaultTerminal,
+    model: &Model,
+    logos: Option<&PreparedLogos>,
+    placer: &mut Placer,
+) {
+    // The saving screen is a frame like any other: the cells it leaves the image covering are
+    // repainted over, so the screen it is drawn on is a screen the run's next frame, if it has one,
+    // will not have to clean up.
+    let done = match terminal.draw(|frame| {
         let area = frame.area();
         if area.is_empty() {
             return;
@@ -1050,7 +1159,15 @@ pub fn draw_saving(terminal: &mut DefaultTerminal, model: &Model) {
         ])
         .areas(area);
         frame.render_widget(Paragraph::new(line).centered(), middle);
-    });
+    }) {
+        Ok(done) => done,
+        Err(_) => return,
+    };
+    if let Some(logos) = logos {
+        let area = done.area.into();
+        let buffer = done.buffer.clone();
+        write_logo_bytes(terminal, placer, logos, &[], area, &buffer);
+    }
 }
 
 /// Polls `f` exactly once and answers right away when it is ready, which is what
@@ -1096,8 +1213,8 @@ impl<S: Stream> Future for OnceStream<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Login, Screen, Switched, Work, could_not_save, forget, local_config, remembered_ui, settle,
-        stored_password_refused, switch_onward,
+        Login, Mark, Screen, Switched, Work, cell_size_changed, could_not_save, forget,
+        local_config, remembered_ui, settle, stored_password_refused, switch_onward,
     };
     use crate::backend::{Backend, BackendKind};
     use crate::fake_store::FakeStore;
@@ -1134,6 +1251,49 @@ mod tests {
             login: LoginMethod::None,
             ..RemoteTarget::default()
         }
+    }
+
+    #[test]
+    fn a_cell_size_moved_by_rounding_is_not_a_change() {
+        // A cell read back from a window whose pixel size wobbled by one: the same cell, which
+        // the mark's bitmap is already the right size for.
+        assert!(
+            !cell_size_changed((16, 34), (17, 34)),
+            "one pixel in the width is rounding"
+        );
+        assert!(
+            !cell_size_changed((16, 34), (16, 35)),
+            "one pixel in the height is rounding"
+        );
+        // Two pixels on a double-height cell is still inside ten percent of the baseline.
+        assert!(
+            !cell_size_changed((8, 16), (8, 17)),
+            "one pixel of a 16-pixel cell is rounding"
+        );
+    }
+
+    #[test]
+    fn a_cell_size_moved_by_a_font_change_is_a_change() {
+        // A zoom from 16 to 18 points wide is eleven percent: a different font size, a new bitmap.
+        assert!(
+            cell_size_changed((16, 34), (18, 34)),
+            "an eleven-percent move is a change"
+        );
+        // And the same move in the other direction, a zoom out.
+        assert!(
+            cell_size_changed((18, 34), (16, 34)),
+            "zooming out is a change too"
+        );
+        // A move that only the height answers.
+        assert!(
+            cell_size_changed((16, 34), (16, 38)),
+            "a taller cell is a change"
+        );
+        // A new answer after no answer at all is a change, whatever it says.
+        assert!(
+            cell_size_changed((0, 0), (16, 34)),
+            "a first answer is a change"
+        );
     }
 
     /// An engine start, in the shape `switch_onward` takes it: boxed, so that a test can hand in a starter
@@ -1271,11 +1431,17 @@ mod tests {
         let running = Backend::start_remote(nowhere(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
-        let mut screen = Screen {
+        let mut logos: Option<std::sync::Arc<fbtt_tui::graphics::place::PreparedLogos>> = None;
+        let mut placer = fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None);
+        let mut mark = Mark {
+            logos: &mut logos,
+            placer: &mut placer,
+        };
+        let screen = Screen {
             model: &mut model,
             snap: &mut snap,
-            logos: None,
-            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
+            mark: &mut mark,
+            prepare_cell: None,
         };
         let switched = switch_onward(
             &work,
@@ -1285,7 +1451,8 @@ mod tests {
                 secret: SecretInput::default(),
             },
             Some(lock),
-            &mut screen,
+            screen.model,
+            screen.snap,
             &mut |_| {},
             record,
         )
@@ -1348,11 +1515,17 @@ mod tests {
         let running = Backend::start_remote(before.clone(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
-        let mut screen = Screen {
+        let mut logos: Option<std::sync::Arc<fbtt_tui::graphics::place::PreparedLogos>> = None;
+        let mut placer = fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None);
+        let mut mark = Mark {
+            logos: &mut logos,
+            placer: &mut placer,
+        };
+        let screen = Screen {
             model: &mut model,
             snap: &mut snap,
-            logos: None,
-            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
+            mark: &mut mark,
+            prepare_cell: None,
         };
         let switched = switch_onward(
             &work,
@@ -1362,7 +1535,8 @@ mod tests {
                 secret: SecretInput::default(),
             },
             Some(lock),
-            &mut screen,
+            screen.model,
+            screen.snap,
             &mut |_| {},
             refused("the library would not open"),
         )
@@ -1412,11 +1586,17 @@ mod tests {
         let running = Backend::start_remote(nowhere(), Secret::None, None);
         let mut snap = running.initial_snapshot();
         let mut model = Model::new();
-        let mut screen = Screen {
+        let mut logos: Option<std::sync::Arc<fbtt_tui::graphics::place::PreparedLogos>> = None;
+        let mut placer = fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None);
+        let mut mark = Mark {
+            logos: &mut logos,
+            placer: &mut placer,
+        };
+        let screen = Screen {
             model: &mut model,
             snap: &mut snap,
-            logos: None,
-            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
+            mark: &mut mark,
+            prepare_cell: None,
         };
         let switched = switch_onward(
             &work,
@@ -1430,7 +1610,8 @@ mod tests {
                 },
             },
             None,
-            &mut screen,
+            screen.model,
+            screen.snap,
             &mut |_| {},
             started(nowhere()),
         )

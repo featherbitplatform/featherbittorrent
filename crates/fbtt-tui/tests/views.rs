@@ -789,10 +789,28 @@ fn no_graphics_shows_text_title() {
         !screen.text().contains('\u{10EEEE}'),
         "no placeholders on a terminal that cannot draw images"
     );
+
+    // The same for a `PreparedLogos` with `Protocol::None`: a terminal that proved nothing. Zero
+    // placements, and the text title where the mark would be.
+    let none = PreparedLogos {
+        graphics: fbtt_tui::graphics::Graphics::none(),
+        small: None,
+        large: Vec::new(),
+    };
+    let drawn = drawn_with(&model, &snap, &none, 100, 30);
+    assert!(
+        drawn.placements.is_empty(),
+        "a terminal with no protocol places no marks: {:?}",
+        drawn.placements
+    );
+    assert!(
+        drawn.screen.text().contains("featherbittorrent"),
+        "the text title is still drawn"
+    );
 }
 
 /// A kitty terminal: the header's cells are placeholders, the image the pixels that will be
-/// there, and the title stands where the mark's blank column leaves it.
+/// there, and the title stands one column to the right of the mark's blank column.
 #[test]
 fn kitty_header_cells_are_placeholders() {
     let snap = library();
@@ -823,14 +841,15 @@ fn kitty_header_cells_are_placeholders() {
         "the placeholder's foreground is the id, the one colour that is not a theme token"
     );
 
-    // The title starts where the mark's columns end: the first cell of the title is the
-    // mark's right edge. The frame buffer holds it as a cell, not as characters, so the
-    // column is a cell count, not a character count.
-    let title_start = usize::from(placement.rect.width);
+    // The title starts one column to the right of the mark: the mark's blank column stands
+    // between them. The frame buffer holds it as a cell, not as characters, so the column is
+    // a cell count, not a character count.
+    let title_start = usize::from(placement.rect.width) + 1;
     let title_cell = &drawn.buffer[(title_start as u16, 0)];
     assert!(
         title_cell.symbol().starts_with('f'),
-        "the title starts at cell {title_start}, found {:?}",
+        "the title starts at cell {title_start} (the mark's columns plus its blank column), \
+         found {:?}",
         title_cell.symbol()
     );
 
@@ -858,6 +877,12 @@ fn sixel_header_cells_are_skipped() {
         .find(|placement| placement.size == LogoSize::Small)
         .expect("the header's mark is placed");
     assert_eq!(placement.size, LogoSize::Small);
+    assert_eq!(
+        drawn.placements.len(),
+        1,
+        "the full view at this size places exactly the header's mark: {:?}",
+        drawn.placements
+    );
 
     // Every cell the mark covers is skipped: the frame never writes it.
     for y in 0..placement.rect.height {
@@ -872,30 +897,55 @@ fn sixel_header_cells_are_skipped() {
     }
 }
 
-/// The help screen on a tall screen: the mark stands above its keys, the tallest of the
-/// prepared sizes the box leaves room for. At 42 rows the help box (30 rows) is centred at
-/// y=6, leaving six rows above it - the shortest of the prepared large marks.
+/// The help screen on a 100 x 30 screen: the mark stands at the top of the help box, centred
+/// above the keys, when the key list and the mark both fit. The rect it is placed over is the
+/// mark's own cells - no more, no less - and only those cells are the ones the frame skips.
 #[test]
 fn help_shows_large_logo_when_it_fits() {
     let snap = library();
     let mut model = model_of(&snap);
     model.modal = Some(fbtt_tui::modal::Modal::Help);
     let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
-    let drawn = drawn_with(&model, &snap, &logos, 100, 42);
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
     let large = drawn
         .placements
         .iter()
         .find(|placement| matches!(placement.size, LogoSize::Large(_)));
-    assert!(large.is_some(), "a 30-row screen has room for the mark");
+    assert!(
+        large.is_some(),
+        "a 30-row screen has room for the mark and for every key"
+    );
     let large = large.expect("the mark is there");
-    // The rows of the mark: the tallest the box leaves room for, and it stands above the box,
-    // which it does not reach.
+    // The rect is exactly the mark's own cells: the bitmap the view placed, no padding around it.
     let prepared = logos
         .large
         .iter()
         .find(|prepared| prepared.dims.rows == large.dims.rows)
         .expect("the rows the view placed");
+    assert_eq!(
+        (large.rect.width, large.rect.height),
+        (prepared.dims.cols, prepared.dims.rows),
+        "the placement is the mark's own cells, not a rect the mark happens to fit in"
+    );
     assert_eq!(large.dims, prepared.dims);
+    // Centred above the keys: the mark is roughly in the middle of the screen, with the same
+    // (or nearly the same) space on either side. The exact centring depends on the box's width,
+    // which is the widest line plus padding, but the mark must be within a few columns of the
+    // screen's centre.
+    let centre = 100u16 / 2;
+    let mark_centre = large.rect.x + large.rect.width / 2;
+    assert!(
+        mark_centre.abs_diff(centre) <= 5,
+        "the mark is roughly centred in the screen: mark at x={}",
+        large.rect.x
+    );
+    // And it is inside the box, at its top: the first row of the box holds the mark, not the
+    // key that would be there without it.
+    let text = drawn.screen.text();
+    assert!(
+        text.contains("quit") && text.contains("sort by the next column"),
+        "every key is still listed beside the mark"
+    );
 }
 
 /// The help screen on a short screen: no rows for the mark, so the keys take them.
@@ -923,6 +973,24 @@ fn help_drops_logo_when_short() {
 /// A dialog over the header: the mark is not placed this frame, because the box it would be
 /// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
 /// centred at (0, 0) and covers the three header rows and the mark's columns.
+///
+/// The help screen's mark is not dropped by the same rule: it belongs to the help box, and a
+/// box that is its own does not stand over it.
+#[test]
+fn help_placement_is_not_dropped_by_its_own_box() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    assert!(
+        drawn
+            .placements
+            .iter()
+            .any(|placement| matches!(placement.size, LogoSize::Large(_))),
+        "the help box's own mark is not dropped by the drop rule"
+    );
+}
 #[test]
 fn modal_over_header_drops_small_placement() {
     let snap = library();
@@ -958,8 +1026,12 @@ fn minimal_view_has_no_logo() {
 /// A header of one row: the mark wants three, so it is not placed and the one line of text
 /// takes the header it has. At height 7 the header gives up two of its three rows to the
 /// torrents, leaving one row for the name and the rates.
+///
+/// The layout only ever makes a header of three rows or one: at eight rows or more it is the
+/// design's three lines, and below that it is the one line that replaces them. There is no
+/// two-row header to test, so this is what the short case actually is.
 #[test]
-fn two_row_header_has_no_logo() {
+fn one_row_header_has_no_logo() {
     let snap = library();
     let model = model_of(&snap);
     let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });

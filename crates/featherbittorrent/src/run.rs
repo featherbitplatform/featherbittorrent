@@ -21,9 +21,7 @@ use fbtt_tui::{Modal, Model};
 
 use crate::backend::{Backend, LockOutcome, Start, initial_target, named_server};
 use crate::secrets::{Keychain, SecretStore, StartSecret, start_secret_for};
-use crate::switch::{
-    Login, Quit, Screen, ShutdownSignal, Work, draw_saving, run_session, start_watching,
-};
+use crate::switch::{Login, Quit, ShutdownSignal, Work, draw_saving, run_session, start_watching};
 use crate::terminal::Terminal;
 
 /// The offer made to a run whose library another featherbittorrent has taken while running a server on it.
@@ -240,43 +238,52 @@ pub async fn run() -> ExitCode {
 
     // The event stream is made once for the whole screen and let go before the last save: its reader owns
     // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
-    let (quit, running) = {
-        let mut stream = EventStream::new();
-        let screen = Screen {
-            model: &mut model,
-            snap: &mut snap,
-            logos: None,
-            placer: fbtt_tui::graphics::place::Placer::new(graphics.protocol),
-        };
-        run_session(
-            terminal.get_mut(),
-            screen,
-            backend,
-            login,
-            &mut work,
-            &mut stream,
-            &mut signal,
-            prepare_fut,
-        )
-        .await
+    // The mark's bookkeeping is here, beside the terminal, because it is the terminal's own: what the
+    // screen last drew is what the exit has to clean up, and the `Saving...` frame it draws has to
+    // repaint the cells a removed mark used to cover. The screen borrows the mark while it runs and
+    // hands it back when it is done, and what it drew last is what the exit knows.
+    let mut stream = EventStream::new();
+    let mut logos: Option<std::sync::Arc<fbtt_tui::graphics::place::PreparedLogos>> = None;
+    let mut placer = fbtt_tui::graphics::place::Placer::new(graphics.protocol);
+    let mut mark = crate::switch::Mark {
+        logos: &mut logos,
+        placer: &mut placer,
     };
+    let screen = crate::switch::Screen {
+        model: &mut model,
+        snap: &mut snap,
+        mark: &mut mark,
+        prepare_cell: None,
+    };
+    let (quit, screen, running) = run_session(
+        terminal.get_mut(),
+        screen,
+        backend,
+        login,
+        &mut work,
+        &mut stream,
+        &mut signal,
+        prepare_fut,
+    )
+    .await;
 
     // The last backend is told once: by a command the loop sent or, if the queue was full, by its channels
     // going out of scope. No timeout - resume data is worth the wait. Whatever it owes - an engine's last
     // save, and with it this library's lock - arrives here, on a screen that says what is happening while it
     // does. A run always ends with a backend under it: a switch that could not go ahead kept the one it had.
+    // The `Saving...` screen is a frame like any other: it goes through the same logo path, so the cells
+    // a removed mark used to cover are repainted rather than left as a ghost under the last words.
     let stopped = running
-        .stop(&mut model, |model| draw_saving(terminal.get_mut(), model))
+        .stop(screen.model, |model| {
+            let logos = screen.mark.logos.as_deref();
+            draw_saving(terminal.get_mut(), model, logos, screen.mark.placer)
+        })
         .await;
-    // Kitty's images live in the terminal after this process is gone, and the placeholder cells this run
-    // drew will not be drawn again, so the ids are deleted on the way out. The other protocols write
-    // nothing on exit: their images are the cells the screen is about to leave, and those go with it.
-    use fbtt_tui::graphics::kitty;
-    if graphics.protocol == fbtt_tui::graphics::Protocol::Kitty {
-        let exit_bytes = kitty::delete(kitty::SMALL_ID)
-            .into_iter()
-            .chain(kitty::delete(kitty::LARGE_ID))
-            .collect::<Vec<_>>();
+    // The mark's ids are the placer's to clean up: kitty's images live in the terminal after this process
+    // is gone, so the ids are deleted on the way out; the other protocols write nothing on exit, because
+    // their images are the cells the screen is about to leave, and those go with it.
+    let exit_bytes = placer.on_exit();
+    if !exit_bytes.is_empty() {
         use std::io::Write as _;
         let _ = terminal.get_mut().backend_mut().write_all(&exit_bytes);
         let _ = terminal.get_mut().backend_mut().flush();

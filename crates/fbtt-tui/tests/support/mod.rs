@@ -136,13 +136,6 @@ impl Screen {
         Screen { terminal }
     }
 
-    /// The buffer the frame just drew, as ratatui's diff sees it: cells with
-    /// [`CellDiffOption::Skip`](ratatui::buffer::CellDiffOption::Skip) are the ones the
-    /// placer wrote the image over and the frame must not touch again.
-    pub fn frame_buffer(&self) -> &ratatui::buffer::Buffer {
-        self.terminal.backend().buffer()
-    }
-
     /// Every buffer line as text, left to right and top to bottom.
     pub fn lines(&self) -> Vec<String> {
         let buffer = self.terminal.backend().buffer();
@@ -181,12 +174,6 @@ impl Screen {
     /// The foreground colour of the cell at a column and row.
     pub fn fg(&self, x: usize, y: usize) -> Color {
         self.cell(x, y).fg
-    }
-
-    /// The drawn cell at a column and row.
-    pub fn drawn_cell(&self, x: u16, y: u16) -> &ratatui::buffer::Cell {
-        let buffer = self.terminal.backend().buffer();
-        &buffer[(x, y)]
     }
 
     /// The background colour of the cell at a column and row, which is how a lifted row or a

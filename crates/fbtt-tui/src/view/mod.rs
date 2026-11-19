@@ -16,7 +16,7 @@ use ratatui::widgets::Fill;
 use fbtt_core::{RowState, Snapshot};
 
 use crate::format;
-use crate::graphics::{LogoView, Placement};
+use crate::graphics::{LogoSize, LogoView, Placement};
 use crate::modal;
 use crate::model::{Model, View};
 use crate::theme;
@@ -110,12 +110,15 @@ pub fn draw_with(
 
     // The marks go on top, applied after the dialog: a mark the open box covers is dropped
     // rather than drawn under it, and the ones that survive are the placements the binary's
-    // placer writes the image around.
+    // placer writes the image around. The help screen's mark is the exception: it belongs to the
+    // help box, standing at its top above the keys, so a box that is its own does not drop it.
     let mut shown = Vec::new();
     for placement in placements {
-        if open_box
-            .as_ref()
-            .is_some_and(|box_area| box_area.intersects(placement.rect))
+        let is_help_mark = matches!(placement.size, LogoSize::Large(_));
+        if !is_help_mark
+            && open_box
+                .as_ref()
+                .is_some_and(|box_area| box_area.intersects(placement.rect))
         {
             continue;
         }
