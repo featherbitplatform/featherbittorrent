@@ -995,10 +995,25 @@ mod tests {
         }
     }
 
+    /// A folder this test has put into a mode it must not be left in, and the way back. Restoring it on drop
+    /// is what lets `ScratchDir` remove everything under the folder - and it happens whatever this test's
+    /// assertions did, so a failure cannot leave a folder nobody can clean up in the temp directory.
+    #[cfg(unix)]
+    struct LockedParent(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for LockedParent {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
     /// A folder that is already there needs nothing from the folders above it, and an ancestor that would
     /// refuse to be made must not decide otherwise. On Unix that shape is a `0500` parent - readable and
-    /// searchable, but no room in it to make anything - and a missing folder under it still fails, so this
-    /// is not the same thing as ignoring what went wrong.
+    /// searchable, but no room in it to make anything - and a missing folder under it still fails, so this is
+    /// not the same thing as ignoring what went wrong.
     #[cfg(unix)]
     #[test]
     fn create_private_dir_accepts_a_folder_under_a_parent_that_cannot_be_written_to() {
@@ -1010,25 +1025,33 @@ mod tests {
         fs::create_dir(&locked).expect("the parent");
         fs::create_dir(&play_dir).expect("the folder this test is about");
 
-        // Root ignores the mode, and so does a file system that does not honour it: if something can still
-        // be made in there, the refusal this test is built on does not exist and saying so is the honest
-        // answer rather than passing for no reason.
+        // Locked first, and only then asked whether the lock holds. Asking before would answer "writable"
+        // about a folder that was never locked, which is how this test used to skip itself every time it ran.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
+            .expect("no room to make anything in there");
+        let _unlock = LockedParent(locked.clone());
+
+        // Root ignores the mode, and so does a file system that does not honour it: if something can still be
+        // made in there now, the refusal this test is built on does not exist on this host, and saying so out
+        // loud is the honest answer rather than passing for no reason. `_unlock` goes back to `0700` on the
+        // way out either way - including the way out of a failed assertion - which is what keeps the scratch
+        // directory removable.
         let probe = locked.join("probe");
         match fs::create_dir(&probe) {
             Ok(()) => {
                 let _ = fs::remove_dir(&probe);
                 eprintln!(
-                    "skipped: {} would not refuse to be written to",
+                    "skipped: {} takes a new folder even at 0500, so this host has no such thing as the refusal this test is about",
                     locked.display()
                 );
                 return;
             }
             Err(problem) if problem.kind() == io::ErrorKind::PermissionDenied => {}
-            Err(problem) => panic!("{} should refuse a new folder: {problem}", locked.display()),
+            Err(problem) => panic!(
+                "{} should refuse a new folder at 0500: {problem}",
+                locked.display()
+            ),
         }
-
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
-            .expect("no room to make anything");
 
         create_private_dir(&play_dir).expect("a folder that is there needs nothing made above it");
 
