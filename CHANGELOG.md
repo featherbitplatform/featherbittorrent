@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Press `s` to open a file in mpv or VLC while it downloads: the file under the cursor with the file list focused, otherwise the selected torrent's largest file. A file that is already whole plays by its path; anything else streams, over loopback from the local engine or from a server through a short-lived token scoped to that one file (`POST /api/v1/stream-tokens`). Behind a gateway that checks a credential of its own, the stream goes through a loopback relay that adds it. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+- `player:` in `config.yaml`: `player.program` (`auto`, `mpv`, `vlc`, or a program name or path) and `player.args` for extra arguments put before the media. `auto` finds mpv, then VLC: `PATH` first, then where each is usually installed. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+- The featherbit mark drawn as an image in the header and on the help screen in terminals that speak the kitty graphics protocol, iTerm2 inline images or sixel; the text title stays everywhere else, and `logo: off` in `config.yaml` turns the image off. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+
+### Changed
+
+- The engine is fbt-lib `v0.10.0`: a custom authenticator now sees the request path as it was received, which is what lets a stream token open exactly one file. ([#6](https://github.com/featherbitplatform/featherbittorrent/pull/6))
+
 ## [0.1.0] - 2026-11-16
 
 ### Added
