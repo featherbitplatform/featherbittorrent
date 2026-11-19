@@ -1531,10 +1531,20 @@ async fn mid_session_401_relogs_once() {
     // does, and what signing this device out from another screen does.
     fake.revoked.store(true, Ordering::SeqCst);
 
-    // The next round finds out and logs in again within itself. Waiting for the second login is also waiting
-    // for the link to have carried on working, since a renewal that worked is not trouble.
-    wait_for(&mut client, |snapshot| {
-        (fake.logins.load(Ordering::SeqCst) == 2
+    // The next round finds out and logs in again within itself, and its retry carries the new session.
+    // The wait is on that retry having arrived, not on the login count: the fake counts a login as it
+    // starts answering it, and the link says `Connected` all along (a renewal that worked is not trouble),
+    // so "two logins and connected" can be true before the retry with the new token has reached this
+    // server at all.
+    let renewed = wait_for(&mut client, |snapshot| {
+        let renewed = fake.session_token();
+        let used = renewed != first
+            && fake
+                .seen
+                .lock()
+                .expect("the test state")
+                .contains(&format!("Bearer {renewed}"));
+        (used
             && matches!(
                 snapshot.connection,
                 Connection::Remote {
@@ -1542,21 +1552,25 @@ async fn mid_session_401_relogs_once() {
                     ..
                 }
             ))
-        .then_some(())
+        .then_some(renewed)
     })
     .await;
 
-    // Both tokens were sent, and the second one is what it sends now.
+    // Both tokens were sent, the second one is what it sends now, and one login earned it.
     let seen = fake.seen.lock().expect("the test state").clone();
     assert!(
         seen.contains(&format!("Bearer {first}")),
         "the dead session was tried: {seen:?}"
     );
-    let renewed = fake.session_token();
-    assert_ne!(renewed, first, "the second login issued a different token");
-    assert!(
-        seen.contains(&format!("Bearer {renewed}")),
-        "and it is the credential now in use: {seen:?}"
+    assert_eq!(
+        fake.logins.load(Ordering::SeqCst),
+        2,
+        "one refused session cost one login: {seen:?}"
+    );
+    assert_eq!(
+        fake.session_token(),
+        renewed,
+        "and the credential it earned is the one in use"
     );
 
     // And nothing about this was reported as a link going down and coming back: the line for that is only
