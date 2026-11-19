@@ -8,8 +8,10 @@ Status: milestone 1, the local client, is complete: `featherbittorrent` in a ter
 client, the engine runs in that process, and there is nothing to install beside the binary. Milestone 2,
 the server role (`serve`), the remote backend, authentication and streaming, shipped the first release,
 [0.1.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0);
-[docs/server.md](docs/server.md) and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Milestone 4
-ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
+[docs/server.md](docs/server.md) and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release
+[0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4.
+Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
+that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
 files, each carrying man pages, shell completions, the licenses and the docs. Every artifact is built and
 smoke tested in a clean container or runner before anything is published, and the release workflow publishes
 them all on a `v*` tag.
