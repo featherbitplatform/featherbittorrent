@@ -195,13 +195,24 @@ pub(crate) fn draw(
         }
         Some(Modal::Settings(form)) => draw_box(frame, area, "Settings", settings::lines(form)),
         Some(Modal::Help) => {
-            // The mark the box has room for, when it does: the box and the mark are sized together,
-            // so the box leaves the mark's rows at its top and the mark stands in them, above the
-            // keys. A box too short for both draws the keys alone.
+            // The mark the box has room for, when it does: it stands at the top of the box, above
+            // the keys, in rows the box leaves for it. A box that would have to grow to hold the
+            // mark draws the keys alone (see `help_placement`).
             let mark: Option<Arc<crate::graphics::place::Prepared>> =
                 help_placement(area, logos).and_then(|placement| placement.prepared());
-            let mark = mark.as_deref();
-            draw_box(frame, area, "Keys", help::lines(area, logos, mark))
+            let mut lines = help::lines(area, logos);
+            if let Some(mark) = mark.as_deref() {
+                // The rows the mark stands in, at the top of the list: its own rows and the one
+                // blank row between it and the first key. The list is shifted down by exactly
+                // that many, so the keys begin where the mark ends.
+                let reserved = usize::from(mark.dims.rows) + 1;
+                let mut top: Vec<Line<'static>> = Vec::with_capacity(reserved);
+                for _ in 0..reserved {
+                    top.push(Line::default());
+                }
+                lines.splice(0..0, top);
+            }
+            draw_box(frame, area, "Keys", lines)
         }
         Some(Modal::Filter) => {
             draw_filter(frame, area, model);
@@ -215,18 +226,7 @@ pub(crate) fn draw(
 /// colour on the surface colour, sized to what they need and never bigger than the screen. The rect
 /// comes back, because a box over a mark takes the mark off the screen for this frame.
 fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) -> Option<Rect> {
-    let widest = lines
-        .iter()
-        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
-        .max()
-        .unwrap_or(0);
-    // A cell of padding on each side, plus the two columns of border.
-    let width = (widest + 4).min(area.width);
-    let height = u16::try_from(lines.len() + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-
-    let box_area = centred(area, width, height);
+    let box_area = box_rect(area, &lines);
     frame.render_widget(Fill::new(" ").bg(theme::INK_850), box_area);
     frame.render_widget(
         Block::bordered()
@@ -241,59 +241,73 @@ fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>
     Some(box_area)
 }
 
-/// The help screen's mark, when there is one to place: the tallest of the prepared large marks the
-/// help box has room for, standing at the top of the box above its keys (decision 12).
-///
-/// The box and the mark are sized together: the box holds the keys, the close hint, and - when it
-/// can hold the mark and every key together - `mark.rows + 1` rows left at its top for the mark.
-/// The rect the mark is placed over is exactly the mark's own cells, `dims.cols` by `dims.rows`,
-/// centred horizontally in the box, with the one row between it and the first key left as the
-/// list's own blank line.
-pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placement> {
-    let logos_ref = logos.logos?;
-    // The keys' own width, as `help::lines` draws them with no mark: that is the widest line the
-    // box holds, since the rows the mark stands in are empty.
-    let widest = help::lines(area, logos, None)
+/// The rect the box of `lines` is drawn in: sized to what the lines need and never bigger than the
+/// screen, centred in it. This is the one place a box's size is worked out, so a box and anything
+/// placed over it - the help screen's mark - measure it the same way and cannot disagree.
+fn box_rect(area: Rect, lines: &[Line<'_>]) -> Rect {
+    let widest = lines
         .iter()
         .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
         .max()
         .unwrap_or(0);
-    // The tallest mark the box can hold together with every key, tried from tallest first.
+    // A cell of padding on each side, plus the two columns of border.
+    let width = (widest + 4).min(area.width);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    centred(area, width, height)
+}
+
+/// The help screen's mark, when there is one to place: the tallest of the prepared large marks
+/// the help box has room for, standing at the top of the box above its keys (decision 12).
+///
+/// The box the mark stands in is sized the way `draw_box` sizes it: the widest of the list and
+/// the mark, the list's rows plus the mark's rows and the one blank row between them, and the
+/// border - centred in the screen. When the box the mark makes does not fit the screen, the
+/// mark is not placed: the box grows for it, and a box taller than the screen costs key lines,
+/// which the help never loses to the mark. The list's own shape comes from
+/// [`crate::modal::help::columns`], the same decision `help::lines` makes, so a narrow screen
+/// that can only draw one column of keys is measured as the one column it will draw, not as
+/// the two the mark would have needed. The rect is the mark's own cells, `dims.cols` by
+/// `dims.rows`, centred horizontally in the box and on the first row inside the border.
+pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placement> {
+    let logos_ref = logos.logos?;
+    let keys = crate::keys::KEYS.len();
+    let half = keys.div_ceil(2);
+    let (left, right) = crate::keys::KEYS.split_at(half);
+    // The list's shape: the one decision `help::lines` makes, so the box this measures and the
+    // list that is drawn in it are the same list.
+    let key_rows = if help::columns(area, left, right) {
+        half
+    } else {
+        keys
+    };
+    // The widest of the list, as `help::lines` draws it and `draw_box` will size to.
+    let widest = help::lines(area, logos)
+        .iter()
+        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    // The tallest mark the box can hold without growing past the screen, tried from tallest
+    // first.
     logos_ref.large.iter().find_map(|prepared| {
         let rows = usize::from(prepared.dims.rows);
         if prepared.dims.cols > area.width {
             return None;
         }
+        // The box as it will be drawn with this mark, sized the way `draw_box` sizes it.
         let width = (widest.max(prepared.dims.cols) + 4).min(area.width);
-        // The rows the list takes: one column when the keys and the mark both fit in it, two
-        // columns otherwise. The box is the list's rows, the close hint, the mark's rows plus its
-        // blank row, and the border.
-        let list_rows = {
-            let keys = crate::keys::KEYS.len();
-            let half = keys.div_ceil(2);
-            let rows_available = usize::from(area.height).saturating_sub(3);
-            if rows_available > keys + rows {
-                keys
-            } else {
-                half
-            }
-        };
-        let height = u16::try_from(list_rows + rows + 1 + 2).unwrap_or(u16::MAX);
+        let height = u16::try_from(key_rows + rows + 1 + 2).unwrap_or(u16::MAX);
         if height > area.height {
             return None;
         }
-        let (box_x, box_y) = (
-            area.x + (area.width.saturating_sub(width)) / 2,
-            area.y + (area.height.saturating_sub(height)) / 2,
-        );
-        // The mark stands in the box's inner top, above the keys: the list leaves the mark's rows
-        // and one blank row at its top, so the rect begins two rows below the box's top, and it is
-        // the mark's own cells, centred in the box's width.
-        let x = box_x + (width.saturating_sub(prepared.dims.cols)) / 2;
-        let y = box_y + 2;
+        let box_rect = centred(area, width, height);
+        // The mark stands on the first row inside the border, and the key lines begin right
+        // below it, after the blank row the list leaves.
+        let x = box_rect.x + (width.saturating_sub(prepared.dims.cols)) / 2;
         Some(Placement {
             size: LogoSize::Large(prepared.dims.rows),
-            rect: Rect::new(x, y, prepared.dims.cols, prepared.dims.rows),
+            rect: Rect::new(x, box_rect.y + 1, prepared.dims.cols, prepared.dims.rows),
             dims: prepared.dims,
             prepared: Some(Arc::new(prepared.clone())),
         })

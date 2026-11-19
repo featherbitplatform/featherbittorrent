@@ -158,14 +158,18 @@ fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims) -> Vec<u8> {
 }
 
 /// The RGB of one of the theme's tokens, for the canvas a mark is composited over.
+///
+/// The theme keeps every token as `Rgb`, so this is a match on the theme's own type: a token that
+/// is not `Rgb` is not a ground this palette would draw a canvas in, and rather than invent a
+/// colour for it, the canvas falls back to the ink the theme's ground is.
+const GROUND: [u8; 3] = [0x0b, 0x0b, 0x0e];
+
 fn rgb(color: Color) -> [u8; 3] {
     match color {
         Color::Rgb(r, g, b) => [r, g, b],
-        // The theme never leaves a token undecided, and a ground that is not `Rgb` is not a ground
-        // this palette would ever draw a canvas in: rather than invent a colour for it, stop.
-        other => panic!(
-            "the canvas is a theme colour, and the theme keeps every token as Rgb: {other:?}"
-        ),
+        // A token the theme did not keep as `Rgb` is not a ground this palette draws a canvas in:
+        // fall back to the ink the theme's ground is, rather than invent a colour.
+        _ => GROUND,
     }
 }
 

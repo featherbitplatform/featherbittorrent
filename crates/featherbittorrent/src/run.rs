@@ -253,7 +253,8 @@ pub async fn run() -> ExitCode {
         model: &mut model,
         snap: &mut snap,
         mark: &mut mark,
-        prepare_cell: None,
+        wanted: None,
+        in_flight: None,
     };
     let (quit, screen, running) = run_session(
         terminal.get_mut(),

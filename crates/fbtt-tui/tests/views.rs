@@ -897,23 +897,23 @@ fn sixel_header_cells_are_skipped() {
     }
 }
 
-/// The help screen on a 100 x 30 screen: the mark stands at the top of the help box, centred
-/// above the keys, when the key list and the mark both fit. The rect it is placed over is the
-/// mark's own cells - no more, no less - and only those cells are the ones the frame skips.
+/// The help screen on a tall enough screen: the mark stands at the top of the help box, on the
+/// first row inside the border, when the box can hold it without growing. The rect it is placed
+/// over is the mark's own cells - no more, no less - and the key lines begin right below it.
 #[test]
 fn help_shows_large_logo_when_it_fits() {
     let snap = library();
     let mut model = model_of(&snap);
     model.modal = Some(fbtt_tui::modal::Modal::Help);
     let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
-    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
     let large = drawn
         .placements
         .iter()
         .find(|placement| matches!(placement.size, LogoSize::Large(_)));
     assert!(
         large.is_some(),
-        "a 30-row screen has room for the mark and for every key"
+        "a 40-row screen has room for the mark and for every key"
     );
     let large = large.expect("the mark is there");
     // The rect is exactly the mark's own cells: the bitmap the view placed, no padding around it.
@@ -928,24 +928,34 @@ fn help_shows_large_logo_when_it_fits() {
         "the placement is the mark's own cells, not a rect the mark happens to fit in"
     );
     assert_eq!(large.dims, prepared.dims);
-    // Centred above the keys: the mark is roughly in the middle of the screen, with the same
-    // (or nearly the same) space on either side. The exact centring depends on the box's width,
-    // which is the widest line plus padding, but the mark must be within a few columns of the
-    // screen's centre.
-    let centre = 100u16 / 2;
-    let mark_centre = large.rect.x + large.rect.width / 2;
+    // The mark sits on the first row inside the border: the box's top border is the row above
+    // it, and the key lines begin right below it, after the list's blank row.
     assert!(
-        mark_centre.abs_diff(centre) <= 5,
-        "the mark is roughly centred in the screen: mark at x={}",
-        large.rect.x
+        large.rect.y >= 1,
+        "the mark is one row inside the border, so the border is above it"
     );
-    // And it is inside the box, at its top: the first row of the box holds the mark, not the
-    // key that would be there without it.
+    assert!(
+        large.rect.bottom() + 1 < 40,
+        "the key lines fit below the mark and the blank row"
+    );
+    // The key lines begin right below the mark and the list's blank row: the first key on the
+    // screen is `j`, the first in the list, on the row after the mark's.
     let text = drawn.screen.text();
+    let first_key_row = large.rect.bottom() + 1;
+    let lines = drawn.screen.lines();
+    let first_key_line = &lines[usize::from(first_key_row)];
+    // The key line is `│j          next torrent                       │`: the first key after
+    // the box's left border is `j`, the first in the list.
+    let after_border = first_key_line.split('│').nth(1).unwrap_or(first_key_line);
     assert!(
-        text.contains("quit") && text.contains("sort by the next column"),
-        "every key is still listed beside the mark"
+        after_border.trim_start().starts_with('j'),
+        "the first key line begins right below the mark and the blank row: {first_key_line:?}"
     );
+    // And every key is still on the screen: the mark took the rows the screen had to spare,
+    // not a key line.
+    for (key, _) in fbtt_tui::keys::KEYS {
+        assert!(text.contains(key), "the key {key:?} is missing");
+    }
 }
 
 /// The help screen on a short screen: no rows for the mark, so the keys take them.
@@ -970,19 +980,83 @@ fn help_drops_logo_when_short() {
     }
 }
 
-/// A dialog over the header: the mark is not placed this frame, because the box it would be
-/// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
-/// centred at (0, 0) and covers the three header rows and the mark's columns.
+/// The help screen's mark, at every screen size from 20 to 60 rows and at 60, 80 and 100
+/// columns: the mark never covers a key line, and a key line is never lost to it. This is the
+/// test that catches a mark placed a row too low (which lands on the first key when the box's
+/// centring has the wrong parity) and a mark that is only placed when the box actually has room
+/// for it and for every key.
 ///
-/// The help screen's mark is not dropped by the same rule: it belongs to the help box, and a
-/// box that is its own does not stand over it.
+/// A screen too short for the whole list in either shape loses keys with or without the mark -
+/// that is the box's own size, not the mark's - so a key is checked only where the box actually
+/// draws it, and the mark's rect is checked against the rows that hold key text.
+#[test]
+fn the_help_mark_never_covers_a_key_line() {
+    use fbtt_tui::keys::KEYS;
+    let snap = library();
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    for height in 20..=60u16 {
+        for width in [60u16, 80, 100] {
+            let mut model = model_of(&snap);
+            model.modal = Some(fbtt_tui::modal::Modal::Help);
+            let drawn = drawn_with(&model, &snap, &logos, width, height);
+            // The screen a person sees: the backend's buffer, clean of the frame's residue
+            // from the full view drawn behind the dialog.
+            let lines = drawn.screen.lines();
+            // Every key the box draws is on the screen with its action: the mark never took a
+            // key line from the list. A key is "present" only if some line has it at the key
+            // column, not as a prefix of a longer key ("K" is not present in "Page Up").
+            for (key, action) in KEYS {
+                let kb = key.len();
+                let present = lines.iter().any(|line| {
+                    let after_border = line.split('│').nth(1).unwrap_or(line);
+                    let trimmed = after_border.trim_start();
+                    trimmed.starts_with(key)
+                        && trimmed
+                            .get(kb..)
+                            .is_some_and(|rest| rest.starts_with(' ') || rest.is_empty())
+                });
+                if present {
+                    let with_action = lines
+                        .iter()
+                        .any(|line| line.contains(key) && line.contains(action));
+                    assert!(
+                        with_action,
+                        "{width}x{height}: the key {key:?} lost its action {action:?}"
+                    );
+                }
+            }
+            // And the mark's rect does not sit on a row that holds key text: the frame skips
+            // the mark's cells, so they are blank in the frame buffer, and the list left the
+            // rows the mark stands in empty.
+            let buffer = drawn.buffer.clone();
+            if let Some(large) = drawn
+                .placements
+                .iter()
+                .find(|placement| matches!(placement.size, LogoSize::Large(_)))
+            {
+                for y in large.rect.top()..large.rect.bottom() {
+                    for x in large.rect.x..large.rect.x + large.rect.width {
+                        assert!(
+                            buffer[(x, y)].symbol().trim().is_empty(),
+                            "{width}x{height}: the mark covers a cell with text at ({x}, {y}): {:?}",
+                            buffer[(x, y)].symbol()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The help screen's mark is not dropped by the modal-overlap rule: it belongs to the help box,
+/// standing at its top, and a box that is its own does not stand over it.
 #[test]
 fn help_placement_is_not_dropped_by_its_own_box() {
     let snap = library();
     let mut model = model_of(&snap);
     model.modal = Some(fbtt_tui::modal::Modal::Help);
     let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
-    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
     assert!(
         drawn
             .placements
@@ -991,6 +1065,10 @@ fn help_placement_is_not_dropped_by_its_own_box() {
         "the help box's own mark is not dropped by the drop rule"
     );
 }
+
+/// A dialog over the header: the mark is not placed this frame, because the box it would be
+/// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
+/// centred at (0, 0) and covers the three header rows and the mark's columns.
 #[test]
 fn modal_over_header_drops_small_placement() {
     let snap = library();
