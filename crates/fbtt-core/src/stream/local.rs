@@ -20,11 +20,12 @@ use crate::stream::tokens::StreamTokens;
 
 /// The matched-path template of the file-stream route, as fbt-api sets it.
 const STREAM_ROUTE: &str = "/api/v1/torrents/{id}/files/{index}/stream";
-/// How many live stream tokens the endpoint's store may hold: the local endpoint
-/// serves one player at a time in practice, but a player may re-request a URL on
-/// every seek, so the cap is the number of files it could plausibly have open at
-/// once rather than a single slot.
-const TOKEN_CAP: usize = 16;
+/// How many live stream tokens the endpoint's store may hold. Each play issues a
+/// fresh token, and a player may still be using a token from an earlier play when
+/// a newer play issues one, so the cap is the number of plays that could be open at
+/// once: a player that seeks re-requests the URL it was given, and a full store
+/// evicts the least recently used token rather than one a player is still on.
+const TOKEN_CAP: usize = 64;
 /// How many concurrent streams fbt-api serves on this endpoint.
 const MAX_STREAMS: usize = 8;
 

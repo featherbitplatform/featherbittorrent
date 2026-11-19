@@ -135,6 +135,14 @@ fn info_text(notice: Notice) -> String {
     }
 }
 
+/// The `Error(text)` a command answers with, taken from the notice queue.
+fn error_text(notice: Notice) -> String {
+    match notice {
+        Notice::Error(text) => text,
+        other => panic!("expected an error notice, got {other:?}"),
+    }
+}
+
 /// The row for `id`, if the snapshot lists it.
 fn row_of(snapshot: &fbtt_core::Snapshot, id: &TorrentId) -> Option<fbtt_core::TorrentRow> {
     snapshot.torrents.iter().find(|row| row.id == *id).cloned()
@@ -243,6 +251,87 @@ async fn local_complete_file_plays_path() {
     shutdown(client, task).await;
 }
 
+/// A `.torrent` whose only file is a BEP 47 pad, so the torrent has no playable
+/// file. The pad occupies one 16 KiB piece of zeros (a pad holds no content, so
+/// its piece hashes to 16 KiB of zero bytes) and is never written to disk. The
+/// name is given so the torrent's notice can be recognised.
+fn pad_torrent(name: &str) -> (Vec<u8>, TorrentId) {
+    let pad_len: u64 = 16_384;
+    // A multi-file torrent whose only file is a BEP 47 pad: the `files` list
+    // has one entry with `attr: p`, so the parser marks it a pad. The pad's
+    // piece is 16 KiB of zeros (a pad holds no content), so `pieces` is one
+    // 20-byte digest of zeros. The file is never written to disk.
+    let mut file_entry = String::new();
+    file_entry.push('d');
+    file_entry.push_str("6:length");
+    file_entry.push_str(&format!("i{pad_len}e"));
+    file_entry.push_str("4:path");
+    file_entry.push('l');
+    file_entry.push_str(&format!("{}:{name}", name.len()));
+    file_entry.push_str("4:.pad");
+    file_entry.push('e');
+    file_entry.push_str("4:attr1:p");
+    file_entry.push('e');
+    let files_list = format!("l{file_entry}e");
+    let mut info = String::new();
+    info.push('d');
+    info.push_str("5:files");
+    info.push_str(&files_list);
+    info.push_str("4:name");
+    info.push_str(&format!("{}:{name}", name.len()));
+    info.push_str("12:piece length");
+    info.push_str(&format!("i{pad_len}e"));
+    info.push_str("6:pieces20:");
+    info.extend(std::iter::repeat_n('\0', 20));
+    info.push('e');
+    let mut torrent = String::new();
+    torrent.push('d');
+    torrent.push_str("4:info");
+    torrent.push_str(&info);
+    torrent.push('e');
+    let metainfo = fbt::Metainfo::from_bytes(torrent.as_bytes()).expect("the pad torrent parses");
+    let id = TorrentId::from_wire_hash(metainfo.info_hashes.wire_hash());
+    (torrent.into_bytes(), id)
+}
+
+/// A torrent with no playable file says so, and a stream of a pad file serves
+/// nothing. The torrent's only file is a BEP 47 pad, so `choose_file` finds no
+/// non-pad file and the `Stream` command answers with an error, not a play
+/// target.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_all_pad_torrent_reports_no_playable_file() {
+    let lib = Library::new("local_stream_pad");
+    let (bytes, id) = pad_torrent("pads");
+
+    let (mut client, task, _) = lib.start().await;
+    assert!(
+        client.send(Command::Add {
+            source: AddSource::File(bytes),
+            dir: None,
+        }),
+        "the queue takes the torrent"
+    );
+    assert_eq!(info_text(notice(&mut client).await), "Added pads");
+
+    // The torrent is in the snapshot now: the metadata is parsed, and the
+    // pad file is recognised as a pad. The torrent may not reach Seeding
+    // (a pad is never written to disk), so we wait only for the row.
+    wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+
+    // No playable file: an error, and the error says the torrent has no playable file.
+    assert!(client.send(Command::Stream {
+        id: id.clone(),
+        file: None,
+    }));
+    assert_eq!(
+        error_text(notice(&mut client).await),
+        "the torrent has no playable file",
+        "a pad-only torrent says it has no playable file"
+    );
+
+    shutdown(client, task).await;
+}
+
 /// A file the leecher does not have yet plays as a stream, and the stream serves
 /// its ranges as the pieces arrive: `206` for a range, `416` for one past the end,
 /// and the first bytes of the file once they come.
@@ -293,13 +382,10 @@ async fn local_partial_file_streams_ranges() {
     assert_eq!(info_text(notice(&mut client).await), "Added src");
 
     wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
-    // Point the leecher at the seed.
-    let torrent = engine
-        .torrent(&fbt::InfoHashes::from_v1(wire_of(&id)))
-        .expect("the session holds the torrent it added");
-    let _ = torrent.add_peer(seed_addr).await;
 
-    // Before the leecher has the data: a stream URL, not a path.
+    // Before the leecher has the data: a stream URL, not a path. The stream is
+    // asked for first, while the leecher still has no piece of the file, so the
+    // answer is a URL rather than a path to a file that would not exist.
     assert!(client.send(Command::Stream {
         id: id.clone(),
         file: Some(0),
@@ -316,16 +402,28 @@ async fn local_partial_file_streams_ranges() {
     assert!(url.contains("token="), "the token is in the query: {url}");
 
     let len = 32 * KB + 7;
-    // A range: `206` with `Content-Range` and the file's first bytes, which
-    // arrive once the piece does.
-    let response = within(
-        reqwest::Client::new()
-            .get(&url)
-            .header("Range", "bytes=0-15")
-            .send(),
-    )
-    .await
-    .expect("the range request is answered");
+    // The range request goes out while the leecher has no piece of the file:
+    // it blocks until the first piece arrives, which is what makes this a
+    // stream of bytes as the pieces do, not a read of a file that is already
+    // complete. The request is answered once the piece does.
+    let range_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a loopback client");
+    let response_fut = range_client.get(&url).header("Range", "bytes=0-15").send();
+    let response_task = tokio::spawn(within(response_fut));
+
+    // Only now does the leecher learn the seed, so the download starts after the
+    // range request is already waiting.
+    let torrent = engine
+        .torrent(&fbt::InfoHashes::from_v1(wire_of(&id)))
+        .expect("the session holds the torrent it added");
+    let _ = torrent.add_peer(seed_addr).await;
+
+    let response = response_task
+        .await
+        .expect("the range request's task ran")
+        .expect("the range request is answered");
     assert_eq!(response.status(), 206, "a satisfiable range is `206`");
     let expected_range = format!("bytes 0-15/{len}");
     assert_eq!(
@@ -346,7 +444,10 @@ async fn local_partial_file_streams_ranges() {
 
     // A range past the end: `416`.
     let response = within(
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a loopback client")
             .get(&url)
             .header("Range", format!("bytes={len}-"))
             .send(),
@@ -355,12 +456,16 @@ async fn local_partial_file_streams_ranges() {
     .expect("the oversized range is answered");
     assert_eq!(response.status(), 416, "a range past the end is `416`");
 
-    // A 10 000-byte `Range` header: the whole file. hyper's default header size
-    // limit is 10 MiB, so a 10 000-byte value is not refused with `431`; fbt-api
-    // answers `200` for a `Range` that does not parse to one range.
+    // A 10 000-byte `Range` header: the whole file. The header fits inside
+    // hyper's HTTP/1 read-buffer cap (about 408 KiB), so a 10 000-byte value is
+    // not refused with `431`; fbt-api answers `200` for a `Range` that does not
+    // parse to one range.
     let big_range: String = "0".repeat(10_000);
     let response = within(
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a loopback client")
             .get(&url)
             .header("Range", format!("bytes={big_range}"))
             .send(),
@@ -435,9 +540,16 @@ async fn local_token_cannot_open_another_file() {
     // The URL is for file 0; the same token on file 1 is refused.
     let other = url.replacen("/files/0/stream", "/files/1/stream", 1);
     assert_ne!(other, url, "file 1's path is different");
-    let response = within(reqwest::Client::new().get(&other).send())
-        .await
-        .expect("the other file is answered");
+    let response = within(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a loopback client")
+            .get(&other)
+            .send(),
+    )
+    .await
+    .expect("the other file is answered");
     assert_eq!(
         response.status(),
         401,

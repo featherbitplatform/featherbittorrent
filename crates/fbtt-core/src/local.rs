@@ -606,20 +606,25 @@ impl Backend {
             return self.no_torrent();
         };
         let status = torrent.status();
-        // A torrent that has no metadata has no file list to pick from yet.
+        // The file list to pick from. A torrent that has no metadata has no
+        // file list yet; a `files()` failure for any other reason is reported
+        // with its own reason rather than as "no metadata yet".
         let files = match torrent.files().await {
-            Ok(files) if status.has_metadata => files,
-            _ => {
+            Ok(files) => files,
+            Err(fbt::SessionError::NoMetadata) => {
                 return self.notify(Notice::Error("The torrent has no metadata yet".to_owned()));
             }
+            Err(error) => return self.notify(Notice::Error(map::clean(&error.to_string()))),
         };
-        // The file to play: the wanted one, or the largest non-pad file.
+        // The file to play: the wanted one, or the largest non-pad file. A
+        // torrent whose files are all pads has no playable file.
         let Some(index) = choose_file(&files, wanted) else {
-            return self.no_torrent();
+            return self.notify(Notice::Error("the torrent has no playable file".to_owned()));
         };
-        let file = match files.get(index) {
-            Some(file) => file,
-            None => return self.no_torrent(),
+        let Some(file) = files.get(index) else {
+            return self.notify(Notice::Error(
+                "the file index is not a playable file".to_owned(),
+            ));
         };
         // The length of what is on disk, read off the blocking pool: this task
         // answers commands and does not wait on a disk (see `save_config`).
