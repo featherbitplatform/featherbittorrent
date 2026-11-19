@@ -7,6 +7,18 @@ on:
     paths:
       - dev/release-version.sh
       - dev/test-release-version.sh
+      # The packaging and smoke scripts, their fixtures and the service examples they ship: a pull request
+      # touching any of them runs every build and smoke job below, without a tag.
+      - dev/package-*.sh
+      - dev/package-*.ps1
+      - dev/smoke-*.sh
+      - dev/smoke-*.ps1
+      - dev/check-linux-binary.sh
+      - dev/test-packaging.sh
+      - dev/test-service-examples.sh
+      - dev/fixtures/**
+      - packaging/**
+      - crates/featherbittorrent/Cargo.toml
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -22,6 +34,9 @@ jobs:
   # with fake refs and files (pull requests cannot try a real tag). Every packaging job
   # resolves the version again as its first build-adjacent step, so a wrong tag stops that
   # job before any compile; this job is what makes the failure show up fast on pull requests.
+  # The packaging decision tests run here too: they build nothing and install nothing, so the
+  # glibc floor, the version mapping deb and rpm need and the argument refusals fail in the
+  # cheapest job of the workflow instead of halfway through a compile.
   verify:
     runs-on: ubuntu-latest
     outputs:
@@ -30,6 +45,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Resolver tests
         run: bash dev/test-release-version.sh
+      - name: Packaging tests
+        run: bash dev/test-packaging.sh
       - name: Resolve version
         id: version
         run: bash dev/release-version.sh
@@ -66,10 +83,14 @@ jobs:
           if-no-files-found: error
           path: target/dist/featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json
 
-  # The Linux archives are built inside a debian:12 container on native runners of each arch:
-  # the binary must not need a glibc newer than Debian 12 (glibc 2.36), because that is also
-  # what Raspberry Pi OS 12 ships, and an ubuntu-24.04 runner would link against 2.39. The
-  # rustup toolchain installs into the job; ring's C needs the compiler packages below.
+  # The Linux packages and archives are built inside an almalinux:9 container on native runners of each
+  # arch. Its glibc (2.34, RHEL 9's) is the oldest of the supported systems, so one binary serves the .deb,
+  # the .rpm and the .tar.gz from Ubuntu 22.04 and RHEL 9 up to Debian 13 and Raspberry Pi OS 13: an
+  # ubuntu-24.04 runner's own glibc (2.39) would be too new for the oldest of them, and
+  # dev/check-linux-binary.sh refuses a binary that asks for a newer symbol than that floor. The rustup
+  # toolchain installs into the job. gcc, make and pkgconf are what ring's C build needs; rpm, cpio and
+  # findutils are what cargo-generate-rpm and the .rpm checks shell out to, and binutils provides the ar
+  # the .deb is read with.
   linux:
     name: linux-${{ matrix.arch }}
     strategy:
@@ -77,22 +98,21 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - arch: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
-    container: debian:12
+    container: almalinux:9
     defaults:
       run:
         shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Install build tools
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential pkg-config git curl ca-certificates unzip tar gzip zlib1g-dev
+        run: dnf install -y gcc make pkgconf-pkg-config git tar gzip gawk binutils rpm cpio findutils
       - uses: actions/checkout@v4
       # First, so a tag that is not v<workspace version> stops the job before any build.
       - name: Resolve version
@@ -102,44 +122,82 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-${{ matrix.arch }}
-      - name: Build
-        run: cargo build --locked --release -p featherbittorrent
+      # Pinned, and installed from the tool's own lockfile, so a release does not change because a
+      # dependency of the packaging tool gained a version. The same pins ../terminal releases with.
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      # Builds, packages as .deb, .rpm and .tar.gz, holds the binary to the glibc floor and the NEEDED
+      # allow list, and proves that no package carries a maintainer script or a file a service manager
+      # would pick up. It prints the paths it wrote, and each one beside its own .sha256.
       - name: Package
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          stage="target/dist/featherbittorrent-$VERSION-$TARGET"
-          mkdir -p "$stage"
-          cp target/release/featherbittorrent "$stage/"
-          cp LICENSE NOTICE README.md "$stage/"
-          tar -C target/dist -czf "target/dist/featherbittorrent-$VERSION-$TARGET.tar.gz" \
-            "featherbittorrent-$VERSION-$TARGET"
-      - name: Smoke the archive
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          rm -rf "$RUNNER_TEMP/smoke" && mkdir -p "$RUNNER_TEMP/smoke"
-          tar -C "$RUNNER_TEMP/smoke" -xzf "target/dist/featherbittorrent-$VERSION-$TARGET.tar.gz"
-          bin="$RUNNER_TEMP/smoke/featherbittorrent-$VERSION-$TARGET/featherbittorrent"
-          test -x "$bin"
-          "$bin" --version | grep -F "$VERSION"
+        run: bash dev/package-linux.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
           name: featherbittorrent-linux-${{ matrix.arch }}
           if-no-files-found: error
-          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+          path: |
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb.sha256
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm.sha256
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
 
-  # One universal archive from both Apple-silicon and Intel builds, joined with lipo; the
-  # runner is Apple silicon, so the packaged binary runs in the smoke step either way.
+  # Every Linux artifact is installed, run and removed in a clean container of the system it claims to
+  # serve, before anything is published: debian:12 and debian:13 stand in for Raspberry Pi OS 12 and 13
+  # (same userland; Raspberry Pi publishes no container image), ubuntu:22.04 is the oldest .deb glibc,
+  # fedora:41 and rockylinux:9 are the .rpm systems, and ubuntu:22.04 again puts the .tar.gz through the
+  # same CLI smoke. fail-fast is off so one sick image cannot hide the state of the others, and the runner
+  # follows the architecture so each package runs natively: a container image is not emulated here.
+  linux-smoke:
+    name: linux smoke ${{ matrix.arch }} ${{ matrix.target.format }} ${{ matrix.target.image }}
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        target:
+          - { image: "debian:12", format: deb }
+          - { image: "debian:13", format: deb }
+          - { image: "ubuntu:22.04", format: deb }
+          - { image: "fedora:41", format: rpm }
+          - { image: "rockylinux:9", format: rpm }
+          - { image: "ubuntu:22.04", format: tar.gz }
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.target.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Only the two scripts this smoke runs. A minimal image carries no git, in which case checkout falls
+      # back to downloading the repository archive, which is enough for two files and needs no toolchain.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            dev/smoke-linux.sh
+            dev/smoke-cli.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: featherbittorrent-linux-${{ matrix.arch }}
+          path: dist
+      # Checksum, minimal install, where the files landed, nothing installed or enabled a service, the CLI
+      # smoke, then removal with the user's config left behind. One line per check on stdout.
+      - name: Install, run and remove
+        run: bash dev/smoke-linux.sh "${{ matrix.target.format }}" dist "${{ needs.linux.outputs.version }}"
+
+  # One universal archive from both Apple-silicon and Intel builds. dev/package-macos.sh joins the slices
+  # with lipo, checks which architectures are really in the result and whether its signature verifies,
+  # generates the man pages and completions from the joined binary, ships the docs and the launchd example
+  # as files only, and finishes with dev/smoke-cli.sh against a fresh extraction. The runner is Apple
+  # silicon, so that smoke runs the arm64 slice; the x86_64 slice is checked by lipo -archs in the script
+  # and by the Intel machine that downloads it.
   macos:
     name: macos-universal
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
       - name: Resolve version
         id: version
         run: bash dev/release-version.sh
@@ -149,44 +207,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-universal
-      - name: Build both archs
-        run: |
-          set -euo pipefail
-          cargo build --locked --release -p featherbittorrent --target aarch64-apple-darwin
-          cargo build --locked --release -p featherbittorrent --target x86_64-apple-darwin
-      - name: Package the universal archive
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          stage="target/dist/featherbittorrent-$VERSION-universal-apple-darwin"
-          mkdir -p "$stage"
-          lipo -create \
-            target/aarch64-apple-darwin/release/featherbittorrent \
-            target/x86_64-apple-darwin/release/featherbittorrent \
-            -output "$stage/featherbittorrent"
-          cp LICENSE NOTICE README.md "$stage/"
-          tar -C target/dist -czf "target/dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz" \
-            "featherbittorrent-$VERSION-universal-apple-darwin"
-          # lipo says which archs really are in the binary; both must be listed.
-          lipo -archs "$stage/featherbittorrent" | grep -w arm64 | grep -w x86_64 > /dev/null
-      - name: Smoke the archive
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          rm -rf "$RUNNER_TEMP/smoke" && mkdir -p "$RUNNER_TEMP/smoke"
-          tar -C "$RUNNER_TEMP/smoke" -xzf "target/dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz"
-          bin="$RUNNER_TEMP/smoke/featherbittorrent-$VERSION-universal-apple-darwin/featherbittorrent"
-          test -x "$bin"
-          "$bin" --version | grep -F "$VERSION"
+      # The script is its own smoke, so there is nothing left to check between it and the upload.
+      - name: Package and smoke
+        run: bash dev/package-macos.sh "${{ steps.version.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
           name: featherbittorrent-macos-universal
           if-no-files-found: error
-          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
+          path: |
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz.sha256
 
-  # The Windows archives build for the runner's own arch on native runners of each arch.
+  # The Windows archives build for the runner's own arch on native runners of each arch. -Target is named
+  # on the cargo command line (see dev/package-windows.ps1), which is why this step installs that target:
+  # under an x64 pwsh emulated on the ARM runner, the architecture the machine reports is not something a
+  # build default can be trusted to turn into the right binary. The script zips, hashes and then smokes its
+  # own archive through dev/smoke-cli.ps1, so nothing else here runs the exe.
   windows:
     name: windows-${{ matrix.arch }}
     strategy:
@@ -208,52 +244,34 @@ jobs:
         shell: bash
         run: bash dev/release-version.sh
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-${{ matrix.arch }}
-      - name: Build
-        run: cargo build --locked --release -p featherbittorrent
-      - name: Package the zip
+      - name: Package and smoke the zip
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TARGET: ${{ matrix.target }}
-        run: |
-          $stage = "target\dist\featherbittorrent-$env:VERSION-$env:TARGET"
-          New-Item -ItemType Directory -Force "$stage" | Out-Null
-          Copy-Item "target\release\featherbittorrent.exe" "$stage\"
-          Copy-Item LICENSE, NOTICE, README.md "$stage\"
-          Compress-Archive -Path "$stage" `
-            -DestinationPath "target\dist\featherbittorrent-$env:VERSION-$env:TARGET.zip"
-      - name: Smoke the archive
-        shell: pwsh
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = "target\dist\featherbittorrent-$env:VERSION-$env:TARGET.zip"
-          [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path $zip), "$env:RUNNER_TEMP\smoke")
-          $bin = "$env:RUNNER_TEMP\smoke\featherbittorrent-$env:VERSION-$env:TARGET\featherbittorrent.exe"
-          if (-not (Test-Path $bin)) { throw "no binary in the archive" }
-          $printed = & $bin --version | Out-String
-          if ($printed -notlike "*$env:VERSION*") { throw "--version did not print the release version" }
+        run: ./dev/package-windows.ps1 -Version $env:VERSION -Target $env:TARGET
       - uses: actions/upload-artifact@v4
         with:
           name: featherbittorrent-windows-${{ matrix.arch }}
           if-no-files-found: error
-          path: target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+          path: |
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip.sha256
 
-  # One release with every system's archive plus the SBOM, published only when every job
-  # passed: any failing job skips this one, so nothing is published. Only a tag push
-  # publishes; a pull request or manual run builds and checks, never releases. The release
-  # is made as a draft, gets all files, and only then is published, so a failed upload never
-  # leaves a half-published release; a re-run first removes the draft a failed run left.
+  # One release with every system's packages and archives plus the SBOM, published only when every job
+  # passed: any failing build or smoke test skips this one, so nothing untested is published. Only a tag
+  # push publishes; a pull request or manual run builds and checks, never releases. The release is made as
+  # a draft, gets all 19 files, and only then is published, so a failed upload never leaves a half-published
+  # release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [verify, sbom, linux, macos, windows]
+    needs: [verify, sbom, linux, linux-smoke, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -264,11 +282,13 @@ jobs:
       GH_REPO: ${{ github.repository }}
       # Put below the version's CHANGELOG.md section and above the generated notes.
       NOTES: >-
-        Archives for macOS (universal `.tar.gz`), Linux x86_64 and aarch64 (`.tar.gz`, built
-        on Debian 12 so they run wherever Debian 12 or Raspberry Pi OS 12 runs) and Windows
-        x86_64 and aarch64 (`.zip`). Each archive holds the binary beside `LICENSE`, `NOTICE`
-        and `README.md`; `featherbittorrent-<version>.cdx.json` is its CycloneDX SBOM. Debian
-        packages arrive in milestone 4.
+        `.deb` for Debian, Ubuntu and Raspberry Pi OS 64-bit (12 or newer), `.rpm` for Fedora and the RHEL 9
+        family, and `.tar.gz` for any other Linux with glibc 2.34 or newer, each built for x86_64 and for
+        aarch64; macOS gets one universal `.tar.gz`, Windows a `.zip` for x86_64 and one for arm64. A
+        `.sha256` sits beside every file, so `sha256sum -c` checks what was downloaded. No package installs,
+        enables or starts a service; `docs/autostart.md` shows how to run `serve` under systemd, launchd or
+        Windows Task Scheduler. `featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json` is this
+        release's CycloneDX SBOM.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -289,11 +309,24 @@ jobs:
           set -euo pipefail
           ls -l dist
           cat > "$RUNNER_TEMP/release-files" <<EOF
-          dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz
+          dist/featherbittorrent-$VERSION-linux-x86_64.deb
+          dist/featherbittorrent-$VERSION-linux-x86_64.deb.sha256
+          dist/featherbittorrent-$VERSION-linux-x86_64.rpm
+          dist/featherbittorrent-$VERSION-linux-x86_64.rpm.sha256
           dist/featherbittorrent-$VERSION-x86_64-unknown-linux-gnu.tar.gz
-          dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256
+          dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz
+          dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz.sha256
           dist/featherbittorrent-$VERSION-x86_64-pc-windows-msvc.zip
+          dist/featherbittorrent-$VERSION-x86_64-pc-windows-msvc.zip.sha256
+          dist/featherbittorrent-$VERSION-linux-aarch64.deb
+          dist/featherbittorrent-$VERSION-linux-aarch64.deb.sha256
+          dist/featherbittorrent-$VERSION-linux-aarch64.rpm
+          dist/featherbittorrent-$VERSION-linux-aarch64.rpm.sha256
+          dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz.sha256
           dist/featherbittorrent-$VERSION-aarch64-pc-windows-msvc.zip
+          dist/featherbittorrent-$VERSION-aarch64-pc-windows-msvc.zip.sha256
           dist/featherbittorrent-$VERSION.cdx.json
           EOF
           missing=0
@@ -303,7 +336,10 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 6 ]
+          # Six files per Linux architecture (deb, rpm and the archive, each with its checksum), two for
+          # macOS, four for the two Windows zips, and the SBOM. A name that changed in a packaging script
+          # without changing here means a download nobody uploaded.
+          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 19 ]
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |
