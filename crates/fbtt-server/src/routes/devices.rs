@@ -11,7 +11,8 @@
 //! nobody asked for and the other with none at all. What they cannot do while that lock is held is lose
 //! the work - `Config::save` replaces the file in one step, so a crash leaves either the old list or the
 //! new one. And what they do not do, when the file cannot be read, is anything at all: no rename, no
-//! defaults written over somebody's hand-edited bytes, only the answer that says to fix it by hand.
+//! defaults written over somebody's hand-edited bytes, only an answer that sends whoever asked to the
+//! server log, where the file and what is wrong with it are written out for the person who can fix them.
 //!
 //! With nobody signing in these three routes answer `403`: a device is a way of proving who you are, and a
 //! server that asks nobody to prove anything has nothing for one to be proof against. It also closes the
@@ -207,9 +208,17 @@ async fn change(
         // Nothing there yet: this run's own config is the only one to add a device to.
         Ok(None) => shared.base_config.clone(),
         Err(problem) => {
-            return Err(RouteError::internal(format!(
-                "config.yaml cannot be read; fix it by hand ({problem})",
-            )));
+            // Where the file sits and what is wrong with it are things its owner can act on, and an owner
+            // reads the server log. A browser that has never seen this machine gets one sentence and no
+            // path: naming `config.yaml` and its directory tells a stranger how the disk is laid out.
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config could not be read or applied",
+            );
+            return Err(RouteError::internal(
+                "the server's config has a setting to fix; see the server log",
+            ));
         }
     };
     // The device list is part of the server section. A config that never named one gets it here: this

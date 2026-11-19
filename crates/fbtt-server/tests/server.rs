@@ -1926,11 +1926,61 @@ async fn verify_concurrency_is_bounded() {
     served.stop().await;
 }
 
+/// The config lives on the server's own disk, where its path means something to its owner. A browser
+/// only needs to know a setting is in the way; where the file sits is for the server log.
+#[tokio::test]
+async fn a_setting_problem_names_the_server_log_not_the_config_file() {
+    let served = Served::start("player-problem", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let config_path = served.paths.config_file();
+    fs::create_dir_all(config_path.parent().expect("the config directory"))
+        .expect("make the config directory");
+    fs::write(&config_path, "player:\n  program: \"\"\n")
+        .expect("write a config whose player cannot be used");
+
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/auth/devices"),
+        serde_json::json!({ "name": "phone", "public_key": public_line(&keypair()) }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a setting this server cannot apply is still not its to repair",
+    );
+
+    let text = within(response.text()).await.expect("an answer");
+    let file_name = config_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let directory = config_path.parent().unwrap().to_string_lossy().into_owned();
+    assert!(!text.is_empty());
+    assert!(
+        !text.contains(&file_name),
+        "the browser was told the config file's name: {text}"
+    );
+    assert!(
+        !text.contains(directory.as_str()),
+        "the browser was told where the config lives: {text}"
+    );
+
+    // The file is still left for its owner to fix, with nothing written over it.
+    let left = fs::read_to_string(&config_path).unwrap();
+    assert!(left.contains("program: \"\""), "{left}");
+}
+
 /// A `config.yaml` this server cannot read is somebody's hand-edited file, and a request that cannot parse it
-/// has no business rearranging it: adding a device answers that it cannot be read and says to fix it by hand,
-/// writes nothing, and leaves the bytes under the name they had. It used to move them aside as
-/// `config.yaml.bad` and write a config of its own in their place - from inside a `POST`, on the strength of
-/// YAML it could not understand.
+/// has no business rearranging it: adding a device answers that the config needs its owner's attention, points
+/// at the server log for what is wrong, writes nothing, and leaves the bytes under the name they had. It used
+/// to move them aside as `config.yaml.bad` and write a config of its own in their place - from inside a
+/// `POST`, on the strength of YAML it could not understand.
 #[tokio::test]
 async fn an_unreadable_config_is_left_for_its_owner() {
     let served = Served::start("bad-config", |scratch| {
@@ -1965,9 +2015,9 @@ async fn an_unreadable_config_is_left_for_its_owner() {
         "a file this server cannot read is not its to repair",
     );
     assert_eq!(code, "internal");
-    assert!(
-        message.starts_with("config.yaml cannot be read; fix it by hand"),
-        "the answer says what to do: {message}"
+    assert_eq!(
+        message, "the server's config has a setting to fix; see the server log",
+        "the answer says what to do without saying where the file lives: {message}",
     );
 
     // The bytes are where they were, under the name they had, with nothing beside them: no `.bad` left behind
