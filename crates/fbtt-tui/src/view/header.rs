@@ -1,6 +1,8 @@
 //! The lines above the table: what this is, what is running the torrents, and what is
 //! moving right now.
 
+use std::sync::Arc;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -10,13 +12,13 @@ use ratatui::widgets::Paragraph;
 use fbtt_core::{Connection, LinkState, Snapshot};
 
 use crate::format;
+use crate::graphics::{LogoSize, LogoView, Placement};
 use crate::theme;
 
 /// What the program calls itself, which is also the name of the binary.
 const APP_NAME: &str = "featherbittorrent";
 
-/// The title and its version, for the first line of the full view. The logo that replaces
-/// it in a terminal that draws images arrives with milestone 3.
+/// The title and its version, for the first line of the full view.
 fn title_line() -> Line<'static> {
     Line::from(vec![
         title_span(),
@@ -118,14 +120,57 @@ fn totals_line(snap: &Snapshot) -> Line<'static> {
 /// whatever of them still matters. A single line carries the name and the rates, because what
 /// is moving says more than the words around it; two lines drop the connection, which nobody
 /// changes from this screen.
-pub(crate) fn draw(frame: &mut Frame, area: Rect, snap: &Snapshot) {
-    let lines: Vec<Line<'static>> = match area.height {
-        0 => return,
-        1 => vec![fallback_line(snap)],
-        2 => vec![title_line(), totals_line(snap)],
+///
+/// With a small mark the terminal can draw, the mark takes the header's left - its columns
+/// plus one blank one - and the three lines stand in what is left (decision 12). A header
+/// shorter than three rows, or a terminal with no mark, draws exactly what it always did:
+/// the text title.
+///
+/// The mark's placement is what comes back: the cells the view draws are the ones the
+/// binary's placer writes the image over, and only this function knows which cells those are.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &Snapshot,
+    logos: LogoView<'_>,
+) -> Option<Placement> {
+    // The mark's rect, when there is one to place: a three-row header, a prepared mark, and
+    // room for it plus its blank column.
+    let logo_rect = logos
+        .logos
+        .and_then(|logos| logos.small.as_ref())
+        .filter(|_| area.height >= 3)
+        .filter(|prepared| u32::from(prepared.dims.cols) + 1 < u32::from(area.width))
+        .map(|prepared| Rect::new(area.x, area.y, prepared.dims.cols, 3));
+
+    let lines: Vec<Line<'static>> = match (area.height, logo_rect) {
+        (0, _) => return None,
+        (1, _) => vec![fallback_line(snap)],
+        (2, _) => vec![title_line(), totals_line(snap)],
+        (_, Some(rect)) => {
+            // The lines stand in the rest of the header, where their first column is what the
+            // mark's blank column leaves behind.
+            let rest = Rect::new(rect.right() + 1, area.y, area.right() - rect.right() - 1, 3);
+            let lines = vec![title_line(), connection_line(snap), totals_line(snap)];
+            frame.render_widget(Paragraph::new(lines), rest);
+            let small = logos
+                .logos
+                .expect("a rect came from a prepared mark")
+                .small
+                .as_ref()
+                .expect("the same mark")
+                .clone();
+            return Some(Placement {
+                size: LogoSize::Small,
+                rect,
+                dims: small.dims,
+                prepared: Some(Arc::new(small)),
+            });
+        }
         _ => vec![title_line(), connection_line(snap), totals_line(snap)],
     };
     frame.render_widget(Paragraph::new(lines), area);
+    None
 }
 
 /// The name and the rates on one line: the header both views fall back to.

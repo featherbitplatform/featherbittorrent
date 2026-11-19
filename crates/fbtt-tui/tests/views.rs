@@ -6,11 +6,88 @@ use fbtt_core::{
     Command, Detail, DetailTab, FilePriority, FileRow, LinkState, Notice, RowState, Snapshot,
     TorrentId,
 };
+use fbtt_tui::graphics::caps::{CellPx, Graphics, Protocol};
+use fbtt_tui::graphics::kitty;
+use fbtt_tui::graphics::place::{LogoSize, LogoView, Placement, PreparedLogos};
 use fbtt_tui::{Action, Descending, SortKey, theme, visible_rows};
+use ratatui::buffer::CellDiffOption;
 use ratatui::style::Color;
 
 mod support;
 use support::*;
+
+/// A drawn screen and the marks the frame placed: `fbtt_tui::view::draw_with` the way the binary
+/// does, with the prepared logos the terminal it pretends to be.
+///
+/// `buffer` is the frame's own buffer, not the backend's: ratatui's diff skips the cells the
+/// mark covers, so the backend only holds what the frame actually wrote, while the frame's
+/// buffer is where the view left its placeholder and skip marks.
+struct Drawn<'a> {
+    screen: Screen,
+    buffer: ratatui::buffer::Buffer,
+    placements: Vec<Placement>,
+    _logos: &'a PreparedLogos,
+}
+
+/// The marks for a terminal whose protocol and cell size a test spells out: the case the binary's
+/// blocking pool answers with. `cell` is the device pixel size of one cell.
+fn logos(protocol: Protocol, cell: CellPx) -> PreparedLogos {
+    fbtt_tui::graphics::prepare(Graphics {
+        protocol,
+        cell: Some(cell),
+        scale: 1,
+    })
+}
+
+/// A screen drawn with the marks `logos` has. The frame's placements are captured on the way
+/// through, the way the binary's draw callback captures them before the frame is handed to the
+/// placer.
+fn drawn_with<'a>(
+    model: &fbtt_tui::Model,
+    snap: &Snapshot,
+    logos: &'a PreparedLogos,
+    width: u16,
+    height: u16,
+) -> Drawn<'a> {
+    drawn_with_view(
+        model,
+        snap,
+        logos,
+        LogoView { logos: Some(logos) },
+        width,
+        height,
+    )
+}
+
+/// The same draw, with the view a test spells out: the help's mark-free reference is the same
+/// screen drawn with the text title, no marks at all.
+fn drawn_with_view<'a>(
+    model: &fbtt_tui::Model,
+    snap: &Snapshot,
+    logos: &'a PreparedLogos,
+    view: LogoView<'a>,
+    width: u16,
+    height: u16,
+) -> Drawn<'a> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+    let mut placements = Vec::new();
+    let frame = terminal
+        .draw(|frame| {
+            placements = fbtt_tui::view::draw_with(frame, model, snap, view);
+        })
+        .expect("a drawn frame");
+    // The frame's buffer is the one that carries the view's marks: the diff the backend saw
+    // wrote only what changed, and skipped cells are exactly the ones it did not.
+    let buffer = frame.buffer.clone();
+    let screen = Screen::from_terminal(terminal);
+    Drawn {
+        screen,
+        buffer,
+        placements,
+        _logos: logos,
+    }
+}
 
 #[test]
 fn full_view_shows_rows_and_header() {
@@ -936,4 +1013,431 @@ fn the_footer_at_eighty_columns_keeps_its_rule() {
         footer.trim_end().ends_with("q quit"),
         "`q quit` is not at the end of: {footer:?}"
     );
+}
+
+/// A terminal with no image protocol at all: the header is the text title, as it has always been.
+#[test]
+fn no_graphics_shows_text_title() {
+    let snap = library();
+    let model = model_of(&snap);
+    let screen = Screen::new(&model, &snap, 100, 30);
+    // The title line is the mark's space, which the text title fills.
+    let title_col = screen
+        .find("featherbittorrent")
+        .expect("the title is drawn");
+    assert_eq!(
+        title_col.0, 0,
+        "no mark is placed, so the title starts the header"
+    );
+    assert!(
+        !screen.text().contains('\u{10EEEE}'),
+        "no placeholders on a terminal that cannot draw images"
+    );
+
+    // The same for a `PreparedLogos` with `Protocol::None`: a terminal that proved nothing. Zero
+    // placements, and the text title where the mark would be.
+    let none = PreparedLogos {
+        graphics: fbtt_tui::graphics::Graphics::none(),
+        small: None,
+        large: Vec::new(),
+    };
+    let drawn = drawn_with(&model, &snap, &none, 100, 30);
+    assert!(
+        drawn.placements.is_empty(),
+        "a terminal with no protocol places no marks: {:?}",
+        drawn.placements
+    );
+    assert!(
+        drawn.screen.text().contains("featherbittorrent"),
+        "the text title is still drawn"
+    );
+}
+
+/// A kitty terminal: the header's cells are placeholders, the image the pixels that will be
+/// there, and the title stands one column to the right of the mark's blank column.
+#[test]
+fn kitty_header_cells_are_placeholders() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let placement = drawn
+        .placements
+        .iter()
+        .find(|placement| placement.size == LogoSize::Small)
+        .expect("the header's mark is placed");
+
+    // The mark's cells hold the placeholder: the first of them is the character for row 0, column 0.
+    let cell = &drawn.buffer[(0, 0)];
+    assert!(
+        cell.symbol().starts_with('\u{10EEEE}'),
+        "the first header cell is a placeholder, found {:?}",
+        cell.symbol()
+    );
+    assert_eq!(
+        cell.symbol(),
+        kitty::placeholder(0, 0).as_str(),
+        "row 0, column 0 of the mark"
+    );
+    assert_eq!(
+        cell.fg,
+        kitty::id_colour(kitty::SMALL_ID),
+        "the placeholder's foreground is the id, the one colour that is not a theme token"
+    );
+
+    // The title starts one column to the right of the mark: the mark's blank column stands
+    // between them. The frame buffer holds it as a cell, not as characters, so the column is
+    // a cell count, not a character count.
+    let title_start = usize::from(placement.rect.width) + 1;
+    let title_cell = &drawn.buffer[(title_start as u16, 0)];
+    assert!(
+        title_cell.symbol().starts_with('f'),
+        "the title starts at cell {title_start} (the mark's columns plus its blank column), \
+         found {:?}",
+        title_cell.symbol()
+    );
+
+    // The corner of the mark: its last cell holds the character for its last row and column.
+    let last = &drawn.buffer[(placement.rect.right() - 1, placement.rect.bottom() - 1)];
+    assert_eq!(
+        last.symbol(),
+        kitty::placeholder(2, placement.rect.width - 1).as_str(),
+        "the last cell of the mark"
+    );
+}
+
+/// A sixel terminal: the mark's cells are skipped, so the frame writes nothing over the image
+/// the placer writes after the frame, and the placement the frame returns is where it will be
+/// written.
+#[test]
+fn sixel_header_cells_are_skipped() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let placement = drawn
+        .placements
+        .iter()
+        .find(|placement| placement.size == LogoSize::Small)
+        .expect("the header's mark is placed");
+    assert_eq!(placement.size, LogoSize::Small);
+    assert_eq!(
+        drawn.placements.len(),
+        1,
+        "the full view at this size places exactly the header's mark: {:?}",
+        drawn.placements
+    );
+
+    // Every cell the mark covers is skipped: the frame never writes it.
+    for y in 0..placement.rect.height {
+        for x in 0..placement.rect.width {
+            let cell = &drawn.buffer[(placement.rect.x + x, placement.rect.y + y)];
+            assert_eq!(
+                cell.diff_option,
+                CellDiffOption::Skip,
+                "the cell at {x}, {y} of the mark must be skipped"
+            );
+        }
+    }
+}
+
+/// The help screen on a tall enough screen: the mark stands at the top of the help box, on the
+/// first row inside the border, when the box can hold it without growing. The rect it is placed
+/// over is the mark's own cells - no more, no less - and the key lines begin right below it.
+#[test]
+fn help_shows_large_logo_when_it_fits() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
+    let large = drawn
+        .placements
+        .iter()
+        .find(|placement| matches!(placement.size, LogoSize::Large(_)));
+    assert!(
+        large.is_some(),
+        "a 40-row screen has room for the mark and for every key"
+    );
+    let large = large.expect("the mark is there");
+    // The rect is exactly the mark's own cells: the bitmap the view placed, no padding around it.
+    let prepared = logos
+        .large
+        .iter()
+        .find(|prepared| prepared.dims.rows == large.dims.rows)
+        .expect("the rows the view placed");
+    assert_eq!(
+        (large.rect.width, large.rect.height),
+        (prepared.dims.cols, prepared.dims.rows),
+        "the placement is the mark's own cells, not a rect the mark happens to fit in"
+    );
+    assert_eq!(large.dims, prepared.dims);
+    // The mark sits on the first row inside the border: the box's top border is the row above
+    // it, and the key lines begin right below it, after the list's blank row.
+    assert!(
+        large.rect.y >= 1,
+        "the mark is one row inside the border, so the border is above it"
+    );
+    assert!(
+        large.rect.bottom() + 1 < 40,
+        "the key lines fit below the mark and the blank row"
+    );
+    // The key lines begin right below the mark and the list's blank row: the first key on the
+    // screen is `j`, the first in the list, on the row after the mark's.
+    let text = drawn.screen.text();
+    let first_key_row = large.rect.bottom() + 1;
+    let lines = drawn.screen.lines();
+    let first_key_line = &lines[usize::from(first_key_row)];
+    // The key line is `│j          next torrent                       │`: the first key after
+    // the box's left border is `j`, the first in the list.
+    let after_border = first_key_line.split('│').nth(1).unwrap_or(first_key_line);
+    assert!(
+        after_border.trim_start().starts_with('j'),
+        "the first key line begins right below the mark and the blank row: {first_key_line:?}"
+    );
+    // And every key is still on the screen: the mark took the rows the screen had to spare,
+    // not a key line.
+    for (key, _) in fbtt_tui::keys::KEYS {
+        assert!(text.contains(key), "the key {key:?} is missing");
+    }
+}
+
+/// The help screen on a short screen: no rows for the mark, so the keys take them.
+#[test]
+fn help_drops_logo_when_short() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 20);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| matches!(placement.size, LogoSize::Large(_))),
+        "a 20-row screen has no rows for the mark"
+    );
+    // The keys are still all there: the box just took the rows the mark would have stood in.
+    let text = drawn.screen.text();
+    for want in ["quit", "sort by the next column"] {
+        assert!(text.contains(want), "the keys lost {want:?}: {text:?}");
+    }
+}
+
+/// The help screen's mark, at every screen size from 20 to 60 rows and from 10 to 100 columns,
+/// at both cell sizes the probe answers: the mark never covers a key line, and a key line is
+/// never lost to it. This is the test that catches a mark placed a row too low (which lands on
+/// the first key when the box's centring has the wrong parity) and a mark that is only placed
+/// when the box actually has room for it and for every key.
+///
+/// A screen too short for the whole list in either shape loses keys with or without the mark -
+/// that is the box's own size, not the mark's - so a key is checked only where the mark-free
+/// draw of the same size actually draws it, and the mark's rect is checked against the box's own
+/// top border: the mark stands on the row right below it, never on it.
+#[test]
+fn the_help_mark_never_covers_a_key_line() {
+    use fbtt_tui::keys::KEYS;
+    let snap = library();
+    // Both cell sizes the probe answers: 8x16 is the one the help suite has always used, and
+    // 4x16 is the narrow cell that makes the mark's own width, not the list's, the limit.
+    for cell in [CellPx { w: 8, h: 16 }, CellPx { w: 4, h: 16 }] {
+        let logos = logos(Protocol::Sixel, cell);
+        for height in 20..=60u16 {
+            for width in 10..=100u16 {
+                let mut model = model_of(&snap);
+                model.modal = Some(fbtt_tui::modal::Modal::Help);
+                let drawn = drawn_with(&model, &snap, &logos, width, height);
+                // The same screen without the mark: the same box, the text title, no mark.
+                // The keys it draws at this size are the ones the marked screen must not lose -
+                // a screen too short for the whole list in either shape loses keys with or
+                // without the mark, and that is the box's own size, not the mark's.
+                let mark_free =
+                    drawn_with_view(&model, &snap, &logos, LogoView::text(), width, height);
+                // The screen a person sees: the backend's buffer, clean of the frame's residue
+                // from the full view drawn behind the dialog.
+                let lines = drawn.screen.lines();
+                let free_lines = mark_free.screen.lines();
+                // Every key the mark-free box draws with its action, the marked screen draws with
+                // it too: the mark never took a key line from the list. The check reads only the
+                // help box's key lines - the lines from its first `│` border down to its bottom
+                // border - not the whole screen: the full view behind the modal shows a `c`
+                // (in "connected") that is not a key line, and would be a false match. A screen
+                // too small for a whole line in either shape clips the line's tail with or
+                // without the mark - that is the box's own size, not the mark's - so the
+                // reference is the mark-free draw's own key lines, and the mark is judged against
+                // it.
+                let key_lines = |lines: &[String]| -> Vec<String> {
+                    let start = lines
+                        .iter()
+                        .position(|line| line.starts_with('┌'))
+                        .unwrap_or(0);
+                    let end = lines
+                        .iter()
+                        .rposition(|line| line.starts_with('└'))
+                        .unwrap_or_else(|| lines.len().saturating_sub(1));
+                    lines[start..=end.min(lines.len().saturating_sub(1))].to_vec()
+                };
+                let free_keys = key_lines(&free_lines);
+                let marked_keys = key_lines(&lines);
+                for (key, action) in KEYS {
+                    let present = |lines: &[String]| {
+                        lines
+                            .iter()
+                            .any(|line| line.contains(key) && line.contains(action))
+                    };
+                    if present(&free_keys) {
+                        assert!(
+                            present(&marked_keys),
+                            "{width}x{height} cell {cell:?}: the mark took the key line of {key:?}"
+                        );
+                    }
+                }
+                // And the mark stands on the row right below the box's own top border, never on
+                // it: a rect one row too high would sit on the border's row, and one too low
+                // would land on the first key.
+                if let Some(large) = drawn
+                    .placements
+                    .iter()
+                    .find(|placement| matches!(placement.size, LogoSize::Large(_)))
+                {
+                    let top_row = lines
+                        .iter()
+                        .position(|line| line.contains('┌'))
+                        .expect("the help box has a top border");
+                    assert_eq!(
+                        usize::from(large.rect.y),
+                        top_row + 1,
+                        "{width}x{height} cell {cell:?}: the mark is on the row right below the box's top border, not on it"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The help screen's mark is not dropped by the modal-overlap rule: it belongs to the help box,
+/// standing at its top, and a box that is its own does not stand over it.
+#[test]
+fn help_placement_is_not_dropped_by_its_own_box() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
+    assert!(
+        drawn
+            .placements
+            .iter()
+            .any(|placement| matches!(placement.size, LogoSize::Large(_))),
+        "the help box's own mark is not dropped by the drop rule"
+    );
+}
+
+/// A dialog over the header: the mark is not placed this frame, because the box it would be
+/// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
+/// centred at (0, 0) and covers the three header rows and the mark's columns.
+#[test]
+fn modal_over_header_drops_small_placement() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Settings(
+        fbtt_tui::modal::SettingsForm::new(&snap.limits),
+    ));
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 10, 10);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| placement.size == LogoSize::Small),
+        "a dialog over the header takes the mark off the screen"
+    );
+}
+
+/// The minimal view has no header mark: its one line per torrent is all it is, at any size. (The
+/// help dialog drawn over it has its own mark, see `minimal_view_help_places_the_mark`.)
+#[test]
+fn minimal_view_has_no_logo() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.view = fbtt_tui::View::Minimal;
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    assert!(
+        drawn.placements.is_empty(),
+        "the minimal view does not place a mark"
+    );
+}
+
+/// The help dialog over the minimal view: the dialog is the same box in either view, so its mark
+/// is placed the same way - once, on the row right below the box's top border, with every key and
+/// the close hint still on the screen. Without it the box would hold a blank band.
+#[test]
+fn minimal_view_help_places_the_mark() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.view = fbtt_tui::View::Minimal;
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 40);
+    let larges: Vec<_> = drawn
+        .placements
+        .iter()
+        .filter(|placement| matches!(placement.size, LogoSize::Large(_)))
+        .collect();
+    assert_eq!(
+        larges.len(),
+        1,
+        "the help over the minimal view places exactly one large mark"
+    );
+    assert!(
+        drawn
+            .placements
+            .iter()
+            .all(|placement| placement.size != LogoSize::Small),
+        "the minimal view itself has no header mark"
+    );
+    let lines = drawn.screen.lines();
+    let top_row = lines
+        .iter()
+        .position(|line| line.contains('┌'))
+        .expect("the help box has a top border");
+    assert_eq!(
+        usize::from(larges[0].rect.y),
+        top_row + 1,
+        "the mark is on the row right below the box's top border"
+    );
+    assert!(
+        drawn.screen.text().contains("Esc close"),
+        "the close hint is still there"
+    );
+}
+
+/// A header of one row: the mark wants three, so it is not placed and the one line of text
+/// takes the header it has. At height 7 the header gives up two of its three rows to the
+/// torrents, leaving one row for the name and the rates.
+///
+/// The layout only ever makes a header of three rows or one: at eight rows or more it is the
+/// design's three lines, and below that it is the one line that replaces them. There is no
+/// two-row header to test, so this is what the short case actually is.
+#[test]
+fn one_row_header_has_no_logo() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 7);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| placement.size == LogoSize::Small),
+        "a one-row header has no mark"
+    );
+    // The one line it has: the name and what is moving.
+    let text = drawn.screen.text();
+    assert!(
+        text.contains("featherbittorrent"),
+        "the title is still there"
+    );
+    assert!(text.contains("MiB/s"), "the rates are still there");
 }

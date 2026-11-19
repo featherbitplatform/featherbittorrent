@@ -16,9 +16,13 @@ pub mod caps;
 pub mod image;
 pub mod iterm2;
 pub mod kitty;
+pub mod place;
 pub mod sixel;
 
 pub use caps::{
     CellPx, Graphics, PROBE_QUERY, Protocol, Replies, choose, da1_complete, parse_replies,
 };
 pub use image::{LogoDims, Rgba, logo_dims, mark, render};
+pub use place::{
+    AfterDraw, LogoSize, LogoView, Placement, Placer, Prepared, PreparedLogos, prepare,
+};

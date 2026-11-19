@@ -16,14 +16,12 @@ use std::time::Instant;
 use crossterm::event::EventStream;
 
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
-use fbtt_core::{Config, ConfigLoad, LibraryLock, Notice, Paths};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, LogoSetting, Notice, Paths};
 use fbtt_tui::{Modal, Model};
 
 use crate::backend::{Backend, LockOutcome, Start, initial_target, named_server};
 use crate::secrets::{Keychain, SecretStore, StartSecret, start_secret_for};
-use crate::switch::{
-    Login, Quit, Screen, ShutdownSignal, Work, draw_saving, run_session, start_watching,
-};
+use crate::switch::{Login, Quit, ShutdownSignal, Work, draw_saving, run_session, start_watching};
 use crate::terminal::Terminal;
 
 /// The offer made to a run whose library another featherbittorrent has taken while running a server on it.
@@ -103,6 +101,12 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    // The logo's capability probe (see `crate::probe`): one write of the queries and the answers that come
+    // back, asked here because it owns stdin until it is done and `EventStream` cannot share it. The logo
+    // setting is read from the config before it moves into `Opening`.
+    let logo_off = config.logo == LogoSetting::Off;
+    let graphics = crate::probe::detect(logo_off);
+
     // Before the terminal: a library somebody else is driving is a sentence to read, not a screen to see,
     // and so is the offer about the server running on it - that other run may be drawing on this terminal
     // right now. A keychain is consulted here too, for the same reason the engine is started after the
@@ -143,11 +147,6 @@ pub async fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    // The logo's capability probe (see `crate::probe`): one write of the queries and the answers that come
-    // back, asked here because it owns stdin until it is done and `EventStream` cannot share it. Nothing is
-    // drawn with the answer yet - Task 9 puts it in the screen state and draws with it.
-    let _graphics = crate::probe::detect(false); // Task 9 reads the logo setting here
 
     // Listened for before anything else can go wrong from here on: a listener made once
     // buffers a signal that lands between two turns of the loop, where one made per turn
@@ -235,6 +234,17 @@ pub async fn run() -> ExitCode {
     model.sync_selection(&snap);
     start_watching(&backend, &model);
 
+    // The prepared logos are CPU work (area-averaging a 511x853 PNG into every size the terminal needs,
+    // plus quantization for the image protocols), so they go to the blocking pool. The screen draws the
+    // text title until they arrive; a terminal with no image protocol at all gets nothing to wait for.
+    let prepare_fut = if graphics.protocol != fbtt_tui::graphics::Protocol::None {
+        Some(tokio::task::spawn_blocking(move || {
+            fbtt_tui::graphics::prepare(graphics)
+        }))
+    } else {
+        None
+    };
+
     // The queue for work this run must not wait on: what a sign-in owes (a `ui.yaml` write and a keychain
     // write), and the delete that follows a refusal of a kept password. It is made here, before the screen,
     // because it lives as long as the screen does - every backend this run switches to sends its work on this
@@ -243,30 +253,58 @@ pub async fn run() -> ExitCode {
 
     // The event stream is made once for the whole screen and let go before the last save: its reader owns
     // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
-    let (quit, running) = {
-        let mut stream = EventStream::new();
-        run_session(
-            terminal.get_mut(),
-            Screen {
-                model: &mut model,
-                snap: &mut snap,
-            },
-            backend,
-            login,
-            &mut work,
-            &mut stream,
-            &mut signal,
-        )
-        .await
+    // The mark's bookkeeping is here, beside the terminal, because it is the terminal's own: what the
+    // screen last drew is what the exit has to clean up, and the `Saving...` frame it draws has to
+    // repaint the cells a removed mark used to cover. The screen borrows the mark while it runs and
+    // hands it back when it is done, and what it drew last is what the exit knows.
+    let mut stream = EventStream::new();
+    let mut logos: Option<std::sync::Arc<fbtt_tui::graphics::place::PreparedLogos>> = None;
+    let mut placer = fbtt_tui::graphics::place::Placer::new(graphics.protocol);
+    let mut mark = crate::switch::Mark {
+        logos: &mut logos,
+        placer: &mut placer,
     };
+    let startup_cell = graphics.cell.map(|cell| (cell.w, cell.h));
+    let screen = crate::switch::Screen {
+        model: &mut model,
+        snap: &mut snap,
+        mark: &mut mark,
+        marks: crate::switch::MarkState::new(graphics.protocol, graphics.scale),
+    };
+    let (quit, screen, running) = run_session(
+        terminal.get_mut(),
+        screen,
+        backend,
+        login,
+        &mut work,
+        &mut stream,
+        &mut signal,
+        prepare_fut,
+        startup_cell,
+    )
+    .await;
 
     // The last backend is told once: by a command the loop sent or, if the queue was full, by its channels
     // going out of scope. No timeout - resume data is worth the wait. Whatever it owes - an engine's last
     // save, and with it this library's lock - arrives here, on a screen that says what is happening while it
     // does. A run always ends with a backend under it: a switch that could not go ahead kept the one it had.
+    // The `Saving...` screen is a frame like any other: it goes through the same logo path, so the cells
+    // a removed mark used to cover are repainted rather than left as a ghost under the last words.
     let stopped = running
-        .stop(&mut model, |model| draw_saving(terminal.get_mut(), model))
+        .stop(screen.model, |model| {
+            let logos = screen.mark.logos.as_deref();
+            draw_saving(terminal.get_mut(), model, logos, screen.mark.placer)
+        })
         .await;
+    // The mark's ids are the placer's to clean up: kitty's images live in the terminal after this process
+    // is gone, so the ids are deleted on the way out; the other protocols write nothing on exit, because
+    // their images are the cells the screen is about to leave, and those go with it.
+    let exit_bytes = placer.on_exit();
+    if !exit_bytes.is_empty() {
+        use std::io::Write as _;
+        let _ = terminal.get_mut().backend_mut().write_all(&exit_bytes);
+        let _ = terminal.get_mut().backend_mut().flush();
+    }
     drop(terminal); // The terminal goes back before anything is printed to it.
     if let Err(problem) = &stopped {
         eprintln!("{problem}");

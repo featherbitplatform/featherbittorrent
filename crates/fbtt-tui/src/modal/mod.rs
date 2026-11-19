@@ -26,6 +26,8 @@ pub use folders::FolderPicker;
 pub use input::{Input, Masked};
 pub use settings::SettingsForm;
 
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use fbtt_core::{Snapshot, TorrentId, TorrentRow};
 use ratatui::Frame;
@@ -35,6 +37,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Fill, Paragraph};
 
 use crate::format;
+use crate::graphics::{LogoSize, LogoView, Placement};
 use crate::model::{Action, Model};
 use crate::theme;
 
@@ -173,37 +176,48 @@ fn filter_on_key(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Answer {
 /// Draws the open dialog over a view that has already been drawn. Only the box it adds is blanked,
 /// so the table behind it stays exactly as it was. `snap` is the newest snapshot: a dialog that lists
 /// something the backend reported draws from it rather than keeping its own copy.
-pub(crate) fn draw(frame: &mut Frame, model: &Model, snap: &Snapshot) {
+///
+/// The box's rect comes back, or `None` for the filter and for no dialog at all: a box over a mark
+/// takes the mark off the screen for this frame, and the caller is what decides that.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    model: &Model,
+    snap: &Snapshot,
+    logos: LogoView<'_>,
+) -> Option<Rect> {
     let area = frame.area();
     match &model.modal {
         Some(Modal::Add(form)) => draw_box(frame, area, "Add torrent", add::lines(form, snap)),
         Some(Modal::Connect(form)) => draw_box(frame, area, "Connect", connect::lines(form)),
         Some(Modal::Devices(form)) => draw_box(frame, area, "Devices", devices::lines(form, snap)),
         Some(Modal::Delete { name, .. }) => {
-            draw_box(frame, area, "Delete torrent", delete::lines(name));
+            draw_box(frame, area, "Delete torrent", delete::lines(name))
         }
         Some(Modal::Settings(form)) => draw_box(frame, area, "Settings", settings::lines(form)),
-        Some(Modal::Help) => draw_box(frame, area, "Keys", help::lines(area)),
-        Some(Modal::Filter) => draw_filter(frame, area, model),
-        None => {}
+        Some(Modal::Help) => {
+            // The mark the box has room for, when it does: it stands at the top of the box, above
+            // the keys, in rows the box leaves for it. A box that would have to grow to hold the
+            // mark draws the keys alone (see `help_placement`). The lines are built the way
+            // `help_placement` measures them, so the box and the mark agree on where the keys
+            // begin.
+            let mark: Option<Arc<crate::graphics::place::Prepared>> =
+                help_placement(area, logos).and_then(|placement| placement.prepared());
+            let lines = help_lines(area, logos, mark.as_deref());
+            draw_box(frame, area, "Keys", lines)
+        }
+        Some(Modal::Filter) => {
+            draw_filter(frame, area, model);
+            None
+        }
+        None => None,
     }
 }
 
 /// The box every dialog but the filter gets: its lines padded one cell inside a border of the rule
-/// colour on the surface colour, sized to what they need and never bigger than the screen.
-fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
-    let widest = lines
-        .iter()
-        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
-        .max()
-        .unwrap_or(0);
-    // A cell of padding on each side, plus the two columns of border.
-    let width = (widest + 4).min(area.width);
-    let height = u16::try_from(lines.len() + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-
-    let box_area = centred(area, width, height);
+/// colour on the surface colour, sized to what they need and never bigger than the screen. The rect
+/// comes back, because a box over a mark takes the mark off the screen for this frame.
+fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) -> Option<Rect> {
+    let box_area = box_rect(area, &lines);
     frame.render_widget(Fill::new(" ").bg(theme::INK_850), box_area);
     frame.render_widget(
         Block::bordered()
@@ -215,6 +229,91 @@ fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>
         box_area,
     );
     frame.render_widget(Paragraph::new(lines), box_area.inner(Margin::new(1, 1)));
+    Some(box_area)
+}
+
+/// The rect the box of `lines` is drawn in: sized to what the lines need and never bigger than the
+/// screen, centred in it. This is the one place a box's size is worked out, so a box and anything
+/// placed over it - the help screen's mark - measure it the same way and cannot disagree.
+fn box_rect(area: Rect, lines: &[Line<'_>]) -> Rect {
+    let widest = lines
+        .iter()
+        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    // A cell of padding on each side, plus the two columns of border.
+    let width = (widest + 4).min(area.width);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    centred(area, width, height)
+}
+
+/// The help screen's lines, with the rows the mark stands in spliced in when there is one to
+/// place: the mark's own rows and the one blank row between it and the first key, at the top of
+/// the list. This is the one place the help's lines are built, so `help_placement` measures the
+/// box from the exact list `draw` draws, and a box and its mark cannot disagree about where the
+/// keys begin.
+fn help_lines(
+    area: Rect,
+    logos: LogoView<'_>,
+    mark: Option<&crate::graphics::place::Prepared>,
+) -> Vec<Line<'static>> {
+    let mut lines = help::lines(area, logos);
+    if let Some(mark) = mark {
+        // The rows the mark stands in, at the top of the list: its own rows and the one blank
+        // row between it and the first key. The list is shifted down by exactly that many, so
+        // the keys begin where the mark ends.
+        let reserved = usize::from(mark.dims.rows) + 1;
+        let mut top: Vec<Line<'static>> = Vec::with_capacity(reserved);
+        for _ in 0..reserved {
+            top.push(Line::default());
+        }
+        lines.splice(0..0, top);
+    }
+    lines
+}
+
+/// The help screen's mark, when there is one to place: the tallest of the prepared large marks
+/// the help box has room for, standing at the top of the box above its keys (decision 12).
+///
+/// The box the mark stands in is built from the exact lines [`help_lines`] makes for it, and
+/// measured by [`box_rect`], the one helper `draw_box` uses: the mark's rows plus the blank row
+/// and the list, sized and centred the way the box is drawn. When that box is taller than the
+/// screen, or wider than the mark's own cells plus the box's padding, the mark is not placed:
+/// the box would grow for it, and a box taller than the screen costs key lines - including the
+/// close hint - which the help never loses to the mark. The rect is the mark's own cells,
+/// `dims.cols` by `dims.rows`, centred horizontally in the box and on the first row inside the
+/// border, where the reserved rows begin.
+pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placement> {
+    let logos_ref = logos.logos?;
+    // The tallest mark the box can hold without growing past the screen, tried from tallest
+    // first.
+    logos_ref.large.iter().find_map(|prepared| {
+        // The box as it will be drawn with this mark: the reserved rows plus the list, sized
+        // and centred the way `draw_box` draws it.
+        let lines = help_lines(area, logos, Some(prepared));
+        if lines.len() + 2 > usize::from(area.height) {
+            return None;
+        }
+        let box_rect = box_rect(area, &lines);
+        // The mark has to fit the box's inner width: the box is padded one cell on each side
+        // inside its two border columns, so the inner width is the box's width minus four. This
+        // is checked against the box as built, not assumed from the mark being narrower than the
+        // key list, so a wider mark or a narrower list can never put the mark outside the box.
+        if u32::from(prepared.dims.cols) + 4 > u32::from(box_rect.width) {
+            return None;
+        }
+        // The mark stands on the first row inside the border, and the key lines begin right
+        // below it, after the blank row the list leaves.
+        let x = box_rect.x + (box_rect.width.saturating_sub(prepared.dims.cols)) / 2;
+        Some(Placement {
+            size: LogoSize::Large(prepared.dims.rows),
+            rect: Rect::new(x, box_rect.y + 1, prepared.dims.cols, prepared.dims.rows),
+            dims: prepared.dims,
+            prepared: Some(Arc::new(prepared.clone())),
+        })
+    })
 }
 
 /// The filter along the bottom of the screen, where the key hints are and go while it is up. It
