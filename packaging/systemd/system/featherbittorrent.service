@@ -22,11 +22,8 @@ Group=featherbittorrent
 # write. A user service leaves both unnamed and shares the platform's directories with the TUI instead.
 Environment=FBTT_CONFIG_DIR=/var/lib/featherbittorrent/config
 Environment=FBTT_DATA_DIR=/var/lib/featherbittorrent/library
-# Everything this run creates belongs to it alone: 0600 files and 0700 directories. config.yaml holds a
-# password hash, and on a machine where other accounts can read /var/lib that is the answer to it. A share
-# mounted with file_mode= and dir_mode= in fstab reports those modes whatever this says, so the NAS setup in
-# docs/autostart.md still gets the ownership it asks for.
-UMask=0077
+# Created files stay readable by others so a media server on the same share can read them; set UMask=0077 if the library must stay private.
+UMask=0022
 ExecStart=/usr/bin/featherbittorrent serve
 # Closed stdin, so the setup wizard can never wait for an answer a service has nobody to give: with no
 # config.yaml this run takes every default rather than blocking. Run `serve` once by hand first, or
@@ -39,6 +36,10 @@ RestartSec=10
 # to whatever the default happens to be on the systemd in front of it.
 TimeoutStopSec=90
 StateDirectory=featherbittorrent
+# The library's parent stays this account's alone. systemd documents 0755 for these directories, so 0700 is a
+# tightening rather than a default, and spelling it out keeps it true: other accounts cannot traverse in to
+# reach config.yaml or session.state, whatever modes the files inside get.
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

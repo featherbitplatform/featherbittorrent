@@ -229,7 +229,10 @@ domain=WORKGROUP
 
 The `uid`, `gid` and mode options decide who the mounted files belong to, so name the account the service
 runs as or its downloads are unwritable. On NFS the same permission is settled on the NAS: the exported
-folder has to be writable by `featherbittorrent`'s uid (or by whoever `root_squash` maps it to).
+folder has to be writable by `featherbittorrent`'s uid (or by whoever `root_squash` maps it to). New files
+land readable by the share's other users, because the example unit sets `UMask=0022`, which is what lets a
+media server on the LAN read them; the library under `/var/lib/featherbittorrent` stays 0700, so
+`config.yaml` and its password hash do not.
 
 **Tell the unit about the mount.** In `/etc/systemd/system/featherbittorrent.service`, uncomment both
 commented lines and name your mount point, so the `[Service]` section says:

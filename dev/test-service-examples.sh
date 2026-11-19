@@ -42,12 +42,13 @@ for text in \
   'RestartSec=10' \
   'TimeoutStopSec=90' \
   'StateDirectory=featherbittorrent' \
+  'StateDirectoryMode=0700' \
   'NoNewPrivileges=yes' \
   'ProtectSystem=strict' \
   'ProtectHome=yes' \
   'PrivateTmp=yes' \
   'PrivateDevices=yes' \
-  'UMask=0077' \
+  'UMask=0022' \
   'ProtectKernelTunables=true' \
   'ProtectControlGroups=true' \
   'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX' \
