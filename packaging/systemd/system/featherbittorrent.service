@@ -22,6 +22,11 @@ Group=featherbittorrent
 # write. A user service leaves both unnamed and shares the platform's directories with the TUI instead.
 Environment=FBTT_CONFIG_DIR=/var/lib/featherbittorrent/config
 Environment=FBTT_DATA_DIR=/var/lib/featherbittorrent/library
+# Everything this run creates belongs to it alone: 0600 files and 0700 directories. config.yaml holds a
+# password hash, and on a machine where other accounts can read /var/lib that is the answer to it. A share
+# mounted with file_mode= and dir_mode= in fstab reports those modes whatever this says, so the NAS setup in
+# docs/autostart.md still gets the ownership it asks for.
+UMask=0077
 ExecStart=/usr/bin/featherbittorrent serve
 # Closed stdin, so the setup wizard can never wait for an answer a service has nobody to give: with no
 # config.yaml this run takes every default rather than blocking. Run `serve` once by hand first, or
@@ -39,6 +44,17 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+# Reads of /proc/sys and /sys/fs/cgroup stay open, writes do not: nothing here tunes a kernel switch or a
+# cgroup.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# Only these three socket families may be opened. Peers, the API and every outbound connection are IPv4 or
+# IPv6, and neither featherbittorrent nor fbt-lib opens another family (no netlink, no packet sockets).
+# AF_UNIX stays available because a name lookup can go over a Unix socket on the way to nscd or D-Bus without
+# this program asking for one. Blocking a family does not cost DNS anything: when glibc's own probe for which
+# address families have interfaces cannot open its netlink socket, it assumes both are usable rather than
+# fail the lookup (sysdeps/unix/sysv/linux/check_pf.c), so tracker hostnames still resolve.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/featherbittorrent
 # Uncomment this too, with the same mount point as RequiresMountsFor above: ProtectSystem=strict makes
 # everything outside the paths below read-only, and a download folder on a NAS is one of them.

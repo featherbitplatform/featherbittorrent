@@ -23,16 +23,44 @@
     .\register-task.ps1 -Binary C:\Tools\featherbittorrent\featherbittorrent.exe
 
     In an elevated PowerShell. -TaskName picks a different task name; -LogFile puts serve's log somewhere
-    other than %LOCALAPPDATA%\featherbit\featherbittorrent\serve.log.
+    other than %LOCALAPPDATA%\featherbit\featherbittorrent\serve.log. A task of this name is replaced, so
+    running this again after moving the binary is enough on its own.
+
+.EXAMPLE
+    .\register-task.ps1 -Binary 'C:\Program Files\featherbittorrent\featherbittorrent.exe' -PrintArgument
+
+    Prints the argument the task action gets and exits: no cmdlet that touches Task Scheduler runs, so this
+    works from any platform. dev/test-service-examples.sh uses it to check the quoting of a path with spaces.
 #>
 param(
     [Parameter(Mandatory)] [string] $Binary,
     [string] $TaskName = 'featherbittorrent',
-    [string] $LogFile = "$env:LOCALAPPDATA\featherbit\featherbittorrent\serve.log"
+    [string] $LogFile = "$env:LOCALAPPDATA\featherbit\featherbittorrent\serve.log",
+    [switch] $PrintArgument
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# cmd.exe and its quotes are the trap here. With /c, when the command line after the switch holds more than
+# two quote characters, cmd strips the first and the last one and hands the rest to the parser as it stands.
+# Two quoted paths in one command line make four quotes, so the plain form
+# '"binary" serve 2>>"log"' arrives as C:\Program Files\...\featherbittorrent.exe" serve 2>>"C:\...\serve.log":
+# unquoted at the front, so the space in Program Files splits it there, with stray quotes left inside both
+# names. Wrapping the whole command in one extra pair gives cmd the pair it wants to remove and leaves
+# '"binary" serve 2>>"log"' intact. The doubled quotes below are literal characters: this is a single-quoted
+# string, so {0} and {1} are filled in by -f rather than interpolated by PowerShell.
+function Get-TaskArgument {
+    param([string] $Binary, [string] $LogFile)
+    '/d /c ""{0}" serve 2>>"{1}""' -f $Binary, $LogFile
+}
+
+if ($PrintArgument) {
+    # What dev/test-service-examples.sh calls on any platform: print the argument and leave. No task
+    # scheduler cmdlet runs, so nothing is registered and no Windows account or share is needed.
+    Get-TaskArgument -Binary $Binary -LogFile $LogFile
+    exit 0
+}
 
 # The task starts in System32, so a path typed relative to this folder would be looked up there. Making it
 # absolute here is also the check that the file exists at all.
@@ -57,7 +85,7 @@ $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $securePassword = Read-Host -AsSecureString "Windows password for $user"
 $password = [System.Net.NetworkCredential]::new('', $securePassword).Password
 
-$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$Binary`" serve 2>>`"$LogFile`""
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument (Get-TaskArgument -Binary $Binary -LogFile $LogFile)
 
 # At boot, before anybody logs in: that is the autostart.
 $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -77,7 +105,7 @@ $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings 
 
 # -Force replaces a task of this name, so running this again after moving the binary is enough on its own.
 # Registering is all that happens here: nothing in this script starts the server.
-Register-ScheduledTask -InputObject $task -TaskName $TaskName -User $user -Password $password | Out-Null
+Register-ScheduledTask -InputObject $task -TaskName $TaskName -User $user -Password $password -Force | Out-Null
 
 Write-Host ''
 Write-Host "Registered task '$TaskName' to run as $user at every boot, logging to $LogFile."

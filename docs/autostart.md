@@ -180,7 +180,7 @@ library runs one engine at a time (exit 3 otherwise).
 ## The Raspberry Pi and the NAS
 
 The reference host for this project is a **Raspberry Pi 2 Model B v1.2** running 64-bit Raspberry Pi OS:
-1 GB of RAM, and 100 Mbit Ethernet on a bus shared with USB (spec section 1). Downloads usually live on
+1 GB of RAM, and 100 Mbit Ethernet on a bus shared with USB (spec section 4). Downloads usually live on
 the NAS. This section is the system service above with the three things a NAS adds: mount it first, give
 the service permission to write there, and keep the cache small.
 
@@ -208,7 +208,16 @@ boot and wait for the share on first use, so a folder that is not there yet is a
 than a failed start. Run `sudo systemctl daemon-reload` (and `sudo mount -a`, or reboot) after editing
 fstab.
 
-SMB needs the credentials file, root-owned and readable by nobody else:
+SMB needs a credentials file. Make it with the right ownership and mode before anything is written into it,
+so it is never readable by the rest of the machine even briefly:
+
+```bash
+sudo install -m 600 /dev/null /etc/featherbittorrent-smb
+sudo ${EDITOR:-vi} /etc/featherbittorrent-smb
+```
+
+`install` creates it as root with mode 600; editing an existing file in place keeps that mode. What goes in
+it:
 
 ```
 username=bitbackup
@@ -216,9 +225,7 @@ password=whatevertheisset
 domain=WORKGROUP
 ```
 
-```bash
-sudo chmod 600 /etc/featherbittorrent-smb
-```
+`mount.cifs` reads it as root during the mount, so nobody else needs access to it.
 
 The `uid`, `gid` and mode options decide who the mounted files belong to, so name the account the service
 runs as or its downloads are unwritable. On NFS the same permission is settled on the NAS: the exported
@@ -341,12 +348,22 @@ Deleting the plist is what takes it out of the picture for good.
 ```
 
 Name an account that exists and can write those two directories: with `UserName` set the daemon runs as
-that account rather than as root, so its home and its permissions are what apply to the library. Load it
-with `sudo launchctl bootstrap system /Library/LaunchDaemons/io.featherbit.featherbittorrent.plist` and stop
-it with `sudo launchctl bootout system/io.featherbit.featherbittorrent`. A daemon lives outside any login
-session, so it cannot reach the login keychain. For `serve` that changes nothing: its logins are a password
-hash and public keys in `config.yaml`, and nothing it does needs a keychain. The TUI is what keeps a secret
-there (a connect password), and the TUI belongs in an agent, not a daemon.
+that account rather than as root, so its home and its permissions are what apply to the library. launchd
+refuses a daemon plist that somebody else owns or that group or others can write, so it has to be root's own
+file before it will load:
+
+```bash
+sudo chown root:wheel /Library/LaunchDaemons/io.featherbit.featherbittorrent.plist
+sudo chmod 644 /Library/LaunchDaemons/io.featherbit.featherbittorrent.plist
+```
+
+An agent in `~/Library/LaunchAgents` must belong to you and not be writable by anybody else, which a file you
+copied there yourself already is. Load the daemon with `sudo launchctl bootstrap system
+/Library/LaunchDaemons/io.featherbit.featherbittorrent.plist` and stop it with `sudo launchctl bootout
+system/io.featherbit.featherbittorrent`. A daemon lives outside any login session, so it cannot reach the
+login keychain. For `serve` that changes nothing: its logins are a password hash and public keys in
+`config.yaml`, and nothing it does needs a keychain (the TUI is what reads the keychain, and only for a
+connect password). The TUI belongs in an agent, not a daemon.
 
 ## Windows
 
