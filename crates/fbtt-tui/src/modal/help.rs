@@ -13,9 +13,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// Cells between a key and what it does.
-const KEY_GAP: usize = 2;
+const KEY_GAP: usize = 1;
 /// Cells between the two columns, used only when the list is drawn in two.
-const COLUMN_GAP: usize = 4;
+const COLUMN_GAP: usize = 2;
 
 /// The keys, padded into one or two columns, and the key that puts the screen away. `area` is the
 /// whole screen: a list of this length needs more rows than a laptop terminal has, so on a screen
@@ -63,13 +63,30 @@ fn wants_two_columns(area: Rect, left: &[(&str, &str)], right: &[(&str, &str)]) 
     if rows_available >= KEYS.len() {
         return false;
     }
+    // The widest two-column row pairs the widest left action with the widest right action:
+    // the left key column and the right key column are each padded to their own widest key,
+    // so the row that is widest is the one that carries both widest actions.
     let cells = |rows: &[(&str, &str)]| {
         rows.iter()
-            .map(|(key, action)| key.chars().count() + KEY_GAP + action.chars().count())
+            .map(|(_, action)| action.chars().count())
             .max()
             .unwrap_or_default()
     };
-    usize::from(area.width) >= cells(left) + COLUMN_GAP + cells(right) + 4
+    let widest_key = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .map(|(key, _)| key.chars().count())
+            .max()
+            .unwrap_or_default()
+    };
+    let two_col_width = widest_key(left)
+        + KEY_GAP
+        + cells(left)
+        + COLUMN_GAP
+        + widest_key(right)
+        + KEY_GAP
+        + cells(right)
+        + 4;
+    usize::from(area.width) >= two_col_width
 }
 
 /// One row: the key in the accent, padded so the actions line up, and what it does beside it.

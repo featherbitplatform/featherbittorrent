@@ -2,7 +2,10 @@
 //! actions out, and a buffer to read what a person would have seen.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use fbtt_core::{Command, DetailTab, LinkState, RowState, Snapshot, TorrentId};
+use fbtt_core::{
+    Command, Detail, DetailTab, FilePriority, FileRow, LinkState, Notice, RowState, Snapshot,
+    TorrentId,
+};
 use fbtt_tui::{Action, Descending, SortKey, theme, visible_rows};
 use ratatui::style::Color;
 
@@ -242,6 +245,189 @@ fn tiny_terminal_does_not_panic() {
         model.handle_key(letter('p'), &snap);
         model.handle_key(letter('O'), &snap);
     }
+}
+
+#[test]
+fn s_streams_selected_torrent() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    // The table's `s` names the torrent; the backend picks the file.
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: snap.torrents[0].id.clone(),
+            file: None,
+        })]
+    );
+
+    // Two rows down, the other torrent is what gets streamed. The snapshot's detail follows
+    // the selection in a real run (the model sends `Watch` and the backend answers), so the
+    // test updates it the same way.
+    model.handle_key(letter('j'), &snap);
+    model.handle_key(letter('j'), &snap);
+    let mut next = snap.clone();
+    next.detail = Some((
+        snap.torrents[1].id.clone(),
+        Detail::Files(vec![FileRow {
+            index: 0,
+            path: "debian-13.1-amd64.iso".to_string(),
+            size: 3_298_534_880,
+            done: 3_298_534_880,
+            priority: FilePriority::Normal,
+        }]),
+    ));
+    let actions = model.handle_key(letter('s'), &next);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: snap.torrents[1].id.clone(),
+            file: None,
+        })]
+    );
+}
+
+#[test]
+fn s_in_file_list_streams_focused_file() {
+    let snap = library();
+    let buck = snap.torrents[0].id.clone();
+    let mut model = model_of(&snap);
+
+    // Enter puts the cursor in the list, on the first file: `s` names it by index.
+    model.handle_key(key(KeyCode::Enter), &snap);
+    assert!(model.files_focused, "Enter did not focus the file list");
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: buck.clone(),
+            file: Some(0),
+        })]
+    );
+
+    // `j` moves the file cursor: the subtitle, not the film, is what gets streamed now.
+    model.handle_key(letter('j'), &snap);
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: buck.clone(),
+            file: Some(1),
+        })]
+    );
+}
+
+#[test]
+fn s_without_metadata_is_a_notice() {
+    // A torrent still fetching metadata: its row state says so, and the press sends nothing
+    // and says why on the footer.
+    let snap = Snapshot {
+        torrents: vec![torrent("a", "metal.torrent", RowState::Metadata)],
+        ..library()
+    };
+    let mut model = model_of(&snap);
+
+    assert_eq!(model.handle_key(letter('s'), &snap), Vec::new());
+    assert_eq!(
+        model.notice(),
+        Some(&Notice::Error(
+            "The torrent has no metadata yet".to_string()
+        ))
+    );
+}
+
+#[test]
+fn s_on_checking_torrent_streams() {
+    // A torrent being checked has its metadata: `s` streams it.
+    let snap = Snapshot {
+        torrents: vec![torrent("a", "checking.iso", RowState::Checking(0.4))],
+        ..library()
+    };
+    let mut model = model_of(&snap);
+    let actions = model.handle_key(letter('s'), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: snap.torrents[0].id.clone(),
+            file: None,
+        })]
+    );
+    assert!(model.notice().is_none(), "a checking torrent was refused");
+}
+
+#[test]
+fn s_streams_while_peers_tab_is_open() {
+    // The detail pane shows one tab at a time: with the Peers answer up, or no answer yet,
+    // a torrent that has its metadata is still streamable. The state, not the pane, decides.
+    let mut with_peers = library();
+    with_peers.detail = Some((with_peers.torrents[0].id.clone(), Detail::Peers(Vec::new())));
+    let mut model = model_of(&with_peers);
+    model.detail_tab = DetailTab::Peers;
+    let actions = model.handle_key(letter('s'), &with_peers);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: with_peers.torrents[0].id.clone(),
+            file: None,
+        })],
+        "a downloading torrent with the Peers tab open was not streamed"
+    );
+
+    // And with no detail answer at all.
+    let mut no_detail = library();
+    no_detail.detail = None;
+    let mut model = model_of(&no_detail);
+    let actions = model.handle_key(letter('s'), &no_detail);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Stream {
+            id: no_detail.torrents[0].id.clone(),
+            file: None,
+        })],
+        "a downloading torrent with no detail answer was not streamed"
+    );
+}
+
+#[test]
+fn s_in_a_dialog_is_typed_not_streamed() {
+    // A dialog owns the keyboard while it is up: an `s` in the filter is a letter, and an
+    // `s` in the add dialog is a typed character, not a stream.
+    let snap = library();
+    let mut model = model_of(&snap);
+
+    // The filter: `s` is typed into the name fragment, not a stream.
+    model.handle_key(letter('/'), &snap);
+    assert!(model.modal.is_some(), "the filter did not open");
+    let actions = model.handle_key(letter('s'), &snap);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Command(Command::Stream { .. }))),
+        "an s in the filter streamed"
+    );
+    assert_eq!(model.filter, "s", "the s was not typed into the filter");
+
+    // The add dialog: `s` is a typed character, not a stream.
+    let mut model = model_of(&snap);
+    model.handle_key(letter('a'), &snap);
+    assert!(model.modal.is_some(), "the add dialog did not open");
+    let actions = model.handle_key(letter('s'), &snap);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Command(Command::Stream { .. }))),
+        "an s in the add dialog streamed"
+    );
+}
+
+#[test]
+fn s_with_nothing_selected_sends_nothing() {
+    let empty = Snapshot {
+        torrents: Vec::new(),
+        ..library()
+    };
+    let mut model = model_of(&empty);
+    assert_eq!(model.handle_key(letter('s'), &empty), Vec::new());
 }
 
 #[test]
@@ -710,5 +896,44 @@ fn header_shows_lost_link() {
     assert!(
         text.contains("connected to Local"),
         "the local engine's header changed: {text:?}"
+    );
+}
+
+#[test]
+fn the_footer_at_eighty_columns_keeps_its_rule() {
+    // Nine hints do not all fit an eighty-column row, and the rule for what does not fit is
+    // to drop from the back, keeping `? help` and `q quit` at the end, in that order: help is
+    // where a person finds the dropped keys, and `q` is the one a person reaches for when
+    // something goes wrong. The `s` hint is part of that line rather than a second one.
+    let snap = library();
+    let screen = Screen::new(&model_of(&snap), &snap, 80, 24);
+    let lines = screen.lines();
+
+    let footer = lines.last().expect("a drawn screen has a last line");
+    // The hints that must survive at eighty columns. The row holds the front of the list -
+    // `a`, `d`, `p` and the new `s` - and the two kept at the end: `? help` and `q quit`.
+    for want in [
+        "a add",
+        "d delete",
+        "p pause/resume",
+        "s stream in mpv or VLC",
+        "? help",
+        "q quit",
+    ] {
+        assert!(
+            footer.contains(want),
+            "{want:?} is missing from: {footer:?}"
+        );
+    }
+    // `? help` is before `q quit`, and `q quit` is at the end.
+    let help_at = footer.find("? help").expect("? help");
+    let quit_at = footer.find("q quit").expect("q quit");
+    assert!(
+        help_at < quit_at,
+        "`? help` is not before `q quit`: {footer:?}"
+    );
+    assert!(
+        footer.trim_end().ends_with("q quit"),
+        "`q quit` is not at the end of: {footer:?}"
     );
 }
