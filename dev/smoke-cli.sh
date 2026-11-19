@@ -7,8 +7,9 @@
 # write and read back an argon2id login in the platform's own config directory, which holds the hash and not
 # the password. HOME is the scratch home, and XDG_CONFIG_HOME, XDG_DATA_HOME, FBTT_CONFIG_DIR and
 # FBTT_DATA_DIR are unset, so what runs here is the platform's real path resolution and nothing of the
-# operator's library is touched. Prints one ok line per check, then `cli smoke ok: <version>` and, on the last
-# line, `config: <path>`: the config file this smoke created, which dev/smoke-linux.sh checks survives
+# operator's library is touched. Every command reads its stdin from /dev/null, so nothing here can wait for a
+# keyboard it was never meant to have. Prints one ok line per check, then `cli smoke ok: <version>` and, on the
+# last line, `config: <path>`: the config file this smoke created, which dev/smoke-linux.sh checks survives
 # removing the package. Windows twin: dev/smoke-cli.ps1.
 # Usage: bash dev/smoke-cli.sh <binary> <version> <home>
 #   <binary>  the binary to smoke: target/release/featherbittorrent, /usr/bin/featherbittorrent, ...
@@ -54,18 +55,19 @@ if [[ -e "$config_file" ]]; then
   fail "$config_file already exists: give the smoke a fresh scratch home"
 fi
 
-# Checks 1 to 3 compare what the binary prints on stdout. Its stderr is left to the log, where a failure's own
-# words are easier to read than mixed into the text being compared.
+# Checks 1 to 3 compare what the binary prints on stdout; its stderr is left to the log, where a failure's own
+# words are easier to read than mixed into the text being compared. The stdin they get is /dev/null, so running
+# this smoke by hand from a terminal cannot let a command reach for the keyboard.
 
 # 1. The version the artifact was built with, spelled the way the release page names it.
-status=0; printed="$( "${scratch[@]}" "$bin" --version )" || status=$?
+status=0; printed="$( "${scratch[@]}" "$bin" --version </dev/null )" || status=$?
 [[ $status -eq 0 ]] || fail "--version exited $status (expected 0): $(one_line "$printed")"
 [[ "$printed" == "featherbittorrent $version" ]] || fail "--version printed '$(one_line "$printed")', expected 'featherbittorrent $version'"
 echo "ok: --version prints featherbittorrent $version"
 
 # 2. Help that names what the binary can do. Word boundaries, because a help text about a "server" is not one
 # that mentions the serve subcommand.
-status=0; help="$( "${scratch[@]}" "$bin" --help )" || status=$?
+status=0; help="$( "${scratch[@]}" "$bin" --help </dev/null )" || status=$?
 [[ $status -eq 0 ]] || fail "--help exited $status (expected 0): $(one_line "$help")"
 for word in serve user device; do
   grep -qwF -- "$word" <<<"$help" || fail "--help does not mention $word: $(one_line "$help")"
@@ -74,7 +76,7 @@ echo 'ok: --help exits 0 and mentions serve, user and device'
 
 # 3. The debug-only switches are hidden from help in every build, so seeing them here would mean the release
 # build leaked flags a person never asked for (see ServeDebug in crates/featherbittorrent/src/serve.rs).
-status=0; serve_help="$( "${scratch[@]}" "$bin" serve --help )" || status=$?
+status=0; serve_help="$( "${scratch[@]}" "$bin" serve --help </dev/null )" || status=$?
 [[ $status -eq 0 ]] || fail "serve --help exited $status (expected 0): $(one_line "$serve_help")"
 for word in stop-file offline; do
   if grep -qiwF -- "$word" <<<"$serve_help"; then
@@ -84,17 +86,47 @@ done
 echo 'ok: serve --help exits 0 and shows no debug-only flag'
 
 # 4. The flag itself, not only its absence from help: clap refuses an argument the binary does not define, so
-# exit 2 is the proof that this artifact was compiled without debug assertions. stdin is /dev/null because a
-# build that accepts the flag answers the wizard's questions and then serves; the timeout bounds that case
-# (10 s is plenty for clap to answer) so a debug binary cannot hang the smoke. The refusal itself is written
-# on stderr, which is why this one check captures both streams.
+# exit 2 is the proof that this artifact was compiled without debug assertions. A build that accepts the flag
+# answers the wizard's questions and then serves, so the run is bounded at 10 s by whichever guard this host
+# has: `timeout`, or `gtimeout` (the name Homebrew's coreutils installs under, because it will not overwrite a
+# system one), or this script's own watchdog. All three answer 124 for a run that had to be cut short, which is
+# what check 4 reports. The output goes to a file rather than into the command substitution: the guard ends the
+# run mid-write, clap writes the refusal on stderr so both streams are wanted here, and a file keeps what was
+# written without this script waiting on a writer that has gone away.
+guard=''
 if command -v timeout >/dev/null 2>&1; then
-  status=0; served="$(timeout 10 "${scratch[@]}" "$bin" serve --offline </dev/null 2>&1)" || status=$?
-else
-  # No timeout on this host: a build that accepts the flag serves until something stops it. Release builds
-  # answer at once, and CI (Linux and macOS) has timeout from coreutils.
-  status=0; served="$( "${scratch[@]}" "$bin" serve --offline </dev/null 2>&1 )" || status=$?
+  guard='timeout'
+elif command -v gtimeout >/dev/null 2>&1; then
+  guard='gtimeout'
 fi
+
+served_file="$(mktemp)" || fail "could not make a temporary file for serve --offline's output"
+status=0
+if [[ -n "$guard" ]]; then
+  "$guard" 10 "${scratch[@]}" "$bin" serve --offline </dev/null >"$served_file" 2>&1 || status=$?
+else
+  # The watchdog: the same budget, polled in one second steps so that a release build is answered as soon as it
+  # has refused the flag and only a build that accepted it is cut short. kill -0 asks whether the process this
+  # script started is still there; bash reaps a finished child by itself, so "gone" means finished and wait
+  # then hands back the code check 4 wants. This one process is the watchdog's own to kill.
+  "${scratch[@]}" "$bin" serve --offline </dev/null >"$served_file" 2>&1 &
+  served_pid=$!
+  waited=0
+  while (( waited < 10 )); do
+    if ! kill -0 "$served_pid" 2>/dev/null; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$served_pid" 2>/dev/null; then
+    kill "$served_pid" 2>/dev/null || true
+    wait "$served_pid" 2>/dev/null || true
+    status=124
+  else
+    wait "$served_pid" || status=$?
+  fi
+fi
+served="$(cat "$served_file")" || fail "could not read $served_file"
+rm -f "$served_file"
 if [[ $status -ne 2 ]]; then
   fail "serve --offline exited $status, expected 2 (clap refusing a flag a release build does not define); it printed: $(one_line "$served")"
 fi
@@ -102,10 +134,11 @@ echo 'ok: serve --offline exits 2, so this is a release build'
 
 # 5. A login, written and read back through the platform's own paths. The password goes in on stdin as two
 # lines because user set reads it with rpassword only when stdin really is a terminal (see admin_command in
-# crates/featherbittorrent/src/main.rs), which is also why nothing here may run attached to one.
+# crates/featherbittorrent/src/main.rs). This is the one command here that gets input of its own; every other
+# one has /dev/null for stdin, so none of them can reach a terminal.
 status=0; user_set="$(printf 'smoke-pass-1\nsmoke-pass-1\n' | "${scratch[@]}" "$bin" user set smoke 2>&1)" || status=$?
 [[ $status -eq 0 ]] || fail "user set smoke exited $status (expected 0): $(one_line "$user_set")"
-status=0; users="$( "${scratch[@]}" "$bin" user list 2>&1 )" || status=$?
+status=0; users="$( "${scratch[@]}" "$bin" user list </dev/null 2>&1 )" || status=$?
 [[ $status -eq 0 ]] || fail "user list exited $status (expected 0): $(one_line "$users")"
 # SC2016: the $ in that pattern is regex syntax (a literal dollar sign), not bash.
 # shellcheck disable=SC2016

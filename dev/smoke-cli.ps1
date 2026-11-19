@@ -14,7 +14,8 @@
     would change nothing here; the two directories this product understands are set explicitly instead, to
     <Scratch>\config and <Scratch>\data. That is also what services and containers use (docs/autostart.md).
     Nothing of the operator's own library is read or written, and -Scratch is left in place for the caller to
-    remove.
+    remove. Every command takes its stdin from an empty source - a pipeline that carries nothing, or the empty
+    file serve --offline redirects - so the smoke can never wait on a keyboard it was not meant to have.
 
 .EXAMPLE
     $scratch = New-Item -ItemType Directory -Force -Path ([IO.Path]::GetTempPath() + 'fbtt-smoke')
@@ -68,8 +69,12 @@ $env:FBTT_DATA_DIR = $dataDir
 if (Test-Path -LiteralPath $configFile) { Write-Failure "$configFile already exists: give the smoke a fresh scratch directory" }
 
 # 1. The version the artifact was built with, spelled the way the release page names it. stderr is left to
-# the log: what is captured here is what the check compares.
-$printed = [string](& $Binary --version | Out-String)
+# the log: what is captured here is what the check compares. Checks 1 to 3 and user list take their stdin from a
+# pipeline that carries nothing, which gives a native command an empty stdin and an immediate EOF (checked in
+# PowerShell 7.4 against /bin/cat: no bytes read, prompt exit). serve --offline gets the same thing from the
+# empty file it redirects, and user set is the one call given input of its own, the two password lines. Nothing
+# here can wait on a terminal this smoke has no business reading.
+$printed = [string]($null | & $Binary --version | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "--version exited $LASTEXITCODE (expected 0)" }
 $printed = $printed.Trim()
 if ($printed -cne "featherbittorrent $Version") {
@@ -79,7 +84,7 @@ Write-Host "ok: --version prints featherbittorrent $Version"
 
 # 2. Help that names what the binary can do, with word boundaries: a help text about a "server" is not one
 # that mentions the serve subcommand.
-$helpText = [string](& $Binary --help | Out-String)
+$helpText = [string]($null | & $Binary --help | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "--help exited $LASTEXITCODE (expected 0)" }
 foreach ($word in @('serve', 'user', 'device')) {
     if ($helpText -notmatch "\b$word\b") { Write-Failure "--help does not mention $word" }
@@ -88,7 +93,7 @@ Write-Host 'ok: --help exits 0 and mentions serve, user and device'
 
 # 3. The debug-only switches are hidden from help in every build, so seeing them here would mean the release
 # build leaked flags a person never asked for (see ServeDebug in crates/featherbittorrent/src/serve.rs).
-$serveHelpText = [string](& $Binary serve --help | Out-String)
+$serveHelpText = [string]($null | & $Binary serve --help | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "serve --help exited $LASTEXITCODE (expected 0)" }
 if ($serveHelpText -match '\b(stop-file|offline)\b') {
     Write-Failure 'serve --help mentions stop-file or offline, which a release build does not have'
@@ -123,7 +128,7 @@ Write-Host 'ok: serve --offline exits 2, so this is a release build'
 # crates/featherbittorrent/src/main.rs), which is also why nothing here may run attached to one.
 $userSet = [string]((@('smoke-pass-1', 'smoke-pass-1') | & $Binary user set smoke) -join "`n")
 if ($LASTEXITCODE -ne 0) { Write-Failure "user set smoke exited $LASTEXITCODE (expected 0): $(Get-OneLineExcerpt $userSet)" }
-$users = [string](& $Binary user list | Out-String)
+$users = [string]($null | & $Binary user list | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "user list exited $LASTEXITCODE (expected 0): $(Get-OneLineExcerpt $users)" }
 if ($users -notmatch '(?m)^smoke  \$argon2id\$') {
     Write-Failure "user list printed no argon2id hash for smoke: $(Get-OneLineExcerpt $users)"
