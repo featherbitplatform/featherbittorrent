@@ -224,6 +224,18 @@ impl Auth {
         }
     }
 
+    /// Whether the gateway token held right now is exactly `token`. The relay's `401` path uses it as the
+    /// compare of a compare-and-swap: only the request that sent the token still held invalidates it.
+    pub(crate) fn gateway_token_is(&self, token: &str) -> bool {
+        match &self.kind {
+            Kind::Gateway(gateway) => gateway
+                .live
+                .as_ref()
+                .is_some_and(|live| live.token == token),
+            _ => false,
+        }
+    }
+
     /// Whether this target signs to a gateway rather than to the server itself, which changes what a `403`
     /// means (see [`super::http::Api::refused`]) and what a notice about a refusal should say.
     pub(crate) fn signs_for_a_gateway(&self) -> bool {

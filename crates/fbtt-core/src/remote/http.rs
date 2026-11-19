@@ -355,8 +355,10 @@ impl Api {
         // refresh loop's [`Self::authorise`] uses: a `Kind::Gateway` token fetch can take a network
         // round, and a stop pressed while it is running should not be waited out behind the auth lock.
         // The lock is held only for the fetch, never across an upstream request (see
-        // [`Self::relay_relay_credential`]).
-        let credential = self.relay_relay_credential().await?;
+        // [`Self::current_relay_credential`]).
+        let credential = self.current_relay_credential().await?;
+        // Kept for the `401` path: a renewal only invalidates the token this request actually sent.
+        let sent = credential.clone();
         // Only a `Kind::Gateway` login can renew its relay credential, so only it retries a `401`.
         // A `Kind::Server` session was never sent by the relay, and a `Kind::Basic` re-send is the
         // same credential: for both, a `401` maps straight to a `502` with no retry and no
@@ -373,7 +375,7 @@ impl Api {
             // The gateway token is no good: invalidate it (never the server session), earn a new one,
             // and make the one retry. The lock is held only for the invalidate and the fetch, never
             // across the retry's upstream request.
-            let renewed = self.renew_gateway_credential().await?;
+            let renewed = self.renew_gateway_credential(&sent).await?;
             self.relay_get_with_credential(&url, range, head, renewed)
                 .await
         } else {
@@ -441,7 +443,7 @@ impl Api {
     /// uses. The auth lock is held only for the fetch itself: a `Kind::Gateway` token fetch can take a
     /// network round, and a stop pressed while it is running is not waited out behind the lock, nor is the
     /// lock held across any upstream request that follows.
-    async fn relay_relay_credential(&self) -> Result<Credential, ApiError> {
+    async fn current_relay_credential(&self) -> Result<Credential, ApiError> {
         let mut auth = self.auth.lock().await;
         tokio::select! {
             result = auth.relay_credential() => result.map_err(ApiError::Refused),
@@ -452,9 +454,18 @@ impl Api {
     /// The gateway token is no good: say so, and earn a new one. The lock is held only for the invalidate
     /// and the fetch - never across the retry's upstream request - and the fetch runs under the same stop
     /// race as the first attempt.
-    async fn renew_gateway_credential(&self) -> Result<Credential, ApiError> {
+    ///
+    /// This is a compare-and-swap on the token: `refused` is the credential the failed request sent. Under
+    /// the lock, the cached token is invalidated only if it is still that one. If another request already
+    /// refreshed it, the cached new token is used as it is, so one expiry costs one token fetch however
+    /// many requests were in flight.
+    async fn renew_gateway_credential(&self, refused: &Credential) -> Result<Credential, ApiError> {
         let mut auth = self.auth.lock().await;
-        auth.invalidate_gateway();
+        if let Credential::Bearer(token) = refused
+            && auth.gateway_token_is(token)
+        {
+            auth.invalidate_gateway();
+        }
         tokio::select! {
             result = auth.relay_credential() => result.map_err(ApiError::Refused),
             _ = self.stopping.waited() => Err(ApiError::Transport(STOPPED.to_string())),
