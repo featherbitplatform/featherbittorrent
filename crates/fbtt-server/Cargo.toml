@@ -69,6 +69,9 @@ p256.workspace = true
 # blocking-pool Argon2 verify at once. `net` is for the two servers `tests/remote.rs` puts up of its own -
 # a hostile one and a gateway one - beside the real one.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+# The relay's bound test puts nine requests in flight at once: `join_all` is the one
+# combinator that does that without naming nine.
+futures.workspace = true
 
 [[test]]
 name = "server"

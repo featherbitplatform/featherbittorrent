@@ -30,13 +30,15 @@ pub(crate) mod gateway;
 pub(crate) mod http;
 pub(crate) mod login;
 pub(crate) mod map;
+pub(crate) mod relay;
 mod routes;
 mod sse;
 mod stopping;
+mod stream;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -196,6 +198,11 @@ impl RemoteBackend {
                     watching: None,
                     dirs: None,
                     devices: None,
+                    // The relay starts on the first `Stream` a gateway target is asked
+                    // for, behind a lock the command's start waits on: starting it is
+                    // a bind, and the loop answers commands rather than racing two of
+                    // them onto the loopback at once.
+                    relay: Mutex::new(None),
                     torrents: Vec::new(),
                     totals: initial.totals,
                     limits: initial.limits,
@@ -315,6 +322,12 @@ struct Backend {
     dirs: Option<DirListing>,
     /// The devices this server lets sign in, from the last `Devices` command; `None` until one is asked for.
     devices: Option<Vec<DeviceRow>>,
+    /// The loopback relay a gateway target streams through: started on the first
+    /// `Stream` that needs it and kept for the run, the same arrangement as the local
+    /// endpoint (see [`crate::stream::local::LocalEndpoint`]). A `Mutex` rather than a
+    /// plain field because the start is a bind the command's own start waits on: the
+    /// lock is held only for the bind itself, never across an await.
+    relay: Mutex<Option<relay::Relay>>,
     /// What the last good round of reads said, reused whole when the link is down so the screen keeps
     /// showing something rather than nothing.
     torrents: Vec<TorrentRow>,

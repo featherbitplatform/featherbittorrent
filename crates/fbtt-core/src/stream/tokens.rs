@@ -136,10 +136,20 @@ impl StreamTokens {
     /// byte for byte. A check that passes marks the token used and renews its idle clock;
     /// one that fails changes nothing.
     pub fn check(&self, token: &str, path: &str) -> bool {
+        self.resolve(token).is_some_and(|scope| scope == path)
+    }
+
+    /// [`resolve`](Self::resolve)'s rule in one place: whether `token` is one that still
+    /// lives, with the first-use window, the idle limit and the eight-hour cap applied,
+    /// and the idle clock renewed when it passes. The scope is read from the same locked
+    /// store in the same call, so the rule about when a token lives and the scope it
+    /// opens are one decision rather than two. `None` when the token is unknown, dead,
+    /// or past its first-use window.
+    fn resolve_scope(&self, token: &str) -> Option<String> {
         // Longer than the limit fbt-api offers a route a query token is not a token at all,
         // and is refused before any hash is even looked up.
         if token.len() > MAX_TOKEN_BYTES {
-            return false;
+            return None;
         }
         let hash = sha256(token.as_bytes());
         let now = self.now();
@@ -147,37 +157,30 @@ impl StreamTokens {
         // Drop whatever has died, oldest first: past its first-use window if it was never
         // used, past its idle limit or its eight-hour cap if it was.
         inner.entries.retain(|entry| !expired(entry, now));
-        let Some(slot) = inner.entries.iter().position(|entry| entry.hash == hash) else {
-            return false;
-        };
-        let entry = &inner.entries[slot];
-        if entry.scope != path {
-            return false;
-        }
-        // It opens this file. The idle clock is what keeps it alive: a first use inside the
-        // window starts it, and every later use that is still inside the limit renews it, so a
-        // film that keeps seeking stays open. A use past the limit is refused, and the token is
+        let slot = inner.entries.iter().position(|entry| entry.hash == hash)?;
+        // The idle clock is what keeps a token alive: a first use inside the window starts
+        // it, and every later use that is still inside the limit renews it, so a film that
+        // keeps seeking stays open. A use past the limit is refused, and the token is
         // already on its way out of the silence.
-        match entry.idle_since {
+        match inner.entries[slot].idle_since {
             None => {
                 // First use: it must still be inside the first-use window, and it starts the
                 // idle clock.
-                if now.duration_since(entry.issued) <= FIRST_USE {
-                    inner.entries[slot].idle_since = Some(now)
-                } else {
-                    return false;
+                if now.duration_since(inner.entries[slot].issued) > FIRST_USE {
+                    return None;
                 }
+                inner.entries[slot].idle_since = Some(now);
             }
             Some(since) => {
                 // A later use is valid while it is inside the idle limit of the last one, and
                 // renews the clock.
                 if now.duration_since(since) > IDLE {
-                    return false;
+                    return None;
                 }
                 inner.entries[slot].idle_since = Some(now);
             }
         }
-        true
+        Some(inner.entries[slot].scope.clone())
     }
 
     /// How many live tokens the store holds: expired entries are dropped before counting,
@@ -192,6 +195,15 @@ impl StreamTokens {
     /// Whether the store holds no live tokens.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The scope `token` opens, applying exactly the rules [`check`](Self::check) applies - the
+    /// length limit, the first-use window, the idle limit, the eight-hour cap, and marking the
+    /// token used for the eviction order - and `None` when the token is dead or unknown. The
+    /// relay needs the scope beside the check: it has to know which server path its token opens
+    /// in order to relay to it.
+    pub fn resolve(&self, token: &str) -> Option<String> {
+        self.resolve_scope(token)
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -374,6 +386,61 @@ mod tests {
         let shown = format!("{tokens:?}");
         assert!(!shown.contains(&path), "the scope is not printed: {shown}");
         assert!(shown.contains("64"), "the count is: {shown}");
+    }
+
+    /// `resolve` applies the same rules `check` does and hands back the scope a live token
+    /// opens: `None` for a token nobody issued, for one past its first-use window, and for
+    /// one its idle limit ended; the scope itself when it is still alive. The relay reads the
+    /// scope this way, so its life is the same life a check gives a token.
+    #[test]
+    fn resolve_gives_the_scope_of_a_live_token() {
+        let (handle, clock) = clock_at(Instant::now());
+        let tokens = StreamTokens::with_clock(16, clock);
+
+        // An unknown token has no scope.
+        assert!(
+            tokens.resolve("never-issued").is_none(),
+            "a token nobody issued resolves to nothing"
+        );
+
+        let path = stream_path(&id(), 0);
+        let token = tokens.issue(path.clone());
+        // A freshly issued token resolves to the scope it was issued for.
+        assert_eq!(tokens.resolve(&token), Some(path.clone()));
+
+        // The first-use window: a token nobody used in 61 s is gone, and so is its scope.
+        let unused = tokens.issue("/somewhere".to_string());
+        *handle.lock().expect("the test clock") += Duration::from_secs(61);
+        assert!(
+            tokens.resolve(&unused).is_none(),
+            "a token past its first-use window resolves to nothing"
+        );
+
+        // The idle limit: a used token dies of a silence past 30 minutes, with it its scope.
+        let idle = tokens.issue(path.clone());
+        assert!(
+            tokens.check(&idle, &path),
+            "a first use starts the idle clock"
+        );
+        *handle.lock().expect("the test clock") += Duration::from_secs(31 * 60);
+        assert!(
+            tokens.resolve(&idle).is_none(),
+            "a token past its idle limit resolves to nothing"
+        );
+
+        // The eight-hour cap: a token kept alive by use is resolved to nothing past it.
+        let film = tokens.issue(path.clone());
+        assert!(tokens.check(&film, &path));
+        *handle.lock().expect("the test clock") += Duration::from_secs(8 * 60 * 60 + 1);
+        assert!(
+            tokens.resolve(&film).is_none(),
+            "a token past the eight-hour cap resolves to nothing"
+        );
+
+        // A resolving use marks the token used: the least recently used order sees it.
+        let used = tokens.issue(path.clone());
+        assert!(tokens.check(&used, &path), "it was used by check");
+        assert!(tokens.resolve(&used).is_some(), "and still resolves");
     }
 
     /// `issue` prunes expired entries before counting against the cap, so a live token is

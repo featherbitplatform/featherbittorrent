@@ -13,9 +13,6 @@ use crate::engine::map::{clean, rate_bytes};
 use crate::remote::routes::{encode, torrent_route};
 use crate::remote::{Backend, map};
 
-/// What the screen is told when it asks to play a file, before this release can.
-const NOT_YET: &str = "Streaming is not available yet";
-
 impl Backend {
     /// One command, answered. `Shutdown` never reaches here: the loop stops on it before doing any work.
     pub(crate) async fn handle(&mut self, command: Command) {
@@ -45,8 +42,9 @@ impl Backend {
             }
             Command::ListDirs(path) => self.dirs = Some(self.list_dirs(path).await),
             Command::Devices(command) => self.devices(command).await,
-            // Playing a file needs a stream address from the server, which arrives with a later task.
-            Command::Stream { .. } => self.notify(Notice::Error(NOT_YET.to_owned())),
+            // Playing a file: a stream address from the server's token route, checked
+            // before it reaches a player, through the relay for a gateway target.
+            Command::Stream { id, file } => self.stream(&id, file).await,
             Command::Shutdown => {}
         }
     }

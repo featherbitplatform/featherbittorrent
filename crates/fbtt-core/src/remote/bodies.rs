@@ -10,6 +10,7 @@ use std::pin::Pin;
 // Named rather than imported anonymously: the stream reader below bounds a body with `poll_next`, and a
 // generic bound has to name the trait it is bounding.
 use futures_core::Stream;
+use futures_util::StreamExt;
 use reqwest::Response;
 
 use crate::client::Notice;
@@ -118,6 +119,22 @@ where
     S: Stream,
 {
     std::future::poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// The response's body as a stream of its own, with the error type named: axum's
+/// `Body::from_stream` needs a `TryStream`, and a response's chunks are one. The relay
+/// serves its upstream's body this way, so the memory a stream holds is one chunk -
+/// whatever the upstream does; an error mid-body ends the stream, which is how a
+/// relayed response ends.
+pub(crate) fn stream<S>(
+    upstream: S,
+) -> impl futures_core::Stream<Item = Result<axum::body::Bytes, axum::Error>>
+where
+    S: Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
+{
+    upstream.map(|chunk| {
+        chunk.map_err(|_| axum::Error::new(std::io::Error::other("the upstream closed mid-body")))
+    })
 }
 
 /// Parses a body this client has already bounded. A server that answers JSON-shaped nonsense, or not

@@ -52,6 +52,11 @@ fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.10.
 # same futures tree crossterm's `EventStream` implements it from. Already in the tree
 # through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# The test that proves the relay's bound needs nine requests in flight at once:
+# `futures::join_all` is the one combinator that names a list rather than nine names.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+# The relay's body stream: `StreamExt` to map a response's chunks into an axum body.
+futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # serde_yaml is unmaintained (RUSTSEC-2024-0340); this is its maintained fork.
 serde_norway = "0.9"

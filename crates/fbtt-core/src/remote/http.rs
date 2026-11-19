@@ -48,6 +48,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long any one call may take, the event stream excepted. A `.torrent` upload to a busy server is
 /// the slowest thing here that is working properly.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the relay waits for an upstream's response head before it gives the player a `504`: the relay's
+/// own, kept beside this one because the relay needs the same clock for the one thing it wraps. A test
+/// build shortens it to one second, so the integration tests that prove the `504` do not wait out a
+/// thirty-second clock; the rule is the same, only the clock is faster.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const RELAY_HEAD_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) const RELAY_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A client with this backend's rules, short of the request timeout. A connection needs the same client
 /// twice - once with the ceiling and once without - and `ClientBuilder` is not clonable, so the settings
@@ -165,6 +173,29 @@ impl Api {
     /// A `DELETE`.
     pub(crate) fn delete(&self, path: &str) -> RequestBuilder {
         self.client.delete(self.url(path))
+    }
+
+    /// The address this API talks to, with its scheme and no trailing slash.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Whether this target signs to a gateway: the methods that need a credential the
+    /// server itself does not know about, and the header that goes with them. A stream
+    /// for such a target goes through the relay, because a player cannot send that
+    /// credential itself (see [`crate::remote::relay`]).
+    ///
+    /// The gateway's key header is the one that says so: a target that names it is
+    /// behind a gateway, and a player cannot send it. A basic login with no gateway
+    /// header is a server that asks for a user name and password on every request,
+    /// and its stream URL is one a player can open.
+    pub(crate) async fn has_gateway_credential(&self) -> bool {
+        if self.gateway.is_some() {
+            return true;
+        }
+        // A basic login with no gateway header: the credential is sent on every
+        // request, and a player cannot send it. The relay is the one that does.
+        self.auth.lock().await.signs_for_a_gateway()
     }
 
     /// The full address of one of this API's paths.
@@ -296,6 +327,68 @@ impl Api {
             result = request.send() => result.map_err(|problem| ApiError::Transport(clean(&problem.to_string()))),
             _ = self.stopping.waited() => Err(ApiError::Transport(STOPPED.to_string())),
         }
+    }
+
+    /// The relay's half of a call: a `GET` or `HEAD` of a stream address the relay was told to open,
+    /// through the client without a request timeout, with the current credential and the gateway's header
+    /// beside it - the stream token is already in the address, so no session bearer goes with it.
+    ///
+    /// The only wait wrapped is the one for the response head: a body may run for as long as the player
+    /// keeps asking for it, and the relay's own cap (see [`RELAY_HEAD_TIMEOUT`]) is the bound on the head.
+    /// A `401` renews the credential once and tries again, on the same rule [`Self::call`] does: the relay
+    /// carries the connection's own credential, and a server that has ended a session is a renewal, not a
+    /// refusal.
+    pub(crate) async fn relay_get(
+        &self,
+        path_and_query: &str,
+        range: Option<&header::HeaderValue>,
+        head: bool,
+    ) -> Result<Response, ApiError> {
+        let url = self.url(path_and_query);
+        for attempt in 0..2 {
+            let credential = self.authorise().await?;
+            let mut request = if head {
+                self.events_client.head(url.clone())
+            } else {
+                self.events_client.get(url.clone())
+            };
+            if let Some(range) = range {
+                request = request.header(header::RANGE, range.clone());
+            }
+            request = request.headers(self.headers(&credential));
+            // Only the wait for the head is timed: the body after it may run as long as the player keeps
+            // asking for it, and it is bounded by the relay's permit, not by a clock.
+            let response = match tokio::time::timeout(RELAY_HEAD_TIMEOUT, self.send(request)).await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(ApiError::Answer(
+                        "the server did not answer the stream request".to_string(),
+                    ));
+                }
+            };
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+            // The server's own reason comes first, as in [`Self::call`]: only a refusal with no business
+            // answer behind it is about the credential.
+            let answer = self.problem(response).await?;
+            if !self.refused(status, answer.as_deref()).await {
+                return Err(ApiError::Answer(
+                    answer.unwrap_or_else(|| status_line(status)),
+                ));
+            }
+            if attempt == 1 {
+                return Err(ApiError::Refused(match answer {
+                    Some(message) => message,
+                    None => "the credential this connection presents is not accepted".to_string(),
+                }));
+            }
+            // The first attempt's credential is no good; the next earns one.
+            self.invalidate().await;
+        }
+        unreachable!("the second attempt always returns")
     }
 
     /// A body this client is still willing to wait for: the same cap as [`read_capped`](bodies::read_capped),

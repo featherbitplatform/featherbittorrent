@@ -102,6 +102,26 @@ impl Library {
         self.serve_on(0).await
     }
 
+    /// Serves this library with authentication off, on a port the OS picks: what a
+    /// gateway test needs, because the gateway in front of the server is the credential,
+    /// and a server with auth on would ask for one the test did not mean to hand it.
+    async fn serve_with_auth_off(&self) -> (Server, SocketAddr) {
+        let dir = self.dir.path();
+        let paths = self.paths.clone();
+        let config = base_config(dir, vec![], vec![], Some(false), 0).resolve(&paths);
+        let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
+        let server = within(Server::start_with_settings(
+            loopback(&config),
+            config,
+            &paths,
+            lock,
+        ))
+        .await
+        .expect("start the server with auth off");
+        let addr = server.local_addr();
+        (server, addr)
+    }
+
     /// Serves this library again, on `port` (0: any port). The lock is taken here and goes with the
     /// server, which holds it until its last save - so a second run starts on the state the first left,
     /// never beside it.
@@ -137,6 +157,10 @@ fn loopback(config: &Config) -> fbt::Settings {
     settings.enable_lsd = false;
     settings.enable_upnp = false;
     settings.enable_natpmp = false;
+    // A read-ahead the server's own stream route can serve without a peer: the
+    // default 16 MiB / 10 s window is enough for a 1 MiB test file, and a
+    // torrent that already has its pieces on disk answers a read from storage
+    // the moment its check finishes.
     settings
 }
 
@@ -956,6 +980,12 @@ struct Fake {
     revoked: AtomicBool,
     /// Set once `burst_events` has written its burst of frames, so a test knows when they are behind it.
     burst_written: AtomicBool,
+    /// How many times the file list of the stream test's torrent was asked for: the file list is the
+    /// one route a `Stream` answers from before it asks for a token, and counting it is how a test
+    /// finds out the answer came from a list it wrote.
+    files_calls: AtomicUsize,
+    /// The body the file list answers with: the two files the largest-file test hashed.
+    files: Mutex<Vec<String>>,
 }
 
 /// The credential a fake server insists on.
@@ -993,6 +1023,8 @@ impl Fake {
             token_gateway_keys: Mutex::new(Vec::new()),
             revoked: AtomicBool::new(false),
             burst_written: AtomicBool::new(false),
+            files_calls: AtomicUsize::new(0),
+            files: Mutex::new(Vec::new()),
         })
     }
 
@@ -2148,8 +2180,415 @@ async fn token(
         .into_response()
 }
 
-/// An ES256 assertion checked the way a provider checks one: fixed-width `r || s`, against the curve point.
-///
+/// The source of a `Play` notice, if the notice is one: what a test that wants the
+/// address the player would open reads out of the notice rather than of a snapshot.
+fn play_source(notice: &Notice) -> Option<fbtt_core::PlaySource> {
+    match notice {
+        Notice::Play(target) => Some(target.source().clone()),
+        _ => None,
+    }
+}
+
+/// The `PlaySource` a `Play` notice carries: what a test that wants the address the
+/// player would open needs out of a notice, panicking if the notice is not a play.
+fn source_of(notice: Notice) -> fbtt_core::PlaySource {
+    match notice {
+        Notice::Play(target) => target.source().clone(),
+        other => panic!("a play notice was asked for, and {other:?} is not one"),
+    }
+}
+
+/// The same routes every fake answers, with a token route that is rude on purpose: the
+/// first answer is not JSON of the shape this client reads, the second is a body that
+/// is over the cap. What a test asks of it is the one line the client says for each,
+/// and nothing more: a `Play` that came out of either would be a player opening what
+/// the server said it was not.
+fn api_routes_with_rude_tokens(stream: MethodRouter<Arc<Fake>>) -> Router<Arc<Fake>> {
+    api_routes(stream)
+        .route("/api/v1/torrents/{id}/files", get(file_list))
+        .route("/api/v1/stream-tokens", post(rude_token_route))
+}
+
+/// The file list the stream test's torrent has: the entries the test wrote, one per line as JSON. The
+/// token route is rude either way, so the list is only there for the choice to be made from.
+async fn file_list(State(fake): State<Arc<Fake>>, _headers: HeaderMap) -> Response {
+    fake.files_calls.fetch_add(1, Ordering::SeqCst);
+    let files = fake.files.lock().expect("the test state").clone();
+    let body = files.join(",");
+    Json(serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap_or_default()).into_response()
+}
+
+/// `POST /api/v1/stream-tokens`, rude in the two ways the test asks of it: not JSON on
+/// the first call, over the cap on the second.
+async fn rude_token_route() -> Response {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    match CALLS.fetch_add(1, Ordering::SeqCst) {
+        0 => (
+            [(header::CONTENT_TYPE, "application/json")],
+            "{ \"not\": [\"a stream answer\"",
+        )
+            .into_response(),
+        _ => {
+            let big = vec![b'x'; 17 * 1024 * 1024];
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                String::from_utf8(big).expect("ascii"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// A password login, a torrent seeded into it, and a stream URL that plays a range of
+/// it: the whole remote path a player uses, from the command to the bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_stream_url_plays_range() {
+    let lib = Library::new("remote_stream_range", vec![alice()], vec![]);
+    let (server, addr) = lib.serve().await;
+
+    // The file in the server's own download folder: the server's copy is what the
+    // stream route serves, and a torrent that already has its pieces on disk
+    // answers a read from storage once its check finishes.
+    let bytes = torrent_for(&write_file(
+        lib.dir.path().join("downloads").as_path(),
+        "payload.bin",
+        &sample(MIB),
+    ))
+    .await;
+    let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
+    let id = id_of(&metainfo);
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+    assert!(client.send(Command::Add {
+        source: AddSource::File(bytes),
+        dir: None,
+    }));
+    wait_for(&mut client, |snapshot| {
+        (!snapshot.torrents.is_empty()).then_some(())
+    })
+    .await;
+
+    // The command the screen sends, and the answer a player gets: a URL on the server,
+    // with its token, and the range a player's first request asks for.
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = source else {
+        panic!("a remote stream is a URL, not a path");
+    };
+    let url = url.as_str();
+    assert!(
+        url.starts_with(&format!("http://{addr}")),
+        "the stream URL is the server's own: {url}"
+    );
+    assert!(url.contains("token="), "the stream URL carries its token");
+    assert!(
+        url.contains("/files/0/stream"),
+        "the stream URL names the file it was issued for: {url}"
+    );
+
+    // The player's first request: a range of the file it was handed.
+    let first = within(http().get(url).header("Range", "bytes=0-15").send())
+        .await
+        .expect("the stream answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "a range is a range: {}",
+        first.status()
+    );
+    let body = within(first.bytes()).await.expect("the range arrived");
+    let wanted = sample(MIB);
+    assert_eq!(
+        body.as_ref(),
+        &wanted[0..16],
+        "the bytes are the file's, from the server's copy"
+    );
+
+    shutdown(&mut client).await;
+    within(server.shutdown()).await.expect("the last save ran");
+}
+
+/// `file: None` plays the largest non-pad file: the server's own list is what the
+/// choice is made from, and the index the URL names is the larger of the two.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_stream_picks_largest_file() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/2/stream?token=t";
+    // Three files in the list, the last one the largest, a pad between the other two:
+    // the choice is the last, and the answer the token route gives names it.
+    let files_calls = Arc::new(AtomicUsize::new(0));
+    let files = vec![
+        r#"{"index":0,"path":"small.bin","len":65536,"pad":false}"#.to_string(),
+        r#"{"index":1,"path":"pad","len":512,"pad":true}"#.to_string(),
+        r#"{"index":2,"path":"large.bin","len":262144,"pad":false}"#.to_string(),
+    ];
+    let files_body = format!("[{}]", files.join(","));
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get({
+                let calls = Arc::clone(&files_calls);
+                let body = files_body.clone();
+                move |id: axum::extract::Path<String>| async move {
+                    let _ = id;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    ([(header::CONTENT_TYPE, "application/json")], body.clone()).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    assert!(client.send(Command::Stream {
+        id: TorrentId(ID.to_string()),
+        file: None
+    }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("a remote stream is a URL, not a path: {source:?}");
+    };
+    // The largest non-pad file is index 2: the URL the server answered names it, and the
+    // choice was made from the server's list, not from the token's answer.
+    assert!(
+        url.as_str().contains("/files/2/stream"),
+        "the larger file is the one the URL names: {}",
+        url.as_str()
+    );
+    // The file list was asked for: the choice came from the server's list.
+    assert!(
+        files_calls.load(Ordering::SeqCst) > 0,
+        "the file list was read before the choice was made"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A gateway that checks `Authorization: Basic` in front of a server with auth off:
+/// the stream URL a player gets is the relay's, not the server's - a player cannot
+/// send the gateway's credential, and the relay is the thing that does.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_stream_goes_through_relay() {
+    const USER: &str = "gw";
+    const PASSWORD: &str = "gw-pass";
+    // The credential as the gateway will see it: standard base64 of `user:password`.
+    let basic = {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::prelude::BASE64_STANDARD.encode("gw:gw-pass")
+        )
+    };
+
+    // The server: auth off, so the only thing between a request and the stream is the
+    // gateway in front of it.
+    let lib = Library::new("remote_stream_gateway", vec![], vec![]);
+    let (server, server_addr) = lib.serve_with_auth_off().await;
+
+    // The file in the server's own download folder, so its copy is what the stream route serves.
+    let bytes = torrent_for(&write_file(
+        lib.dir.path().join("downloads").as_path(),
+        "payload.bin",
+        &sample(MIB),
+    ))
+    .await;
+
+    // The gateway: a proxy that refuses anything without the credential, and records
+    // what it saw, so the test can answer "did the relay send it?"
+    let saw = Arc::new(Mutex::new(Vec::new()));
+    let gateway = {
+        let saw = Arc::clone(&saw);
+        let forward_to = format!("http://{server_addr}");
+        let expected = basic.clone();
+        Router::new().fallback(move |request: axum::extract::Request| {
+            let saw = Arc::clone(&saw);
+            let forward_to = forward_to.clone();
+            let expected = expected.clone();
+            async move {
+                let authorization = request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                saw.lock()
+                    .expect("the test state")
+                    .push(authorization.clone());
+                if authorization != expected {
+                    return (StatusCode::UNAUTHORIZED, "the gateway sees no credential")
+                        .into_response();
+                }
+                // Forward to the server, keeping the method, the path with its query
+                // (the stream URL's token is in the query, and it has to go through),
+                // and every header except the host and the credential the relay adds:
+                // what the server sees is what the relay sent it.
+                let method = request.method().clone();
+                let uri = request.uri().to_string();
+                let mut headers = header::HeaderMap::new();
+                for (name, value) in request.headers() {
+                    if name.as_str() != header::HOST.as_str()
+                        && name.as_str() != header::AUTHORIZATION.as_str()
+                    {
+                        headers.append(name, value.clone());
+                    }
+                }
+                let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let response = within(
+                    http()
+                        .request(method, format!("{forward_to}{uri}"))
+                        .headers(headers)
+                        .body(body.to_vec())
+                        .send(),
+                )
+                .await
+                .expect("the server answered the relay");
+                let status = response.status();
+                let body = within(response.bytes()).await.expect("the server's body");
+                (status, body).into_response()
+            }
+        })
+    };
+    let gateway_addr = serve(gateway).await;
+
+    // The target: the gateway's address, a basic login, and a gateway key header, which is
+    // what tells the client this target signs to a gateway: a player cannot send that
+    // credential itself, and the relay is the one that does.
+    let mut remote = target(gateway_addr, LoginMethod::GatewayBasic, Some(USER), None);
+    remote.gateway_key_header = Some("x-gateway".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password(PASSWORD.to_string().into()),
+        Some("gw-key".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    // The torrent goes through the gateway too: the add and the token route both need
+    // the credential, and both go with the same call the refresh loop makes.
+    let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
+    let id = id_of(&metainfo);
+    assert!(client.send(Command::Add {
+        source: AddSource::File(bytes),
+        dir: None,
+    }));
+    wait_for(&mut client, |snapshot| {
+        (!snapshot.torrents.is_empty()).then_some(())
+    })
+    .await;
+
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("a remote stream is a URL, not a path: {source:?}");
+    };
+    let url = url.as_str();
+    // The URL is the relay's: loopback, the relay's path, and nothing of the password
+    // in it - the credential is a header the relay adds, not a string the player
+    // carries.
+    assert!(
+        url.starts_with("http://127.0.0.1:"),
+        "a gateway stream is the relay's URL: {url}"
+    );
+    assert!(
+        url.contains("/relay/"),
+        "a gateway stream is the relay's path: {url}"
+    );
+    assert!(
+        !url.contains(PASSWORD) && !url.contains("Basic"),
+        "the player's URL carries no credential: {url}"
+    );
+    assert!(
+        !url.contains(&server_addr.to_string()),
+        "the player's URL is not the server's: {url}"
+    );
+
+    // The player's first request through the relay: a range of the file, and the
+    // gateway in front of the server sees the credential the relay added.
+    let first = within(http().get(url).header("Range", "bytes=0-15").send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "the relay served the range: {}",
+        first.status()
+    );
+    let body = within(first.bytes()).await.expect("the range arrived");
+    let wanted = sample(MIB);
+    assert_eq!(
+        body.as_ref(),
+        &wanted[0..16],
+        "the bytes are the file's, through the relay"
+    );
+    // The gateway saw the credential on the relay's way through.
+    let saw = saw.lock().expect("the test state").clone();
+    assert!(
+        saw.iter().any(|seen| seen == &basic),
+        "the gateway saw the credential the relay sent: {saw:?}"
+    );
+
+    shutdown(&mut client).await;
+    within(server.shutdown()).await.expect("the last save ran");
+}
 /// The check comes from the `p256` crate and not from ssh-key on purpose: ssh-key would have accepted the
 /// mpint spelling of the same signature, so verifying with it would only prove that one library agrees with
 /// itself about how to read its own bytes. What a gateway actually receives is the other spelling, and this
@@ -2214,4 +2653,339 @@ fn percent_pair(rest: &[u8]) -> Option<u8> {
     std::str::from_utf8(digits)
         .ok()
         .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+}
+
+// --------------------------------------------------------------------------------- the relay's bound
+
+/// The relay's bound, one part at a time: a request for a host it does not serve is
+/// refused; an unknown token is refused; nine concurrent requests against an upstream
+/// that holds its body open get eight through and one `503` with a second to wait; a
+/// 300-byte `Range` reaches the upstream as no `Range` at all; and a response copies
+/// back only the status and five headers.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_is_bounded() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM_PATH: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream the relay forwards to: it answers the backend's own calls so the
+    // connection comes up, and its stream route is what the relay's requests reach.
+    // The stream route records what it saw, so "what did the relay send?" has an
+    // answer; the `hold` flag is how a test makes it hold a body open.
+    let hold = Arc::new(AtomicBool::new(false));
+    let hold_clone = Arc::clone(&hold);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen);
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            STREAM_PATH,
+            get({
+                let hold = Arc::clone(&hold_clone);
+                let seen = Arc::clone(&seen_clone);
+                move |request: axum::extract::Request| {
+                    let hold = Arc::clone(&hold);
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let range = request
+                            .headers()
+                            .get(header::RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        seen.lock().expect("the test state").push(range);
+                        if hold.load(Ordering::SeqCst) {
+                            // One chunk, then the body never ends: what a player seeking
+                            // through a slow file looks like, and what the bound exists
+                            // for - a slot is held for the whole body, not the head.
+                            return ("0123456789abcdef").into_response();
+                        }
+                        (
+                            [
+                                (header::CONTENT_TYPE, "application/octet-stream"),
+                                (header::CONTENT_RANGE, "bytes 0-15/16"),
+                                (header::ACCEPT_RANGES, "bytes"),
+                                (header::CONTENT_DISPOSITION, "inline"),
+                                (header::SET_COOKIE, "a=secret"),
+                                (header::HeaderName::from_static("x-foo"), "bar"),
+                            ],
+                            "0123456789abcdef".to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    // The target signs to a gateway: a basic login with a gateway key header, so the
+    // client routes streams through the relay rather than handing the player the
+    // server's own URL.
+    let mut remote = target(addr, LoginMethod::GatewayBasic, Some("relay-user"), None);
+    remote.gateway_key_header = Some("x-gw".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("relay-pass".to_string().into()),
+        Some("relay-key".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    // The relay starts on the first `Stream` it is asked for, and its own address is
+    // what the player opens: loopback, the relay's path, no token of the server's in
+    // it - the relay's token is its own, and it is the only one the relay knows.
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+    assert!(
+        url.starts_with("http://127.0.0.1:"),
+        "the relay's URL is loopback: {url}"
+    );
+    assert!(
+        url.contains("/relay/"),
+        "the relay's URL is the relay's path: {url}"
+    );
+
+    // The relay does not serve a host it does not name: a request for another host is
+    // refused before the token is looked up, so it learns nothing about the tokens.
+    // The request goes to the relay's own address with a wrong `Host` header.
+    let refused_host = within(http().get(url).header("Host", "evil.example").send())
+        .await
+        .expect("the relay answered the other host");
+    assert_eq!(
+        refused_host.status(),
+        StatusCode::FORBIDDEN,
+        "a request for another host is refused: {}",
+        refused_host.status()
+    );
+
+    // An unknown token is refused before a slot is taken: a stranger's guesses do not
+    // count against the bound, and a `401` is what a player sees of them.
+    let relay_host = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let unknown = format!("http://{}/relay/{}", relay_host, "a-token-nobody-issued");
+    let unknown = within(http().get(&unknown).send())
+        .await
+        .expect("the relay answered the unknown token");
+    assert_eq!(
+        unknown.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unknown token is refused: {}",
+        unknown.status()
+    );
+
+    // A range of the file through the relay: the five headers the relay copies back,
+    // and the two it does not.
+    let first = within(http().get(url).header("Range", "bytes=0-15").send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the relay served the stream: {}",
+        first.status()
+    );
+    let headers = first.headers().clone();
+    let body = within(first.bytes()).await.expect("the body arrived");
+    assert_eq!(
+        body.as_ref(),
+        b"0123456789abcdef".as_slice(),
+        "the relay streamed the upstream's chunk"
+    );
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::CONTENT_DISPOSITION,
+    ] {
+        assert!(headers.get(&name).is_some(), "the relay copied {name}");
+    }
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "the relay did not copy a cookie"
+    );
+    assert!(
+        headers.get("x-foo").is_none(),
+        "the relay did not copy a header it was not told to"
+    );
+
+    // A 300-byte `Range` reaches the upstream as no `Range` at all: the limit is 256,
+    // and a range past it is not a range a player would send.
+    let long_range = format!("bytes=0-{}", "9".repeat(292));
+    assert_eq!(long_range.len(), 300, "the test's range is 300 bytes");
+    let long = within(http().get(url).header("Range", &long_range).send())
+        .await
+        .expect("the relay answered the long range");
+    assert_eq!(
+        long.status(),
+        StatusCode::OK,
+        "a range past the limit is served: {}",
+        long.status()
+    );
+    let seen = seen.lock().expect("the test state").clone();
+    assert!(
+        seen.iter().any(|range| range.is_empty()),
+        "the 300-byte range reached the upstream as no range: {seen:?}"
+    );
+
+    // Nine concurrent requests against an upstream that holds its body open: the slots
+    // are held for the whole body, not the head, so eight in flight hold eight slots,
+    // and the ninth is refused before it reaches the upstream.
+    hold.store(true, Ordering::SeqCst);
+    let requests: Vec<_> = (0..9)
+        .map(|_| {
+            let url = url.to_string();
+            async move { http().get(url).send().await }
+        })
+        .collect();
+    let results: Vec<Result<reqwest::Response, reqwest::Error>> =
+        within(futures::future::join_all(requests)).await;
+    let statuses: Vec<_> = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok().map(|response| response.status()))
+        .collect();
+    assert_eq!(
+        statuses.len(),
+        9,
+        "all nine requests got an answer: {statuses:?}"
+    );
+    let refused = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .find(|response| response.status() == StatusCode::SERVICE_UNAVAILABLE);
+    let Some(refused) = refused else {
+        panic!("exactly one of nine concurrent requests should be refused: {statuses:?}");
+    };
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "one of nine concurrent requests is refused, not two: {statuses:?}"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "the refusal says when to wait"
+    );
+
+    // The upstream's body that the eight held open ends with the test: the client goes,
+    // and with it the relay, and with the relay the bodies it was forwarding.
+    shutdown(&mut client).await;
+}
+
+/// A server that answers the token route with garbage: one error notice, no `Play`,
+/// and a body this client cannot read is a body this client does not read whole - a
+/// 100 MiB answer costs the client the cap and a line, not its memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_server_stream_answer() {
+    let fake = Fake::open();
+    let addr =
+        serve(api_routes_with_rude_tokens(get(counted_events)).with_state(Arc::clone(&fake))).await;
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId("0123456789abcdef0123456789abcdef01234567".to_string());
+    // First stream: the garbage answer, one error, no play.
+    assert!(client.send(Command::Stream {
+        id: id.clone(),
+        file: None
+    }));
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line.contains("could not read"))
+    })
+    .await;
+    assert!(
+        lines.iter().any(|line| line.contains("could not read")),
+        "a body that is not JSON says so: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.is_empty()),
+        "a garbage answer is not a play: {lines:?}"
+    );
+
+    // Second stream: the body over the cap, one line about it, no play.
+    assert!(client.send(Command::Stream { id, file: None }));
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line.contains("MiB"))
+    })
+    .await;
+    assert!(
+        lines.iter().any(|line| line.contains("MiB")),
+        "a body over the cap says so: {lines:?}"
+    );
+
+    // The link is up: a rude answer is an answer, and the client is still answering
+    // its screen.
+    wait_for_state(&mut client, true).await;
+    shutdown(&mut client).await;
 }
