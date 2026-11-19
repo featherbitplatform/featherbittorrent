@@ -10,18 +10,60 @@
 # Usage: bash dev/package-linux.sh <version> <x86_64|aarch64>   e.g. bash dev/package-linux.sh 0.1.0 aarch64
 # Output: target/dist/featherbittorrent-<version>-linux-<arch>.{deb,rpm} and
 #         target/dist/featherbittorrent-<version>-<arch>-unknown-linux-gnu.tar.gz, each with a .sha256.
+# Test hooks that need no build and ask nothing about the platform (dev/test-packaging.sh runs them on
+# any OS): --print-versions <version> prints the deb version then the rpm version; --check-rpm-reqs
+# reads requirement lines on stdin and refuses any the declared dependencies do not cover. Both refuse
+# with one line like everything else here.
 set -euo pipefail
 
 fail() { echo "package-linux.sh: $*" >&2; exit 1; }
+
+# Debian and RPM sort "~" before anything, so a pre-release precedes its release, and RPM versions may
+# not contain "-", so both mappings replace the dash with a tilde. A variable holds the tilde because on
+# bash 3.2, which these scripts support, "${version//-/\~}" keeps the backslash inside double quotes and
+# "${version//-/'~'}" keeps the quotes; "$tilde" is a plain tilde on every bash.
+tilde='~'
+
+print_versions() { # <version>; prints the deb version, then the rpm version, one per line
+  local v="$1"
+  printf '%s\n%s\n' "${v//-/$tilde}" "${v//-/$tilde}"
+}
+
+check_version() { # <version>; refuses anything that is not X.Y.Z or X.Y.Z(-pre)
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
+    || fail "invalid version '$1' (expected X.Y.Z or X.Y.Z-pre)"
+}
+
+check_rpm_reqs() { # rpm requirement lines on stdin; refuses any the declared dependencies do not cover
+  local req
+  while IFS= read -r req; do
+    [[ -z "$req" ]] && continue
+    grep -qE '^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[0-9]|rtld|rpmlib|/bin/sh)' <<<"$req" \
+      || fail "the .rpm requires '$req', which the declared dependencies do not cover: add it to [package.metadata.deb] depends and to dev/check-linux-binary.sh's allow list together"
+  done
+}
+
+# The hooks dispatch here, ahead of every platform and tool question. --print-versions checks the
+# version exactly as package mode does, so a bad one is refused the same way.
+if [[ "${1:-}" == "--print-versions" ]]; then
+  [[ $# -eq 2 ]] || fail "usage: bash dev/package-linux.sh --print-versions <version>"
+  check_version "$2"
+  print_versions "$2"
+  exit 0
+fi
+if [[ "${1:-}" == "--check-rpm-reqs" ]]; then
+  [[ $# -eq 1 ]] || fail "usage: bash dev/package-linux.sh --check-rpm-reqs (requirement lines on stdin)"
+  check_rpm_reqs
+  echo 'package-linux.sh ok: every rpm requirement is covered by the declared dependencies'
+  exit 0
+fi
 
 # Arguments first, before any platform or tool question, so dev/test-packaging.sh can exercise the
 # refusals on any OS.
 [[ $# -eq 2 ]] || fail "usage: bash dev/package-linux.sh <version> <x86_64|aarch64>"
 version="$1"
 arch="$2"
-if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-  fail "invalid version '$version' (expected X.Y.Z or X.Y.Z-pre)"
-fi
+check_version "$version"
 case "$arch" in
   x86_64|aarch64) ;;
   *) fail "invalid arch '$arch' (expected x86_64 or aarch64)" ;;
@@ -42,10 +84,8 @@ triple="${arch}-unknown-linux-gnu"
 targz="featherbittorrent-${version}-${triple}"
 stage="$dist/stage-linux-$arch"
 
-# Debian and RPM sort "~" before anything, so a pre-release precedes its release; RPM versions may not
-# contain "-".
-deb_version="${version//-/\~}"
-rpm_version="${version//-/\~}"
+# The same mapping the --print-versions hook prints (see print_versions for why a variable holds "~").
+{ read -r deb_version; read -r rpm_version; } < <(print_versions "$version")
 
 cargo build --locked --release -p featherbittorrent
 bin="$target/release/featherbittorrent"
@@ -162,11 +202,7 @@ if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --
 if ! reqs="$(rpm -qpR "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qpR could not read $dist/$pkg.rpm: $(head -1 <<<"$reqs")"; fi
 echo "rpm requirements:"
 printf '%s\n' "$reqs"
-while IFS= read -r req; do
-  [[ -z "$req" ]] && continue
-  grep -qE '^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[0-9]|rtld|rpmlib|/bin/sh)' <<<"$req" \
-    || fail "the .rpm requires '$req', which the declared dependencies do not cover: add it to [package.metadata.deb] depends and to dev/check-linux-binary.sh's allow list together"
-done <<<"$reqs"
+check_rpm_reqs <<<"$reqs"
 
 rm -rf "$stage"
 

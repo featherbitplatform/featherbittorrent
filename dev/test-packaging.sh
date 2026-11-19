@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Tests the linux packaging decisions without building anything, on any OS, the way the release
 # workflow's verify job runs it: dev/check-linux-binary.sh accepts excerpts of a real almalinux:9
-# release build (the -ok fixtures) and refuses a glibc symbol newer than its 2.34 floor or a NEEDED
-# library off the allow list, each refusal one line naming its culprit; dev/package-linux.sh refuses
-# missing arguments, a version that is not X.Y.Z(-pre), and an arch other than x86_64 or aarch64, all
-# before it asks anything about the platform, which is why these tests run on macOS too; and
-# dev/test-service-examples.sh passes, because the packages ship those examples as documentation. The
-# fixtures are excerpts of objdump -T and objdump -p output for the binary dev/package-linux.sh builds
-# in almalinux:9 (the failing copies are hand-edited from them), so they name no machine's paths.
-# Nothing here contacts the network, builds anything, or installs anything.
+# release build (the -ok fixtures), refuses a glibc symbol newer than its 2.34 floor or a NEEDED
+# library off the allow list, each refusal one line naming its culprit, and is run at the boundary
+# (GLIBC_2.4 and 2.34 accepted, 2.35 and 2.34.1 refused) so the version compare itself is tested, not
+# just the two fixtures; dev/package-linux.sh maps X.Y.Z-pre to the tilde form deb and rpm need
+# (--print-versions), holds the requirements rpm derives from the real binary to the allow list
+# (--check-rpm-reqs), and refuses missing arguments, a version that is not X.Y.Z(-pre), and an arch
+# other than x86_64 or aarch64, all before it asks anything about the platform, which is why these
+# tests run on macOS too; and dev/test-service-examples.sh passes, because the packages ship those
+# examples as documentation. The fixtures are excerpts of objdump -T and objdump -p output for the
+# binary dev/package-linux.sh builds in almalinux:9 (the failing copies are hand-edited from them), so
+# they name no machine's paths. Nothing here contacts the network, builds anything, or installs
+# anything.
 # Usage: bash dev/test-packaging.sh
 set -euo pipefail
 
@@ -66,7 +70,70 @@ grep -qF 'allow list' <<<"$check_out" || fail "the refusal did not mention the a
 grep -qF 'depends' <<<"$check_out" || fail "the refusal did not mention the .deb depends: $check_out"
 echo 'ok: check-linux-binary.sh refuses NEEDED libssl.so.3 and names it with both places to fix'
 
-# 4. dev/package-linux.sh validates its arguments before any platform or tool question. None of these
+# 4. The version mapping deb and rpm need: RPM versions may not contain "-", and both package managers
+# sort "~" before everything else, so "0.1.0-rc.1" has to come out as exactly "0.1.0~rc.1", twice. The
+# output is compared byte for byte because on bash 3.2, which these scripts support, "${version//-/\~}"
+# inside double quotes leaves a backslash behind, and one in a version string would poison both
+# package managers.
+versions_test() { # <version to map> <what each of the two printed lines must be>
+  local v="$1" want_line="$2" status=0 out want
+  out="$(bash "$package_sh" --print-versions "$v" 2>&1)" || status=$?
+  [[ $status -eq 0 ]] || fail "package-linux.sh --print-versions $v exited $status: $out"
+  want="$(printf '%s\n%s' "$want_line" "$want_line")"
+  [[ "$out" == "$want" ]] || fail "package-linux.sh --print-versions $v printed '$out', expected two lines of '$want_line'"
+  case "$out" in *\\*) fail "the mapping left a backslash in: $out" ;; esac
+}
+versions_test 0.1.0-rc.1 '0.1.0~rc.1'
+versions_test 0.2.0 '0.2.0'
+echo 'ok: package-linux.sh maps 0.1.0-rc.1 to 0.1.0~rc.1 for deb and rpm, leaves 0.2.0 alone, prints no backslash'
+
+# 5. The glibc floor as a boundary, not just the two fixtures: "2.4" sorts above "2.34" when dotted
+# versions compare as text, so only a numeric sort lets an older symbol pass, and a third number like
+# GLIBC_2.34.1 has to lose to 2.34 on its own field. Each run feeds check-linux-binary.sh one versioned
+# symbol through CHECK_OBJDUMP_T with the ok -p fixture beside it, so only the compare is under test.
+tmp="$(mktemp -d)" || fail "mktemp failed"
+trap 'rm -rf "$tmp"' EXIT
+glibc_case() { # <symbol version> <exit to expect>; a refusal must name that version
+  local ver="$1" want="$2" status=0 out
+  printf '%s\n%s\n' 'DYNAMIC SYMBOL TABLE:' \
+    "0000000000000000      DF *UND*  0000000000000000  GLIBC_$ver   some_symbol" \
+    > "$tmp/objdump-T-$ver.txt"
+  out="$(CHECK_OBJDUMP_T="$tmp/objdump-T-$ver.txt" CHECK_OBJDUMP_P="$fixtures/objdump-p-ok.txt" bash "$check_sh" "$check_sh" 2>&1)" || status=$?
+  [[ $status -eq "$want" ]] || fail "check-linux-binary.sh exited $status on a lone GLIBC_$ver symbol, expected $want: $out"
+  if [[ $want -eq 1 ]]; then
+    grep -qF "GLIBC_$ver" <<<"$out" || fail "the refusal did not name GLIBC_$ver: $out"
+  fi
+}
+glibc_case 2.4 0     # older than the floor, and lexicographically above 2.34; a numeric sort must pass it
+glibc_case 2.34 0    # exactly the floor
+glibc_case 2.35 1    # just above the floor
+glibc_case 2.34.1 1  # a third number, newer than 2.34 only on its own field
+echo 'ok: check-linux-binary.sh accepts GLIBC_2.4 and GLIBC_2.34, refuses GLIBC_2.35 and GLIBC_2.34.1 by name'
+
+# 6. The requirements rpm derives from the real binary, held to the allow list through --check-rpm-reqs,
+# which reads stdin and asks nothing about the platform. The accepted list is verbatim what rpm -qpR
+# printed for the almalinux:9 aarch64 build (task-4-report.md); libssl.so.3 is what a stray NEEDED
+# would add, and it must be refused by name with both places to fix, as section 3 insists.
+reqs_std="$(printf '%s\n' /bin/sh \
+  'libc.so.6()(64bit)' 'libc.so.6(GLIBC_2.17)(64bit)' 'libc.so.6(GLIBC_2.18)(64bit)' \
+  'libc.so.6(GLIBC_2.25)(64bit)' 'libc.so.6(GLIBC_2.27)(64bit)' 'libc.so.6(GLIBC_2.28)(64bit)' \
+  'libc.so.6(GLIBC_2.29)(64bit)' 'libc.so.6(GLIBC_2.30)(64bit)' 'libc.so.6(GLIBC_2.32)(64bit)' \
+  'libc.so.6(GLIBC_2.33)(64bit)' 'libc.so.6(GLIBC_2.34)(64bit)' \
+  'libgcc_s.so.1()(64bit)' 'libgcc_s.so.1(GCC_3.0)(64bit)' 'libgcc_s.so.1(GCC_3.3)(64bit)' \
+  'libgcc_s.so.1(GCC_4.2.0)(64bit)' 'libm.so.6()(64bit)' 'libm.so.6(GLIBC_2.29)(64bit)' \
+  'rpmlib(CompressedFileNames) <= 3.0.4-1' 'rpmlib(FileDigests) <= 4.6.0-1' \
+  'rpmlib(PayloadFilesHavePrefix) <= 4.0-1' 'rpmlib(PayloadIsZstd) <= 5.4.18-1' 'rtld(GNU_HASH)')"
+status=0; reqs_out="$(bash "$package_sh" --check-rpm-reqs <<<"$reqs_std" 2>&1)" || status=$?
+[[ $status -eq 0 ]] || fail "package-linux.sh --check-rpm-reqs refused the real build's requirements (exit $status): $reqs_out"
+reqs_extra="$(printf '%s\nlibssl.so.3()(64bit)' "$reqs_std")"
+status=0; reqs_out="$(bash "$package_sh" --check-rpm-reqs <<<"$reqs_extra" 2>&1)" || status=$?
+[[ $status -eq 1 ]] || fail "package-linux.sh --check-rpm-reqs exited $status on a list holding libssl.so.3()(64bit), expected 1: $reqs_out"
+grep -qF 'libssl.so.3()(64bit)' <<<"$reqs_out" || fail "the refusal did not name libssl.so.3()(64bit): $reqs_out"
+grep -qF 'allow list' <<<"$reqs_out" || fail "the refusal did not mention the allow list: $reqs_out"
+grep -qF 'depends' <<<"$reqs_out" || fail "the refusal did not mention the .deb depends: $reqs_out"
+echo 'ok: package-linux.sh accepts the requirements of the real build and refuses libssl.so.3()(64bit) by name'
+
+# 7. dev/package-linux.sh validates its arguments before any platform or tool question. None of these
 # refusals may mention Linux, because here they run on macOS and still have to mean the same thing.
 refusal() { # <what the message must say> <package-linux.sh argument>...
   local want="$1"; shift
@@ -83,10 +150,11 @@ refusal() { # <what the message must say> <package-linux.sh argument>...
 refusal usage
 refusal 'invalid version' 0.1 x86_64
 refusal 'invalid version' 1.2.3/4 x86_64
+refusal 'invalid version' --print-versions 0.1
 refusal 'invalid arch' 0.1.0 armv7
 echo 'ok: package-linux.sh refuses bad arguments with one line each, before any platform check'
 
-# 5. The service examples the packages ship as documentation (Review Focus 1 starts there).
+# 8. The service examples the packages ship as documentation (Review Focus 1 starts there).
 status=0; examples_out="$(bash dev/test-service-examples.sh 2>&1)" || status=$?
 [[ $status -eq 0 ]] || fail "dev/test-service-examples.sh failed (exit $status): $(tail -3 <<<"$examples_out")"
 echo 'ok: dev/test-service-examples.sh passes'
