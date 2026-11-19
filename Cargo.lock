@@ -1412,6 +1412,7 @@ dependencies = [
  "fbt-api",
  "fbtt-core",
  "futures",
+ "futures-util",
  "getrandom 0.4.3",
  "p256 0.14.0",
  "reqwest",

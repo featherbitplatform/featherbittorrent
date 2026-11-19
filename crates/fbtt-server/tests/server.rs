@@ -2517,6 +2517,73 @@ async fn stream_token_route_auth_off() {
     served.stop().await;
 }
 
+/// A body over the stream-token route's cap is read to its end - within a bound - before the `413` goes out,
+/// so a client still sending when the server decides gets the answer rather than a reset. Spelled out over a
+/// raw socket so the timing is the test's own: half the body, a pause in which an answer would arrive if the
+/// server had stopped reading at the cap, then the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_stream_token_body_is_read_before_the_answer() {
+    use std::io::{ErrorKind, Read as _, Write as _};
+
+    let served = Served::start("stream-refused-body", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let addr = served.server.local_addr();
+
+    // 32 KiB: four times the route's cap, half the bound on what it reads of a refused body.
+    let body =
+        serde_json::json!({ "torrent": "0".repeat(40), "file": 0, "junk": "x".repeat(32 * 1024) })
+            .to_string();
+    let head = format!(
+        "POST /api/v1/stream-tokens HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let half = body.len() / 2;
+
+    let answer = within(tokio::task::spawn_blocking(move || {
+        let mut socket = std::net::TcpStream::connect(addr).expect("connect to the server");
+        socket.write_all(head.as_bytes()).expect("send the head");
+        socket
+            .write_all(&body.as_bytes()[..half])
+            .expect("send the first half");
+        socket.flush().expect("flush the first half");
+
+        // Past the cap already, and nothing comes back while the rest is still owed.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("a read timeout");
+        let mut early = [0u8; 1];
+        match socket.read(&mut early) {
+            Err(problem)
+                if matches!(problem.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            other => panic!("the server answered before the body was in: {other:?}"),
+        }
+
+        socket
+            .write_all(&body.as_bytes()[half..])
+            .expect("the rest of the body is still taken");
+        socket.set_read_timeout(None).expect("no read timeout");
+        let mut answer = Vec::new();
+        socket
+            .read_to_end(&mut answer)
+            .expect("the whole answer, not a reset");
+        String::from_utf8_lossy(&answer).into_owned()
+    }))
+    .await
+    .expect("the raw client");
+
+    assert!(
+        answer.starts_with("HTTP/1.1 413"),
+        "a body this route has no use for: {answer}"
+    );
+    assert!(answer.contains("body_too_large"), "{answer}");
+
+    served.stop().await;
+}
+
 /// What a request can get wrong: an id that is not this library's (`404`), an index past the end of the file
 /// list (`404`, the same answer fbt-api's own stream route gives for one), an id that is not hex at all
 /// (`400 invalid_id`, the same code fbt-api uses), and a body far bigger than two short fields (`413`).
@@ -2577,9 +2644,10 @@ async fn stream_token_bad_requests() {
     assert_eq!(code, "invalid_id");
 
     // A body far bigger than the two fields this route takes: refused for its size, in this API's error
-    // shape. Its own client, because a server that stops reading a body it refused has closed the
-    // connection that carried it (see `login_bodies_are_capped`).
-    let junk = "x".repeat(1024 * 1024);
+    // shape. The server reads a refused body to its end, within a bound, before it answers: a client that is
+    // still writing when the connection closes under it gets a reset instead of the answer (on Windows the
+    // write fails with `ConnectionAborted`), and a real player or TUI should see the `413`.
+    let junk = "x".repeat(32 * 1024);
     let (status, code) = error_of(
         post_json(
             &http(),
@@ -2596,6 +2664,30 @@ async fn stream_token_bad_requests() {
         "a body this route has no use for"
     );
     assert_eq!(code, "body_too_large");
+
+    // Past that bound the server stops reading and closes, so a megabyte gets either the `413` (when the
+    // client had written it all before the close) or a failed send: both are a refusal, and which one depends
+    // only on the operating system's timing. What may not happen is the server reading it all, or falling over.
+    let junk = "x".repeat(1024 * 1024);
+    let sent = within(
+        http()
+            .post(served.url("/api/v1/stream-tokens"))
+            .json(&serde_json::json!({ "torrent": id, "file": 0, "junk": junk }))
+            .bearer_auth(&session)
+            .send(),
+    )
+    .await;
+    // Only the status is looked at: the reset that may follow it can take the body with it.
+    if let Ok(response) = sent {
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a megabyte of JSON"
+        );
+    }
+
+    // The bad requests above all carry bodies far below the cap, which the server reads in full before it
+    // answers, so none of them can race the connection's close the way an oversized one did.
 
     // And the route still answers a normal request afterwards: this was a cap, not a broken route.
     let path = stream_address(&served, Some(&session), &id, 0).await;

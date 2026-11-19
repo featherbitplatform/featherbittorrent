@@ -40,6 +40,8 @@ sha2.workspace = true
 ssh-key.workspace = true
 # The request and response bodies of our own routes.
 serde.workspace = true
+# `StreamExt::next`, for the stream-token route reading its body chunk by chunk under its own caps.
+futures-util.workspace = true
 # The login route parses a body it took as bytes. Already in the tree through axum's `json`.
 serde_json.workspace = true
 thiserror.workspace = true

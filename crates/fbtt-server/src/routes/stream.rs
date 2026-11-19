@@ -19,13 +19,14 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use fbt::{InfoHashV1, InfoHashV2, InfoHashes, SessionError};
 use fbtt_core::client::TorrentId;
 use fbtt_core::stream::stream_path;
 use fbtt_core::stream::tokens::FIRST_USE;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::{RouteError, Shared, clean};
@@ -37,6 +38,17 @@ use crate::auth::bearer;
 /// it could be: a megabyte of JSON naming a file is refused before any of it is parsed.
 pub(super) const MAX_TOKEN_BODY: usize = 8 * 1024;
 
+/// How much of a body over [`MAX_TOKEN_BODY`] is still read, and thrown away, before the `413` goes out.
+///
+/// A server that answers without reading the rest of a request closes a connection with unread bytes on
+/// it, and the operating system turns that into a reset: on Windows the client's next write fails with
+/// `WSAECONNABORTED`, on macOS and Linux with `ECONNRESET`, and the client reports a failed send instead of
+/// the `413` that was already on its way. Reading a refused body to its end is what lets an ordinary client
+/// see the answer. This bound is what keeps that from being an invitation: past it the rest is not read, the
+/// connection closes, and whoever sent a body that size gets the reset it asked for. Nothing past
+/// [`MAX_TOKEN_BODY`] is kept either way, so the room one request may make this server hold does not change.
+pub(super) const MAX_REFUSED_BODY: usize = 64 * 1024;
+
 /// `POST /api/v1/stream-tokens`: an address to stream one file from, answering 201 with
 /// `{path, expires_in}`.
 ///
@@ -47,12 +59,18 @@ pub(super) const MAX_TOKEN_BODY: usize = 8 * 1024;
 /// what the stream route itself answers for the same torrent.
 pub(super) async fn issue(
     State(shared): State<Arc<Shared>>,
-    headers: HeaderMap,
-    given: Result<Json<StreamTokenRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<(StatusCode, Json<StreamTokenAnswer>), RouteError> {
-    // A body that is not JSON of this shape - or bigger than this route takes - comes back in this API's
-    // error shape rather than axum's plain-text one.
-    let Json(body) = given?;
+    // The body is read here rather than by the `Json` extractor, because the extractor stops at the cap and
+    // leaves the rest unread (see [`MAX_REFUSED_BODY`]). What is kept is then handed to the same extractor, so
+    // a body that is not JSON of this shape - a wrong content type included - gets the answer it always got,
+    // in this API's error shape rather than axum's plain-text one.
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let kept = read_body(&headers, body).await?;
+    let Json(body) =
+        Json::<StreamTokenRequest>::from_request(Request::from_parts(parts, Body::from(kept)), &())
+            .await?;
     let hashes = parse_id(&body.torrent)?;
     let Some(torrent) = shared.session().torrent(&hashes) else {
         return Err(RouteError::not_found("no such torrent"));
@@ -118,6 +136,44 @@ pub(super) async fn issue(
             expires_in: FIRST_USE.as_secs(),
         }),
     ))
+}
+
+/// A request body of at most [`MAX_TOKEN_BODY`] bytes, or `413 body_too_large` once the client has finished
+/// sending one that is bigger - as long as it finished within [`MAX_REFUSED_BODY`]. A body declared bigger
+/// than that is refused before any of it is read, and one that turns out bigger stops being read there:
+/// either way the connection that carried it is over.
+async fn read_body(headers: &HeaderMap, body: Body) -> Result<Bytes, RouteError> {
+    let too_large = || {
+        RouteError::rejection(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a stream-token request is at most {MAX_TOKEN_BODY} bytes"),
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_REFUSED_BODY as u64) {
+        return Err(too_large());
+    }
+    let mut stream = body.into_data_stream();
+    let mut kept = Vec::new();
+    let mut read = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| RouteError::invalid_request("the request body could not be read"))?;
+        read = read.saturating_add(chunk.len());
+        if read > MAX_REFUSED_BODY {
+            return Err(too_large());
+        }
+        if read <= MAX_TOKEN_BODY {
+            kept.extend_from_slice(&chunk);
+        }
+    }
+    if read > MAX_TOKEN_BODY {
+        return Err(too_large());
+    }
+    Ok(Bytes::from(kept))
 }
 
 /// Who asked, for the log line: this server's own name for whoever holds the session token that
