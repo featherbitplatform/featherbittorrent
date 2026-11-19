@@ -355,8 +355,14 @@ mod tests {
     }
 
     /// `issue` prunes expired entries before counting against the cap, so a live token is
-    /// never evicted to make room for one that is already gone. With a cap of 2, token A
-    /// expires unused after 61 s; issuing token C then must not evict the still-live B.
+    /// never evicted to make room for one that is already gone. With a cap of 2, B is issued
+    /// and used first; A is issued after and never used, so A is the newest entry and
+    /// expires after 61 s. Issuing C then must not evict B: without the pruning in
+    /// `issue`, the store counts the expired A against the cap and evicts B, the oldest.
+    ///
+    /// The test does not call `check` or `len` between the expiry and the `issue`: both of
+    /// those prune expired entries on their own, and a `check` before the `issue` would
+    /// remove A first and let the test pass even if `issue` had no pruning of its own.
     #[test]
     fn an_expired_entry_does_not_count_against_the_cap() {
         let (handle, clock) = clock_at(Instant::now());
@@ -365,27 +371,26 @@ mod tests {
         let path_a = stream_path(&id(), 0);
         let path_b = stream_path(&id(), 1);
 
-        // Issue A, then use B right away so its idle clock starts and it is not in the
-        // fragile first-use window. The store is at its cap: A (unused) and B (used).
-        let a = tokens.issue(path_a.clone());
+        // Issue B first and use it right away so its idle clock starts and it is not in the
+        // fragile first-use window. Then issue A after B: A is the newest entry, so a cap
+        // eviction would evict B, the oldest, not A.
         let b = tokens.issue(path_b.clone());
         assert!(
             tokens.check(&b, &path_b),
             "B is used and its idle clock starts"
         );
+        let _a = tokens.issue(path_a.clone());
         assert_eq!(tokens.len(), 2, "the store is full at its cap");
 
-        // Advance 61 s: A, which was never used, is past its first-use window and is gone.
-        // B was used at the issue, so 61 s is well inside its 30-minute idle limit.
+        // Advance 61 s: A, which was never used, is now past its first-use window and is
+        // expired. B was used at the issue, so 61 s is well inside its 30-minute idle
+        // limit. No `check` or `len` runs in between, so A is still in the store, merely
+        // expired: `issue` is the next thing to prune it.
         *handle.lock().expect("the test clock") += Duration::from_secs(61);
-        assert!(!tokens.check(&a, &path_a), "A is past its first-use window");
-        assert!(
-            tokens.check(&b, &path_b),
-            "B is still inside its idle limit"
-        );
 
-        // A has expired. Issuing C must not evict B: the store prunes A first, sees one
-        // live entry, and has room for C.
+        // Issuing C must not evict B: `issue` prunes A first, sees one live entry, and has
+        // room for C. Without the pruning in `issue`, the store counts A against the cap
+        // and evicts B, the oldest, to make room.
         let c = tokens.issue(path_a.clone());
         assert_eq!(tokens.len(), 2, "A is gone, B and C are live");
         assert!(tokens.check(&b, &path_b), "B survived the issue of C");
@@ -395,7 +400,9 @@ mod tests {
         );
     }
 
-    /// `len` counts only live entries: expired ones are dropped before the count.
+    /// `len` counts only live entries: expired ones are dropped before the count. The test
+    /// calls `len` with no `check` in between: a `check` would prune the expired entry on
+    /// its own and let the test pass even if `len` counted stored rather than live entries.
     #[test]
     fn len_counts_live_entries_only() {
         let (handle, clock) = clock_at(Instant::now());
@@ -404,7 +411,7 @@ mod tests {
         let path_a = stream_path(&id(), 0);
         let path_b = stream_path(&id(), 1);
         // Issue A (never used) and B (used right away, so it is not in the first-use window).
-        let a = tokens.issue(path_a.clone());
+        let _a = tokens.issue(path_a);
         let b = tokens.issue(path_b.clone());
         assert!(
             tokens.check(&b, &path_b),
@@ -412,9 +419,10 @@ mod tests {
         );
         assert_eq!(tokens.len(), 2, "two tokens issued, two live");
 
-        // 61 s later: A, which was never used, is past its first-use window.
+        // 61 s later: A, which was never used, is past its first-use window. No `check` runs
+        // in between, so A is still in the store, merely expired: `len` is the next thing
+        // to drop it.
         *handle.lock().expect("the test clock") += Duration::from_secs(61);
-        assert!(!tokens.check(&a, &path_a), "A is past its first-use window");
         // `len` drops A and counts only B.
         assert_eq!(tokens.len(), 1, "only B is live");
         assert!(tokens.check(&b, &path_b), "B is still alive");

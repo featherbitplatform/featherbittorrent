@@ -91,6 +91,10 @@ pub enum ConfigLoad {
     /// [`MAX_PLAYER_ARG_BYTES`] bytes. The file is left exactly where it is - it was read, and a
     /// person fixing the line needs to see what was in it - and every setting but the player's is
     /// kept as read. Only the player's comes back at its default, and the run works on that.
+    ///
+    /// The reset is in memory, not in the file: the next save of this config - for example the
+    /// first limits save the local engine makes while it runs - writes the default player over
+    /// the bad value, so the file is corrected on the next write, not before.
     PlayerProblem {
         /// The config as the file has it, with only the player's setting at its default.
         config: Config,

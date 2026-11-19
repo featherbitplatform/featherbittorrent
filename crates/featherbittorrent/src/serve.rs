@@ -168,6 +168,80 @@ fn offline_settings(config: &Config, offline: bool) -> fbt::Settings {
     settings
 }
 
+/// What a loaded config means for `serve`: whether to serve it as read (no wizard)
+/// or to start the wizard from it. The second value is the line about the file that
+/// `Config::load` reported, kept until the first log line is out of the way.
+#[derive(Debug)]
+pub enum ServeBase {
+    /// The file named a server: it has already been asked the questions the wizard
+    /// asks, so serve it as read, with no prompting.
+    Ready {
+        /// The config to serve, resolved.
+        config: Config,
+        /// The one line to log before `listening on`, if the file needed saying something.
+        problem: Option<String>,
+    },
+    /// No server section to serve as read: the wizard starts from this base and the
+    /// file is rewritten with its answers.
+    Wizard {
+        /// The base the wizard starts from.
+        base: Config,
+        /// The one line to log before `listening on`, if the file needed saying something.
+        problem: Option<String>,
+    },
+}
+
+/// What a loaded config means for `serve`, decided without touching stdin or stdout:
+/// the pure half of [`config_for_serve`], factored out so a test can check the
+/// decision without running a server or prompting.
+///
+/// A file that carries a server section has already been asked the questions the
+/// wizard asks, so it is served as read. A file that reads as this config but whose
+/// only problem is the player's setting is in the same shape: the server section is
+/// there and valid, the player's value is the one thing a run does not act on, so the
+/// config is served as read (the player's at its default) and the one line about it is
+/// kept to log. Every other shape is what the wizard starts from.
+pub fn serve_base_from_load(loaded: ConfigLoad, paths: &Paths) -> ServeBase {
+    match loaded {
+        // A file that carries a server section has already been asked these questions; one that does
+        // not, which is what a settings save from the TUI writes, never has. Presence is in the parsed
+        // config: `Config` keeps no implicit server section to mistake for an answer.
+        ConfigLoad::Loaded(config) if config.server.is_some() => ServeBase::Ready {
+            config: config.resolve(paths),
+            problem: None,
+        },
+        ConfigLoad::Loaded(config) => ServeBase::Wizard {
+            base: config,
+            problem: None,
+        },
+        // The file read as this config and named a server: the player's setting is the one thing a
+        // run does not act on, so the config is served as read, the player's at its default, and the
+        // one line about it is kept to log. This is the case a bad `player` value must not push into
+        // the wizard: a server config with a player typo is still a server config.
+        ConfigLoad::PlayerProblem { config, problem } if config.server.is_some() => {
+            ServeBase::Ready {
+                config,
+                problem: Some(problem),
+            }
+        }
+        // A player problem on a config with no server section is the same shape as a first run: the
+        // wizard starts from the file's settings, the player's at its default.
+        ConfigLoad::PlayerProblem { config, problem } => ServeBase::Wizard {
+            base: config,
+            problem: Some(problem),
+        },
+        // The unreadable bytes are already kept aside under `.bad`, so asking again loses nothing.
+        ConfigLoad::Bad { config, problem } => ServeBase::Wizard {
+            base: config,
+            problem: Some(problem),
+        },
+        ConfigLoad::Missing => ServeBase::Wizard {
+            base: Config::default_for(paths),
+            problem: None,
+        },
+    }
+}
+
 /// The config to serve on: what the file says, or the wizard's answers when there
 /// is no file, no server section in it, or bytes this run could not read. Called
 /// with the library lock already held, so a wizard run cannot replace a file some
@@ -175,53 +249,30 @@ fn offline_settings(config: &Config, offline: bool) -> fbt::Settings {
 ///
 /// A server address and a login rule are two decisions nobody should have to look
 /// up in a YAML file, and a config written by the TUI has never been asked them.
-/// The second value is the line about the state file that `Config::load` reported,
-/// which becomes a warning once the first log line is out of the way.
+/// The second value is the line about the file that `Config::load` reported, which
+/// becomes a warning once the first log line is out of the way.
 fn config_for_serve(paths: &Paths) -> Result<(Config, Option<String>), Failure> {
-    let startup_problem;
-    let base = match Config::load(paths)? {
-        // A file that carries a server section has already been asked these questions; one that does not,
-        // which is what a settings save from the TUI writes, never has. Presence is in the parsed config:
-        // `Config` keeps no implicit server section to mistake for an answer.
-        ConfigLoad::Loaded(config) if config.server.is_some() => {
-            return Ok((config.resolve(paths), None));
+    match serve_base_from_load(Config::load(paths)?, paths) {
+        // A file that named a server is served as read: no prompting, no rewrite.
+        ServeBase::Ready { config, problem } => Ok((config, problem)),
+        // Everything else starts the wizard, which rewrites the file with its answers.
+        ServeBase::Wizard { base, problem } => {
+            let stdin = std::io::stdin();
+            let secret_input = stdin.is_terminal();
+            let mut input = stdin.lock();
+            let mut out = std::io::stdout();
+            let config = wizard::run(&base, &mut input, &mut out, secret_input)?;
+            drop(input);
+            config.save(&paths.config_file())?;
+            writeln!(out, "Wrote {}", paths.config_file().display())?;
+            writeln!(
+                out,
+                "Add a device key later with: featherbittorrent device add"
+            )?;
+            let _ = out.flush();
+            Ok((config.resolve(paths), problem))
         }
-        ConfigLoad::Loaded(config) => {
-            startup_problem = None;
-            config
-        }
-        ConfigLoad::PlayerProblem { config, problem } => {
-            // The file was read and is left where it is: its settings, the player's at its
-            // default, are what the wizard starts from.
-            startup_problem = Some(problem);
-            config
-        }
-        ConfigLoad::Bad { config, problem } => {
-            // The unreadable bytes are already kept aside under `.bad`, so asking
-            // again loses nothing.
-            startup_problem = Some(problem);
-            config
-        }
-        ConfigLoad::Missing => {
-            startup_problem = None;
-            Config::default_for(paths)
-        }
-    };
-
-    let stdin = std::io::stdin();
-    let secret_input = stdin.is_terminal();
-    let mut input = stdin.lock();
-    let mut out = std::io::stdout();
-    let config = wizard::run(&base, &mut input, &mut out, secret_input)?;
-    drop(input);
-    config.save(&paths.config_file())?;
-    writeln!(out, "Wrote {}", paths.config_file().display())?;
-    writeln!(
-        out,
-        "Add a device key later with: featherbittorrent device add"
-    )?;
-    let _ = out.flush();
-    Ok((config.resolve(paths), startup_problem))
+    }
 }
 
 /// Waits for the cue to stop: Ctrl-C, or SIGTERM on Unix, or (debug builds) the
@@ -374,5 +425,103 @@ impl<'w> MakeWriter<'w> for HeldMakeWriter {
 
     fn make_writer(&'w self) -> HeldWriter {
         HeldWriter
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServeBase, serve_base_from_load};
+    use fbtt_core::scratch::ScratchDir;
+    use fbtt_core::{Config, Paths};
+    use std::fs;
+
+    /// A scratch library: config side and data side in the same place, which is all
+    /// `Config::load` and `serve_base_from_load` need to know.
+    fn library(dir: &ScratchDir) -> Paths {
+        Paths {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        }
+    }
+
+    /// A server config whose only problem is the player's setting is served as read, with the
+    /// one line kept to log: it is not a first run, and the wizard must not be asked anything.
+    /// This is the case a bad `player` value used to push into the wizard, which under systemd or
+    /// Docker would stall or fail, and which, if the wizard completed, would rewrite the file.
+    #[test]
+    fn a_server_config_with_a_player_problem_is_served_not_wizarded() {
+        let dir = ScratchDir::new("serve_player_problem");
+        let paths = library(&dir);
+
+        // A valid server section and a player whose program is empty: the one thing a run does
+        // not act on, and nothing else wrong.
+        fs::write(
+            paths.config_file(),
+            "server:\n  bind: 127.0.0.1:8099\nplayer:\n  program: \"\"\n",
+        )
+        .expect("write a server config with a bad player");
+
+        let loaded = Config::load(&paths).expect("the file is read, not refused");
+        let base = serve_base_from_load(loaded, &paths);
+
+        // It is served as read, not started through the wizard.
+        let ServeBase::Ready { config, problem } = base else {
+            panic!(
+                "a server config with a player problem is served as read, not wizarded: {base:?}"
+            );
+        };
+
+        // The server section is exactly as the file has it.
+        let bind = config
+            .server
+            .as_ref()
+            .expect("the server section survives a bad player")
+            .bind;
+        assert_eq!(
+            bind,
+            "127.0.0.1:8099"
+                .parse()
+                .expect("the address the file named"),
+            "the server's bind is kept as the file named it"
+        );
+
+        // The player's setting is at its default: the default program, no extra arguments.
+        assert_eq!(
+            config.player,
+            Config::default().player,
+            "only the player's is reset"
+        );
+
+        // The one line about the player's setting is kept to log before `listening on`.
+        assert!(
+            problem
+                .as_ref()
+                .expect("the problem line is kept to log")
+                .lines()
+                .count()
+                == 1,
+            "one line: {problem:?}"
+        );
+    }
+
+    /// A config with a player problem and no server section is still a first run: the wizard
+    /// starts from it. Only the server-section case skips the wizard.
+    #[test]
+    fn a_player_problem_without_a_server_still_wizards() {
+        let dir = ScratchDir::new("serve_player_problem_no_server");
+        let paths = library(&dir);
+
+        fs::write(paths.config_file(), "player:\n  program: \"\"\n")
+            .expect("write a player config with no server");
+
+        let loaded = Config::load(&paths).expect("the file is read, not refused");
+        let base = serve_base_from_load(loaded, &paths);
+
+        // No server section: the wizard starts from it.
+        let ServeBase::Wizard { base, problem } = base else {
+            panic!("no server section, so the wizard starts: {base:?}");
+        };
+        assert!(problem.is_some(), "the problem line is kept to log");
+        assert!(base.server.is_none(), "no server section to serve as read");
     }
 }
