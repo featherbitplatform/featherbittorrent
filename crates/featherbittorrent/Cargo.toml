@@ -1,6 +1,6 @@
 [package]
 name = "featherbittorrent"
-description = "BitTorrent client for the terminal: a local TUI, and a server with milestone 2."
+description = "BitTorrent client for the terminal: a local TUI, and a headless server it can drive."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-clap.workspace = true
+# `string` is for `assets.rs`: it builds a command again from the name and text of one that was already
+# built, and those are owned strings rather than `'static` literals.
+clap = { workspace = true, features = ["string"] }
+# The hidden `generate-assets` subcommand: the man pages (`clap_mangen`) and the shell completions
+# (`clap_complete`) the packages install, built from the same `Command` as `--help`. They are in every
+# build, release included, because the packaging scripts run the release binary to make them.
+clap_complete.workspace = true
+clap_mangen.workspace = true
 # The library this binary wires terminal, runtime and backend together with.
 fbtt-core.workspace = true
 fbtt-tui.workspace = true
@@ -68,3 +75,65 @@ rustix = { workspace = true, features = ["std", "stdio", "event"] }
 # The test process holds `LibraryLock` to make the binary's second acquire lose, and `fbtt_core::scratch`
 # gives the pure decisions above a library directory of their own to read.
 fbtt-core = { workspace = true, features = ["test-support"] }
+
+# Packages: cargo-deb and cargo-generate-rpm read these two sections (both tools are pinned in
+# .github/workflows/release.yml; they are packaging tools, not dependencies of the build). The binary
+# links only libc, libm, libgcc_s and the loader, so `depends` is short; dev/check-linux-binary.sh
+# refuses a binary that asks for a newer glibc than 2.34 or for any other shared library, which is what
+# keeps this list true. No maintainer scripts and no systemd-units: a package never installs, enables or
+# starts a service (the design spec's autostart non-goal), so the example units ship as documentation
+# under /usr/share/doc instead of under a unit directory. The man pages and completions are the
+# `generate-assets` output staged by dev/package-linux.sh; their sources sit under target/release because
+# that is the prefix both tools resolve to the build's own target directory, wherever CARGO_TARGET_DIR
+# sends it, and the pages arrive already gzipped because Debian policy wants them compressed.
+[package.metadata.deb]
+name = "featherbittorrent"
+maintainer = "featherbit <featherbit-gw@outlook.com>"
+copyright = "featherbit"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+featherbittorrent is a BitTorrent client for the terminal, built on fbt-lib. It runs either as a TUI \
+that downloads and seeds on the machine in front of you, or headless as a server that the same TUI \
+controls over the network."""
+section = "net"
+priority = "optional"
+depends = "libc6 (>= 2.34), libgcc-s1"
+assets = [
+    ["target/release/featherbittorrent", "usr/bin/", "755"],
+    ["target/release/pkg/man/*.1.gz", "usr/share/man/man1/", "644"],
+    ["target/release/pkg/completions/featherbittorrent.bash", "usr/share/bash-completion/completions/featherbittorrent", "644"],
+    ["target/release/pkg/completions/_featherbittorrent", "usr/share/zsh/vendor-completions/_featherbittorrent", "644"],
+    ["target/release/pkg/completions/featherbittorrent.fish", "usr/share/fish/vendor_completions.d/featherbittorrent.fish", "644"],
+    ["../../README.md", "usr/share/doc/featherbittorrent/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/featherbittorrent/NOTICE", "644"],
+    ["../../docs/autostart.md", "usr/share/doc/featherbittorrent/autostart.md", "644"],
+    ["../../docs/server.md", "usr/share/doc/featherbittorrent/server.md", "644"],
+    ["../../docs/reverse-proxy.md", "usr/share/doc/featherbittorrent/reverse-proxy.md", "644"],
+    ["../../packaging/systemd/system/featherbittorrent.service", "usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service", "644"],
+    ["../../packaging/systemd/user/featherbittorrent.service", "usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service", "644"],
+]
+
+# Fedora's zsh path is site-functions, not Debian's vendor-completions; RPM puts licenses under
+# /usr/share/licenses. `doc = true` marks the documentation files so removal owns them with the package.
+# The requirements are cargo-generate-rpm's automatic ones, read from the packaged binary itself:
+# dev/package-linux.sh prints `rpm -qpR` and refuses anything the deb `depends` above does not cover
+# too. No script keys here either, for the same reason as above.
+[package.metadata.generate-rpm]
+name = "featherbittorrent"
+summary = "BitTorrent client for the terminal, with a headless server"
+url = "https://github.com/featherbitplatform/featherbittorrent"
+assets = [
+    { source = "target/release/featherbittorrent", dest = "/usr/bin/featherbittorrent", mode = "755" },
+    { source = "target/release/pkg/man/*.1.gz", dest = "/usr/share/man/man1/", mode = "644" },
+    { source = "target/release/pkg/completions/featherbittorrent.bash", dest = "/usr/share/bash-completion/completions/featherbittorrent", mode = "644" },
+    { source = "target/release/pkg/completions/_featherbittorrent", dest = "/usr/share/zsh/site-functions/_featherbittorrent", mode = "644" },
+    { source = "target/release/pkg/completions/featherbittorrent.fish", dest = "/usr/share/fish/vendor_completions.d/featherbittorrent.fish", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/featherbittorrent/README.md", mode = "644", doc = true },
+    { source = "../../docs/autostart.md", dest = "/usr/share/doc/featherbittorrent/autostart.md", mode = "644", doc = true },
+    { source = "../../docs/server.md", dest = "/usr/share/doc/featherbittorrent/server.md", mode = "644", doc = true },
+    { source = "../../docs/reverse-proxy.md", dest = "/usr/share/doc/featherbittorrent/reverse-proxy.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/featherbittorrent/LICENSE", mode = "644", doc = true },
+    { source = "../../NOTICE", dest = "/usr/share/licenses/featherbittorrent/NOTICE", mode = "644", doc = true },
+    { source = "../../packaging/systemd/system/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service", mode = "644", doc = true },
+    { source = "../../packaging/systemd/user/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service", mode = "644", doc = true },
+]

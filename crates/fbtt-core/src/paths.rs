@@ -2,10 +2,12 @@
 //! config directory, the session state and the library lock in its data
 //! directory.
 //!
-//! The debug variables `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR` each replace one
-//! of the two directories, which is how a scratch library runs beside the real
-//! one (see `CLAUDE.md`). Nothing here creates a directory: [`Config::save`]
-//! and the engine make room in whatever they write into.
+//! `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR` are supported overrides: each one
+//! replaces one of the two directories, which is how a test keeps a scratch
+//! library beside the real one and how a service or a container keeps its
+//! library outside any home directory (see `CLAUDE.md`). Nothing here creates a
+//! directory: [`Config::save`] and the engine make room in whatever they write
+//! into.
 //!
 //! [`Config::save`]: crate::Config::save
 
@@ -18,8 +20,8 @@ use crate::config::ConfigError;
 
 /// The identity the platform's conventions key on: the reverse domain
 /// `io.featherbit` plus the application name, which becomes
-/// `~/.config/io.featherbit.featherbittorrent` on Linux and the matching
-/// bundle or AppData folder elsewhere.
+/// `~/.config/featherbittorrent` on Linux and the matching bundle or AppData
+/// folder elsewhere.
 const PROJECT: (&str, &str, &str) = ("io", "featherbit", "featherbittorrent");
 
 /// The config file, in [`Paths::config_dir`].
@@ -53,8 +55,8 @@ impl Paths {
     ///
     /// `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR` win; what they leave out comes
     /// from [`ProjectDirs::from("io", "featherbit", "featherbittorrent")`](ProjectDirs::from).
-    /// A host with no home directory and no debug variable is
-    /// [`ConfigError::NoHome`]; setting both variables works even there.
+    /// A host with no home directory and neither override set is
+    /// [`ConfigError::NoHome`]; setting both works even there.
     pub fn resolve() -> Result<Paths, ConfigError> {
         Self::resolve_with(|key| std::env::var_os(key))
     }
@@ -131,8 +133,8 @@ mod tests {
     use directories::ProjectDirs;
     use std::ffi::OsString;
 
-    /// The debug variables win over the platform's directories, so a scratch
-    /// library can run anywhere without touching the real one.
+    /// The overrides win over the platform's directories, so a scratch library
+    /// can run anywhere without touching the real one.
     #[test]
     fn env_overrides_paths() {
         let dir = ScratchDir::new("paths_env");
@@ -155,8 +157,8 @@ mod tests {
         assert_eq!(paths.play_dir(), data_dir.join(PLAY_DIR_NAME));
     }
 
-    /// Without the debug variables the platform's own directories are used, so
-    /// a normal run lands in `~/.config` and `~/.local/share` on Linux, or in
+    /// Without the overrides the platform's own directories are used, so a
+    /// normal run lands in `~/.config` and `~/.local/share` on Linux, or in
     /// their macOS and Windows equivalents.
     #[test]
     fn without_env_the_project_dirs_are_used() {
@@ -174,8 +176,8 @@ mod tests {
         assert_eq!(paths.data_dir, project.data_dir());
     }
 
-    /// An empty debug variable is a mistake, not a directory: it does not turn
-    /// the library into files in whatever directory the app was started in.
+    /// An empty override is a mistake, not a directory: it does not turn the
+    /// library into files in whatever directory the app was started in.
     #[test]
     fn an_empty_env_value_is_no_value() {
         let Some(project) = ProjectDirs::from(PROJECT.0, PROJECT.1, PROJECT.2) else {
