@@ -12,7 +12,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-clap.workspace = true
+# `string` is for `assets.rs`: it builds a command again from the name and text of one that was already
+# built, and those are owned strings rather than `'static` literals.
+clap = { workspace = true, features = ["string"] }
+# The hidden `generate-assets` subcommand: the man pages (`clap_mangen`) and the shell completions
+# (`clap_complete`) the packages install, built from the same `Command` as `--help`. They are in every
+# build, release included, because the packaging scripts run the release binary to make them.
+clap_complete.workspace = true
+clap_mangen.workspace = true
 # The library this binary wires terminal, runtime and backend together with.
 fbtt-core.workspace = true
 fbtt-tui.workspace = true

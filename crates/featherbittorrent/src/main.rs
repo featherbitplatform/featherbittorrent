@@ -7,12 +7,14 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::{BufRead, IsTerminal, Stdout, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use fbtt_core::Paths;
 
 mod admin;
+mod assets;
 mod backend;
 mod exit;
 #[cfg(test)]
@@ -26,9 +28,39 @@ mod wizard;
 
 use crate::exit::Failure;
 
+/// Where the library's files are, what the environment can move them to, and what each exit code
+/// means: the three paragraphs that belong beside the flags rather than in any one subcommand's help.
+///
+/// Every body line starts with two spaces and stays under 75 columns. That is what makes both readers
+/// agree: clap prints `after_long_help` without wrapping it, so a long line would run past the
+/// terminal, and man keeps a text line that begins with white space on a line of its own (it fills
+/// unindented lines into one folded paragraph), so a line over 75 columns would break mid-path at the
+/// width man renders at. Raw text so the Windows paths keep their single backslashes; the roff writer
+/// escapes them for the page.
+const LONG_HELP_AFTER: &str = r#"FILES:
+  config.yaml and ui.yaml live in this library's config directory:
+  Linux ~/.config/featherbittorrent
+  macOS ~/Library/Application Support/io.featherbit.featherbittorrent
+  Windows %APPDATA%\featherbit\featherbittorrent\config
+  session.state and library.lock live in the data directory:
+  Linux ~/.local/share/featherbittorrent
+  Windows %APPDATA%\featherbit\featherbittorrent\data
+  On macOS the config and data directories are the same folder.
+
+ENVIRONMENT:
+  FBTT_CONFIG_DIR and FBTT_DATA_DIR each replace one of those directories,
+  which is how a service or a container keeps a library outside the home
+  directory. RUST_LOG decides what serve writes to stderr.
+
+EXIT STATUS:
+  0 stopped cleanly. 1 something went wrong, and the line on stderr says
+  what. 2 clap could not read the command line. 3 another featherbittorrent
+  holds this library.
+"#;
+
 /// BitTorrent client for the terminal.
 #[derive(Parser)]
-#[command(name = "featherbittorrent", version)]
+#[command(name = "featherbittorrent", version, after_long_help = LONG_HELP_AFTER)]
 struct Cli {
     /// What to run. With nothing, the terminal client.
     #[command(subcommand)]
@@ -43,6 +75,9 @@ enum Action {
     User(UserArgs),
     /// Register a device key, or list the ones that log in without a password.
     Device(DeviceArgs),
+    /// Write the man pages and shell completions the packages install, from this same command.
+    #[command(hide = true, name = "generate-assets")]
+    GenerateAssets(assets::GenerateAssetsArgs),
 }
 
 #[derive(Args)]
@@ -154,7 +189,18 @@ fn main() -> ExitCode {
                 admin::list_devices(paths, out)
             })),
         },
+        Some(Action::GenerateAssets(args)) => report(generate_assets(&args.dir)),
     }
+}
+
+/// Writes the packaging assets into `dir` and prints one line per file written, which is what the
+/// packaging scripts read to know what to gzip and where to copy it. No library paths are involved:
+/// this command touches nothing but the directory it was given.
+fn generate_assets(dir: &Path) -> Result<(), Failure> {
+    for path in assets::write_assets(Cli::command(), dir)? {
+        println!("{}", path.display());
+    }
+    Ok(())
 }
 
 /// One terminal run: the runtime, then `run::run`'s own answer.

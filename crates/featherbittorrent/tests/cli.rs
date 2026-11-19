@@ -128,11 +128,7 @@ fn terminal_setup_failure_exits() {
         .expect("a config on a port the OS picks");
     // stderr goes to a file, not a pipe: nothing to drain, and no way for a full pipe
     // buffer to look like a hung binary.
-    let err_path = scratch
-        .config_dir
-        .parent()
-        .expect("a scratch root")
-        .join("stderr.txt");
+    let err_path = scratch.root.join("stderr.txt");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
         .env("FBTT_CONFIG_DIR", &scratch.config_dir)
@@ -194,9 +190,165 @@ fn terminal_setup_failure_exits() {
     );
 }
 
-/// A scratch pair of directories, removed when the test that made it is done. The
+/// The hidden `generate-assets` subcommand writes what the packages install: man pages and
+/// completions built from the same `Command` that prints `--help`, so they cannot drift from the
+/// flags. This is the whole command on a scratch directory, seen the way the packaging scripts see
+/// it. The binary under test is a debug build, which means it also has the two hidden `serve`
+/// flags; nothing hidden may show up in a file somebody installs, because a release build does not
+/// accept those flags at all.
+#[test]
+fn generate_assets_writes_man_and_completions() {
+    let scratch = Scratch::new("generate_assets");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .arg("generate-assets")
+        .arg(&scratch.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        out.status.success(),
+        "assets written into a writable directory is exit 0: {stderr}"
+    );
+
+    // One page for the command and one for each subcommand, named by joining the command path
+    // with `-`, plus the four shells the packaging scripts copy out of this directory.
+    const SHIPPED: [&str; 8] = [
+        "man/featherbittorrent.1",
+        "man/featherbittorrent-serve.1",
+        "man/featherbittorrent-user-set.1",
+        "man/featherbittorrent-device-add.1",
+        "completions/featherbittorrent.bash",
+        "completions/_featherbittorrent",
+        "completions/featherbittorrent.fish",
+        "completions/_featherbittorrent.ps1",
+    ];
+    for shipped in SHIPPED {
+        let path = scratch.root.join(shipped);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|problem| panic!("{} was not written: {problem}", path.display()));
+        assert!(!text.trim().is_empty(), "{} came out empty", path.display());
+        // The command prints every path it wrote, which is how the packaging scripts know what
+        // to gzip and copy.
+        assert!(
+            stdout.contains(&path.display().to_string()),
+            "stdout lists every file written, and not this one: {stdout}"
+        );
+    }
+
+    // A man page that `man` can render, and a top page that says the subcommands exist.
+    let top_page = fs::read_to_string(scratch.root.join("man/featherbittorrent.1")).unwrap();
+    assert!(
+        top_page.contains(".TH"),
+        "the page carries the roff macros man reads: {top_page}"
+    );
+    assert!(
+        top_page.contains("serve"),
+        "the top page names the subcommands: {top_page}"
+    );
+
+    // A completion script that knows the subcommands, which is what a person typing expects.
+    let bash = fs::read_to_string(scratch.root.join("completions/featherbittorrent.bash")).unwrap();
+    assert!(
+        bash.contains("serve") && bash.contains("device"),
+        "the bash completion knows the subcommands: {bash}"
+    );
+
+    // The hidden subcommand and the debug-only `serve` flags belong to this build only, so no
+    // shipped file may mention them.
+    for dir in ["man", "completions"] {
+        let entries = fs::read_dir(scratch.root.join(dir))
+            .unwrap_or_else(|problem| panic!("{} is missing: {problem}", dir));
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            let text = fs::read_to_string(&path).expect("a generated file reads as text");
+            for hidden in ["generate-assets", "stop-file", "offline"] {
+                assert!(
+                    !text.contains(hidden),
+                    "{} mentions the hidden `{hidden}`, which a release build does not have: {}",
+                    path.display(),
+                    // The line that got it wrong, so the failure says what to filter.
+                    text.lines()
+                        .find(|line| line.contains(hidden))
+                        .unwrap_or("")
+                        .trim()
+                );
+            }
+        }
+    }
+}
+
+/// An unwritable directory is a problem like any other: one line on stderr and exit 1, not a panic
+/// and not clap's usage error. The scratch root is made, then taken away, so the path exists as a
+/// file where no directory can be written.
+#[test]
+fn generate_assets_reports_an_unwritable_directory() {
+    let scratch = Scratch::new("generate_assets_unwritable");
+    let blocked = scratch.root.join("blocked");
+    fs::write(&blocked, "not a directory\n").expect("a file where the assets were asked for");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .arg("generate-assets")
+        .arg(&blocked)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a directory that cannot be written is exit 1: {:?}",
+        String::from_utf8(out.stderr).unwrap()
+    );
+}
+
+/// `generate-assets` exists for the packaging scripts, not for a person at a prompt, so it is not in
+/// `--help`, and completions built from the same command do not offer it.
+#[test]
+fn generate_assets_is_hidden() {
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("generate-assets"),
+        "the help a person reads does not list the packaging subcommand: {stdout}"
+    );
+}
+
+/// The man page and the terminal see the same text, so what a person needs to know about where the
+/// library lives, what the environment variables do, and what the exit codes mean is in `--help`.
+#[test]
+fn help_names_files_and_exit_codes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for expected in ["FBTT_CONFIG_DIR", "config.yaml", "EXIT STATUS"] {
+        assert!(
+            stdout.contains(expected),
+            "--help says {expected}, and did not: {stdout}"
+        );
+    }
+}
+
+/// A scratch set of directories, removed when the test that made it is done. The
 /// workspace takes no `tempfile` dependency, so tests make their own scratch space.
 struct Scratch {
+    /// The directory the config and data directories are made inside, which is also where a test
+    /// that needs somewhere to write files puts them.
+    root: PathBuf,
     config_dir: PathBuf,
     data_dir: PathBuf,
 }
@@ -212,6 +364,7 @@ impl Scratch {
                 .unwrap_or(0),
         ));
         let scratch = Scratch {
+            root: dir.clone(),
             config_dir: dir.join("config"),
             data_dir: dir.join("data"),
         };
@@ -223,7 +376,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // Best effort, and a directory already gone is not a failure.
-        match fs::remove_dir_all(self.config_dir.parent().unwrap()) {
+        match fs::remove_dir_all(&self.root) {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             other => other.unwrap(),
         }
