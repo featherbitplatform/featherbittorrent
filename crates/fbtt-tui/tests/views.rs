@@ -1292,21 +1292,34 @@ fn the_help_mark_never_covers_a_key_line() {
                 // without the mark - that is the box's own size, not the mark's - so the
                 // reference is the mark-free draw's own key lines, and the mark is judged against
                 // it.
-                let key_lines = |lines: &[String]| -> Vec<String> {
+                // The box's top row and columns: the row holding the `┌` (a centred box has
+                // none at row 0), and the columns of that row's `┌` and `┐`. A screen without
+                // them is a test that checks nothing, so it fails instead of falling back.
+                let box_of = |lines: &[String]| -> (usize, usize, usize) {
                     let start = lines
                         .iter()
-                        .position(|line| line.starts_with('┌'))
-                        .unwrap_or(0);
-                    let end = lines
-                        .iter()
-                        .rposition(|line| line.starts_with('└'))
-                        .unwrap_or_else(|| lines.len().saturating_sub(1));
+                        .position(|line| line.contains('┌'))
+                        .unwrap_or_else(|| {
+                            panic!("{width}x{height} cell {cell:?}: no help box top border found")
+                        });
+                    let top = &lines[start];
+                    let first = top.chars().position(|c| c == '┌').expect("a corner");
+                    let last = top.chars().position(|c| c == '┐').unwrap_or_else(|| {
+                        panic!(
+                            "{width}x{height} cell {cell:?}: the help box has no top-right corner"
+                        )
+                    });
+                    (start, first, last)
+                };
+                let key_lines = |lines: &[String]| -> Vec<String> {
                     // Only the box's own columns, from its top-left corner to its top-right: the
                     // rows beside the box are the view behind the dialog, and a word of it
                     // ("connect" in the header) must not stand in for a key line the box clipped.
-                    let top = lines.get(start).map(String::as_str).unwrap_or_default();
-                    let first = top.chars().position(|c| c == '┌').unwrap_or(0);
-                    let last = top.chars().position(|c| c == '┐').unwrap_or(first);
+                    let (start, first, last) = box_of(lines);
+                    let end = lines
+                        .iter()
+                        .rposition(|line| line.starts_with('└') || line.contains('└'))
+                        .unwrap_or_else(|| lines.len().saturating_sub(1));
                     lines[start..=end.min(lines.len().saturating_sub(1))]
                         .iter()
                         .map(|line| {
@@ -1349,6 +1362,41 @@ fn the_help_mark_never_covers_a_key_line() {
                         top_row + 1,
                         "{width}x{height} cell {cell:?}: the mark is on the row right below the box's top border, not on it"
                     );
+                    // The rows the mark reserves are exactly its own plus one blank separator:
+                    // the row right below the mark's rect, inside the box, is blank, and the
+                    // first key line stands below the mark's bottom edge. A reserve one row short
+                    // leaves a key on that row.
+                    let (_, first, last) = box_of(&lines);
+                    let below = usize::from(large.rect.y) + usize::from(large.rect.height);
+                    let inner: String = lines[below]
+                        .chars()
+                        .skip(first + 1)
+                        .take(last - first - 1)
+                        .collect();
+                    assert!(
+                        inner.trim().is_empty(),
+                        "{width}x{height} cell {cell:?}: the row under the mark is not the blank separator: {inner:?}"
+                    );
+                    // A box too short to hold any key under the mark draws none, which is the box's
+                    // own size; where one is drawn, it is below the mark's bottom edge.
+                    let first_key_row =
+                        lines
+                            .iter()
+                            .enumerate()
+                            .skip(top_row + 1)
+                            .find_map(|(i, line)| {
+                                let boxed: String =
+                                    line.chars().skip(first).take(last + 1 - first).collect();
+                                KEYS.iter()
+                                    .any(|(k, a)| boxed.contains(k) && boxed.contains(a))
+                                    .then_some(i)
+                            });
+                    if let Some(row) = first_key_row {
+                        assert!(
+                            row > below,
+                            "{width}x{height} cell {cell:?}: a key line stands at or above the mark's bottom edge"
+                        );
+                    }
                 }
             }
         }
