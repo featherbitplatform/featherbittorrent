@@ -1375,7 +1375,7 @@ fn the_help_mark_never_covers_a_key_line() {
                     // the row right below the mark's rect, inside the box, is blank, and the
                     // first key line stands below the mark's bottom edge. A reserve one row short
                     // leaves a key on that row.
-                    let (_, first, last, end) = box_of(&lines);
+                    let (_, first, last, _) = box_of(&lines);
                     let below = usize::from(large.rect.y) + usize::from(large.rect.height);
                     let row_below = lines.get(below).unwrap_or_else(|| {
                         panic!("{width}x{height} cell {cell:?}: the row under the mark ({below}) is off the screen")
