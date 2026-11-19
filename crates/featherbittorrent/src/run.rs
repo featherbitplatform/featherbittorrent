@@ -16,7 +16,7 @@ use std::time::Instant;
 use crossterm::event::EventStream;
 
 use fbtt_core::ui_state::{LastUsed, RemoteTarget, UiState};
-use fbtt_core::{Config, ConfigLoad, LibraryLock, Notice, Paths};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, LogoSetting, Notice, Paths};
 use fbtt_tui::{Modal, Model};
 
 use crate::backend::{Backend, LockOutcome, Start, initial_target, named_server};
@@ -88,6 +88,12 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    // The logo's capability probe (see `crate::probe`): one write of the queries and the answers that come
+    // back, asked here because it owns stdin until it is done and `EventStream` cannot share it. The logo
+    // setting is read from the config before it moves into `Opening`.
+    let logo_off = config.logo == LogoSetting::Off;
+    let graphics = crate::probe::detect(logo_off);
+
     // Before the terminal: a library somebody else is driving is a sentence to read, not a screen to see,
     // and so is the offer about the server running on it - that other run may be drawing on this terminal
     // right now. A keychain is consulted here too, for the same reason the engine is started after the
@@ -128,11 +134,6 @@ pub async fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    // The logo's capability probe (see `crate::probe`): one write of the queries and the answers that come
-    // back, asked here because it owns stdin until it is done and `EventStream` cannot share it. Nothing is
-    // drawn with the answer yet - Task 9 puts it in the screen state and draws with it.
-    let _graphics = crate::probe::detect(false); // Task 9 reads the logo setting here
 
     // Listened for before anything else can go wrong from here on: a listener made once
     // buffers a signal that lands between two turns of the loop, where one made per turn
@@ -220,6 +221,17 @@ pub async fn run() -> ExitCode {
     model.sync_selection(&snap);
     start_watching(&backend, &model);
 
+    // The prepared logos are CPU work (area-averaging a 511x853 PNG into every size the terminal needs,
+    // plus quantization for the image protocols), so they go to the blocking pool. The screen draws the
+    // text title until they arrive; a terminal with no image protocol at all gets nothing to wait for.
+    let prepare_fut = if graphics.protocol != fbtt_tui::graphics::Protocol::None {
+        Some(tokio::task::spawn_blocking(move || {
+            fbtt_tui::graphics::prepare(graphics)
+        }))
+    } else {
+        None
+    };
+
     // The queue for work this run must not wait on: what a sign-in owes (a `ui.yaml` write and a keychain
     // write), and the delete that follows a refusal of a kept password. It is made here, before the screen,
     // because it lives as long as the screen does - every backend this run switches to sends its work on this
@@ -230,17 +242,21 @@ pub async fn run() -> ExitCode {
     // stdin, and switching backends changes which library the screen talks to, not who owns the keyboard.
     let (quit, running) = {
         let mut stream = EventStream::new();
+        let screen = Screen {
+            model: &mut model,
+            snap: &mut snap,
+            logos: None,
+            placer: fbtt_tui::graphics::place::Placer::new(graphics.protocol),
+        };
         run_session(
             terminal.get_mut(),
-            Screen {
-                model: &mut model,
-                snap: &mut snap,
-            },
+            screen,
             backend,
             login,
             &mut work,
             &mut stream,
             &mut signal,
+            prepare_fut,
         )
         .await
     };
@@ -252,6 +268,19 @@ pub async fn run() -> ExitCode {
     let stopped = running
         .stop(&mut model, |model| draw_saving(terminal.get_mut(), model))
         .await;
+    // Kitty's images live in the terminal after this process is gone, and the placeholder cells this run
+    // drew will not be drawn again, so the ids are deleted on the way out. The other protocols write
+    // nothing on exit: their images are the cells the screen is about to leave, and those go with it.
+    use fbtt_tui::graphics::kitty;
+    if graphics.protocol == fbtt_tui::graphics::Protocol::Kitty {
+        let exit_bytes = kitty::delete(kitty::SMALL_ID)
+            .into_iter()
+            .chain(kitty::delete(kitty::LARGE_ID))
+            .collect::<Vec<_>>();
+        use std::io::Write as _;
+        let _ = terminal.get_mut().backend_mut().write_all(&exit_bytes);
+        let _ = terminal.get_mut().backend_mut().flush();
+    }
     drop(terminal); // The terminal goes back before anything is printed to it.
     if let Err(problem) = &stopped {
         eprintln!("{problem}");

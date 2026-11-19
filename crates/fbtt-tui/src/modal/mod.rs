@@ -35,6 +35,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Fill, Paragraph};
 
 use crate::format;
+use crate::graphics::{LogoSize, LogoView, Placement};
 use crate::model::{Action, Model};
 use crate::theme;
 
@@ -173,25 +174,37 @@ fn filter_on_key(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Answer {
 /// Draws the open dialog over a view that has already been drawn. Only the box it adds is blanked,
 /// so the table behind it stays exactly as it was. `snap` is the newest snapshot: a dialog that lists
 /// something the backend reported draws from it rather than keeping its own copy.
-pub(crate) fn draw(frame: &mut Frame, model: &Model, snap: &Snapshot) {
+///
+/// The box's rect comes back, or `None` for the filter and for no dialog at all: a box over a mark
+/// takes the mark off the screen for this frame, and the caller is what decides that.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    model: &Model,
+    snap: &Snapshot,
+    logos: LogoView<'_>,
+) -> Option<Rect> {
     let area = frame.area();
     match &model.modal {
         Some(Modal::Add(form)) => draw_box(frame, area, "Add torrent", add::lines(form, snap)),
         Some(Modal::Connect(form)) => draw_box(frame, area, "Connect", connect::lines(form)),
         Some(Modal::Devices(form)) => draw_box(frame, area, "Devices", devices::lines(form, snap)),
         Some(Modal::Delete { name, .. }) => {
-            draw_box(frame, area, "Delete torrent", delete::lines(name));
+            draw_box(frame, area, "Delete torrent", delete::lines(name))
         }
         Some(Modal::Settings(form)) => draw_box(frame, area, "Settings", settings::lines(form)),
-        Some(Modal::Help) => draw_box(frame, area, "Keys", help::lines(area)),
-        Some(Modal::Filter) => draw_filter(frame, area, model),
-        None => {}
+        Some(Modal::Help) => draw_box(frame, area, "Keys", help::lines(area, logos)),
+        Some(Modal::Filter) => {
+            draw_filter(frame, area, model);
+            None
+        }
+        None => None,
     }
 }
 
 /// The box every dialog but the filter gets: its lines padded one cell inside a border of the rule
-/// colour on the surface colour, sized to what they need and never bigger than the screen.
-fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+/// colour on the surface colour, sized to what they need and never bigger than the screen. The rect
+/// comes back, because a box over a mark takes the mark off the screen for this frame.
+fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) -> Option<Rect> {
     let widest = lines
         .iter()
         .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
@@ -215,6 +228,38 @@ fn draw_box(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>
         box_area,
     );
     frame.render_widget(Paragraph::new(lines), box_area.inner(Margin::new(1, 1)));
+    Some(box_area)
+}
+
+/// The help screen's mark, when there is one to place: the tallest of the prepared large marks the
+/// help box has room for, centred at the top of the box above its keys (decision 12).
+///
+/// The box is `help::lines` plus the border, centred like every other dialog, so the rows the mark
+/// may take are the screen's rows left after that box, and the mark sits in them, on top, where the
+/// box does not reach.
+pub(crate) fn help_placement(area: Rect, logos: LogoView<'_>) -> Option<Placement> {
+    let logos_ref = logos.logos?;
+    // The box, as it will be drawn: the help's lines and the border around them, centred.
+    let lines = help::lines(area, logos);
+    let widest = lines
+        .iter()
+        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    let width = (widest + 4).min(area.width);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let box_area = centred(area, width, height);
+    // The tallest mark the rows above the box can hold, tried from tallest first.
+    logos_ref.large.iter().find_map(|prepared| {
+        let rows = prepared.dims.rows;
+        (box_area.y >= rows).then(|| Placement {
+            size: LogoSize::Large(rows),
+            rect: Rect::new(box_area.x, box_area.y - rows, width, rows),
+            dims: prepared.dims,
+        })
+    })
 }
 
 /// The filter along the bottom of the screen, where the key hints are and go while it is up. It

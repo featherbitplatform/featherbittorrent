@@ -3,11 +3,69 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fbtt_core::{Command, DetailTab, LinkState, RowState, Snapshot, TorrentId};
+use fbtt_tui::graphics::caps::{CellPx, Graphics, Protocol};
+use fbtt_tui::graphics::kitty;
+use fbtt_tui::graphics::place::{LogoSize, LogoView, Placement, PreparedLogos};
 use fbtt_tui::{Action, Descending, SortKey, theme, visible_rows};
+use ratatui::buffer::CellDiffOption;
 use ratatui::style::Color;
 
 mod support;
 use support::*;
+
+/// A drawn screen and the marks the frame placed: `fbtt_tui::view::draw_with` the way the binary
+/// does, with the prepared logos the terminal it pretends to be.
+///
+/// `buffer` is the frame's own buffer, not the backend's: ratatui's diff skips the cells the
+/// mark covers, so the backend only holds what the frame actually wrote, while the frame's
+/// buffer is where the view left its placeholder and skip marks.
+struct Drawn<'a> {
+    screen: Screen,
+    buffer: ratatui::buffer::Buffer,
+    placements: Vec<Placement>,
+    _logos: &'a PreparedLogos,
+}
+
+/// The marks for a terminal whose protocol and cell size a test spells out: the case the binary's
+/// blocking pool answers with. `cell` is the device pixel size of one cell.
+fn logos(protocol: Protocol, cell: CellPx) -> PreparedLogos {
+    fbtt_tui::graphics::prepare(Graphics {
+        protocol,
+        cell: Some(cell),
+        scale: 1,
+    })
+}
+
+/// A screen drawn with the marks `logos` has. The frame's placements are captured on the way
+/// through, the way the binary's draw callback captures them before the frame is handed to the
+/// placer.
+fn drawn_with<'a>(
+    model: &fbtt_tui::Model,
+    snap: &Snapshot,
+    logos: &'a PreparedLogos,
+    width: u16,
+    height: u16,
+) -> Drawn<'a> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+    let mut placements = Vec::new();
+    let frame = terminal
+        .draw(|frame| {
+            placements =
+                fbtt_tui::view::draw_with(frame, model, snap, LogoView { logos: Some(logos) });
+        })
+        .expect("a drawn frame");
+    // The frame's buffer is the one that carries the view's marks: the diff the backend saw
+    // wrote only what changed, and skipped cells are exactly the ones it did not.
+    let buffer = frame.buffer.clone();
+    let screen = Screen::from_terminal(terminal);
+    Drawn {
+        screen,
+        buffer,
+        placements,
+        _logos: logos,
+    }
+}
 
 #[test]
 fn full_view_shows_rows_and_header() {
@@ -711,4 +769,213 @@ fn header_shows_lost_link() {
         text.contains("connected to Local"),
         "the local engine's header changed: {text:?}"
     );
+}
+
+/// A terminal with no image protocol at all: the header is the text title, as it has always been.
+#[test]
+fn no_graphics_shows_text_title() {
+    let snap = library();
+    let model = model_of(&snap);
+    let screen = Screen::new(&model, &snap, 100, 30);
+    // The title line is the mark's space, which the text title fills.
+    let title_col = screen
+        .find("featherbittorrent")
+        .expect("the title is drawn");
+    assert_eq!(
+        title_col.0, 0,
+        "no mark is placed, so the title starts the header"
+    );
+    assert!(
+        !screen.text().contains('\u{10EEEE}'),
+        "no placeholders on a terminal that cannot draw images"
+    );
+}
+
+/// A kitty terminal: the header's cells are placeholders, the image the pixels that will be
+/// there, and the title stands where the mark's blank column leaves it.
+#[test]
+fn kitty_header_cells_are_placeholders() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let placement = drawn
+        .placements
+        .iter()
+        .find(|placement| placement.size == LogoSize::Small)
+        .expect("the header's mark is placed");
+
+    // The mark's cells hold the placeholder: the first of them is the character for row 0, column 0.
+    let cell = &drawn.buffer[(0, 0)];
+    assert!(
+        cell.symbol().starts_with('\u{10EEEE}'),
+        "the first header cell is a placeholder, found {:?}",
+        cell.symbol()
+    );
+    assert_eq!(
+        cell.symbol(),
+        kitty::placeholder(0, 0).as_str(),
+        "row 0, column 0 of the mark"
+    );
+    assert_eq!(
+        cell.fg,
+        kitty::id_colour(kitty::SMALL_ID),
+        "the placeholder's foreground is the id, the one colour that is not a theme token"
+    );
+
+    // The title starts where the mark's columns end: the first cell of the title is the
+    // mark's right edge. The frame buffer holds it as a cell, not as characters, so the
+    // column is a cell count, not a character count.
+    let title_start = usize::from(placement.rect.width);
+    let title_cell = &drawn.buffer[(title_start as u16, 0)];
+    assert!(
+        title_cell.symbol().starts_with('f'),
+        "the title starts at cell {title_start}, found {:?}",
+        title_cell.symbol()
+    );
+
+    // The corner of the mark: its last cell holds the character for its last row and column.
+    let last = &drawn.buffer[(placement.rect.right() - 1, placement.rect.bottom() - 1)];
+    assert_eq!(
+        last.symbol(),
+        kitty::placeholder(2, placement.rect.width - 1).as_str(),
+        "the last cell of the mark"
+    );
+}
+
+/// A sixel terminal: the mark's cells are skipped, so the frame writes nothing over the image
+/// the placer writes after the frame, and the placement the frame returns is where it will be
+/// written.
+#[test]
+fn sixel_header_cells_are_skipped() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    let placement = drawn
+        .placements
+        .iter()
+        .find(|placement| placement.size == LogoSize::Small)
+        .expect("the header's mark is placed");
+    assert_eq!(placement.size, LogoSize::Small);
+
+    // Every cell the mark covers is skipped: the frame never writes it.
+    for y in 0..placement.rect.height {
+        for x in 0..placement.rect.width {
+            let cell = &drawn.buffer[(placement.rect.x + x, placement.rect.y + y)];
+            assert_eq!(
+                cell.diff_option,
+                CellDiffOption::Skip,
+                "the cell at {x}, {y} of the mark must be skipped"
+            );
+        }
+    }
+}
+
+/// The help screen on a tall screen: the mark stands above its keys, the tallest of the
+/// prepared sizes the box leaves room for. At 42 rows the help box (30 rows) is centred at
+/// y=6, leaving six rows above it - the shortest of the prepared large marks.
+#[test]
+fn help_shows_large_logo_when_it_fits() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 42);
+    let large = drawn
+        .placements
+        .iter()
+        .find(|placement| matches!(placement.size, LogoSize::Large(_)));
+    assert!(large.is_some(), "a 30-row screen has room for the mark");
+    let large = large.expect("the mark is there");
+    // The rows of the mark: the tallest the box leaves room for, and it stands above the box,
+    // which it does not reach.
+    let prepared = logos
+        .large
+        .iter()
+        .find(|prepared| prepared.dims.rows == large.dims.rows)
+        .expect("the rows the view placed");
+    assert_eq!(large.dims, prepared.dims);
+}
+
+/// The help screen on a short screen: no rows for the mark, so the keys take them.
+#[test]
+fn help_drops_logo_when_short() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 20);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| matches!(placement.size, LogoSize::Large(_))),
+        "a 20-row screen has no rows for the mark"
+    );
+    // The keys are still all there: the box just took the rows the mark would have stood in.
+    let text = drawn.screen.text();
+    for want in ["quit", "sort by the next column"] {
+        assert!(text.contains(want), "the keys lost {want:?}: {text:?}");
+    }
+}
+
+/// A dialog over the header: the mark is not placed this frame, because the box it would be
+/// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
+/// centred at (0, 0) and covers the three header rows and the mark's columns.
+#[test]
+fn modal_over_header_drops_small_placement() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Settings(
+        fbtt_tui::modal::SettingsForm::new(&snap.limits),
+    ));
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 10, 10);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| placement.size == LogoSize::Small),
+        "a dialog over the header takes the mark off the screen"
+    );
+}
+
+/// The minimal view never has a mark: its one line per torrent is all it is, at any size.
+#[test]
+fn minimal_view_has_no_logo() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.view = fbtt_tui::View::Minimal;
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 30);
+    assert!(
+        drawn.placements.is_empty(),
+        "the minimal view does not place a mark"
+    );
+}
+
+/// A header of one row: the mark wants three, so it is not placed and the one line of text
+/// takes the header it has. At height 7 the header gives up two of its three rows to the
+/// torrents, leaving one row for the name and the rates.
+#[test]
+fn two_row_header_has_no_logo() {
+    let snap = library();
+    let model = model_of(&snap);
+    let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with(&model, &snap, &logos, 100, 7);
+    assert!(
+        !drawn
+            .placements
+            .iter()
+            .any(|placement| placement.size == LogoSize::Small),
+        "a one-row header has no mark"
+    );
+    // The one line it has: the name and what is moving.
+    let text = drawn.screen.text();
+    assert!(
+        text.contains("featherbittorrent"),
+        "the title is still there"
+    );
+    assert!(text.contains("MiB/s"), "the rates are still there");
 }

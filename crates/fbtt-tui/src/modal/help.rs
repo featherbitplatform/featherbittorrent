@@ -5,6 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::graphics::place::LogoView;
 use crate::keys::KEYS;
 use crate::modal::{Answer, keys_hint};
 use crate::theme;
@@ -20,7 +21,7 @@ const COLUMN_GAP: usize = 4;
 /// The keys, padded into one or two columns, and the key that puts the screen away. `area` is the
 /// whole screen: a list of this length needs more rows than a laptop terminal has, so on a screen
 /// too short for it in one column and wide enough for it in two, it is drawn in two.
-pub(crate) fn lines(area: Rect) -> Vec<Line<'static>> {
+pub(crate) fn lines(area: Rect, _logos: LogoView<'_>) -> Vec<Line<'static>> {
     let half = KEYS.len().div_ceil(2);
     let (left, right) = KEYS.split_at(half);
     let widest = |rows: &[(&str, &str)]| rows.iter().map(|(key, _)| key.chars().count()).max();
@@ -101,14 +102,14 @@ mod tests {
 
     #[test]
     fn a_tall_screen_gets_one_column_and_a_short_wide_one_two() {
-        let one = lines(Rect::new(0, 0, 100, 40));
+        let one = lines(Rect::new(0, 0, 100, 40), LogoView::text());
         assert_eq!(
             one.len(),
             KEYS.len() + 1,
             "a tall screen did not list every key"
         );
 
-        let two = lines(Rect::new(0, 0, 80, 24));
+        let two = lines(Rect::new(0, 0, 80, 24), LogoView::text());
         assert_eq!(
             two.len(),
             KEYS.len().div_ceil(2) + 1,
@@ -118,7 +119,7 @@ mod tests {
         // Every action is on the screen either way, which is the point of splitting it.
         for name in ["quit", "raise the focused file's priority"] {
             for area in [Rect::new(0, 0, 100, 40), Rect::new(0, 0, 80, 24)] {
-                let text = lines(area)
+                let text = lines(area, LogoView::text())
                     .iter()
                     .map(|line| {
                         line.spans
@@ -136,7 +137,7 @@ mod tests {
     #[test]
     fn a_screen_too_small_for_both_shapes_still_draws_what_fits() {
         for area in [Rect::new(0, 0, 20, 5), Rect::new(0, 0, 1, 1)] {
-            let lines = lines(area);
+            let lines = lines(area, LogoView::text());
             assert!(!lines.is_empty(), "no help was drawn at {area:?}");
         }
     }

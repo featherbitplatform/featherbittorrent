@@ -36,6 +36,7 @@ use crossterm::event::{Event, EventStream};
 // tree crossterm's own `EventStream` implements it from.
 use futures_core::Stream;
 use ratatui::DefaultTerminal;
+use ratatui::backend::Backend as _;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::{Fill, Paragraph};
@@ -47,6 +48,7 @@ use fbtt_core::{
     Command, Config, ConfigLoad, Connection, LibraryLock, LinkState, Notice, Paths, Secret,
     Snapshot,
 };
+use fbtt_tui::graphics::place::{LogoView, Placer, PreparedLogos};
 use fbtt_tui::{Action, ConnectRequest, ConnectTarget, Modal, Model, format, theme, view};
 
 use crate::backend::{Backend, BackendKind, LockOutcome, SwitchPlan, plan_switch};
@@ -319,6 +321,8 @@ impl ShutdownSignal {
 pub struct Screen<'a> {
     pub model: &'a mut Model,
     pub snap: &'a mut Arc<Snapshot>,
+    pub logos: Option<Arc<PreparedLogos>>,
+    pub placer: Placer,
 }
 
 /// The screen over `backend`, through every backend this run switches to, until the person is finished.
@@ -328,6 +332,7 @@ pub struct Screen<'a> {
 /// was signed in as, and what is still owed for it. A switch replaces both together; a quit drops whatever
 /// was still owed, because an answer that never signed in is not worth remembering - which is the whole
 /// reason it was waited for.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session(
     terminal: &mut DefaultTerminal,
     mut screen: Screen<'_>,
@@ -336,7 +341,20 @@ pub async fn run_session(
     work: &mut Work<'_>,
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
+    prepare_fut: Option<tokio::task::JoinHandle<PreparedLogos>>,
 ) -> (Quit, Backend) {
+    // The prepared logos arrive on this oneshot; the screen draws the text title until they do.
+    let mut logos_rx: Option<tokio::sync::oneshot::Receiver<PreparedLogos>> =
+        prepare_fut.map(|handle| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let result = handle.await;
+                if let Ok(logos) = result {
+                    let _ = tx.send(logos);
+                }
+            });
+            rx
+        });
     loop {
         let (mut parts, task) = backend.into_parts();
         let outcome = run_loop(
@@ -347,6 +365,7 @@ pub async fn run_session(
             work,
             stream,
             signal,
+            &mut logos_rx,
         )
         .await;
         // Whatever it answered with, this is still what is running: `Connect` means something else runs
@@ -391,6 +410,7 @@ pub async fn run_session(
 /// takes that entry out and asks again (see [`stored_password_refused`]), and the lines those jobs answer with
 /// go on the footer like any other news. The first two are once per connection, and neither touches the
 /// backend's channels.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     screen: &mut Screen<'_>,
@@ -399,6 +419,7 @@ async fn run_loop(
     work: &mut Work<'_>,
     stream: &mut EventStream,
     signal: &mut ShutdownSignal,
+    logos_rx: &mut Option<tokio::sync::oneshot::Receiver<PreparedLogos>>,
 ) -> Outcome {
     // The screen's two halves are used apart all through the loop - a key press reads one and writes the
     // other - so they are taken out here, once, rather than reached through `screen` in every branch.
@@ -418,6 +439,17 @@ async fn run_loop(
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // The prepared logos answer here, whenever the blocking pool gets done with them. The screen
+        // has been drawing the text title until now; from this frame on it draws the mark. A non-blocking
+        // check: the oneshot is either ready (the prepare finished) or it is not, and either way we move
+        // on to the next turn of the loop.
+        if let Some(rx) = logos_rx.as_mut()
+            && let Ok(logos) = rx.try_recv()
+        {
+            screen.logos = Some(Arc::new(logos));
+            *logos_rx = None;
+            dirty = true;
+        }
         tokio::select! {
             // Every branch is a `once`: each wakes on one event, and re-arming the next
             // is what an iteration of this loop does anyway.
@@ -451,7 +483,47 @@ async fn run_loop(
                     }
                     dirty = true;
                 }
-                Some(Ok(Event::Resize(_, _))) => dirty = true,
+                Some(Ok(Event::Resize(cols, rows))) => {
+                    dirty = true;
+                    // A resize may have changed the cell's pixel size: the window's pixel size divided by
+                    // the new grid. If it did, the bitmaps the placer sent are the wrong size, so the
+                    // placer forgets them and the screen asks for new ones.
+                    if cols > 0
+                        && rows > 0
+                        && let Ok(ws) = crossterm::terminal::window_size()
+                        && ws.width > 0
+                        && ws.height > 0
+                    {
+                        let w = ws.width / cols;
+                        let h = ws.height / rows;
+                        if w > 0
+                            && h > 0
+                            && let Some(logos) = &screen.logos
+                            && let Some(old_cell) = logos.graphics.cell
+                            && (old_cell.w != w || old_cell.h != h)
+                        {
+                            screen.placer.invalidate();
+                            let graphics = fbtt_tui::graphics::caps::Graphics {
+                                protocol: logos.graphics.protocol,
+                                cell: Some(fbtt_tui::graphics::caps::CellPx { w, h }),
+                                scale: logos.graphics.scale,
+                            };
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            tokio::spawn(async move {
+                                let result =
+                                    tokio::task::spawn_blocking(move || {
+                                        fbtt_tui::graphics::prepare(graphics)
+                                    })
+                                    .await;
+                                if let Ok(logos) = result {
+                                    let _ = tx.send(logos);
+                                }
+                            });
+                            *logos_rx = Some(rx);
+                            screen.logos = None;
+                        }
+                    }
+                }
                 // A closed event stream is the terminal going away: quit like any other.
                 Some(Err(_)) | None => return Outcome::Quit(Quit::Ok),
                 Some(Ok(_)) => {}
@@ -544,10 +616,60 @@ async fn run_loop(
                     parts.commands.send(Command::Watch(watch.clone()));
                     last_watch = watch;
                 }
-                if let Err(error) = terminal.draw(|frame| view::draw(frame, model, snap)) {
-                    // The screen is the thing that failed: carry the line out of here and
-                    // print it once the terminal is back.
-                    return Outcome::Quit(Quit::Failed(format!("the terminal failed: {error}")));
+                // The logo's bytes, before the frame: kitty transmits the pixels it has not sent yet for
+                // this cell size. The other protocols write nothing before the frame.
+                let pre_bytes = screen
+                    .logos
+                    .as_ref()
+                    .map(|logos| screen.placer.before_draw(logos))
+                    .unwrap_or_default();
+                if !pre_bytes.is_empty() {
+                    let backend = terminal.backend_mut();
+                    let _ = std::io::Write::write_all(backend, &pre_bytes);
+                    let _ = std::io::Write::flush(backend);
+                }
+                // The frame: the view draws the mark's placeholder or skip cells into the buffer, and
+                // the placements come back for the placer to write the image around. The buffer the frame
+                // just drew is only valid until the next draw, so the repaint cells are copied out before
+                // anything else touches the terminal.
+                let logos_view = screen
+                    .logos
+                    .as_ref()
+                    .map(|logos| LogoView { logos: Some(logos) })
+                    .unwrap_or(LogoView::text());
+                let mut placements = Vec::new();
+                let done = match terminal.draw(|frame| {
+                    placements = view::draw_with(frame, model, snap, logos_view);
+                }) {
+                    Ok(done) => done,
+                    Err(error) => {
+                        return Outcome::Quit(Quit::Failed(format!("the terminal failed: {error}")));
+                    }
+                };
+                // The logo's bytes, after the frame: the image protocols write the image over the
+                // skipped cells, and the cells a removed placement used to cover are repainted from
+                // the buffer the frame just drew.
+                if let Some(logos) = screen.logos.as_ref() {
+                    let after = screen.placer.after_draw(&placements, done.area.into(), logos);
+                    if !after.repaint.is_empty() {
+                        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = after
+                            .repaint
+                            .iter()
+                            .flat_map(|rect| {
+                                (rect.top()..rect.bottom()).flat_map(move |y| {
+                                    (rect.left()..rect.right())
+                                        .map(move |x| (x, y, done.buffer[(x, y)].clone()))
+                                })
+                            })
+                            .collect();
+                        let backend = terminal.backend_mut();
+                        let _ = backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)));
+                    }
+                    let backend = terminal.backend_mut();
+                    if !after.bytes.is_empty() {
+                        let _ = std::io::Write::write_all(backend, &after.bytes);
+                    }
+                    let _ = std::io::Write::flush(backend);
                 }
             },
             _ = once(signal.wait.as_mut()) => return Outcome::Quit(Quit::Ok),
@@ -1152,6 +1274,8 @@ mod tests {
         let mut screen = Screen {
             model: &mut model,
             snap: &mut snap,
+            logos: None,
+            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
         };
         let switched = switch_onward(
             &work,
@@ -1227,6 +1351,8 @@ mod tests {
         let mut screen = Screen {
             model: &mut model,
             snap: &mut snap,
+            logos: None,
+            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
         };
         let switched = switch_onward(
             &work,
@@ -1289,6 +1415,8 @@ mod tests {
         let mut screen = Screen {
             model: &mut model,
             snap: &mut snap,
+            logos: None,
+            placer: fbtt_tui::graphics::place::Placer::new(fbtt_tui::graphics::Protocol::None),
         };
         let switched = switch_onward(
             &work,
