@@ -66,6 +66,25 @@ fn args_of(recording: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The playlists sitting in `dir` at this moment, by name: either the one a test expects, or none - which
+/// is how the two tests about what happens when a play goes wrong say "nothing was left behind".
+fn playlists(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// The address every test here pretends is a stream: the shape the local endpoint and a server both
 /// answer with, token and all.
 fn stream_url(token: &str) -> String {
@@ -205,4 +224,104 @@ async fn missing_player_is_an_error_not_a_spawn() {
         !log.exists(),
         "and nothing ran that could have written to it"
     );
+}
+
+/// A player that refuses to start takes its address with it. The playlist was written for that one process
+/// and nobody else will ever read it, so leaving it here would keep a live token on disk until some later
+/// run's twelve-hour sweep happened to find it - which is the opposite of why the file exists.
+#[tokio::test]
+async fn a_failed_spawn_takes_the_playlist_with_it() {
+    let dir = ScratchDir::new("play_spawn_fails");
+    let play_dir = dir.path().join("play");
+    // A file that is there, so finding a player succeeds, and would not run, so the spawn is what fails:
+    // `0644` on Unix means no execute bit for anybody, and on every platform this is a text file with none
+    // of the shape an executable has. Either way the answer is a spawn failure, which is what is being tested.
+    let program = dir.path().join("not-executable");
+    fs::write(&program, "print('I am not a media player')\n")
+        .expect("a file for config.yaml to name");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o644))
+            .expect("take the execute bit");
+    }
+
+    let url = stream_url("s3cret");
+    let target = PlayTarget::new("The Film", PlaySource::Url(StreamUrl::new(url)));
+    let config = PlayerConfig {
+        program: program.display().to_string(),
+        args: Vec::new(),
+    };
+
+    let problem = player::play(&config, target, &play_dir, &SystemLookup)
+        .await
+        .expect_err("the program is here but will not run");
+    assert!(
+        matches!(&problem, PlayError::Spawn { .. }),
+        "a program that is there and will not start says so: {problem:?}"
+    );
+
+    assert_eq!(
+        playlists(&play_dir),
+        Vec::<PathBuf>::new(),
+        "the file it was written for goes the same way the process did"
+    );
+}
+
+/// Quitting inside the grace period takes the playlist too. What removes the file has to be the cleanup
+/// task letting go of it - not the part of it that runs after a wait - because dropping a runtime cancels
+/// the tasks on it rather than finishing them, and a run that quits ten seconds into a film is exactly that.
+#[test]
+fn a_dropped_runtime_still_takes_the_playlist_out() {
+    let dir = ScratchDir::new("play_quits_early");
+    let play_dir = dir.path().join("play");
+    let log = dir.path().join("fake.log");
+    let url = stream_url("s3cret");
+    let target = PlayTarget::new("The Film", PlaySource::Url(StreamUrl::new(url)));
+    // Long enough that the stand-in is certainly still alive when the runtime goes, and short enough that
+    // nothing here has to wait for it: this is a quit during a film, not a film that ended.
+    let config = PlayerConfig {
+        program: FAKE.to_string(),
+        args: vec![
+            "--log".to_string(),
+            log.display().to_string(),
+            "--hold-ms".to_string(),
+            "5000".to_string(),
+        ],
+    };
+
+    // A runtime of this test's own, one thread, no worker to hand the waiting task to: dropping it is the
+    // cancellation a quit is, on this thread, at a moment this test chooses.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to drop");
+
+    let line = runtime
+        .block_on(player::play(&config, target, &play_dir, &SystemLookup))
+        .expect("the stand-in player starts");
+    assert!(
+        line.starts_with("Opening The Film in "),
+        "the play was started: {line}"
+    );
+
+    let written = playlists(&play_dir);
+    assert_eq!(
+        written.len(),
+        1,
+        "the address is on disk while the player is still holding it: {written:?}"
+    );
+
+    drop(runtime);
+
+    // The player runs on, unbothered, and this thread no longer has a runtime at all: what is being asserted
+    // is that the file went with the task. Polling rather than one look only keeps a slow disk out of it.
+    let started = Instant::now();
+    while !playlists(&play_dir).is_empty() {
+        assert!(
+            started.elapsed() < GONE_WITHIN,
+            "the playlist outlived the run that wrote it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

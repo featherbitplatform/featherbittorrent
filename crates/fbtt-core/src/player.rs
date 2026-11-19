@@ -10,8 +10,8 @@
 //! nothing secret, and its file is readable only by this user (decision 3).
 //!
 //! [`play`] is the whole of it for anybody else: find, write, start, say what was opened in one line.
-//! The player outlives this program - quitting does not stop a film somebody is watching - and the
-//! playlist does not outlive the player.
+//! The player outlives this program - quitting does not stop a film somebody is watching - and the playlist
+//! outlives neither the player, nor the play that failed to start one, nor the run that quit mid-film.
 
 use std::ffi::OsString;
 use std::fs;
@@ -358,10 +358,10 @@ pub fn write_playlist(dir: &Path, target: &PlayTarget) -> io::Result<PathBuf> {
 /// `dir`, and any directory above it this library has not made yet, each readable only by this user
 /// (`0700` on Unix).
 ///
-/// A directory that is already there keeps the mode it has: this program does not change permissions
-/// on a folder somebody else made. The parent comes first by hand because `DirBuilder`'s own recursive
-/// create is not public, and because `<data_dir>/play` on a library nobody has run yet needs
-/// `<data_dir>` under it.
+/// A directory that is already there keeps the mode it has: this program does not change permissions on a
+/// folder somebody else made. The recursive rule is `std`'s own, which as a method is still private, both
+/// because `<data_dir>/play` on a library nobody has run yet needs `<data_dir>` under it and because the
+/// folders above are not this program's to ask permission from (see [`create_dir_chain`]).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -369,14 +369,50 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        create_private_dir(parent)?;
+    create_dir_chain(dir, &|path| builder.create(path), &|path| path.is_dir())
+}
+
+/// The recursive directory create `std` uses, with the making and the checking handed in so that a test can
+/// answer the way another platform does.
+///
+/// Ask for the directory itself; climb to its parent only when something above it is genuinely missing
+/// (`NotFound`); and count a refusal as done when the path turns out to be a folder anyway, whatever reason
+/// was given for it. That last rule is what a platform needs that does not answer `AlreadyExists` for a
+/// folder that is already there: Windows answers *access denied* for a drive root, so making every folder
+/// above first would ask `C:\` for permission it never had and fail every stream play on a library at the
+/// root of a disk - where the folder this program needed was there all along.
+fn create_dir_chain(
+    dir: &Path,
+    mkdir: &dyn Fn(&Path) -> io::Result<()>,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        // An empty path is the folder this process is standing in, which this program neither makes nor
+        // needs made.
+        return Ok(());
     }
-    match builder.create(dir) {
+    match mkdir(dir) {
+        Ok(()) => return Ok(()),
+        // Something above it is missing: that answer, and only that answer, sends this code up the tree.
+        Err(problem) if problem.kind() == io::ErrorKind::NotFound => {}
+        Err(_) if is_dir(dir) => return Ok(()),
+        Err(problem) => return Err(problem),
+    }
+    match dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        Some(parent) => create_dir_chain(parent, mkdir, is_dir)?,
+        // Nothing above it left to make, and it is not a folder itself: the first answer stands.
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{dir:?} has no parent left to make"),
+            ));
+        }
+    }
+    match mkdir(dir) {
         Ok(()) => Ok(()),
-        // Somebody got here first: an earlier play, or the person who pointed `FBTT_DATA_DIR` at a
-        // folder of their own. Its mode stays theirs.
-        Err(problem) if problem.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        // Somebody else made it while this was climbing - another play, another run - which says the same
+        // thing it said before: what is there stays exactly as it is.
+        Err(_) if is_dir(dir) => Ok(()),
         Err(problem) => Err(problem),
     }
 }
@@ -446,6 +482,25 @@ pub fn sweep_playlists(dir: &Path) {
     }
 }
 
+/// A playlist file, and the promise that it does not outlive the reason for it.
+///
+/// The promise is kept whenever this is dropped: at the end of the cleanup task, half way through it because
+/// the run quit inside the grace period, or on the way out of a `play` whose player refused to start. It has
+/// to be a drop rather than a line of code because no line of code covers all three - dropping a runtime
+/// cancels the tasks on it instead of finishing them - and what is in the file is an address with a token in
+/// it, which should not sit on disk until some later run's sweep happens to walk past it twelve hours from
+/// now. Removal is best effort, and that sweep is the backstop for the platform that will not remove a file
+/// another process still has open.
+struct PlaylistGuard(Option<PathBuf>);
+
+impl Drop for PlaylistGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Finds a player, hands it `target`, and says in one line what was opened.
 ///
 /// * A stream address goes to the player inside a playlist, never on its command line, so no token
@@ -455,9 +510,10 @@ pub fn sweep_playlists(dir: &Path) {
 /// * On Unix it starts in its own process group, so a Ctrl-C at this program's terminal is not sent to
 ///   the film as well; on Windows it starts with no console window.
 /// * It is not killed when this program forgets it.
-/// * A task nobody awaits waits for the player and takes the playlist out when the player exits or
-///   thirty seconds after the launch, whichever comes first. Being detached is what lets it: a wait
-///   anybody had to finish would make quitting cost as long as the film.
+/// * A task nobody awaits waits for the player and lets go of the playlist when the player exits, or thirty
+///   seconds after the launch, whichever comes first - and lets go of it if this run quits in between, which
+///   is the same promise a player that refused to start gets on the way out (see `PlaylistGuard`). Being
+///   detached is what lets it: a wait anybody had to finish would make quitting cost as long as the film.
 pub async fn play(
     config: &PlayerConfig,
     target: PlayTarget,
@@ -470,12 +526,15 @@ pub async fn play(
     // they happen: the binary awaits it from a job on its own worker thread (see its `switch.rs`), and
     // never from the thread that draws the screen.
     let player = find_player(config, lookup)?;
+    // A playlist comes with the promise about it, before anything is started: from here to the end of this
+    // function, every way out that does not hand the file to a running player drops the promise, and the
+    // file with it - which is what a player that was found and would not start owes.
     let (media, playlist) = match target.source() {
-        PlaySource::Path(path) => (path.clone(), None),
+        PlaySource::Path(path) => (path.clone(), PlaylistGuard(None)),
         PlaySource::Url(_) => {
             let path =
                 write_playlist(dir, &target).map_err(|source| PlayError::Playlist { source })?;
-            (path.clone(), Some(path))
+            (path.clone(), PlaylistGuard(Some(path)))
         }
     };
 
@@ -502,27 +561,31 @@ pub async fn play(
         source,
     })?;
 
-    // A task nobody holds a handle to, on purpose: shutting down must not cost as long as the film.
+    // A task nobody holds a handle to, on purpose: shutting down must not cost as long as the film. The
+    // playlist travels into it, promise included, so that it goes whether that task finishes waiting or is
+    // cancelled half way through - which is what a quit inside the grace period is.
     tokio::spawn(tidy_up(child, playlist));
 
     Ok(opening_line(&player, target.title()))
 }
 
-/// Waits for the player, then takes its playlist out.
+/// Waits for the player, then lets go of its playlist.
 ///
-/// The timeout is no deadline for the film: it bounds how long a playlist - one entry carrying an
-/// address with its token in it - sits on disk once nobody is watching the process that read it. Thirty
-/// seconds is longer than any player takes to read three lines and shorter than a pause at the start of
-/// a film. After it the player is simply left alone: this program's part was the file.
-async fn tidy_up(mut child: tokio::process::Child, playlist: Option<PathBuf>) {
+/// The timeout is no deadline for the film: it bounds how long a playlist - one entry carrying an address
+/// with its token in it - sits on disk once nobody is watching the process that read it. Thirty seconds is
+/// longer than any player takes to read three lines and shorter than a pause at the start of a film. After
+/// it the player is simply left alone: this program's part was the file. Waiting is also what reaps the
+/// process, which is what `kill_on_drop(false)` needs while its handle is held.
+async fn tidy_up(mut child: tokio::process::Child, playlist: PlaylistGuard) {
     tokio::select! {
         // The player exited, which is how a film ends.
         _ = child.wait() => {}
         _ = tokio::time::sleep(LAUNCH_GRACE) => {}
     }
-    if let Some(playlist) = playlist {
-        let _ = fs::remove_file(playlist);
-    }
+    // Nothing special happens on this line: the file goes because this function is ending, and it goes just
+    // as surely when the runtime is dropped instead - which cancels this task rather than finishing it. See
+    // `PlaylistGuard`.
+    drop(playlist);
 }
 
 /// The one line to show: what is opening, in which player.
@@ -543,12 +606,13 @@ fn opening_line(player: &Player, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Lookup, PlayError, Player, PlayerKind, find_player, player_args, sweep_playlists,
-        write_playlist,
+        Lookup, PlayError, Player, PlayerKind, create_dir_chain, create_private_dir, find_player,
+        player_args, sweep_playlists, write_playlist,
     };
     use crate::client::{PlaySource, PlayTarget, StreamUrl};
     use crate::config::PlayerConfig;
     use crate::scratch::ScratchDir;
+    use std::cell::RefCell;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -868,5 +932,208 @@ mod tests {
 
         // A folder that is not there says nothing rather than failing: the run starts anyway.
         sweep_playlists(&dir.path().join("no-such-folder"));
+    }
+
+    /// Making room for a playlist on a library nobody has run yet: `<data_dir>` does not exist either, so
+    /// every folder above the play folder that is missing gets made, each one private, and none of them is
+    /// touched if it is already there.
+    #[test]
+    fn create_private_dir_makes_every_missing_parent() {
+        let dir = ScratchDir::new("player_dir_chain");
+        let deep = dir.path().join("a").join("b").join("c");
+
+        create_private_dir(&deep).expect("the three missing folders");
+
+        assert!(deep.is_dir(), "the play folder is there now");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [dir.path().join("a"), dir.path().join("a/b"), deep] {
+                let mode = fs::metadata(&path)
+                    .unwrap_or_else(|problem| panic!("{} should exist: {problem}", path.display()))
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o777,
+                    0o700,
+                    "{} was made by this program, so only this user may see inside it",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// A folder somebody else made keeps the mode they gave it: an earlier run made it `0700`, a person who
+    /// pointed `FBTT_DATA_DIR` at a folder of their own may have made it anything, and asking twice for the
+    /// same folder is not a failure either time.
+    #[test]
+    fn create_private_dir_leaves_an_existing_folder_alone() {
+        let dir = ScratchDir::new("player_dir_exists");
+        let play_dir = dir.path().join("play");
+        fs::create_dir(&play_dir).expect("a folder made by somebody else");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&play_dir, fs::Permissions::from_mode(0o755)).expect("their mode");
+        }
+
+        create_private_dir(&play_dir).expect("an existing folder is not an error");
+        create_private_dir(&play_dir).expect("nor the second time");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&play_dir)
+                .expect("the folder")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o755,
+                "this program does not change permissions on a folder it did not make"
+            );
+        }
+    }
+
+    /// A folder that is already there needs nothing from the folders above it, and an ancestor that would
+    /// refuse to be made must not decide otherwise. On Unix that shape is a `0500` parent - readable and
+    /// searchable, but no room in it to make anything - and a missing folder under it still fails, so this
+    /// is not the same thing as ignoring what went wrong.
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_accepts_a_folder_under_a_parent_that_cannot_be_written_to() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("player_dir_locked_parent");
+        let locked = dir.path().join("data");
+        let play_dir = locked.join("play");
+        fs::create_dir(&locked).expect("the parent");
+        fs::create_dir(&play_dir).expect("the folder this test is about");
+
+        // Root ignores the mode, and so does a file system that does not honour it: if something can still
+        // be made in there, the refusal this test is built on does not exist and saying so is the honest
+        // answer rather than passing for no reason.
+        let probe = locked.join("probe");
+        match fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = fs::remove_dir(&probe);
+                eprintln!(
+                    "skipped: {} would not refuse to be written to",
+                    locked.display()
+                );
+                return;
+            }
+            Err(problem) if problem.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(problem) => panic!("{} should refuse a new folder: {problem}", locked.display()),
+        }
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
+            .expect("no room to make anything");
+
+        create_private_dir(&play_dir).expect("a folder that is there needs nothing made above it");
+
+        let problem = create_private_dir(&locked.join("fresh"))
+            .expect_err("and a folder that has to be made in there still cannot be");
+        assert_eq!(
+            problem.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the answer is still the reason it failed"
+        );
+    }
+
+    /// A disk that answers the way Windows answers: making a folder that is already there is refused as
+    /// *access denied* rather than answered "already exists". `C:\` answers that way to every attempt to
+    /// make it, so a library at the root of a disk looks exactly like this table - and nothing here touches
+    /// a real disk, so both tests below run wherever they are run.
+    struct LockedTree {
+        /// The folders that are already there.
+        there: RefCell<Vec<PathBuf>>,
+        /// Every path `mkdir` was asked about, in the order it was asked about.
+        asked: RefCell<Vec<PathBuf>>,
+    }
+
+    impl LockedTree {
+        fn new(there: &[&str]) -> LockedTree {
+            LockedTree {
+                there: RefCell::new(there.iter().map(PathBuf::from).collect()),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Refused where the folder is there, made where its parent is, `NotFound` where even that would
+        /// need something above it that is missing.
+        fn mkdir(&self, path: &Path) -> io::Result<()> {
+            self.asked.borrow_mut().push(path.to_path_buf());
+            if self.is_dir(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Access is denied.",
+                ));
+            }
+            match path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .filter(|parent| self.is_dir(parent))
+            {
+                Some(_) => {
+                    self.there.borrow_mut().push(path.to_path_buf());
+                    Ok(())
+                }
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "The system cannot find the path specified.",
+                )),
+            }
+        }
+
+        fn is_dir(&self, path: &Path) -> bool {
+            self.there.borrow().iter().any(|found| found == path)
+        }
+
+        /// What was asked about, for an assertion.
+        fn asked(&self) -> Vec<PathBuf> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    /// A play folder that is already there needs no permission from anybody above it, whatever answer its
+    /// own making was refused with - and the folders above it are none of this program's business.
+    #[test]
+    fn create_dir_chain_accepts_a_folder_that_answers_like_windows() {
+        let tree = LockedTree::new(&["/", "/data", "/data/library", "/data/library/play"]);
+        let mkdir = |path: &Path| tree.mkdir(path);
+        let is_dir = |path: &Path| tree.is_dir(path);
+
+        create_dir_chain(Path::new("/data/library/play"), &mkdir, &is_dir)
+            .expect("a folder that is there needs nothing made above it");
+
+        assert_eq!(
+            tree.asked(),
+            [PathBuf::from("/data/library/play")],
+            "and the refusal at the top of the tree was never even asked about"
+        );
+    }
+
+    /// The climb belongs to a folder that is missing and to nothing else: this program asks for the two
+    /// folders it has to make, in the order it needs them, and never for a folder that is already there.
+    #[test]
+    fn create_dir_chain_climbs_only_when_something_above_is_missing() {
+        let tree = LockedTree::new(&["/", "/data", "/data/library"]);
+        let mkdir = |path: &Path| tree.mkdir(path);
+        let is_dir = |path: &Path| tree.is_dir(path);
+
+        create_dir_chain(Path::new("/data/library/play/deeper"), &mkdir, &is_dir).expect(
+            "the two missing folders get made, and the three that are there stay as they are",
+        );
+
+        assert_eq!(
+            tree.asked(),
+            [
+                PathBuf::from("/data/library/play/deeper"),
+                PathBuf::from("/data/library/play"),
+                PathBuf::from("/data/library/play/deeper"),
+            ],
+            "the missing folder, then its parent, then the missing folder again - no folder above them"
+        );
     }
 }
