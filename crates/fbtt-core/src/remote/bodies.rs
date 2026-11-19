@@ -37,6 +37,11 @@ pub(crate) enum ApiError {
     /// outside the server's roots, a body the server could not parse. The link is fine; one line tells
     /// the person what the server said.
     Answer(String),
+    /// The relay's head wait ran out: the upstream opened the connection and then never sent a
+    /// response head within [`super::http::RELAY_HEAD_TIMEOUT`]. It is its own variant rather than
+    /// [`Transport`](Self::Transport) or [`Answer`](Self::Answer) because the relay answers it with
+    /// `504` - the upstream is slow, not unreachable, and it is not an answer the server gave.
+    HeadTimeout,
 }
 
 impl ApiError {
@@ -49,6 +54,7 @@ impl ApiError {
             ApiError::Transport(problem) => format!("the server could not be reached: {problem}"),
             ApiError::Refused(reason) => format!("{SIGN_IN_REFUSED}: {reason}"),
             ApiError::Answer(message) => message.clone(),
+            ApiError::HeadTimeout => "the server did not answer the stream request".to_string(),
         }
     }
 
@@ -69,6 +75,12 @@ impl ApiError {
     /// asked for something the server does not have.
     pub(crate) fn breaks_the_link(&self) -> bool {
         matches!(self, ApiError::Transport(_) | ApiError::Refused(_))
+    }
+
+    /// Whether this is the relay's own head timeout, as opposed to a transport failure or a
+    /// refusal. The relay answers it with `504` rather than `502`.
+    pub(crate) fn is_head_timeout(&self) -> bool {
+        matches!(self, ApiError::HeadTimeout)
     }
 }
 

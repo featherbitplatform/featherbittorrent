@@ -63,6 +63,17 @@ pub(crate) fn checked_stream_path<'a>(
     if path.len() > MAX_PATH_BYTES {
         return None;
     }
+    // The id must be exactly 40 lowercase hex characters before we build any path from it:
+    // a hostile id with a newline, a `/`, an upper-case letter, or a different length
+    // would change the authority or the shape of the prefix we compare against.
+    let id_str = &id.0;
+    if id_str.len() != 40
+        || !id_str
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
     let prefix = crate::stream::stream_path(id, index);
     let rest = path.strip_prefix(&prefix)?;
     if rest.is_empty() {
@@ -101,6 +112,14 @@ impl Backend {
                 "the torrent has no playable file".to_owned(),
             ));
         };
+        // Look up the file by its `index` field, not by position: the server's `index`
+        // values are its own, and a hostile list may not line them up with the list's
+        // positions. A missing match is an error notice, not a panic.
+        let Some(chosen) = find_file(&files, index) else {
+            return self.notify(crate::client::Notice::Error(
+                "the server's file list does not name the file it chose".to_owned(),
+            ));
+        };
         // The address to stream it from. The id the server names in its answer is the wire
         // hash this client asked by, so the check is against that id and the index it
         // named: the two together are the one file this command asked for.
@@ -137,7 +156,7 @@ impl Backend {
             crate::client::StreamUrl::new(format!("{}{}", self.api.base(), checked))
         };
         self.notify(crate::client::Notice::Play(PlayTarget::new(
-            &crate::engine::map::clean(&files[index].path),
+            &crate::engine::map::clean(&chosen.path),
             PlaySource::Url(url),
         )));
     }
@@ -162,31 +181,39 @@ impl Backend {
             .relay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A second `Stream` may have won the race while the bind was in flight: the
-        // relay that lost it is shut down and the one that won is kept.
-        let relay = guard.get_or_insert_with(|| started);
+        *guard = Some(started);
+        let relay = guard.as_ref().expect("just set");
         Ok(relay.url_for(checked))
     }
 }
 
-/// The file a remote `Stream` plays: the wanted index if it names a real, non-pad file,
-/// else the largest non-pad file (lowest index on a tie), `None` when there is none.
+/// The file a remote `Stream` plays: the wanted file if it names a real, non-pad file
+/// whose `index` field matches, else the largest non-pad file (lowest index on a tie),
+/// `None` when there is none.
 ///
-/// It reads the same three fields of a file the local rule reads, and the pad files in
-/// the server's list are skipped the way the server's own token route skips them: they
-/// hold part of a piece and have no content a player could open.
+/// The returned value is the `index` field of the chosen file. The caller must look it up
+/// by that field (`find_file`) rather than using it as a positional index: the server's
+/// `index` values are its own, and a hostile list may name an index that does not exist
+/// or that is duplicated. A missing match is an error notice, not a panic.
 pub(crate) fn choose(files: &[FileDto], wanted: Option<usize>) -> Option<usize> {
-    if let Some(index) = wanted
-        && let Some(file) = files.get(index)
+    if let Some(wanted_index) = wanted
+        && let Some(file) = files.iter().find(|file| file.index == wanted_index)
         && !file.pad
     {
-        return Some(index);
+        return Some(file.index);
     }
     files
         .iter()
         .filter(|file| !file.pad)
         .max_by_key(|file| (file.len, std::cmp::Reverse(file.index)))
         .map(|file| file.index)
+}
+
+/// Look up a file by its `index` field. `None` when no file in the list has that index:
+/// a hostile server may name an index that does not exist in its own list, and the
+/// answer is an error notice, not a panic.
+pub(crate) fn find_file(files: &[FileDto], index: usize) -> Option<&FileDto> {
+    files.iter().find(|file| file.index == index)
 }
 
 #[cfg(test)]
@@ -201,12 +228,13 @@ mod tests {
     }
 
     fn file(index: usize, path: &str, len: u64, pad: bool) -> FileDto {
-        let mut dto = FileDto::default();
-        dto.index = index;
-        dto.path = path.to_string();
-        dto.len = len;
-        dto.pad = pad;
-        dto
+        FileDto {
+            index,
+            path: path.to_string(),
+            len,
+            pad,
+            ..Default::default()
+        }
     }
 
     /// Every address a server may answer with, and the one shape this client will hand to a
@@ -327,5 +355,73 @@ mod tests {
         // A tie in size: the lowest index.
         let tie = vec![file(0, "a.bin", 50, false), file(1, "b.bin", 50, false)];
         assert_eq!(choose(&tie, None), Some(0));
+    }
+
+    /// A hostile file list: the `index` field is looked up, not used as a positional
+    /// index. A list whose `index` values do not line up with the list's positions must
+    /// not panic, and a wanted index that names no file in the list must not panic.
+    #[test]
+    fn hostile_file_list_does_not_panic() {
+        // A file list where the `index` field does not match the position: a server
+        // that says index 7 for the first file in a list of one.
+        let offset = vec![file(7, "a.bin", 10, false)];
+        // No wanted index: the largest non-pad file is chosen by its `index` field.
+        assert_eq!(choose(&offset, None), Some(7));
+        // The lookup by `index` field finds it.
+        assert!(super::find_file(&offset, 7).is_some());
+        // An out-of-range wanted index: no file has that index, so the largest is chosen.
+        assert_eq!(choose(&offset, Some(0)), Some(7));
+        // A wanted index that matches the position but not the `index` field: refused.
+        assert_eq!(choose(&offset, Some(0)), Some(7));
+
+        // Duplicate indexes: the first match wins, no panic.
+        let dup = vec![
+            file(3, "a.bin", 10, false),
+            file(3, "b.bin", 30, false),
+            file(3, "c.bin", 20, false),
+        ];
+        // No wanted index: the largest non-pad file (b.bin at index 3).
+        assert_eq!(choose(&dup, None), Some(3));
+        // A wanted index that matches: the first match (a.bin) is found.
+        assert_eq!(choose(&dup, Some(3)), Some(3));
+        // The lookup finds the first file with that index.
+        let found = super::find_file(&dup, 3).expect("a file at index 3");
+        assert_eq!(found.path, "a.bin");
+
+        // A wanted index that is a pad file: falls back to the largest non-pad file.
+        let with_pad = vec![file(0, "a.bin", 10, false), file(1, "pad", 999, true)];
+        assert_eq!(choose(&with_pad, Some(1)), Some(0));
+    }
+
+    /// A hostile torrent id in `checked_stream_path`: the id must be exactly 40 lowercase
+    /// hex characters before any path is built from it. Newline, `?`, `/`, upper case, and
+    /// a different length are all refused.
+    #[test]
+    fn hostile_torrent_id_is_refused() {
+        let id = id();
+        let bare = crate::stream::stream_path(&id, 0);
+        // The valid id passes.
+        assert_eq!(checked_stream_path(&bare, &id, 0), Some(bare.as_str()));
+
+        // A newline in the id: a request smuggling vector.
+        let newline = TorrentId("0123456789abcdef0123456789abcdef012345\n7".to_string());
+        assert_eq!(checked_stream_path(&bare, &newline, 0), None);
+        // A `?` in the id: a query smuggling vector.
+        let question = TorrentId("0123456789abcdef0123456789abcdef0123456?".to_string());
+        assert_eq!(checked_stream_path(&bare, &question, 0), None);
+        // A `/` in the id: a path smuggling vector.
+        let slash = TorrentId("0123456789abcdef0123456789abcdef0123456/".to_string());
+        assert_eq!(checked_stream_path(&bare, &slash, 0), None);
+        // Upper case in the id: another spelling.
+        let upper = TorrentId("0123456789ABCDEF0123456789abcdef01234567".to_string());
+        assert_eq!(checked_stream_path(&bare, &upper, 0), None);
+        // 64 hex characters (a SHA-256): the wrong length.
+        let sha256 = TorrentId(
+            "0123456789abcdef0123456789abcdef012345670123456789abcdef0123456789abcdef".to_string(),
+        );
+        assert_eq!(checked_stream_path(&bare, &sha256, 0), None);
+        // 39 characters: too short.
+        let short = TorrentId("0123456789abcdef0123456789abcdef0123456".to_string());
+        assert_eq!(checked_stream_path(&bare, &short, 0), None);
     }
 }

@@ -32,6 +32,7 @@ use fbtt_core::{
 };
 use fbtt_server::Server;
 use fbtt_server::auth::password;
+use futures::StreamExt;
 use serde_json::{Value, json};
 use signature::Verifier;
 use ssh_key::{
@@ -157,10 +158,6 @@ fn loopback(config: &Config) -> fbt::Settings {
     settings.enable_lsd = false;
     settings.enable_upnp = false;
     settings.enable_natpmp = false;
-    // A read-ahead the server's own stream route can serve without a peer: the
-    // default 16 MiB / 10 s window is enough for a 1 MiB test file, and a
-    // torrent that already has its pieces on disk answers a read from storage
-    // the moment its check finishes.
     settings
 }
 
@@ -290,10 +287,12 @@ fn id_of(metainfo: &fbt::Metainfo) -> TorrentId {
 }
 
 /// The client every direct request goes through: no redirect following, so a test sees the answer the
-/// server gave.
+/// server gave. `.no_proxy()` keeps a test from routing a `127.0.0.1` request through a proxy a machine
+/// happens to be set with.
 fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .expect("an http client")
 }
@@ -1253,6 +1252,9 @@ async fn torrents(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response
         )
             .into_response(),
         2 if fake.rude => {
+            // 17 MiB crosses the 16 MiB cap this client reads: the test proves the
+            // cap is enforced, and the over-cap answer costs the client a line, not
+            // its memory.
             let big = vec![b'x'; 17 * 1024 * 1024];
             (
                 [(header::CONTENT_TYPE, "application/json")],
@@ -2229,6 +2231,9 @@ async fn rude_token_route() -> Response {
         )
             .into_response(),
         _ => {
+            // 17 MiB crosses the 16 MiB cap this client reads: the test proves the
+            // cap is enforced, and the over-cap answer costs the client a line, not
+            // its memory.
             let big = vec![b'x'; 17 * 1024 * 1024];
             (
                 [(header::CONTENT_TYPE, "application/json")],
@@ -2323,7 +2328,7 @@ async fn remote_stream_picks_largest_file() {
     // Three files in the list, the last one the largest, a pad between the other two:
     // the choice is the last, and the answer the token route gives names it.
     let files_calls = Arc::new(AtomicUsize::new(0));
-    let files = vec![
+    let files = [
         r#"{"index":0,"path":"small.bin","len":65536,"pad":false}"#.to_string(),
         r#"{"index":1,"path":"pad","len":512,"pad":true}"#.to_string(),
         r#"{"index":2,"path":"large.bin","len":262144,"pad":false}"#.to_string(),
@@ -2417,6 +2422,106 @@ async fn remote_stream_picks_largest_file() {
     assert!(
         files_calls.load(Ordering::SeqCst) > 0,
         "the file list was read before the choice was made"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A hostile file list: the server's `index` field does not line up with the list's
+/// positions. The choice looks up by `index` field, not by position, so a list with
+/// `[{"index":7,...}]` does not panic. The result is one error notice, not a dead
+/// backend task.
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_file_list_does_not_panic() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/7/stream?token=t";
+    // A one-element file list whose `index` field is 7: the server's own value, not
+    // the position. The choice looks up by `index` field and finds it.
+    let files_body = r#"[{"index":7,"path":"a.bin","len":10,"pad":false}]"#;
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get({
+                let body = files_body.to_string();
+                move |_id: axum::extract::Path<String>| async move {
+                    ([(header::CONTENT_TYPE, "application/json")], body.clone()).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    // The stream command: the file list has one file at `index` 7, the token route
+    // answers with the matching path. The choice looks up by `index` field and finds
+    // it; the URL the server answered names it. No panic.
+    assert!(client.send(Command::Stream {
+        id: TorrentId(ID.to_string()),
+        file: None
+    }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("a remote stream is a URL, not a path: {source:?}");
+    };
+    // The file at `index` 7 is the one the URL names: the choice was made by the
+    // `index` field, not by position.
+    assert!(
+        url.as_str().contains("/files/7/stream"),
+        "the file at index 7 is the one the URL names: {}",
+        url.as_str()
     );
 
     shutdown(&mut client).await;
@@ -2678,6 +2783,13 @@ async fn relay_is_bounded() {
     let hold_clone = Arc::clone(&hold);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = Arc::clone(&seen);
+    // The held-open bodies: each request that arrives with `hold` set gets its own
+    // mpsc channel. The test holds the sending ends in `held_senders`; dropping
+    // one of them ends that one body, which is how the permit-release assertion
+    // proves the slot is released when the body ends and not earlier.
+    let held_senders: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<axum::body::Bytes>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let held_senders_clone = Arc::clone(&held_senders);
     let upstream = Router::new()
         .route(
             "/api/v1/fs/roots",
@@ -2737,9 +2849,11 @@ async fn relay_is_bounded() {
             get({
                 let hold = Arc::clone(&hold_clone);
                 let seen = Arc::clone(&seen_clone);
+                let held_senders = Arc::clone(&held_senders_clone);
                 move |request: axum::extract::Request| {
                     let hold = Arc::clone(&hold);
                     let seen = Arc::clone(&seen);
+                    let held_senders = Arc::clone(&held_senders);
                     async move {
                         let range = request
                             .headers()
@@ -2749,10 +2863,42 @@ async fn relay_is_bounded() {
                             .unwrap_or_default();
                         seen.lock().expect("the test state").push(range);
                         if hold.load(Ordering::SeqCst) {
-                            // One chunk, then the body never ends: what a player seeking
-                            // through a slow file looks like, and what the bound exists
-                            // for - a slot is held for the whole body, not the head.
-                            return ("0123456789abcdef").into_response();
+                            // A held-open body: one chunk, then the body stays open
+                            // until the test drops this request's mpsc sender. The
+                            // mpsc channel is per-request, so each body is independent.
+                            // Dropping the sender closes the channel, which ends the
+                            // body stream, which releases the relay's permit.
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+                            // Hold the sender: the body stays open until the test
+                            // drops it.
+                            held_senders.lock().expect("the test state").push(tx);
+                            // The first chunk is sent immediately; the body stays
+                            // open until the channel is closed (the sender is dropped).
+                            let first_chunk = futures::stream::once(async {
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                    b"0123456789abcdef",
+                                ))
+                            });
+                            let rest = futures::stream::poll_fn(move |cx| {
+                                // `poll_recv` returns `Poll<Option<Bytes>>`; wrap it in
+                                // `Ok` to match the first chunk's `Result<Bytes, io::Error>`.
+                                match rx.poll_recv(cx) {
+                                    std::task::Poll::Ready(Some(chunk)) => {
+                                        std::task::Poll::Ready(Some(Ok(chunk)))
+                                    }
+                                    std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                                    std::task::Poll::Pending => std::task::Poll::Pending,
+                                }
+                            });
+                            let stream = first_chunk.chain(rest);
+                            return (
+                                [
+                                    (header::CONTENT_TYPE, "application/octet-stream"),
+                                    (header::ACCEPT_RANGES, "bytes"),
+                                ],
+                                axum::body::Body::from_stream(stream),
+                            )
+                                .into_response();
                         }
                         (
                             [
@@ -2909,6 +3055,18 @@ async fn relay_is_bounded() {
         9,
         "all nine requests got an answer: {statuses:?}"
     );
+    // Eight of the nine get their first bytes: the body is held open by the upstream,
+    // so the relay's slot is held for the whole body, not the head.
+    let held = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter(|response| response.status() == StatusCode::OK)
+        .count();
+    assert_eq!(
+        held, 8,
+        "eight of nine concurrent requests hold a slot: {statuses:?}"
+    );
+    // The ninth is refused before it reaches the upstream.
     let refused = results
         .iter()
         .filter_map(|result| result.as_ref().ok())
@@ -2933,8 +3091,297 @@ async fn relay_is_bounded() {
         "the refusal says when to wait"
     );
 
-    // The upstream's body that the eight held open ends with the test: the client goes,
+    // Drop one of the eight held-open bodies: the test drops its oneshot sender, the
+    // body stream ends, the relay's permit is released, and a tenth request succeeds
+    // within two seconds. This proves the permit is released when the body ends, not
+    // earlier and not never.
+    {
+        let mut senders = held_senders.lock().expect("the test state");
+        assert_eq!(senders.len(), 8, "eight held-open bodies: one sender each");
+        senders.remove(0); // drop the first sender, ending that body
+    }
+    let tenth = within(http().get(url).send())
+        .await
+        .expect("the tenth request was answered");
+    assert_eq!(
+        tenth.status(),
+        StatusCode::OK,
+        "the tenth request succeeds after a body ends: {}",
+        tenth.status()
+    );
+
+    // The upstream's body that the seven held open ends with the test: the client goes,
     // and with it the relay, and with the relay the bodies it was forwarding.
+    shutdown(&mut client).await;
+}
+
+/// An upstream that accepts the connection and never sends a response head: the relay
+/// answers `504 Gateway Timeout` within the head timeout (1 s under test), not `502`.
+/// The body the relay sends is a fixed sentence, never the reqwest error's text (which
+/// holds the URL with the stream token in it).
+///
+/// The upstream's stream handler awaits forever: the head is never sent, so the
+/// relay's `tokio::time::timeout` is the only thing that ends the wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_head_timeout_is_504() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream: the stream handler awaits forever, so the response head is never
+    // sent. The relay's `tokio::time::timeout` is the only thing that ends the wait.
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get(|| async {
+                // The handler awaits forever: the response is never returned, so the
+                // head is never sent. The relay's head timeout is the only thing that
+                // ends the wait.
+                futures::future::pending::<()>().await
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    let mut remote = target(addr, LoginMethod::GatewayBasic, Some("timeout-user"), None);
+    remote.gateway_key_header = Some("x-gw".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("timeout-pass".to_string().into()),
+        Some("timeout-key".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // The relay answers 504 within 3 s (head timeout is 1 s under test).
+    let started = std::time::Instant::now();
+    let response = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "a silent upstream gets 504, not 502: {}",
+        response.status()
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the 504 came within 3 s: {elapsed:?}"
+    );
+    // The body is a fixed sentence, never the reqwest error's text.
+    let body = within(response.text()).await.expect("the body arrived");
+    assert!(
+        !body.contains(url),
+        "the 504 body does not hold the relay's URL: {body}"
+    );
+    assert!(
+        !body.contains("token"),
+        "the 504 body does not name a token: {body}"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A Password login with a `gateway_key_header`, streaming through the relay: the
+/// upstream records the headers it saw, and there is no `Authorization: Bearer` in
+/// them. The relay sends only the gateway's credential (the key header), never the
+/// server's session bearer.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_does_not_send_session_bearer() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream records every `Authorization` header it sees on the stream route,
+    // and answers the login and stream routes.
+    let saw_auth = Arc::new(Mutex::new(Vec::new()));
+    let saw_auth_clone = Arc::clone(&saw_auth);
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        // The login route: a Password login needs it. The test checks that the relay
+        // does not send the session bearer it earns here.
+        .route(
+            "/api/v1/auth/session",
+            post(|| async { Json(json!({"token": "session-token-123", "expires_in": 3600})) }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get({
+                let saw_auth = Arc::clone(&saw_auth_clone);
+                move |request: axum::extract::Request| {
+                    let saw_auth = Arc::clone(&saw_auth);
+                    async move {
+                        let auth = request
+                            .headers()
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        saw_auth.lock().expect("the test state").push(auth);
+                        ("0123456789abcdef".to_string()).into_response()
+                    }
+                }
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    // A Password login (server session) with a `gateway_key_header` and a key: the
+    // client signs to a gateway, so it routes streams through the relay. The relay must
+    // send the gateway key header, not the session bearer.
+    let mut remote = target(addr, LoginMethod::Password, Some("bearer-user"), None);
+    remote.gateway_key_header = Some("x-gw-key".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("bearer-pass".to_string().into()),
+        Some("gw-key-value".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+    assert!(
+        url.starts_with("http://127.0.0.1:"),
+        "the relay's URL is loopback: {url}"
+    );
+
+    // The player's request through the relay: the upstream records the `Authorization`
+    // header it saw, and there is no `Bearer` in it.
+    let first = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the relay served the stream: {}",
+        first.status()
+    );
+    let _ = within(first.bytes()).await.expect("the body arrived");
+
+    // The upstream saw no `Authorization: Bearer` header: the relay sent only the
+    // gateway key header, never the server's session bearer.
+    let saw = saw_auth.lock().expect("the test state").clone();
+    assert!(
+        saw.iter().all(|auth| !auth.starts_with("Bearer")),
+        "the relay did not send the session bearer: {saw:?}"
+    );
+
     shutdown(&mut client).await;
 }
 

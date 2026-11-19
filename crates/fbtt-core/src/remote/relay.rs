@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, Request, State as RouteState};
@@ -24,6 +25,7 @@ use axum::routing::any;
 use futures_util::StreamExt;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::watch;
 
 use crate::client::StreamUrl;
 use crate::remote::http::Api;
@@ -54,6 +56,10 @@ pub struct Relay {
     tokens: Arc<StreamTokens>,
     /// The one bit that ends the relay's server task with the backend.
     stop: Arc<crate::remote::stopping::Stopping>,
+    /// The signal every relayed body stream watches: when it flips, every stream ends
+    /// at once, which is what lets `shutdown` bound its wait instead of waiting for
+    /// players to hang up.
+    body_stop: watch::Sender<bool>,
     /// The server task, joined on shutdown so the listener is closed before this ends.
     task: tokio::task::JoinHandle<()>,
 }
@@ -76,12 +82,14 @@ impl Relay {
         let slots = Arc::new(Semaphore::new(MAX_REQUESTS));
         let stop = api.stopping();
         let port = Arc::new(OnceLock::new());
+        let (body_stop, _) = watch::channel(false);
 
         let state = State {
             tokens: Arc::clone(&tokens),
             api: Arc::clone(&api),
             slots,
             addr: Arc::clone(&port),
+            body_stop: body_stop.clone(),
         };
         let app = Router::new()
             .route("/relay/{token}", any(relay_request))
@@ -111,6 +119,7 @@ impl Relay {
             addr,
             tokens,
             stop,
+            body_stop,
             task,
         })
     }
@@ -124,15 +133,30 @@ impl Relay {
         StreamUrl::new(format!("http://{}/relay/{}", self.addr, token))
     }
 
-    /// Ends the relay: the stop signal closes the listener and ends every stream it
-    /// forwards, and this waits for the server task. Called on the backend's `Shutdown`,
-    /// after the backend's own calls are done.
-    pub async fn shutdown(self) {
+    /// Ends the relay: every relayed body stream is told to end, the stop signal closes
+    /// the listener, and this waits for the server task at most two seconds, then aborts
+    /// it. Called on the backend's `Shutdown`, after the backend's own calls are done.
+    ///
+    /// A held-open body that the player never closes would otherwise keep the server
+    /// task alive indefinitely: axum's graceful shutdown waits for open connections, and
+    /// a relayed body is one. Flipping the body-stop signal ends every stream at once,
+    /// which is what makes the two-second bound enough.
+    pub async fn shutdown(mut self) {
+        // Tell every relayed body to end. The body streams watch this signal; when it
+        // flips they finish on the next poll, releasing their permits and closing the
+        // upstream connections.
+        let _ = self.body_stop.send(true);
+        // Close the listener so no new connection is accepted.
         self.stop.stop();
-        let _ = self.task.await;
-        // A request still in flight holds its permit in its body stream; the permit is
-        // released when the body ends or the player hangs up, and the task above is
-        // gone by then, whatever that order was.
+        // Wait for the server task to finish, but not for more than two seconds: a body
+        // that is already ending (the signal just flipped) should end in well under a
+        // second, and anything slower is not going to end on its own.
+        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(_) => {}
+            Err(_) => {
+                self.task.abort();
+            }
+        }
     }
 }
 
@@ -147,6 +171,9 @@ struct State {
     /// needs the port, and the port is only known after the bind. A request in the
     /// moment between the bind and the set is refused, which is closed.
     addr: Arc<OnceLock<SocketAddr>>,
+    /// The signal every relayed body stream watches: when it flips, every stream ends
+    /// at once (see [`Relay::shutdown`]).
+    body_stop: watch::Sender<bool>,
 }
 
 /// `GET` and `HEAD` on `/relay/{token}`: the one route, answered in order - the method,
@@ -198,7 +225,8 @@ async fn relay_request(
     let range = range_of(headers);
     let api = state.api.clone();
     let head = request.method() == Method::HEAD;
-    forward(api, scope, range, head, permit).await
+    let body_stop = state.body_stop.subscribe();
+    forward(api, scope, range, head, permit, body_stop).await
 }
 
 /// Whether `headers` name one of the two hosts this relay serves: its own
@@ -246,27 +274,31 @@ async fn forward(
     range: Option<HeaderValue>,
     head: bool,
     permit: OwnedSemaphorePermit,
+    body_stop: watch::Receiver<bool>,
 ) -> Response {
-    // The call itself. `relay_get` carries the credential and the gateway's header,
-    // renews them once on a `401`, and wraps only the wait for the head in
-    // [`RELAY_HEAD_TIMEOUT`]: a server that opens a connection and answers none of
-    // them costs the relay that much, and not the whole request timeout.
+    // The call itself. `relay_get` carries the gateway's credential and header, renews it once
+    // on a `401`, and wraps only the wait for the head in [`RELAY_HEAD_TIMEOUT`]: a server that
+    // opens a connection and answers none of them costs the relay that much, and not the whole
+    // request timeout.
+    //
+    // The body of every error the relay answers is a fixed sentence, never the error's own text:
+    // a reqwest error holds the URL it failed on, and that URL holds the stream token. What goes
+    // in the body is what the player can act on, not what the client saw.
     let response = match api.relay_get(&scope, range.as_ref(), head).await {
         Ok(response) => response,
         Err(problem) => {
-            // A refusal of the credential is the one this relay cannot fix: it is the same
-            // credential every other call on the connection carries, and the refresh loop
-            // is the one that renews it. What the player gets is what the server said.
-            let (status, line) = match &problem {
-                crate::remote::bodies::ApiError::Refused(_) => {
-                    (StatusCode::UNAUTHORIZED, problem.line())
-                }
-                crate::remote::bodies::ApiError::Answer(_) => {
-                    (StatusCode::BAD_GATEWAY, problem.line())
-                }
-                crate::remote::bodies::ApiError::Transport(_) => {
-                    (StatusCode::BAD_GATEWAY, problem.line())
-                }
+            // A head timeout is `504`: the upstream opened the connection and did not answer its
+            // head in time. Everything else that is not a credential refusal is a `502`.
+            let (status, line) = if problem.is_head_timeout() {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "the server did not answer the stream request".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "the server could not be reached".to_string(),
+                )
             };
             return (status, line).into_response();
         }
@@ -276,16 +308,22 @@ async fn forward(
     // rest of the upstream's headers are the upstream's business, not the relay's.
     let upstream = response.headers().clone();
     let status = response.status();
-    // The body is the upstream's own, one chunk at a time. The permit goes with it: the
-    // map holds it for every item the stream produces, and it is released when the body
-    // ends or the player closes the connection - a slow body holds its slot for as long
-    // as the player plays it, and no longer.
+    // The body is the upstream's own, one chunk at a time, ending when the body ends,
+    // the player closes the connection, or the relay's stop signal flips (see
+    // [`Relay::shutdown`]). The permit goes with it: it is held for every item the
+    // stream yields and released when the body ends or the player closes the connection.
     let body = crate::remote::bodies::stream(response.bytes_stream()).map(move |chunk| {
-        // The permit goes with the body: it is held for every item the stream yields
-        // and released when the body ends or the player closes the connection.
         let _ = &permit;
         chunk
     });
+    let body_stop_wait = async move {
+        let mut rx = body_stop;
+        // End the stream when the stop signal flips, or when the sender is dropped
+        // (the relay is gone). `wait_for` returns `Ok(true)` when the value changes
+        // to `true` and `Err` when the sender is dropped; both end the stream.
+        while rx.wait_for(|stopped| *stopped).await.is_ok() {}
+    };
+    let body = body.take_until(body_stop_wait);
     let mut reply = Response::new(axum::body::Body::from_stream(body));
     *reply.status_mut() = status;
     for name in [
@@ -300,4 +338,127 @@ async fn forward(
         }
     }
     reply
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{range_of, serves_host};
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn serves_host_accepts_the_two_forms() {
+        let a = addr(8443);
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "127.0.0.1:8443".parse().unwrap());
+        assert!(serves_host(&headers, a));
+        headers.insert(axum::http::header::HOST, "localhost:8443".parse().unwrap());
+        assert!(serves_host(&headers, a));
+    }
+
+    #[test]
+    fn serves_host_refuses_without_port() {
+        let a = addr(8443);
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "127.0.0.1".parse().unwrap());
+        assert!(!serves_host(&headers, a));
+        headers.insert(axum::http::header::HOST, "localhost".parse().unwrap());
+        assert!(!serves_host(&headers, a));
+    }
+
+    #[test]
+    fn serves_host_refuses_wrong_port() {
+        let a = addr(8443);
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "127.0.0.1:9999".parse().unwrap());
+        assert!(!serves_host(&headers, a));
+        headers.insert(axum::http::header::HOST, "localhost:9999".parse().unwrap());
+        assert!(!serves_host(&headers, a));
+    }
+
+    #[test]
+    fn serves_host_refuses_another_host() {
+        let a = addr(8443);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "192.168.1.1:8443".parse().unwrap(),
+        );
+        assert!(!serves_host(&headers, a));
+        headers.insert(axum::http::header::HOST, "evil.com:8443".parse().unwrap());
+        assert!(!serves_host(&headers, a));
+    }
+
+    #[test]
+    fn serves_host_refuses_no_host() {
+        let a = addr(8443);
+        let headers = HeaderMap::new();
+        assert!(!serves_host(&headers, a));
+    }
+
+    #[test]
+    fn range_of_accepts_a_single_visible_ascii_value() {
+        let mut headers = HeaderMap::new();
+        headers.append(axum::http::header::RANGE, "bytes=0-15".parse().unwrap());
+        assert_eq!(
+            range_of(&headers),
+            Some("bytes=0-15".parse::<HeaderValue>().unwrap())
+        );
+    }
+
+    #[test]
+    fn range_of_accepts_a_256_byte_value() {
+        let value = format!("bytes=0-{}", "x".repeat(248));
+        assert_eq!(value.len(), 256);
+        let mut headers = HeaderMap::new();
+        headers.append(axum::http::header::RANGE, value.parse().unwrap());
+        assert_eq!(
+            range_of(&headers).map(|v| v.to_str().unwrap().to_string()),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn range_of_drops_two_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(axum::http::header::RANGE, "bytes=0-15".parse().unwrap());
+        headers.append(axum::http::header::RANGE, "bytes=16-31".parse().unwrap());
+        assert_eq!(range_of(&headers), None);
+    }
+
+    #[test]
+    fn range_of_drops_257_bytes() {
+        let value = format!("bytes=0-{}", "x".repeat(249));
+        assert_eq!(value.len(), 257);
+        let mut headers = HeaderMap::new();
+        headers.append(axum::http::header::RANGE, value.parse().unwrap());
+        assert_eq!(range_of(&headers), None);
+    }
+
+    #[test]
+    fn range_of_drops_a_byte_above_the_printable_range() {
+        // The HTTP spec allows bytes 0x20-0x7e and 0x80-0xff in header values, but
+        // `range_of` only passes 0x20-0x7e (visible ASCII). A byte above 0x7e is a
+        // visible-ASCII violation even when the header parser accepts it.
+        // 0x7f (DEL) is rejected by the header parser, so we use 0x80, which is
+        // accepted by the parser but outside `range_of`'s allowed range.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::RANGE,
+            HeaderValue::from_bytes(b"bytes=0-\x80").expect("a valid header value"),
+        );
+        assert_eq!(range_of(&headers), None);
+    }
+
+    #[test]
+    fn range_of_drops_no_range_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(range_of(&headers), None);
+    }
 }

@@ -330,14 +330,19 @@ impl Api {
     }
 
     /// The relay's half of a call: a `GET` or `HEAD` of a stream address the relay was told to open,
-    /// through the client without a request timeout, with the current credential and the gateway's header
-    /// beside it - the stream token is already in the address, so no session bearer goes with it.
+    /// through the client without a request timeout, with the gateway's credential and header beside it.
+    ///
+    /// The credential here is the gateway's proof only, never the server's session bearer (see
+    /// [`super::login::Auth::relay_credential`]): the stream token is already in the address, so a
+    /// password or device login behind a gateway that checks only its key header sends that header
+    /// alone. A `401` from the upstream renews the gateway credential once and tries again; a `401`
+    /// that is the server's own answer (a bad stream token) does not trigger a session login.
     ///
     /// The only wait wrapped is the one for the response head: a body may run for as long as the player
     /// keeps asking for it, and the relay's own cap (see [`RELAY_HEAD_TIMEOUT`]) is the bound on the head.
-    /// A `401` renews the credential once and tries again, on the same rule [`Self::call`] does: the relay
-    /// carries the connection's own credential, and a server that has ended a session is a renewal, not a
-    /// refusal.
+    ///
+    /// Statuses the relay copies back as-is: `200`, `206`, `404`, `416`. Every other status, including
+    /// every `3xx`, is an upstream the relay does not understand: it answers `502` with a fixed body.
     pub(crate) async fn relay_get(
         &self,
         path_and_query: &str,
@@ -346,7 +351,10 @@ impl Api {
     ) -> Result<Response, ApiError> {
         let url = self.url(path_and_query);
         for attempt in 0..2 {
-            let credential = self.authorise().await?;
+            let credential = {
+                let mut auth = self.auth.lock().await;
+                auth.relay_credential().await.map_err(ApiError::Refused)?
+            };
             let mut request = if head {
                 self.events_client.head(url.clone())
             } else {
@@ -361,32 +369,32 @@ impl Api {
             let response = match tokio::time::timeout(RELAY_HEAD_TIMEOUT, self.send(request)).await
             {
                 Ok(result) => result?,
-                Err(_) => {
-                    return Err(ApiError::Answer(
-                        "the server did not answer the stream request".to_string(),
-                    ));
-                }
+                // The head wait ran out: its own error, so the relay can answer `504` rather
+                // than the `502` a transport failure or a bad upstream answer gets.
+                Err(_) => return Err(ApiError::HeadTimeout),
             };
             let status = response.status();
-            if status.is_success() {
+            // Copy back the statuses a media player understands; everything else is a 502 the relay
+            // answers with a fixed body (see [`crate::remote::relay::forward`]).
+            if status == StatusCode::OK
+                || status == StatusCode::PARTIAL_CONTENT
+                || status == StatusCode::NOT_FOUND
+                || status == StatusCode::RANGE_NOT_SATISFIABLE
+            {
                 return Ok(response);
             }
-            // The server's own reason comes first, as in [`Self::call`]: only a refusal with no business
-            // answer behind it is about the credential.
-            let answer = self.problem(response).await?;
-            if !self.refused(status, answer.as_deref()).await {
-                return Err(ApiError::Answer(
-                    answer.unwrap_or_else(|| status_line(status)),
-                ));
+            // A `401` is the only status that means "renew the credential and try again". Any other
+            // status, including every `3xx`, is an upstream the relay does not forward: a fixed `502`.
+            if status == StatusCode::UNAUTHORIZED && attempt == 0 {
+                // The first attempt's credential is no good; the next earns one.
+                self.invalidate().await;
+                continue;
             }
-            if attempt == 1 {
-                return Err(ApiError::Refused(match answer {
-                    Some(message) => message,
-                    None => "the credential this connection presents is not accepted".to_string(),
-                }));
-            }
-            // The first attempt's credential is no good; the next earns one.
-            self.invalidate().await;
+            // Every other status: a fixed 502. The body is a constant the relay sends (see `forward`),
+            // never this response's text, which might hold a URL with the stream token in it.
+            return Err(ApiError::Answer(
+                "the server could not be reached: the stream answer was not a stream".to_string(),
+            ));
         }
         unreachable!("the second attempt always returns")
     }

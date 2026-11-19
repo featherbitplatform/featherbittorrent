@@ -220,6 +220,38 @@ impl Auth {
         matches!(self.kind, Kind::Gateway(_) | Kind::Basic { .. })
     }
 
+    /// The credential the relay may send on a stream forward: only the gateway's proof, never the
+    /// server's session bearer. The stream token is already in the query the relay forwards, so a
+    /// password or device login behind a gateway that checks only its key header sends that header
+    /// alone, and a `GatewayBasic` login sends its `Authorization`. [`Credential::Open`] when the
+    /// target has no gateway credential of its own.
+    ///
+    /// This is what keeps the relay from carrying the TUI's session bearer onto every player seek:
+    /// a `Kind::Server` credential is the session, and the relay is not where a session goes. A
+    /// `Kind::Gateway` login's bearer is a gateway token earned from the gateway's own endpoint, and
+    /// that one the relay may send: earning it is what the gateway checks.
+    pub(crate) async fn relay_credential(&mut self) -> Result<Credential, String> {
+        match &mut self.kind {
+            // A server login's credential is the session bearer: the relay never sends it. The
+            // gateway header still goes on the request beside it (see [`super::http::gateway_headers`]).
+            Kind::Server(_) | Kind::Open => Ok(Credential::Open),
+            Kind::Basic { user, password } => Ok(Credential::Basic(user.clone(), password.clone())),
+            // The gateway's own bearer token, earning it when the one held is missing or stale.
+            // `Gateway::fetch` signs an assertion the gateway checks against this client's public
+            // key, so it needs nothing from the server - and no gateway key (see its own docs).
+            Kind::Gateway(gateway) => {
+                if let Some(live) = &gateway.live
+                    && live.still_good()
+                {
+                    return Ok(Credential::Bearer(live.token.clone()));
+                }
+                let live = gateway.fetch(&self.client).await?;
+                gateway.live = Some(live.clone());
+                Ok(Credential::Bearer(live.token))
+            }
+        }
+    }
+
     /// The credential in hand right now, without signing in: what the event stream is allowed to send, and
     /// `None` when a request would first have to log in or fetch a token. The stream takes this rather than
     /// [`Self::credential`] so that only the refresh loop ever spends a login (see [`super::sse`]).
