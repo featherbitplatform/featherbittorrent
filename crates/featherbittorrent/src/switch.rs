@@ -2315,8 +2315,8 @@ mod tests {
     use fbtt_tui::graphics::caps::{CellPx, Graphics, Protocol};
     use fbtt_tui::graphics::kitty;
     use fbtt_tui::graphics::place::{LogoSize, Placement, Placer, PreparedLogos};
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::layout::Rect;
+    use ratatui::backend::{Backend as RatatuiBackend, ClearType, CrosstermBackend, WindowSize};
+    use ratatui::layout::{Position, Rect, Size};
     use ratatui::{Terminal, TerminalOptions, Viewport};
 
     /// A writer that keeps every byte it is handed, in order.
@@ -2333,12 +2333,80 @@ mod tests {
         }
     }
 
-    /// A terminal of `height` rows over a recording writer, with a fixed viewport so the test
-    /// does not ask a real tty for its size. The recording is read through the returned handle.
-    fn recording_terminal(height: u16) -> (Terminal<CrosstermBackend<Recorder>>, Recorder) {
+    /// The crossterm backend over a recording writer, with every question a terminal would be asked
+    /// answered from a fixed size instead: crossterm's own `size()`, `window_size()` and
+    /// `get_cursor_position()` read the real tty, which a test never does (and which fails with
+    /// `WouldBlock` where there is none). Everything that writes goes to the inner backend, so the
+    /// recording holds the exact bytes the real backend would send.
+    struct FixedBackend {
+        inner: CrosstermBackend<Recorder>,
+        size: Size,
+    }
+
+    impl std::io::Write for FixedBackend {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut self.inner, buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::Write::flush(&mut self.inner)
+        }
+    }
+
+    impl RatatuiBackend for FixedBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            Ok(Position::new(0, 0))
+        }
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+        fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+            self.inner.clear_region(clear_type)
+        }
+        fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+            self.inner.append_lines(n)
+        }
+        fn size(&self) -> std::io::Result<Size> {
+            Ok(self.size)
+        }
+        fn window_size(&mut self) -> std::io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            RatatuiBackend::flush(&mut self.inner)
+        }
+    }
+
+    /// A terminal of `height` rows over a recording writer, with a fixed viewport and a backend
+    /// that answers its own size and cursor questions, so nothing on the test path asks a real tty.
+    /// The recording is read through the returned handle.
+    fn recording_terminal(height: u16) -> (Terminal<FixedBackend>, Recorder) {
         let recorder = Recorder::default();
+        let backend = FixedBackend {
+            inner: CrosstermBackend::new(recorder.clone()),
+            size: Size::new(100, height),
+        };
         let terminal = Terminal::with_options(
-            CrosstermBackend::new(recorder.clone()),
+            backend,
             TerminalOptions {
                 viewport: Viewport::Fixed(Rect::new(0, 0, 100, height)),
             },
