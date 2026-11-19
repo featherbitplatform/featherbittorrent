@@ -139,13 +139,17 @@ impl Relay {
     ///
     /// A held-open body that the player never closes would otherwise keep the server
     /// task alive indefinitely: axum's graceful shutdown waits for open connections, and
-    /// a relayed body is one. Flipping the body-stop signal ends every stream at once,
-    /// which is what makes the two-second bound enough.
+    /// a relayed body is one. Flipping the body-stop signal ends every stream at once.
+    /// That signal is the real bound on a held body: the two-second abort below only
+    /// ends the serve task, not the connections axum already spawned, so a body whose
+    /// stop signal did not fire would keep forwarding past the abort.
     pub async fn shutdown(mut self) {
         // Tell every relayed body to end. The body streams watch this signal; when it
         // flips they finish on the next poll, releasing their permits and closing the
-        // upstream connections.
-        let _ = self.body_stop.send(true);
+        // upstream connections. `send_replace` rather than `send`: with no receiver the
+        // plain `send` stores nothing, and the value would stay `false` for any body
+        // that subscribes after quit.
+        self.body_stop.send_replace(true);
         // Close the listener so no new connection is accepted.
         self.stop.stop();
         // Wait for the server task to finish, but not for more than two seconds: a body

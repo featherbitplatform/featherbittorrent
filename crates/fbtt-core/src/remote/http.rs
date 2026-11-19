@@ -354,71 +354,41 @@ impl Api {
         // (see [`super::login::Auth::relay_credential`]). It is earned under the same stop race the
         // refresh loop's [`Self::authorise`] uses: a `Kind::Gateway` token fetch can take a network
         // round, and a stop pressed while it is running should not be waited out behind the auth lock.
-        let credential = {
-            let mut auth = self.auth.lock().await;
-            tokio::select! {
-                result = auth.relay_credential() => result.map_err(ApiError::Refused)?,
-                _ = self.stopping.waited() => return Err(ApiError::Transport(STOPPED.to_string())),
-            }
-        };
+        // The lock is held only for the fetch, never across an upstream request (see
+        // [`Self::relay_relay_credential`]).
+        let credential = self.relay_relay_credential().await?;
         // Only a `Kind::Gateway` login can renew its relay credential, so only it retries a `401`.
         // A `Kind::Server` session was never sent by the relay, and a `Kind::Basic` re-send is the
         // same credential: for both, a `401` maps straight to a `502` with no retry and no
         // invalidate.
         let renew_on_401 = self.gateway_token_kind().await;
-        let mut request = if head {
-            self.events_client.head(url.clone())
+        let attempt = self
+            .relay_get_with_credential(&url, range, head, credential)
+            .await;
+        // A `401` on a gateway login is the only answer that means "renew the credential and try
+        // again": the gateway token is the credential the relay sent, and it can be re-issued. Every
+        // other status, including every `3xx` and a `401` on any other kind, is an upstream the relay
+        // does not forward: a fixed `502`.
+        if matches!(attempt, Err(ApiError::Refused(_))) && renew_on_401 {
+            // The gateway token is no good: invalidate it (never the server session), earn a new one,
+            // and make the one retry. The lock is held only for the invalidate and the fetch, never
+            // across the retry's upstream request.
+            let renewed = self.renew_gateway_credential().await?;
+            self.relay_get_with_credential(&url, range, head, renewed)
+                .await
         } else {
-            self.events_client.get(url.clone())
-        };
-        if let Some(range) = range {
-            request = request.header(header::RANGE, range.clone());
+            attempt
         }
-        request = request.headers(self.headers(&credential));
-        // Only the wait for the head is timed: the body after it may run as long as the player keeps
-        // asking for it, and it is bounded by the relay's permit, not by a clock.
-        let response = match tokio::time::timeout(RELAY_HEAD_TIMEOUT, self.send(request)).await {
-            Ok(result) => result?,
-            // The head wait ran out: its own error, so the relay can answer `504` rather
-            // than the `502` a transport failure or a bad upstream answer gets.
-            Err(_) => return Err(ApiError::HeadTimeout),
-        };
-        let status = response.status();
-        // Copy back the statuses a media player understands; everything else is a 502 the relay
-        // answers with a fixed body (see [`crate::remote::relay::forward`]).
-        if status == StatusCode::OK
-            || status == StatusCode::PARTIAL_CONTENT
-            || status == StatusCode::NOT_FOUND
-            || status == StatusCode::RANGE_NOT_SATISFIABLE
-        {
-            return Ok(response);
-        }
-        // A `401` on a gateway login is the only status that means "renew the credential and try
-        // again": the gateway token is the one the relay sent, and it can be re-issued. Every
-        // other status, including every `3xx` and a `401` on any other kind, is an upstream the
-        // relay does not forward: a fixed `502`.
-        if status == StatusCode::UNAUTHORIZED && renew_on_401 {
-            // The gateway token is no good; earn one and make the one retry. Only the gateway token
-            // is invalidated, never the server session.
-            self.invalidate_gateway().await;
-            let mut auth = self.auth.lock().await;
-            let renewed = tokio::select! {
-                result = auth.relay_credential() => result.map_err(ApiError::Refused)?,
-                _ = self.stopping.waited() => return Err(ApiError::Transport(STOPPED.to_string())),
-            };
-            return self
-                .relay_get_with_credential(&url, range, head, renewed)
-                .await;
-        }
-        // Every other status: a fixed 502. The body is a constant the relay sends (see `forward`),
-        // never this response's text, which might hold a URL with the stream token in it.
-        Err(ApiError::Answer(
-            "the server could not be reached: the stream answer was not a stream".to_string(),
-        ))
     }
 
-    /// The relay's second attempt after a `401` renewed the gateway credential: the same request, the
-    /// head waited on within [`RELAY_HEAD_TIMEOUT`], and the same status mapping, with no further retry.
+    /// The one upstream call the relay makes on its own behalf: the request built for `url` with the
+    /// credential the relay holds, the head waited on within [`RELAY_HEAD_TIMEOUT`], and the status
+    /// mapped - a status the relay forwards is the response, a `401` is a refused credential (the one
+    /// that earns a retry), and every other status is a fixed `502` the relay answers with its own
+    /// body (see [`crate::remote::relay::forward`]).
+    ///
+    /// Both the first attempt and the `401` retry go through this, so the head timeout and the
+    /// status allowlist are written once.
     async fn relay_get_with_credential(
         &self,
         url: &str,
@@ -435,11 +405,16 @@ impl Api {
             request = request.header(header::RANGE, range.clone());
         }
         request = request.headers(self.headers(&credential));
+        // Only the wait for the head is timed: the body after it may run as long as the player keeps
+        // asking for it, and it is bounded by the relay's permit, not by a clock.
         let response = match tokio::time::timeout(RELAY_HEAD_TIMEOUT, self.send(request)).await {
             Ok(result) => result?,
+            // The head wait ran out: its own error, so the relay can answer `504` rather
+            // than the `502` a transport failure or a bad upstream answer gets.
             Err(_) => return Err(ApiError::HeadTimeout),
         };
         let status = response.status();
+        // Copy back the statuses a media player understands.
         if status == StatusCode::OK
             || status == StatusCode::PARTIAL_CONTENT
             || status == StatusCode::NOT_FOUND
@@ -447,9 +422,43 @@ impl Api {
         {
             return Ok(response);
         }
+        // A `401` is a refused credential: the relay's caller decides whether it retries. It is its
+        // own [`ApiError::Refused`] (with the fixed line) rather than an `Answer`, so the retry path
+        // can tell a `401` from every other status.
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::Refused(
+                "the upstream refused the relay's credential".to_string(),
+            ));
+        }
+        // Every other status, including every `3xx`: a fixed 502. The body is a constant the relay
+        // sends, never this response's text, which might hold a URL with the stream token in it.
         Err(ApiError::Answer(
             "the server could not be reached: the stream answer was not a stream".to_string(),
         ))
+    }
+
+    /// The credential the relay sends on a stream forward, earned under the stop race [`Self::authorise`]
+    /// uses. The auth lock is held only for the fetch itself: a `Kind::Gateway` token fetch can take a
+    /// network round, and a stop pressed while it is running is not waited out behind the lock, nor is the
+    /// lock held across any upstream request that follows.
+    async fn relay_relay_credential(&self) -> Result<Credential, ApiError> {
+        let mut auth = self.auth.lock().await;
+        tokio::select! {
+            result = auth.relay_credential() => result.map_err(ApiError::Refused),
+            _ = self.stopping.waited() => Err(ApiError::Transport(STOPPED.to_string())),
+        }
+    }
+
+    /// The gateway token is no good: say so, and earn a new one. The lock is held only for the invalidate
+    /// and the fetch - never across the retry's upstream request - and the fetch runs under the same stop
+    /// race as the first attempt.
+    async fn renew_gateway_credential(&self) -> Result<Credential, ApiError> {
+        let mut auth = self.auth.lock().await;
+        auth.invalidate_gateway();
+        tokio::select! {
+            result = auth.relay_credential() => result.map_err(ApiError::Refused),
+            _ = self.stopping.waited() => Err(ApiError::Transport(STOPPED.to_string())),
+        }
     }
 
     /// A body this client is still willing to wait for: the same cap as [`read_capped`](bodies::read_capped),
@@ -547,13 +556,6 @@ impl Api {
     /// the session, and for the latter a re-send is the same credential.
     async fn gateway_token_kind(&self) -> bool {
         self.auth.lock().await.gateway_token_kind()
-    }
-
-    /// Says the gateway's token is no good, so that the next gateway call renews it. Unlike
-    /// [`Self::invalidate`], this never touches the server session: a `401` on the relay's forward
-    /// may be a bad stream token, and throwing the TUI's session away for it is a login storm.
-    async fn invalidate_gateway(&self) {
-        self.auth.lock().await.invalidate_gateway();
     }
 
     /// Ends this client's own session with the server, so the device stops showing up as connected. A

@@ -3179,9 +3179,11 @@ async fn relay_shutdown_ends_a_held_body() {
         "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
 
     // The upstream holds its body open: one chunk, then the body never ends until the
-    // relay's stop signal does.
-    let hold = Arc::new(AtomicBool::new(true));
-    let hold_clone = Arc::clone(&hold);
+    // relay's stop signal does. The sender is kept in test state for the whole test, so
+    // the body is genuinely held open and does not end by itself.
+    let sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<axum::body::Bytes>>>> =
+        Arc::new(Mutex::new(None));
+    let sender_clone = Arc::clone(&sender);
     let upstream = Router::new()
         .route(
             "/api/v1/fs/roots",
@@ -3239,38 +3241,35 @@ async fn relay_shutdown_ends_a_held_body() {
         .route(
             "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
             get({
-                let hold = Arc::clone(&hold_clone);
+                let sender = Arc::clone(&sender_clone);
                 move |_request: axum::extract::Request| {
-                    let hold = Arc::clone(&hold);
+                    let sender = Arc::clone(&sender);
                     async move {
-                        if hold.load(Ordering::SeqCst) {
-                            // One chunk, then the body is held open by a channel the
-                            // test never feeds: the body never ends until the relay's
-                            // stop signal ends it.
-                            let (_tx, mut rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
-                            let first = futures::stream::once(async {
-                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
-                                    b"0123456789abcdef",
-                                ))
-                            });
-                            let rest = futures::stream::poll_fn(move |cx| match rx.poll_recv(cx) {
-                                std::task::Poll::Ready(Some(chunk)) => {
-                                    std::task::Poll::Ready(Some(Ok(chunk)))
-                                }
-                                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-                                std::task::Poll::Pending => std::task::Poll::Pending,
-                            });
-                            (
-                                [
-                                    (header::CONTENT_TYPE, "application/octet-stream"),
-                                    (header::ACCEPT_RANGES, "bytes"),
-                                ],
-                                axum::body::Body::from_stream(first.chain(rest)),
-                            )
-                                .into_response()
-                        } else {
-                            "0123456789abcdef".into_response()
-                        }
+                        // One chunk, then the body is held open by a channel the test never
+                        // feeds: the sender is kept in test state for the whole test, so the
+                        // body never ends until the relay's stop signal ends it.
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+                        *sender.lock().expect("the test state") = Some(tx);
+                        let first = futures::stream::once(async {
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                b"0123456789abcdef",
+                            ))
+                        });
+                        let rest = futures::stream::poll_fn(move |cx| match rx.poll_recv(cx) {
+                            std::task::Poll::Ready(Some(chunk)) => {
+                                std::task::Poll::Ready(Some(Ok(chunk)))
+                            }
+                            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        });
+                        (
+                            [
+                                (header::CONTENT_TYPE, "application/octet-stream"),
+                                (header::ACCEPT_RANGES, "bytes"),
+                            ],
+                            axum::body::Body::from_stream(first.chain(rest)),
+                        )
+                            .into_response()
                     }
                 }
             }),
@@ -3307,21 +3306,21 @@ async fn relay_shutdown_ends_a_held_body() {
         "the player received the first chunk"
     );
 
-    // Quitting: the relay's stop signal ends the held-open body, so the player's next
-    // chunk read ends within a second rather than blocking for as long as the upstream
-    // holds on.
+    // Quitting *first*: the relay's stop signal ends the held-open body, so the player's
+    // next chunk read ends within a second rather than blocking for as long as the
+    // upstream holds on. The read has to come after `shutdown`: a read before it would
+    // block for the whole `DEADLINE`, because nothing has yet told the body to end.
+    shutdown(&mut client).await;
     let started = std::time::Instant::now();
     let next = tokio::time::timeout(Duration::from_secs(1), response.chunk())
         .await
         .expect("the held body ended within 1 s of quit");
-    let _ = next;
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "the held body ended within 1 s of quit: {:?}",
         started.elapsed()
     );
-
-    shutdown(&mut client).await;
+    let _ = next;
 }
 
 /// An upstream that accepts the connection and never sends a response head: the relay
@@ -3767,6 +3766,476 @@ async fn relay_401_does_not_drop_the_session() {
     );
 
     shutdown(&mut client).await;
+}
+
+/// A `401` on a gateway login is the one the relay retries: the upstream answers `401`
+/// once (the gateway token is no good) and `200` on the retry, and the relay answers
+/// `200`. The token endpoint is asked for exactly one new token for the retry: the
+/// initial login already earned one, and the `401` renewal is the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_401_renews_the_gateway_token() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream answers the stream route `401` once, then `200`: the first attempt's
+    // gateway token is the one that is no good, the retry's is new.
+    let stream_hits = Arc::new(AtomicUsize::new(0));
+    let stream_hits_clone = Arc::clone(&stream_hits);
+    // The token endpoint counts how many times the gateway asked for a token.
+    let token_hits = Arc::new(AtomicUsize::new(0));
+    let token_hits_clone = Arc::clone(&token_hits);
+
+    let key = keypair();
+    let pem = key.to_openssh(LineEnding::LF).expect("the key file");
+    let dir = ScratchDir::new("relay_401_renew");
+    let key_file = write_file(dir.path(), "id_ed25519", pem.as_bytes());
+
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get({
+                let stream_hits = Arc::clone(&stream_hits_clone);
+                move |request: axum::extract::Request| {
+                    let stream_hits = Arc::clone(&stream_hits);
+                    async move {
+                        let _ = request;
+                        let count = stream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        if count == 1 {
+                            (StatusCode::UNAUTHORIZED, "the token is no good").into_response()
+                        } else {
+                            (
+                                [(header::CONTENT_TYPE, "application/octet-stream")],
+                                "0123456789abcdef".to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        )
+        // The gateway's token endpoint: issues a numbered token on every call, and counts
+        // the calls. The client's refresh loop earns token 1 at start; the `401` renewal
+        // earns token 2.
+        .route(
+            "/token",
+            post({
+                let token_hits = Arc::clone(&token_hits_clone);
+                move |_request: axum::extract::Request| {
+                    let token_hits = Arc::clone(&token_hits);
+                    async move {
+                        let count = token_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        // The assertion is not verified here: the test is about the relay's
+                        // retry, not the gateway's signature check. The token is issued
+                        // regardless, numbered so the relay's first and second tokens
+                        // differ.
+                        Json(json!({"access_token": format!("token-{count}"), "expires_in": 3600}))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    // A `GatewayKey` login: the client earns a bearer token from the gateway's token
+    // endpoint, and the relay sends it on a stream forward.
+    let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file.clone()));
+    remote.token_url = Some(format!("http://{addr}/token"));
+    remote.client_id = Some("featherbittorrent-test".to_string());
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None), None);
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // The player's request: the upstream answers 401 once, the relay renews the gateway
+    // token, and the retry gets 200. The relay answers 200 to the player.
+    let first = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the relay answered 200 after the 401 renewal: {}",
+        first.status()
+    );
+    let _ = within(first.bytes()).await.expect("the body arrived");
+
+    // The upstream was reached twice: the first attempt (401) and the retry (200).
+    assert_eq!(
+        stream_hits.load(Ordering::SeqCst),
+        2,
+        "the upstream was reached once for the 401 and once for the retry"
+    );
+    // The token endpoint was asked for exactly one new token for the retry: the initial
+    // login earned token 1, and the 401 renewal earned token 2.
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        2,
+        "the gateway token was earned once at start and once for the 401 renewal"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A `401` on a basic login is a bad stream token, not a refused credential: the relay
+/// answers `502` with no retry. The upstream is reached exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_401_basic_login_no_retry() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    let stream_hits = Arc::new(AtomicUsize::new(0));
+    let stream_hits_clone = Arc::clone(&stream_hits);
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get({
+                let stream_hits = Arc::clone(&stream_hits_clone);
+                move |_request: axum::extract::Request| {
+                    let stream_hits = Arc::clone(&stream_hits);
+                    async move {
+                        stream_hits.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::UNAUTHORIZED, "the token is no good").into_response()
+                    }
+                }
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    // A `GatewayBasic` login: the relay sends its `Authorization` header on a stream
+    // forward, and a `401` is a bad stream token, not a refused credential.
+    let mut remote = target(addr, LoginMethod::GatewayBasic, Some("basic-user"), None);
+    remote.gateway_key_header = Some("x-gw".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("basic-pass".to_string().into()),
+        Some("basic-key".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // The player's request: the upstream answers 401, and the relay maps it to a 502
+    // with no retry. The upstream is reached exactly once.
+    let first = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::BAD_GATEWAY,
+        "a 401 on a basic login is a 502 with no retry: {}",
+        first.status()
+    );
+    let _ = within(first.bytes()).await.expect("the body arrived");
+    assert_eq!(
+        stream_hits.load(Ordering::SeqCst),
+        1,
+        "the upstream was reached exactly once: no retry on a basic login's 401"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// The gateway `401` retry must not hold the auth lock across the retry's upstream
+/// request: while the retry's upstream is stalled, an ordinary TUI call through the
+/// same client completes. The upstream answers the first stream request `401` and
+/// holds the second (the retry) for about 900 ms; the TUI's `Devices` command is
+/// timed meanwhile and must complete within 2 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_retry_does_not_hold_the_auth_lock() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream answers the stream route `401` once, then holds the second (the
+    // retry) for about 900 ms before answering `200`. The stall is the case the
+    // finding is about: a slow or hostile upstream on the retry's path.
+    let stream_hits = Arc::new(AtomicUsize::new(0));
+    let stream_hits_clone = Arc::clone(&stream_hits);
+    let key = keypair();
+    let pem = key.to_openssh(LineEnding::LF).expect("the key file");
+    let dir = ScratchDir::new("relay_retry_no_lock");
+    let key_file = write_file(dir.path(), "id_ed25519", pem.as_bytes());
+
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/auth/devices",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get({
+                let stream_hits = Arc::clone(&stream_hits_clone);
+                move |_request: axum::extract::Request| {
+                    let stream_hits = Arc::clone(&stream_hits);
+                    async move {
+                        let count = stream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        if count == 1 {
+                            (StatusCode::UNAUTHORIZED, "the token is no good").into_response()
+                        } else {
+                            // The retry: hold the head for about 900 ms before answering.
+                            // A client that holds the auth lock across this request keeps
+                            // every TUI call blocked for that long.
+                            tokio::time::sleep(Duration::from_millis(900)).await;
+                            (
+                                [(header::CONTENT_TYPE, "application/octet-stream")],
+                                "0123456789abcdef".to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(|| async {
+                Json(json!({"access_token": "token-1", "expires_in": 3600})).into_response()
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    // A `GatewayKey` login: the client earns a bearer token from the gateway's token
+    // endpoint, and the relay sends it on a stream forward.
+    let mut remote = target(addr, LoginMethod::GatewayKey, None, Some(key_file.clone()));
+    remote.token_url = Some(format!("http://{addr}/token"));
+    remote.client_id = Some("featherbittorrent-test".to_string());
+    let mut client = RemoteBackend::start(remote, Secret::KeyPassphrase(None), None);
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // Split the client: the TUI half keeps its own command sender and snapshot
+    // receiver, so an ordinary TUI call can be fired and timed while the main thread
+    // drives the player's request. The two halves share the backend's task, so a TUI
+    // call that is blocked behind the relay's retry shows up as a snapshot that never
+    // arrives.
+    let client_parts = client.split();
+    let tui_commands = client_parts.commands;
+    let mut tui_snapshots = client_parts.snapshots;
+    drop(client_parts.notices);
+
+    // An ordinary TUI call, fired in the same instant as the player's request
+    // (`tokio::join!`): a `Devices` list. The `Devices` command goes through
+    // `authorise`, which takes the auth lock, so it is blocked while the retry
+    // holds it. The test asserts the TUI call's snapshot is published within 2 s.
+    let shutdown_commands = tui_commands.clone();
+    assert!(tui_commands.send(Command::Devices(DeviceCommand::List)));
+    let started = tokio::time::Instant::now();
+    let (response, tui_elapsed) = tokio::join!(
+        async {
+            within(http().get(url).send())
+                .await
+                .expect("the relay answered")
+        },
+        async {
+            // The `Devices` command's answer is a snapshot publish: the backend
+            // republishes once the command is done. Wait for the next publish,
+            // bounded by the 2 s deadline.
+            let deadline = started + Duration::from_secs(2);
+            let _ = tokio::time::timeout(deadline - started, tui_snapshots.changed()).await;
+            tokio::time::Instant::now() - started
+        }
+    );
+    assert!(
+        tui_elapsed < Duration::from_secs(2),
+        "the TUI call's snapshot was not published within 2 s: the relay held the auth lock across the retry's stall: {tui_elapsed:?}"
+    );
+
+    // The player's request: 200 after the 401 renewal.
+    let status = response.status();
+    let _ = within(response.bytes()).await.expect("the body arrived");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the relay answered 200 after the 401 renewal: {status}"
+    );
+
+    // Quit: send `Shutdown` through the command queue, and read notices until the
+    // queue closes, the same way every other test ends.
+    assert!(shutdown_commands.send(Command::Shutdown));
+    drop(tui_snapshots);
+    drop(tui_commands);
+    // The notices receiver was dropped at the split, so there is nothing to read: the
+    // backend ends when the command queue closes and the snapshot receiver goes.
 }
 
 /// A server that answers the token route with garbage: one error notice, no `Play`,
