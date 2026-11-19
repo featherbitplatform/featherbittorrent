@@ -20,8 +20,16 @@ test-support = []
 [dependencies]
 # The nonce a challenge gives is base64url, and so is a JWT's header and payload.
 base64.workspace = true
+# Only for the `http` types the local stream endpoint's authenticator reads (the method
+# and the `Host` header), which fbt-api does not re-export: the same reason the workspace
+# names axum rather than `http` - one crate with the `HeaderMap` fbt-api hands us.
+axum.workspace = true
 directories.workspace = true
 fbt.workspace = true
+# The control API the local stream endpoint serves: fbt-api's own file-stream route, on the
+# same tag as the engine it drives, so the streaming implementation is the one fbt-api
+# already tests for ranges, permits and stalls.
+fbt-api.workspace = true
 # Only the `Stream` trait, polled by hand in the event stream reader: reqwest's body stream is one,
 # and this adds no version to the lock (see the workspace comment).
 futures-core.workspace = true
@@ -60,7 +68,14 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 # `#[tokio::test]`, and a runtime with worker threads: each test runs two live
 # sessions, and a blocking call in one should not stall the other's timers.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The streaming tests' client: plain http to loopback, which needs no TLS and
+# speaks HTTP/1.1, so the workspace's default-features-off reqwest is enough.
+reqwest.workspace = true
 
 [[test]]
 name = "local"
+required-features = ["test-support"]
+
+[[test]]
+name = "stream"
 required-features = ["test-support"]

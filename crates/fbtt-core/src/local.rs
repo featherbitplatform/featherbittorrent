@@ -26,13 +26,14 @@ use tokio::task::JoinHandle;
 
 use crate::client::{
     AddSource, Client, Command, Connection, Detail, DetailTab, DirListing, FilePriority,
-    LiveLimits, Notice, Snapshot, TorrentId, TorrentRow, Totals,
+    LiveLimits, Notice, PlaySource, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::config::{Config, ConfigLoad, Limits};
 use crate::engine::{Engine, SAVE_EVERY, map};
 use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
+use crate::stream::local::{Choice, LocalEndpoint, choose_file, local_source};
 
 /// How often the snapshot is rebuilt, and with it the watched pane. Short enough that
 /// a rate looks alive, long enough that nobody pays for it.
@@ -45,8 +46,6 @@ const NO_TORRENT: &str = "the torrent is not in this library";
 /// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
 /// them - not an empty one, none at all.
 const DEVICES_ON_A_SERVER: &str = "Devices are managed on a server";
-/// What the screen is told when it asks to play a file, before this release can.
-const NOT_YET: &str = "Streaming is not available yet";
 
 /// The backend that runs the torrents in this process.
 ///
@@ -158,6 +157,7 @@ async fn spawn(
         watching: None,
         dirs: None,
         stalled,
+        stream: None,
         published: initial,
         snapshot_tx: channels.snapshot,
         notices: channels.notices,
@@ -283,6 +283,9 @@ struct Backend {
     /// When each torrent's stalled count last started running: while it is downloading and
     /// taking nothing. See [`map::stalled_clock`].
     stalled: HashMap<TorrentId, Instant>,
+    /// The loopback stream endpoint, started on the first `Stream` command that
+    /// needs it and reused after that; shut down before the engine on `Shutdown`.
+    stream: Option<LocalEndpoint>,
     /// The snapshot the screen is looking at, so that only a change publishes.
     published: Arc<Snapshot>,
     /// Where snapshots go out.
@@ -330,8 +333,15 @@ impl Backend {
             match wake {
                 // The engine consumes itself here: the session goes with it, and so does the lock,
                 // after the state file was written or failed to be. Another featherbittorrent may
-                // start on the new state from that moment, never beside a half-written one.
-                Wake::Command(Command::Shutdown) => return self.engine.shutdown().await,
+                // start on the new state from that moment, never beside a half-written one. The
+                // stream endpoint goes first: its streams read through the engine's session, so the
+                // endpoint must be done before the session is.
+                Wake::Command(Command::Shutdown) => {
+                    if let Some(endpoint) = self.stream.take() {
+                        endpoint.shutdown().await;
+                    }
+                    return self.engine.shutdown().await;
+                }
                 Wake::Command(command) => self.handle(command).await,
                 Wake::Tick => {}
                 Wake::Save => {
@@ -408,8 +418,9 @@ impl Backend {
             // running its own engine has no device list to change, and says so rather than pretending
             // to have an empty one.
             Command::Devices(_) => self.notify(Notice::Error(DEVICES_ON_A_SERVER.to_owned())),
-            // Playing a file needs a path or a loopback stream, which arrive with the next tasks.
-            Command::Stream { .. } => self.notify(Notice::Error(NOT_YET.to_owned())),
+            // Playing a file: a path when the file is whole on disk, a loopback stream
+            // otherwise.
+            Command::Stream { id, file } => self.stream(&id, file).await,
             Command::Shutdown => {}
         }
     }
@@ -585,6 +596,86 @@ impl Backend {
         }
     }
 
+    /// One [`Command::Stream`] answered: a path when the file is whole on disk
+    /// (decision 4), a loopback stream URL otherwise. The endpoint starts on the
+    /// first stream it is asked for and is kept for the run, shut down with the
+    /// engine. A paused torrent whose data is missing says so beside the play
+    /// target, because playback will stop where the download does.
+    async fn stream(&mut self, id: &TorrentId, wanted: Option<usize>) {
+        let Some(torrent) = self.torrent(id) else {
+            return self.no_torrent();
+        };
+        let status = torrent.status();
+        // A torrent that has no metadata has no file list to pick from yet.
+        let files = match torrent.files().await {
+            Ok(files) if status.has_metadata => files,
+            _ => {
+                return self.notify(Notice::Error("The torrent has no metadata yet".to_owned()));
+            }
+        };
+        // The file to play: the wanted one, or the largest non-pad file.
+        let Some(index) = choose_file(&files, wanted) else {
+            return self.no_torrent();
+        };
+        let file = match files.get(index) {
+            Some(file) => file,
+            None => return self.no_torrent(),
+        };
+        // The length of what is on disk, read off the blocking pool: this task
+        // answers commands and does not wait on a disk (see `save_config`).
+        let path = status.save_path.join(&file.path);
+        let stat = path.clone();
+        let on_disk_len = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&stat)
+                .ok()
+                .and_then(|meta| meta.len().into())
+        })
+        .await
+        .ok()
+        .flatten();
+        let choice = local_source(status.state, file, on_disk_len);
+        let title = file_name(file);
+        match choice {
+            Choice::Path => {
+                self.notify(Notice::Play(crate::client::PlayTarget::new(
+                    &title,
+                    PlaySource::Path(path),
+                )));
+            }
+            Choice::Stream => {
+                // The endpoint starts on the first stream and is kept: a player
+                // re-requests the URL on every seek, and the tokens outlive this
+                // command.
+                let endpoint = match self.stream.as_ref() {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        let session = self.engine.session().clone();
+                        match LocalEndpoint::start(session).await {
+                            Ok(endpoint) => {
+                                self.stream = Some(endpoint);
+                                self.stream.as_ref().expect("the endpoint just started")
+                            }
+                            Err(problem) => {
+                                return self.notify(Notice::Error(map::clean(&problem)));
+                            }
+                        }
+                    }
+                };
+                // A paused torrent with missing data will not finish, and playback
+                // stops where the download does: say so beside the play target.
+                if status.state == fbt::TorrentState::Paused && file.downloaded < file.len {
+                    self.notify(Notice::Info(
+                        "The torrent is paused: playback stops where the download does".to_owned(),
+                    ));
+                }
+                self.notify(Notice::Play(crate::client::PlayTarget::new(
+                    &title,
+                    PlaySource::Url(endpoint.url_for(id, index)),
+                )));
+            }
+        }
+    }
+
     /// The session's handle for a row id. A row id is the v1 hash, or the first twenty
     /// bytes of a v2-only torrent's, and the session finds either by its wire hashes.
     fn torrent(&self, id: &TorrentId) -> Option<TorrentHandle> {
@@ -609,4 +700,12 @@ impl Backend {
     fn no_torrent(&self) {
         self.notify(Notice::Error(NO_TORRENT.to_owned()));
     }
+}
+
+/// The file's name, its last path component: what a play target is called.
+fn file_name(file: &fbt::FileStatus) -> String {
+    file.path.file_name().map_or_else(
+        || "file".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }

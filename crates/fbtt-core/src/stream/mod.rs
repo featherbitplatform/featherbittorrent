@@ -6,6 +6,7 @@
 //! where a token is born, dies and is checked; [`stream_path`] is the one spelling every
 //! such address takes, so the token and the URL it guards are the same string.
 
+pub mod local;
 pub mod tokens;
 
 use crate::client::TorrentId;
