@@ -78,7 +78,9 @@ function New-WorkDir {
     # A scratch directory of our own, named after a GUID so two runs on one machine never meet. The caller
     # removes it, whatever happens.
     $path = Join-Path ([System.IO.Path]::GetTempPath()) ("featherbittorrent-package-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -LiteralPath $path | Out-Null
+    # -Path and not -LiteralPath: New-Item has no -LiteralPath parameter, whatever the cmdlet next to it
+    # accepts. -Force keeps this quiet when the directory name is somehow taken already.
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
     return $path
 }
 
@@ -140,7 +142,7 @@ try {
     Remove-Item -LiteralPath $zip, $hashPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     foreach ($dir in @($top, (Join-Path $top 'completions'), (Join-Path $top 'docs'), (Join-Path $top 'examples\windows'))) {
-        New-Item -ItemType Directory -LiteralPath $dir | Out-Null
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     Copy-Item -LiteralPath $exe -Destination (Join-Path $top 'featherbittorrent.exe') -Force
     foreach ($file in @('LICENSE', 'NOTICE', 'README.md')) {
@@ -211,7 +213,7 @@ try {
     # The same smoke every other artifact passes through, on the binary this archive shipped. It is what
     # checks the version, so a mismatch here means the artifact and the release disagree.
     $scratch = Join-Path $work 'smoke-home'
-    New-Item -ItemType Directory -LiteralPath $scratch | Out-Null
+    New-Item -ItemType Directory -Path $scratch -Force | Out-Null
     & (Join-Path $PSScriptRoot 'smoke-cli.ps1') -Binary (Join-Path $extract "$name\featherbittorrent.exe") `
         -Version $Version -Scratch $scratch
     if ($LASTEXITCODE -ne 0) { Write-Failure "dev/smoke-cli.ps1 failed with exit code $LASTEXITCODE" }

@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -229,7 +229,9 @@ fn generate_assets_writes_man_and_completions() {
         "completions/_featherbittorrent.ps1",
     ];
     for shipped in SHIPPED {
-        let path = scratch.root.join(shipped);
+        // Built one component at a time (see `under`): the program prints `\` on Windows, so joining
+        // "man/featherbittorrent-serve.1" as one string gives a path its own output never contains.
+        let path = under(&scratch.root, shipped);
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|problem| panic!("{} was not written: {problem}", path.display()));
         assert!(!text.trim().is_empty(), "{} came out empty", path.display());
@@ -242,7 +244,8 @@ fn generate_assets_writes_man_and_completions() {
     }
 
     // A man page that `man` can render, and a top page that says the subcommands exist.
-    let top_page = fs::read_to_string(scratch.root.join("man/featherbittorrent.1")).unwrap();
+    let top_path = under(&scratch.root, "man/featherbittorrent.1");
+    let top_page = fs::read_to_string(&top_path).unwrap();
     assert!(
         top_page.contains(".TH"),
         "the page carries the roff macros man reads: {top_page}"
@@ -253,7 +256,8 @@ fn generate_assets_writes_man_and_completions() {
     );
 
     // A completion script that knows the subcommands, which is what a person typing expects.
-    let bash = fs::read_to_string(scratch.root.join("completions/featherbittorrent.bash")).unwrap();
+    let bash_path = under(&scratch.root, "completions/featherbittorrent.bash");
+    let bash = fs::read_to_string(&bash_path).unwrap();
     assert!(
         bash.contains("serve") && bash.contains("device"),
         "the bash completion knows the subcommands: {bash}"
@@ -341,6 +345,16 @@ fn help_names_files_and_exit_codes() {
             "--help says {expected}, and did not: {stdout}"
         );
     }
+}
+
+/// `relative` below `root`, one component at a time. The relative paths in these tests are spelled with
+/// `/` because that is how the packaging scripts and `docs/install.md` name them. Joined as one string the
+/// `/` stays inside the path, and on Windows the program prints `\`, so a path built that way never
+/// appears in what the program printed - a failure on that platform alone.
+fn under(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part))
 }
 
 /// A scratch set of directories, removed when the test that made it is done. The
