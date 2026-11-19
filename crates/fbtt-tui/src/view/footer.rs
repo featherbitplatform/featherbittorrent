@@ -28,13 +28,13 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, model: &Model) {
             if model.files_focused {
                 hints_from(&fit_hints(keys::FILE_LIST_HINTS, row_cells))
             } else {
-                hints_for(keys::FOOTER_KEYS)
+                hints_for(keys::FOOTER_KEYS, row_cells)
             }
         })
     } else if model.files_focused {
         hints_from(&fit_hints(keys::FILE_LIST_HINTS, row_cells))
     } else {
-        hints_for(keys::FOOTER_KEYS)
+        hints_for(keys::FOOTER_KEYS, row_cells)
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -50,7 +50,11 @@ fn line_cells(described: &[(&'static str, &'static str)]) -> usize {
 
 /// The hints for one set of keys, in the order they are wanted. Everything on this line comes from
 /// the key table, which a test keeps true, so a hint cannot promise a key that does nothing.
-fn hints_for(wanted: &[&'static str]) -> Line<'static> {
+/// `width` is the cells the row has: when the hints do not fit they are dropped from the back,
+/// but `? help` and `q quit` always stay at the end, in that order - help is where a person finds
+/// every key the footer cannot show, and `q quit` is the one a person looks for when something
+/// goes wrong.
+fn hints_for(wanted: &[&'static str], width: usize) -> Line<'static> {
     let described: Vec<(&'static str, &'static str)> = wanted
         .iter()
         .filter_map(|key| {
@@ -60,40 +64,31 @@ fn hints_for(wanted: &[&'static str]) -> Line<'static> {
                 .map(|(_, action)| (*key, *action))
         })
         .collect();
-    // The row the footer draws into at eighty columns is eighty cells minus the two cells of
-    // padding a box over it would take. The order the list is in is the order its hints are
-    // wanted in, and what does not fit is dropped from the back, one at a time, but never the
-    // last hint: `q quit` is the one a person looks for when something goes wrong, and a
-    // footer that drops it is a footer that says nothing when it matters most.
-    let shown = fit_hints(&described, 78);
+    let shown = fit_hints(&described, width);
     hints_from(&shown)
 }
 
-/// The hints that fit in `limit` cells: the longest prefix of `described` that fits, with
-/// the last hint kept at the end. The last hint is the one a person looks for most, so it
-/// stays; the hints that go are the ones just before it.
+/// The hints that fit in `limit` cells, in their original order. What does not fit is dropped
+/// from the back, one at a time, but the last two hints are never dropped: `?` opens the list
+/// of every key, so a person can always find the dropped ones, and `q` is the one a person
+/// reaches for when something goes wrong.
 fn fit_hints(
     described: &[(&'static str, &'static str)],
     limit: usize,
 ) -> Vec<(&'static str, &'static str)> {
     let n = described.len();
-    if n <= 1 || line_cells(described) <= limit {
+    if n <= 2 || line_cells(described) <= limit {
         return described.to_vec();
     }
-    let last = n - 1;
-    for count in (0..=last).rev() {
-        let mut shown: Vec<(&'static str, &'static str)> = described[..count].to_vec();
-        if count < last {
-            shown.push(described[last]);
-        }
-        if shown.is_empty() {
-            break;
-        }
+    let (droppable, kept) = described.split_at(n - 2);
+    for count in (0..=droppable.len()).rev() {
+        let mut shown: Vec<(&'static str, &'static str)> = droppable[..count].to_vec();
+        shown.extend_from_slice(kept);
         if line_cells(&shown) <= limit {
             return shown;
         }
     }
-    vec![described[last]]
+    vec![described[n - 2], described[n - 1]]
 }
 
 /// The hints given as a key and what it does: each key in the lifted accent, and its meaning beside
@@ -148,9 +143,10 @@ mod tests {
 
     #[test]
     fn the_hints_line_stays_one_line_of_its_own() {
-        // Nine hints does not all fit the row the footer draws into at eighty columns, and the
-        // rule for what does not fit is the order the list is in: drop from the back, one at a
-        // time, so what is drawn is a prefix of the list that no longer wraps the row.
+        // Nine hints does not all fit an eighty-column row, and the rule for what does not fit
+        // is to drop from the back, one at a time, keeping `? help` and `q quit` at the end:
+        // help is where a person finds the dropped keys, and `q` is the one a person reaches
+        // for when something goes wrong. What is drawn fits the row, and keeps its order.
         let wanted: Vec<(&'static str, &'static str)> = keys::FOOTER_KEYS
             .iter()
             .filter_map(|key| {
@@ -160,24 +156,35 @@ mod tests {
                     .map(|(_, action)| (*key, *action))
             })
             .collect();
-        let row_cells = 78; // eighty columns minus the help box's two borders
+        let row_cells = 80;
         assert!(
             line_cells(&wanted) > row_cells,
             "all nine hints fit, so there is nothing to drop: {} cells",
             line_cells(&wanted)
         );
-        let mut shown = wanted.clone();
-        while line_cells(&shown) > row_cells && shown.len() > 1 {
-            shown.pop();
-        }
+        let shown = fit_hints(&wanted, row_cells);
         assert!(
             line_cells(&shown) <= row_cells,
             "the footer wrapped the row"
         );
         assert!(shown.len() < wanted.len(), "no hint needed dropping");
+        // The two kept hints are the last two of the list, in order.
         assert_eq!(
-            &wanted[..shown.len()],
-            shown.as_slice(),
+            shown.last().map(|(key, _)| *key),
+            Some("q"),
+            "`q quit` is not at the end"
+        );
+        assert_eq!(
+            shown.get(shown.len() - 2).map(|(key, _)| *key),
+            Some("?"),
+            "`? help` is not before `q quit`"
+        );
+        // What is shown is a prefix of the list followed by the two kept hints: no gaps.
+        let (droppable, kept) = wanted.split_at(wanted.len() - 2);
+        let prefix_len = shown.len() - kept.len();
+        assert_eq!(
+            &shown[..prefix_len],
+            &droppable[..prefix_len],
             "a dropped hint left a gap in the order"
         );
     }

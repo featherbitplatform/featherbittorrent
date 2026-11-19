@@ -182,38 +182,48 @@ fn devices_press(model: &mut Model, snap: &Snapshot) -> Vec<Action> {
 
 /// `s`: play the selected torrent's files. With the cursor in the file list the file under it is
 /// played, named by its index; in the table the torrent itself is named and the backend picks the
-/// largest non-pad file. A torrent whose metadata has not arrived has no files to play yet: the
-/// press says so on the footer rather than send a command that would only fail.
+/// largest non-pad file. Only a torrent still fetching its metadata has no files to play yet: the
+/// press says so on the footer rather than send a command that would only fail. Whether the
+/// torrent has its metadata is the row's state, not what the detail pane happens to be showing:
+/// the pane shows one tab at a time, so a torrent whose `detail` is the Peers answer, or no
+/// answer yet, can still be streamed.
 fn stream_press(model: &mut Model, rows: &[&TorrentRow], snap: &Snapshot) -> Vec<Action> {
     if model.files_focused {
-        let Some(file) = watched_files(model, snap)
-            .and_then(|files| files.get(model.file_cursor.min(files.len().saturating_sub(1))))
-        else {
-            model.push_notice(
-                Notice::Error("The torrent has no metadata yet".to_string()),
-                Instant::now(),
-            );
-            return Vec::new();
+        let id = match model.selected.clone() {
+            Some(id) => id,
+            None => return Vec::new(),
         };
-        let Some(id) = model.selected.as_ref() else {
+        let is_metadata = snap
+            .torrents
+            .iter()
+            .find(|r| r.id == id)
+            .is_some_and(|r| matches!(r.state, RowState::Metadata));
+        let file = match watched_files(model, snap) {
+            Some(files) => files
+                .get(model.file_cursor.min(files.len().saturating_sub(1)))
+                .cloned(),
+            None => None,
+        };
+        let Some(file) = file else {
+            // Without a file list there is nothing to name; the state says why.
+            if is_metadata {
+                model.push_notice(
+                    Notice::Error("The torrent has no metadata yet".to_string()),
+                    Instant::now(),
+                );
+            }
             return Vec::new();
         };
         return vec![Action::Command(Command::Stream {
-            id: id.clone(),
+            id,
             file: Some(file.index),
         })];
     }
-    let Some(row) = model.selected_row(rows) else {
-        return Vec::new();
+    let row = match model.selected_row(rows) {
+        Some(row) => row,
+        None => return Vec::new(),
     };
-    // A torrent whose metadata has not arrived has no files to play yet: the state says it
-    // is still waiting, or the snapshot has no file list for it because the detail request
-    // has not been answered.
-    let has_files = !matches!(row.state, RowState::Metadata | RowState::Checking(_))
-        && snap.detail.as_ref().is_some_and(|(id, detail)| {
-            *id == row.id && matches!(&detail, Detail::Files(files) if !files.is_empty())
-        });
-    if !has_files {
+    if matches!(row.state, RowState::Metadata) {
         model.push_notice(
             Notice::Error("The torrent has no metadata yet".to_string()),
             Instant::now(),
