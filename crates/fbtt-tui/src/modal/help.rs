@@ -164,9 +164,17 @@ mod tests {
 
     #[test]
     fn the_columns_decision_never_splits_when_the_keys_fit_one_column() {
+        // `lines` hands `columns` the two halves of the list, and the width check measures those
+        // halves, so the test does too: passing the whole list as both halves measures a row
+        // that never exists (the widest action twice, with the widest key twice) and is too wide
+        // for 80 cells whatever the list says.
+        let half = KEYS.len().div_ceil(2);
+        let (left, right) = KEYS.split_at(half);
         // A screen tall enough for the whole list in one column never splits, whatever the
         // width, and one too short for it splits when the two columns fit across.
-        assert!(!columns(Rect::new(0, 0, 100, 40), KEYS, KEYS));
-        assert!(columns(Rect::new(0, 0, 80, 24), KEYS, KEYS));
+        assert!(!columns(Rect::new(0, 0, 100, 40), left, right));
+        assert!(columns(Rect::new(0, 0, 80, 24), left, right));
+        // Too narrow for two columns, a short screen stays in one and loses nothing sideways.
+        assert!(!columns(Rect::new(0, 0, 60, 24), left, right));
     }
 }

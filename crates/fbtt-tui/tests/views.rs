@@ -1224,6 +1224,32 @@ fn help_drops_logo_when_short() {
     }
 }
 
+/// The help at the smallest screen the product is designed for: 80 by 24, no mark, draws every
+/// key with what it does and the line that closes it. The list is in two columns there, and the
+/// longest rows of the two halves have to fit across the box; a key line clipped at 80 would show
+/// here as an action missing its tail.
+#[test]
+fn the_help_at_eighty_by_twenty_four_loses_no_key() {
+    let snap = library();
+    let mut model = model_of(&snap);
+    model.modal = Some(fbtt_tui::modal::Modal::Help);
+    let logos = logos(Protocol::Sixel, CellPx { w: 8, h: 16 });
+    let drawn = drawn_with_view(&model, &snap, &logos, LogoView::text(), 80, 24);
+    let lines = drawn.screen.lines();
+    for (key, action) in fbtt_tui::keys::KEYS {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(key) && line.contains(action)),
+            "the key line of {key:?} ({action:?}) is missing at 80x24"
+        );
+    }
+    assert!(
+        lines.iter().any(|line| line.contains("Esc close")),
+        "the close hint is missing at 80x24"
+    );
+}
+
 /// The help screen's mark, at every screen size from 20 to 60 rows and from 10 to 100 columns,
 /// at both cell sizes the probe answers: the mark never covers a key line, and a key line is
 /// never lost to it. This is the test that catches a mark placed a row too low (which lands on
@@ -1275,7 +1301,21 @@ fn the_help_mark_never_covers_a_key_line() {
                         .iter()
                         .rposition(|line| line.starts_with('└'))
                         .unwrap_or_else(|| lines.len().saturating_sub(1));
-                    lines[start..=end.min(lines.len().saturating_sub(1))].to_vec()
+                    // Only the box's own columns, from its top-left corner to its top-right: the
+                    // rows beside the box are the view behind the dialog, and a word of it
+                    // ("connect" in the header) must not stand in for a key line the box clipped.
+                    let top = lines.get(start).map(String::as_str).unwrap_or_default();
+                    let first = top.chars().position(|c| c == '┌').unwrap_or(0);
+                    let last = top.chars().position(|c| c == '┐').unwrap_or(first);
+                    lines[start..=end.min(lines.len().saturating_sub(1))]
+                        .iter()
+                        .map(|line| {
+                            line.chars()
+                                .skip(first)
+                                .take(last + 1 - first)
+                                .collect::<String>()
+                        })
+                        .collect()
                 };
                 let free_keys = key_lines(&free_lines);
                 let marked_keys = key_lines(&lines);
