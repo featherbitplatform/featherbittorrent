@@ -28,18 +28,20 @@ pub enum Protocol {
     Sixel,
 }
 
-/// The size of one character cell, as the terminal reports it.
+/// The size of one character cell, in the device pixels the terminal draws in.
 ///
-/// For [`Protocol::Iterm2`] these are the *points* iTerm2's `ReportCellSize` gives and
-/// [`Graphics::scale`] is its pixels-per-point factor; for every other protocol the scale is 1 and
-/// these are already device pixels. `cell.w * scale` and `cell.h * scale` are therefore always
-/// the device pixel size of one cell, which is what the prepared image is sized against so that no
-/// terminal has to rescale it.
+/// Every protocol reports something different and [`choose`] turns it into this: kitty, Ghostty and the
+/// sixel terminals answer `CSI 16 t` or a window size divided by a grid, which are already device
+/// pixels; iTerm2 answers `ReportCellSize` in *points* with its own pixels-per-point factor, and that
+/// factor is multiplied in before anything is rounded, so what lands here is the pixel size of the cell
+/// and not a point size waiting to be scaled. That is why [`Graphics::scale`] is not something to
+/// multiply `cell` by again: the prepared image has to be exactly `cols * cell.w` by `rows * cell.h`
+/// pixels, or the terminal rescales it and the mark goes soft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellPx {
-    /// The width of one cell.
+    /// The width of one cell in device pixels.
     pub w: u16,
-    /// The height of one cell.
+    /// The height of one cell in device pixels.
     pub h: u16,
 }
 
@@ -52,8 +54,13 @@ pub struct Graphics {
     /// The cell size, or `None` when the terminal never answered any of the cell size queries.
     /// That is also when `protocol` is [`Protocol::None`]: no cell pixel size means no logo.
     pub cell: Option<CellPx>,
-    /// 1 for every protocol except iTerm2, whose inline images are measured in cells while the
-    /// bitmap has to be built at those cells' device pixel size.
+    /// What this terminal multiplies a point by to get a device pixel, rounded and clamped to 1..=4: 1
+    /// for every protocol except iTerm2, which reports the factor in its `ReportCellSize` answer.
+    ///
+    /// `choose` has already multiplied that factor into [`cell`] when it needed it, so this is a fact
+    /// about the terminal rather than something to apply to `cell`: sizing a logo from `cell` alone is
+    /// right for every protocol, and multiplying by this as well would build a bitmap twice the size of
+    /// the cells it is placed over.
     pub scale: u16,
 }
 
@@ -328,21 +335,28 @@ fn parse_u16(field: &[u8]) -> Option<u16> {
     Some(value as u16)
 }
 
-/// Whether the buffer holds a complete DA1 answer, which is the probe's stop condition: DA1 is the
-/// last query in [`PROBE_QUERY`] and every terminal answers it.
+/// Whether the buffer *ends* with a complete DA1 answer, which is the probe's stop condition: DA1 is
+/// the last query in [`PROBE_QUERY`] and every terminal answers it.
+///
+/// The probe calls this after every byte it reads, so it looks at one candidate instead of at every
+/// `ESC` in the buffer. An answer that ends here has its `c` as the buffer's last byte, and a DA1 answer
+/// carries no `ESC` of its own, so the `ESC [ ?` that opened it is the last `ESC` there is to look at.
+/// A stream that answers nothing - `\x1b[?` repeated to the probe's 4096-byte cap - is turned away by
+/// the first check, which is what stops a hostile terminal costing one scan per escape byte. Bytes past
+/// a complete answer are not this function's question: the probe reads a byte at a time, stops on the
+/// answer's own last byte, and hands anything else to whoever reads next.
 ///
 /// An answer whose numbers are unusable counts as no answer here too, which costs the probe at most
 /// the deadline it was going to pay anyway.
 #[must_use]
 pub fn da1_complete(bytes: &[u8]) -> bool {
-    let mut at = 0usize;
-    while at < bytes.len() {
-        if bytes[at] == ESC && match_da1(bytes, at).is_some() {
-            return true;
-        }
-        at += 1;
+    if bytes.last() != Some(&b'c') {
+        return false;
     }
-    false
+    let Some(at) = bytes.iter().rposition(|b| *b == ESC) else {
+        return false;
+    };
+    match_da1(bytes, at).is_some()
 }
 
 /// The protocol and cell size to draw with, from what the terminal answered (decisions 10 and 11).
@@ -453,16 +467,16 @@ fn parse_number(digits: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-/// The cell size and the scale that turns it into device pixels, in decision 11's order:
-/// `ReportCellSize` (iTerm2 only: its points and its pixels-per-point factor), else `CSI 16 t`, else
-/// the window size divided by the grid, else `CSI 14 t` divided by the grid. An answer whose value
-/// is outside [`CELL_MIN_W`]..=[`CELL_MAX_W`] wide or [`CELL_MIN_H`]..=[`CELL_MAX_H`] tall is ignored
-/// and the next source gets its turn.
+/// The cell size in device pixels and the terminal's own scale, in decision 11's order: `ReportCellSize`
+/// (iTerm2 only: its points multiplied by its pixels-per-point factor), else `CSI 16 t`, else the window
+/// size divided by the grid, else `CSI 14 t` divided by the grid. An answer whose device pixel size is
+/// outside [`CELL_MIN_W`]..=[`CELL_MAX_W`] wide or [`CELL_MIN_H`]..=[`CELL_MAX_H`] tall is ignored and
+/// the next source gets its turn.
 ///
-/// The scale only comes from `ReportCellSize`, and only when the protocol is iTerm2's: it is what
-/// turns iTerm2's points into device pixels, and for every other protocol the sizes below are
-/// already in device pixels and multiplying them by anything would make the image too big for the
-/// cells it is placed over.
+/// The scale that comes back with it is iTerm2's factor rounded to a whole number, and 1 for every other
+/// protocol: those answers are already device pixels, so there is nothing to multiply in. For iTerm2 the
+/// multiplying happens here, once, before the rounding, so what comes back is the cell this terminal
+/// really draws rather than a point size a caller still has to convert.
 fn cell_size(
     replies: &Replies,
     protocol: Protocol,
@@ -470,21 +484,15 @@ fn cell_size(
     ioctl: Option<(u16, u16)>,
 ) -> Option<(CellPx, u16)> {
     if protocol == Protocol::Iterm2
-        && let Some((height_pts, width_pts, scale)) = replies.iterm_cell
+        && let Some((height_pts, width_pts, raw_scale)) = replies.iterm_cell
     {
-        let scale = iterm_scale(scale);
-        // `ReportCellSize` answers in points and its third number is the pixels per point. The sanity
-        // bounds are about device pixels, so they are checked against points times that factor; what
-        // `CellPx` carries is the points themselves, because points are the unit iTerm2 lays an inline
-        // image out in and multiplying them here would double-count the scale.
-        if let (Some(w), Some(h)) = (round_to_u16(width_pts), round_to_u16(height_pts))
-            && sane_cell(
-                u32::from(w) * u32::from(scale),
-                u32::from(h) * u32::from(scale),
-            )
-            .is_some()
-        {
-            return Some((CellPx { w, h }, scale));
+        // `ReportCellSize` answers in points and its third number is the device pixels per point, so the
+        // multiplication comes before the rounding: an 8.25-point column at scale 2 is a 16.5-pixel column,
+        // which is the 17 pixels this terminal draws, where rounding the points first would call it 8
+        // points and then return 16 or 17 on nothing but which way the half fell. A bitmap sized against
+        // the wrong one of those is rescaled by the terminal, which is what this module exists to avoid.
+        if let Some(cell) = device_cell(width_pts, height_pts, raw_scale) {
+            return Some((cell, iterm_scale(raw_scale)));
         }
     }
     if let Some((height, width)) = replies.cell_16t
@@ -502,8 +510,20 @@ fn cell_size(
     None
 }
 
-/// iTerm2's pixels-per-point factor as this module can use it: rounded to a whole number because a
-/// bitmap has whole pixels, and inside 1..=[`SCALE_MAX`] because nothing bigger is worth placing.
+/// iTerm2's cell in points as the device pixels it is worth: each axis multiplied by the terminal's own
+/// pixels-per-point factor and rounded once, at the end, then checked against the sizes decision 11
+/// accepts. `None` for an answer whose numbers are not finite or whose cells no font produces.
+fn device_cell(width_pts: f32, height_pts: f32, raw_scale: f32) -> Option<CellPx> {
+    let w = round_to_u16(width_pts * raw_scale)?;
+    let h = round_to_u16(height_pts * raw_scale)?;
+    sane_cell(u32::from(w), u32::from(h))
+}
+
+/// iTerm2's pixels-per-point factor as [`Graphics::scale`] reports it: rounded to a whole number because
+/// a bitmap has whole pixels, and inside 1..=[`SCALE_MAX`] because nothing bigger is worth placing. The
+/// cell size above uses the factor before it was rounded or clamped; this is the answer to "what does
+/// this terminal multiply a point by", which is what a caller needs when it wants the terminal's own
+/// arithmetic rather than this module's.
 fn iterm_scale(scale: f32) -> u16 {
     match round_to_u16(scale) {
         Some(0) | None => 1,
@@ -544,8 +564,9 @@ fn sane_cell(w_px: u32, h_px: u32) -> Option<CellPx> {
     })
 }
 
-/// A reported point size or scale as a whole number of pixels, or `None` when it is not a value that
-/// could be one.
+/// A number the terminal reported as a whole number of pixels or points, or `None` when it is not finite,
+/// is negative or is past what a `u16` holds. Half rounds away from zero, which is what makes an exact
+/// half pixel land on the larger cell rather than the smaller one.
 fn round_to_u16(x: f32) -> Option<u16> {
     if !x.is_finite() {
         return None;
@@ -562,6 +583,7 @@ fn round_to_u16(x: f32) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     /// The answer to the probe's kitty graphics query, from a terminal that speaks it.
     const KITTY_OK: &[u8] = b"\x1b_Gi=4242;OK\x1b\\";
@@ -716,9 +738,48 @@ mod tests {
         // The probe's stop condition: the buffer up to DA1's final `c`, and not before it.
         let full = full_replies();
         assert!(da1_complete(&full));
-        assert!(da1_complete(b"junk\x1b[?62;4;22cmore"));
+        // The stop condition is about the end of the buffer: the probe reads a byte at a time and stops on
+        // the answer's own final `c`, so bytes after it are never in the buffer while it is deciding.
+        assert!(da1_complete(b"junk\x1b[?62;4;22c"));
+        assert!(!da1_complete(b"junk\x1b[?62;4;22cmore"));
+        // `parse_replies` still finds an answer anywhere in a buffer, so nothing is lost by the narrower
+        // stop condition: these same bytes answer DA1 whether or not something follows them.
+        assert_eq!(
+            parse_replies(b"junk\x1b[?62;4;22cmore").da1,
+            Some(vec![62, 4, 22])
+        );
         assert!(!da1_complete(&full[..full.len() - 1]));
         assert!(!da1_complete(b"\x1b[>0q\x1b[16t"));
+    }
+
+    /// The probe calls [`da1_complete`] after every byte it reads, so a terminal that answers nothing must
+    /// not cost it a fresh scan from every `ESC` in the buffer: 4 KiB read a byte at a time is 4096 checks
+    /// of a buffer that grows to 4096 bytes.
+    #[test]
+    fn da1_complete_is_linear_on_hostile_input() {
+        // `\x1b[?` repeated is the worst such stream: an escape opener every three bytes, and no final `c`
+        // anywhere for a scan to stop at.
+        let repeated = b"\x1b[?".repeat(1366);
+        let hostile = &repeated[..4096];
+        assert_eq!(hostile.len(), 4096);
+        assert!(!hostile.contains(&b'c'), "nothing here ends a DA1 answer");
+
+        let started = Instant::now();
+        for cut in 1..=hostile.len() {
+            assert!(
+                !da1_complete(&hostile[..cut]),
+                "a prefix of a probe nobody answered is not an answer"
+            );
+        }
+        // Generous on purpose: this measures that the check looks at the tail once rather than at every
+        // escape byte, not that it is quick. Checking DA1 from every `ESC` took seconds here.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the stop check took {:?} over {} prefixes of 4 KiB",
+            elapsed,
+            hostile.len()
+        );
     }
 
     #[test]
@@ -814,7 +875,8 @@ mod tests {
             ..Replies::default()
         };
         assert_eq!(choose(&wezterm, grid, None).protocol, Protocol::Iterm2);
-        // iTerm2's own cell size answer is enough to pick it, and its scale comes with the answer.
+        // iTerm2's own cell size answer is enough to pick it, and its scale comes with the answer. The
+        // cell is what those points are worth in device pixels: 8 x 17 points at scale 2 draws 16 x 34.
         let iterm = Replies {
             xtversion: Some("iTerm2 3.6.9".to_string()),
             iterm_cell: Some((17.0, 8.0, 2.0)),
@@ -824,7 +886,23 @@ mod tests {
             choose(&iterm, grid, None),
             Graphics {
                 protocol: Protocol::Iterm2,
-                cell: Some(CellPx { w: 8, h: 17 }),
+                cell: Some(CellPx { w: 16, h: 34 }),
+                scale: 2
+            }
+        );
+        // A half pixel is settled on the multiplied number and not on the points: 8.25 x 16.5 points at
+        // scale 2 is a 17-pixel column and a 33-pixel row. Rounding the points first would have called
+        // this a cell of 8 x 17 points and then handed back 16 x 34 pixels, a size this terminal never
+        // draws and a bitmap it would have to rescale.
+        let iterm_half = Replies {
+            iterm_cell: Some((16.50, 8.25, 2.00)),
+            ..iterm
+        };
+        assert_eq!(
+            choose(&iterm_half, grid, None),
+            Graphics {
+                protocol: Protocol::Iterm2,
+                cell: Some(CellPx { w: 17, h: 33 }),
                 scale: 2
             }
         );

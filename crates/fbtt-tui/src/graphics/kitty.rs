@@ -102,8 +102,14 @@ pub fn place(id: u32, cols: u16, rows: u16) -> Vec<u8> {
     out
 }
 
-/// Delete the placement of `id` from the screen and keep the image, so placing it again later costs
-/// no transmission.
+/// Delete `id` from the screen and free its data too: kitty's uppercase `d=I` removes the image's
+/// placements *and* forgets the transmitted pixels, so drawing it again afterwards needs a fresh
+/// [`transmit`].
+///
+/// That is an exit verb, and this client only sends it on exit (`Placer::on_exit`, Task 9, before the
+/// terminal is restored), where giving the data back is exactly what should happen. A change of size or
+/// position mid-session is not a delete: the placer transmits the new pixels under the same id and
+/// [`place`]s it again.
 #[must_use]
 pub fn delete(id: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
@@ -235,6 +241,8 @@ mod tests {
             place(LARGE_ID, 12, 10),
             b"\x1b_Ga=p,U=1,q=2,i=16478210,c=12,r=10\x1b\\".to_vec()
         );
+        // The `d=I` in these bytes is the whole rule: exit only, and it frees the placements and the
+        // transmitted data together.
         assert_eq!(
             delete(SMALL_ID),
             b"\x1b_Ga=d,d=I,i=16478209,q=2\x1b\\".to_vec()
