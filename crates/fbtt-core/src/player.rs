@@ -363,12 +363,15 @@ pub fn write_playlist(dir: &Path, target: &PlayTarget) -> io::Result<PathBuf> {
 /// because `<data_dir>/play` on a library nobody has run yet needs `<data_dir>` under it and because the
 /// folders above are not this program's to ask permission from (see [`create_dir_chain`]).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     create_dir_chain(dir, &|path| builder.create(path), &|path| path.is_dir())
 }
 
