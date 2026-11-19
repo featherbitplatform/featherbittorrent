@@ -80,11 +80,16 @@ echo "ok: $(basename "$file") matches its sha256"
 # Step 4, first half: the grep dev/package-linux.sh applies to the artifact at build time, now applied to
 # what the package manager says it installed. No package installs or starts a service, so no path may land
 # in /etc (packages own none) and none in a directory a service manager reads. Paths arrive absolute from
-# dpkg -L and rpm -ql, and relative to the extraction from tar; a leading-slash-or-segment boundary matches
-# either spelling.
+# dpkg -L and rpm -ql, and relative to the extraction from tar; a segment boundary at the start or after any
+# slash matches either spelling, and the closing group accepts the end of the line as well as a slash, so a
+# bare `/etc` or `/usr/lib/systemd` entry counts too. That last part is one thing stricter than the build
+# time grep at the other end of this flow, which needs the trailing slash: a directory entry on its own is
+# exactly what a package that shipped a unit or a conffile would leave behind among its listed files, and it
+# is the case a person would otherwise have to notice by hand. `lib/systemd` covers `/usr/lib/systemd` as
+# well as `/lib/systemd`, because the match starts at a slash.
 check_no_service_paths() { # <what the list is of> <one path per line>
   local what="$1" files="$2" hit
-  hit="$(grep -nE '(^|/)etc/|(^|/)lib/systemd/' <<<"$files" | head -1)" || true
+  hit="$(grep -nE '(^|/)(etc|lib/systemd)(/|$)' <<<"$files" | head -1)" || true
   [[ -z "$hit" ]] || fail "$what names a path in /etc or in a unit directory, and no package may install one: $hit"
 }
 
@@ -136,7 +141,7 @@ check_installed() { # <what installed it> <one path per line, absolute>
            "$zsh_dir/_featherbittorrent" \
            /usr/share/fish/vendor_completions.d/featherbittorrent.fish \
            /usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service; do
-    grep -qx "$p" <<<"$files" || fail "the $what does not own $p"
+    grep -qFx -- "$p" <<<"$files" || fail "the $what does not own $p"
     [[ -e "$p" ]] || fail "$p is not there after the $what install"
   done
   echo "ok: the $what installed the binary, the man page, the bash, zsh and fish completions and the example unit"
@@ -261,8 +266,22 @@ if [[ "$format" != tar.gz ]]; then
     # The directories stay, and only for the .rpm: cargo-generate-rpm lists files and no %dir, so dnf has
     # nothing to remove them by. Empty, unnamed by any package, harmless to a reinstall. Recorded rather than
     # asserted away, because asking RPM to delete what it never claimed would be asking the wrong thing of it.
-    empty_dirs="$(find /usr/share/doc/featherbittorrent /usr/share/licenses/featherbittorrent -type d 2>/dev/null | sort | tr '\n' ' ')"
-    if [[ -n "$empty_dirs" ]]; then
+    # Each directory is asked about only if it is there now: find exits 1 for a path that is not there, and
+    # with pipefail that status lands on the assignment, where set -e ends the script without printing
+    # anything and without the smoke ok line at the end. Today both exist; the day the .rpm owns its
+    # directories (the change this note argues for) or stops shipping the licenses tree, one of them is
+    # gone, so the list comes from what is present rather than from two remembered names. A find that fails
+    # on a directory that *is* there still says so, because that one is worth stopping for.
+    empty_dirs=''
+    for d in /usr/share/doc/featherbittorrent /usr/share/licenses/featherbittorrent; do
+      if [[ -d "$d" ]]; then
+        status=0
+        listed="$(find "$d" -type d | sort)" || status=$?
+        [[ $status -eq 0 ]] || fail "find could not list $d after the removal, exit $status"
+        empty_dirs="$empty_dirs$(tr '\n' ' ' <<<"$listed")"
+      fi
+    done
+    if [[ -n "${empty_dirs//[[:space:]]/}" ]]; then
       echo "note: dnf left the empty directories it created but does not own: $empty_dirs"
     fi
   fi
