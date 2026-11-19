@@ -134,3 +134,8 @@ rpassword = "7"
 # (`crypto-rust`, which keyring itself asks for), so no system D-Bus or OpenSSL library is needed to
 # build it. The macOS half links the Security framework the platform already provides.
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
+# The logo (milestone 3): `png` decodes the shipped mark and encodes the image an iTerm2 inline
+# payload carries, `color_quant` picks the 256-colour palette a sixel stream is allowed. Neither
+# is default-features-off because neither has features to name: what they do is decode and encode.
+png = "0.18"
+color_quant = "2"
