@@ -6,6 +6,11 @@
 //! request carries it as `Authorization: Bearer <token>`, and [`FbttAuth`] is what fbt-api asks
 //! before it serves one.
 //!
+//! One credential does not come from a login: the short-lived token that opens one file's stream, which a
+//! media player cannot send as a header and so carries in its URL. It is checked here too, on the file-stream
+//! route alone, against the exact path it was issued for - never as a bearer token and never on the event
+//! stream ([`stream_route`]). It opens one file; a session is the whole API.
+//!
 //! With nobody signing in there is still one question to answer - which name the request says it came to,
 //! and where it says it came from - because that is all that separates this server's own user from a page
 //! somebody else opened in a browser on the same machine (see [`FbttAuth`]). With logins on every
@@ -30,6 +35,7 @@ use std::time::Instant;
 use axum::http::{HeaderMap, Method, header};
 use fbt_api::{AuthRejection, AuthRequest, Authenticator};
 use fbtt_core::ServerConfig;
+use fbtt_core::stream::tokens::StreamTokens;
 
 /// The clock a store with a life keeps time by: the process's own in a run, whatever a test
 /// wants. The login stores and the core's stream tokens keep time by the same shape, so the
@@ -72,6 +78,25 @@ fn login_route(method: &Method, matched_path: Option<&str>) -> bool {
 
 /// The authorization scheme a session token is presented in, matched without regard to case.
 const BEARER_SCHEME: &str = "Bearer";
+
+/// How many live stream tokens one server hands out at most, oldest evicted: the files several players
+/// could plausibly have open at once, rather than one slot per client, because a player re-requests its URL
+/// on every seek and each of those addresses stays live while it is being used
+/// (see [`fbtt_core::stream::tokens`]).
+const STREAM_TOKEN_CAP: usize = 64;
+
+/// The matched-path template of fbt-api's file-stream route, as that crate sets it.
+const STREAM_ROUTE: &str = "/api/v1/torrents/{id}/files/{index}/stream";
+
+/// Whether `(method, matched_path)` names the file-stream route: its two methods, since a player fetches a
+/// file with `HEAD` before it starts asking for ranges. Matched by suffix, the way fbt-api recognises its own
+/// routes, so a router mounted under a prefix keeps the same rules; a token issued here names an unprefixed
+/// path, so under a mount point one simply stops matching, which is the direction that refuses rather than
+/// the one that lets through.
+fn stream_route(method: &Method, matched_path: Option<&str>) -> bool {
+    (*method == Method::GET || *method == Method::HEAD)
+        && matched_path.is_some_and(|path| path.ends_with(STREAM_ROUTE))
+}
 
 /// The token of `Authorization: Bearer <token>`: the scheme in any case, then exactly one space, as
 /// fbt-api's own bearer parsing spells it. `None` when the header is absent, cannot be read as text,
@@ -223,6 +248,10 @@ pub struct FbttAuth {
     /// The separate cap on how often one address may ask for a nonce: asking is not an attempt at a
     /// login, so it does not spend the failure budget above.
     challenge_limiter: limiter::ChallengeLimiter,
+    /// The short-lived tokens that open one file's stream each ([`StreamTokens`]). Kept here rather than in
+    /// the routes because the guard that lets a stream request through and the route that hands its token out
+    /// have to agree about which tokens this server issued - the same reason they share the session store.
+    stream_tokens: Arc<StreamTokens>,
 }
 
 impl FbttAuth {
@@ -240,7 +269,8 @@ impl FbttAuth {
             sessions: sessions::Sessions::with_clock(clock.clone()),
             challenges: sessions::Challenges::with_clock(clock.clone()),
             limiter: limiter::LoginLimiter::with_clock(clock.clone()),
-            challenge_limiter: limiter::ChallengeLimiter::with_clock(clock),
+            challenge_limiter: limiter::ChallengeLimiter::with_clock(clock.clone()),
+            stream_tokens: Arc::new(StreamTokens::with_clock(STREAM_TOKEN_CAP, clock.clone())),
         }
     }
 
@@ -270,6 +300,13 @@ impl FbttAuth {
     /// route does not.
     pub fn challenge_limiter(&self) -> &limiter::ChallengeLimiter {
         &self.challenge_limiter
+    }
+
+    /// The tokens that open this server's files: issued by [`crate::routes`]' stream-token route, checked
+    /// here on the way in. One store for both, so a token this server handed out is accepted by this server
+    /// and nowhere else.
+    pub fn stream_tokens(&self) -> &Arc<StreamTokens> {
+        &self.stream_tokens
     }
 
     /// The guard that stands in for a credential when nobody has to sign in: which name the request says it
@@ -333,6 +370,7 @@ impl fmt::Debug for FbttAuth {
             .field("challenges", &self.challenges)
             .field("limiter", &self.limiter)
             .field("challenge_limiter", &self.challenge_limiter)
+            .field("stream_tokens", &self.stream_tokens)
             .finish()
     }
 }
@@ -347,6 +385,20 @@ impl Authenticator for FbttAuth {
         // else - including `DELETE /api/v1/auth/session`, which has to know whose session it is
         // ending - needs one.
         if login_route(request.method, request.matched_path) {
+            return Ok(());
+        }
+        // A stream token is a player's credential for one file, so it is tried first exactly where a player
+        // could have been sent one: the two methods of the file-stream route, against the path it was issued
+        // for, and only when there is no header for it to answer behind. Nowhere else - not
+        // `GET /api/v1/events`, which takes a query token but is a session's stream of news, and never as a
+        // bearer header, which would make it a second way to be anybody rather than a way to fetch one file.
+        // Behind it stays the session check below, so a web page that puts its own session token in the query
+        // still works.
+        if !request.headers.contains_key(header::AUTHORIZATION)
+            && let Some(token) = request.query_token
+            && stream_route(request.method, request.matched_path)
+            && self.stream_tokens.check(token, request.path)
+        {
             return Ok(());
         }
         // The header, or the query parameter on the routes fbt-api says take one (the file streams and
@@ -567,6 +619,146 @@ mod tests {
         let printed = format!("{auth:?}");
         assert!(!printed.contains("alice"), "{printed}");
         assert!(printed.contains("sessions"), "{printed}");
+    }
+
+    /// A stream token opens one file and nothing else: the two methods that fetch a file, on the exact path
+    /// it was issued for. Another file of the same torrent, another spelling of the right one, the event
+    /// stream (which takes a `?token=` too), and any `Authorization` header are all refused - while a session
+    /// token still opens what it always did. This is Review Focus item 1 of the milestone plan, checked where
+    /// the rule lives.
+    #[test]
+    fn stream_tokens_open_one_file_each() {
+        let (_clock, handle) = TestClock::starting_at(Instant::now());
+        let auth = FbttAuth::with_clock(&server(true), handle);
+        let none = HeaderMap::new();
+
+        let route = "/api/v1/torrents/{id}/files/{index}/stream";
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let path = format!("/api/v1/torrents/{hash}/files/0/stream");
+        let token = auth.stream_tokens().issue(path.clone());
+
+        // The request, the way fbt-api's layer builds it: the matched template, and the path as received.
+        fn ask(
+            auth: &FbttAuth,
+            method: &Method,
+            matched: Option<&str>,
+            path: &str,
+            query: Option<&str>,
+            headers: &HeaderMap,
+        ) -> Result<(), AuthRejection> {
+            let request =
+                fbt_api::AuthRequest::new(method, matched, headers, query, None).with_path(path);
+            auth.authorize(&request)
+        }
+
+        // Its own file, on both methods a player fetches with.
+        for method in [&Method::GET, &Method::HEAD] {
+            assert!(
+                ask(&auth, method, Some(route), &path, Some(&token), &none).is_ok(),
+                "{method} on the file this token was issued for",
+            );
+        }
+
+        // Another file of the same torrent, and another spelling of the right one: the scope is compared byte
+        // for byte, so both are refused rather than normalised.
+        for other in [
+            format!("/api/v1/torrents/{hash}/files/1/stream"),
+            format!("/api/v1/torrents/{hash}/files/00/stream"),
+            format!("/api/v1/torrents/{}/files/0/stream", hash.to_uppercase()),
+        ] {
+            assert!(
+                matches!(
+                    ask(
+                        &auth,
+                        &Method::GET,
+                        Some(route),
+                        &other,
+                        Some(&token),
+                        &none
+                    ),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{other} is not the address this token opens",
+            );
+        }
+
+        // The event stream takes a query token as well, and this one is not a session token.
+        assert!(
+            matches!(
+                ask(
+                    &auth,
+                    &Method::GET,
+                    Some("/api/v1/events"),
+                    "/api/v1/events",
+                    Some(&token),
+                    &none,
+                ),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a stream token is not a way to watch the library",
+        );
+
+        // A bearer header is a session's place: this token never gets to be one, not even on the URL it was
+        // issued for, and it does not get to answer behind a header this server cannot read either.
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("a bearer header"),
+        );
+        assert!(
+            matches!(
+                ask(
+                    &auth,
+                    &Method::GET,
+                    Some(route),
+                    &path,
+                    None,
+                    &bearer_headers
+                ),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a stream token is not a bearer credential",
+        );
+        let mut other_scheme = HeaderMap::new();
+        other_scheme.insert(
+            header::AUTHORIZATION,
+            "Basic YWxpY2U6aHVudGVyNDI=".parse().expect("a header"),
+        );
+        assert!(
+            matches!(
+                ask(
+                    &auth,
+                    &Method::GET,
+                    Some(route),
+                    &path,
+                    Some(&token),
+                    &other_scheme
+                ),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a header the request brought decides, and this token is not it",
+        );
+
+        // A session token still streams: the query parameter keeps working on these routes for a web page
+        // that has one, which is what the stream-token check sits in front of.
+        let (session, _) = auth.sessions().issue("alice".to_string());
+        assert!(
+            ask(
+                &auth,
+                &Method::GET,
+                Some(route),
+                &path,
+                Some(&session),
+                &none
+            )
+            .is_ok(),
+            "a session token still opens the stream route",
+        );
+
+        // `Debug` counts the tokens; it does not print one.
+        let printed = format!("{auth:?}");
+        assert!(!printed.contains(token.as_str()), "{printed}");
+        assert!(printed.contains("stream_tokens"), "{printed}");
     }
 
     /// With logins off, the name a request says it came to is the only credential there is, so it has to be
