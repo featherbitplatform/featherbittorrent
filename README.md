@@ -5,11 +5,23 @@ featherbittorrent is a BitTorrent client built on [fbt-lib](https://github.com/f
 The clients that came before it (uTorrent, Deluge, qBittorrent) work, and their shape is the one people expect: a torrent list with a detail pane, a daemon and a thin client. featherbittorrent wants that shape snappier and lighter: keypresses that feel instant, redraws that stay smooth with hundreds of torrents, and memory and CPU use small enough for the server to run comfortably on a Raspberry Pi 2B.
 
 Status: milestone 1, the local client, is complete: `featherbittorrent` in a terminal is a whole
-client, the engine runs in that process, and there is nothing to install beside the binary.
-Milestone 2, the server role (`serve`), the remote backend, authentication and streaming, lives on
-the `feature/m2-server` branch and carries the first release, 0.1.0; [docs/server.md](docs/server.md)
-and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release archives for macOS, Linux and
-Windows are built by the release workflow on a `v*` tag. Nothing is released yet.
+client, the engine runs in that process, and there is nothing to install beside the binary. Milestone 2,
+the server role (`serve`), the remote backend, authentication and streaming, shipped the first release,
+[0.1.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0);
+[docs/server.md](docs/server.md) and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Milestone 4
+ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
+files, each carrying man pages, shell completions, the licenses and the docs. Every artifact is built and
+smoke tested in a clean container or runner before anything is published, and the release workflow publishes
+them all on a `v*` tag.
+
+## Install
+
+Downloads are on the [releases page](https://github.com/featherbitplatform/featherbittorrent/releases), each
+file beside its own `.sha256`. [docs/install.md](docs/install.md) says which file is for your system, how to
+check it and where installing puts its files. Installing never starts anything: no package installs or enables
+a service, none creates an account, and nothing runs after the install. To have `serve` start at boot under
+systemd, launchd or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a
+time, all of it opt-in.
 
 ## Build and run
 
@@ -106,7 +118,11 @@ Two environment variables point the app at a different library, which is how you
 FBTT_CONFIG_DIR=/tmp/fbtt-config FBTT_DATA_DIR=/tmp/fbtt-data cargo run -p featherbittorrent
 ```
 
-Each one replaces one of the two directories above, and both together mean no home directory is needed at all. They are the only debug knobs, and an empty value counts as unset rather than as "use whatever directory the app happens to run in".
+Each one replaces one of the two directories above, and both together mean no home directory is needed at
+all. That is also what services and containers use them for, not only experiments: the systemd system unit and
+the LaunchDaemon variant in [docs/autostart.md](docs/autostart.md) keep a service's library under
+`/var/lib/featherbittorrent`, and the `Dockerfile`'s run line points both directories at the `/data` volume. An
+empty value counts as unset rather than as "use whatever directory the app happens to run in".
 
 ### Two instances on one library
 

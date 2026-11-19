@@ -154,7 +154,8 @@ refusal 'invalid version' --print-versions 0.1
 refusal 'invalid arch' 0.1.0 armv7
 echo 'ok: package-linux.sh refuses bad arguments with one line each, before any platform check'
 
-# 8. The service examples the packages ship as documentation (Review Focus 1 starts there).
+# 8. The service examples the packages ship as documentation: no package installs, enables or starts a
+# service, so each example is a file a person copies where their own service manager looks.
 status=0; examples_out="$(bash dev/test-service-examples.sh 2>&1)" || status=$?
 [[ $status -eq 0 ]] || fail "dev/test-service-examples.sh failed (exit $status): $(tail -3 <<<"$examples_out")"
 echo 'ok: dev/test-service-examples.sh passes'

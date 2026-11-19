@@ -152,7 +152,7 @@ if grep -qF 'smoke-pass-1' "$config_file"; then
 fi
 echo "ok: $config_file exists and holds no password"
 
-# The last two lines are what the smokes above this one read: the version, and the config file that has to
-# survive `apt-get purge` and `dnf remove` (Review Focus 2 of the milestone 4 plan).
+# The last two lines are what the smokes above this one read: the version, and the config file. A package owns
+# only the files it installed, so `apt-get purge` and `dnf remove` leave this one exactly where it is.
 echo "cli smoke ok: $version"
 echo "config: $config_file"
