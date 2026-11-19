@@ -40,6 +40,7 @@ Each is marked here once; the tasks implement them.
 - Task 0 goes ahead: the owner's go-ahead of 2026-11-19 ("continue working on the featherbittorrent milestones") covers the one fbt-lib change this milestone needs. The fallback is not used.
 - The kitty diacritics table in Task 7 must be copied from the reference already in this workspace, `../feathercritty/src/graphics/kitty_diacritics.rs` (the first 24 entries of its table), not from memory; the Task 7 reviewer checks it against that file.
 - fbterm supports sixel, kitty graphics and OSC 1337 since its inline-images work; the spec's 5.3 note that it has none is out of date. Under decision 10 it gets sixel. Task 10's docs say so.
+- Token scope and URL are one string (fbt-lib review, 2026-11-19): `AuthRequest::path` is the raw received path, and the compare is byte for byte, so other spellings of the same file (`%30` for `0`, upper-case or 64-hex ids, a leading zero) are refused, which fails closed. Every stream URL, local or remote, must be built from the very `stream_path(id, index)` string its token was issued for (lowercase 40-hex id, decimal index without leading zeros), never re-spelled. Task 1's `stream_token_rules` adds a case: a token for `.../files/0/stream` is refused for `.../files/00/stream` and for the upper-case id.
 - Execution: two branches so two implementers can work at once. `feature/m3-logo` takes Tasks 7 and 8 off `develop`; `feature/m3-streaming-logo` takes Tasks 1 to 6, 9 and 10, and merges `feature/m3-logo` in before Task 9.
 
 ## Global Constraints
