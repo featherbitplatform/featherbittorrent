@@ -254,10 +254,7 @@ pub async fn run() -> ExitCode {
         model: &mut model,
         snap: &mut snap,
         mark: &mut mark,
-        wanted: None,
-        in_flight: None,
-        protocol: graphics.protocol,
-        scale: graphics.scale,
+        marks: crate::switch::MarkState::new(graphics.protocol, graphics.scale),
     };
     let (quit, screen, running) = run_session(
         terminal.get_mut(),

@@ -36,7 +36,6 @@ use crossterm::event::{Event, EventStream};
 // tree crossterm's own `EventStream` implements it from.
 use futures_core::Stream;
 use ratatui::DefaultTerminal;
-use ratatui::backend::Backend as _;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::{Fill, Paragraph};
@@ -322,18 +321,9 @@ pub struct Screen<'a> {
     pub model: &'a mut Model,
     pub snap: &'a mut Arc<Snapshot>,
     pub mark: &'a mut Mark<'a>,
-    /// The latest cell size estimate that counted as a change: the size the next prepare is for,
-    /// remembered whether or not logos exist yet (a resize during the first prepare is not lost).
-    pub wanted: Option<(u16, u16)>,
-    /// The cell size the running prepare was made for: the answer it gives back is matched
-    /// against `wanted`, not against whatever the window says now.
-    pub in_flight: Option<(u16, u16)>,
-    /// The image protocol the screen was probed with: every prepare this run makes is for this
-    /// protocol, so a resize that re-prepares before the first answer keeps the protocol the
-    /// terminal can draw, not a `None` the mark would die on.
-    pub protocol: fbtt_tui::graphics::caps::Protocol,
-    /// The cell scale the screen was probed with: the same reason, kept beside the protocol.
-    pub scale: u16,
+    /// The state machine of the mark's prepares: what is wanted, what is in flight, and the
+    /// protocol and scale every prepare of this run is made for.
+    pub marks: MarkState,
 }
 
 /// The mark's bookkeeping for one screen: what the screen last drew, and the placer that remembers
@@ -343,6 +333,140 @@ pub struct Screen<'a> {
 pub struct Mark<'a> {
     pub logos: &'a mut Option<Arc<PreparedLogos>>,
     pub placer: &'a mut Placer,
+}
+
+/// What a prepare's answer leads to, as [`MarkState::answered`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// The answer is the right size: swap the logos in.
+    Swap,
+    /// The answer is stale: drop it and prepare for this.
+    Prepare(fbtt_tui::graphics::caps::Graphics),
+}
+
+/// The mark's prepare state machine, kept apart from the loop that drives it so every transition
+/// is testable without a terminal: the startup, a resize, and the answer of a prepare.
+#[derive(Debug, Clone)]
+pub struct MarkState {
+    /// The latest cell size estimate that counted as a change: the size the next prepare is for,
+    /// remembered whether or not logos exist yet (a resize during the first prepare is not lost).
+    pub wanted: Option<(u16, u16)>,
+    /// The cell size the running prepare was made for, `None` when none is running. A startup
+    /// prepare whose cell size was never probed is in flight for `(0, 0)`: a size that always
+    /// counts as a change against a real one, but that is still a prepare running, so a resize
+    /// does not start a second one beside it.
+    pub in_flight: Option<(u16, u16)>,
+    /// The image protocol the screen was probed with: every prepare this run makes is for this
+    /// protocol, so a re-prepare keeps the protocol the terminal can draw, not a `None` the mark
+    /// would die on.
+    pub protocol: fbtt_tui::graphics::caps::Protocol,
+    /// The cell scale the screen was probed with, kept beside the protocol for the same reason.
+    pub scale: u16,
+}
+
+impl MarkState {
+    /// A state with nothing wanted and nothing in flight, for a screen probed with `protocol`
+    /// and `scale`.
+    pub fn new(protocol: fbtt_tui::graphics::caps::Protocol, scale: u16) -> Self {
+        MarkState {
+            wanted: None,
+            in_flight: None,
+            protocol,
+            scale,
+        }
+    }
+
+    /// The startup prepare is running, for the probed `cell` (or for none known).
+    pub fn start(&mut self, cell: Option<(u16, u16)>) {
+        self.in_flight = Some(cell.unwrap_or((0, 0)));
+    }
+
+    /// What a prepare for `cell` is made of: the probed protocol and scale, and that size.
+    fn graphics_for(&self, cell: (u16, u16)) -> fbtt_tui::graphics::caps::Graphics {
+        fbtt_tui::graphics::caps::Graphics {
+            protocol: self.protocol,
+            cell: Some(fbtt_tui::graphics::caps::CellPx {
+                w: cell.0,
+                h: cell.1,
+            }),
+            scale: self.scale,
+        }
+    }
+
+    /// A resize whose cell estimate is `estimate`, with logos on screen made for `logos_cell`.
+    /// Returns the graphics to prepare when a prepare is to be started; the state then has it in
+    /// flight.
+    pub fn resize(
+        &mut self,
+        logos_cell: Option<(u16, u16)>,
+        estimate: (u16, u16),
+    ) -> Option<fbtt_tui::graphics::caps::Graphics> {
+        match on_resize(logos_cell, self.wanted, self.in_flight, estimate) {
+            ResizeAction::Nothing => None,
+            ResizeAction::SetWanted { cell, spawn } => {
+                self.wanted = Some(cell);
+                if spawn {
+                    self.in_flight = Some(cell);
+                    Some(self.graphics_for(cell))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The running prepare answered, with logos made for `logos_cell` (`None` when they carry no
+    /// cell size). A stale answer starts the prepare for `wanted` and the state has it in flight;
+    /// otherwise nothing is in flight any more.
+    pub fn answered(&mut self, logos_cell: Option<(u16, u16)>) -> Answer {
+        let answered_for = self.in_flight.or(logos_cell).unwrap_or((0, 0));
+        match on_prepared(self.wanted, self.in_flight, answered_for) {
+            PrepareAction::Swap => {
+                self.in_flight = None;
+                Answer::Swap
+            }
+            PrepareAction::Prepare { cell } => {
+                self.in_flight = Some(cell);
+                Answer::Prepare(self.graphics_for(cell))
+            }
+        }
+    }
+}
+
+/// Runs `prepare` on the blocking pool and gives back the receiver its answer arrives on.
+fn spawn_prepare(
+    graphics: fbtt_tui::graphics::caps::Graphics,
+) -> tokio::sync::oneshot::Receiver<PreparedLogos> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || fbtt_tui::graphics::prepare(graphics)).await;
+        if let Ok(logos) = result {
+            let _ = tx.send(logos);
+        }
+    });
+    rx
+}
+
+/// The startup prepare, already running on the blocking pool as `handle`: remembered as in flight
+/// for the probed `cell`, so a resize that arrives before it answers is matched against that size
+/// rather than starting a second prepare, and the answer is what the screen was set up to wait for.
+fn adopt_startup_prepare(
+    state: &mut MarkState,
+    handle: Option<tokio::task::JoinHandle<PreparedLogos>>,
+    cell: Option<(u16, u16)>,
+) -> Option<tokio::sync::oneshot::Receiver<PreparedLogos>> {
+    handle.map(|handle| {
+        state.start(cell);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = handle.await;
+            if let Ok(logos) = result {
+                let _ = tx.send(logos);
+            }
+        });
+        rx
+    })
 }
 
 /// The screen over `backend`, through every backend this run switches to, until the person is finished.
@@ -365,21 +489,8 @@ pub async fn run_session<'a>(
     startup_cell: Option<(u16, u16)>,
 ) -> (Quit, Screen<'a>, Backend) {
     // The prepared logos arrive on this oneshot; the screen draws the text title until they do.
-    // The startup prepare is remembered as in flight for the cell it was probed for, so a resize
-    // that arrives before it answers is matched against that size rather than against `(0, 0)`,
-    // and the answer it gives back is the one the screen was set up to wait for.
-    let mut logos_rx: Option<tokio::sync::oneshot::Receiver<PreparedLogos>> =
-        prepare_fut.map(|handle| {
-            screen.in_flight = startup_cell;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                let result = handle.await;
-                if let Ok(logos) = result {
-                    let _ = tx.send(logos);
-                }
-            });
-            rx
-        });
+    // The startup prepare is remembered as in flight for the cell it was probed for.
+    let mut logos_rx = adopt_startup_prepare(&mut screen.marks, prepare_fut, startup_cell);
     loop {
         let (mut parts, task) = backend.into_parts();
         let outcome = run_loop(
@@ -491,52 +602,19 @@ async fn run_loop(
             // The answer is matched against the latest estimate that counted as a change, not
             // against whatever the window says now: a prepare in flight is worth its own size,
             // and a resize that happened while it was running is already remembered in
-            // `wanted`. The decision is one pure function, so the sequences it answers are
-            // tested without a terminal.
-            let answered_for = screen.in_flight.unwrap_or_else(|| {
-                // The first prepare was asked for before any resize: its size is what it is.
-                logos
-                    .graphics
-                    .cell
-                    .map(|cell| (cell.w, cell.h))
-                    .unwrap_or((0, 0))
-            });
-            let action = on_prepared(screen.wanted, screen.in_flight, answered_for);
-            match action {
-                PrepareAction::Swap => {
+            // `wanted`. The decision is `MarkState::answered`, tested without a terminal.
+            let logos_cell = logos.graphics.cell.map(|cell| (cell.w, cell.h));
+            match screen.marks.answered(logos_cell) {
+                Answer::Swap => {
                     *screen.mark.logos = Some(Arc::new(logos));
                     screen.mark.placer.invalidate();
                     dirty = true;
                 }
-                PrepareAction::Prepare { cell } => {
+                Answer::Prepare(graphics) => {
                     // The answer is stale: drop it, and prepare the size `wanted` remembers.
                     // The screen keeps the mark it is showing until the fresh prepare answers.
-                    // The protocol and scale are the ones the screen was probed with, so a
-                    // re-prepare never swaps the terminal's protocol for another.
-                    let graphics = fbtt_tui::graphics::caps::Graphics {
-                        protocol: screen.protocol,
-                        cell: Some(fbtt_tui::graphics::caps::CellPx {
-                            w: cell.0,
-                            h: cell.1,
-                        }),
-                        scale: screen.scale,
-                    };
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            fbtt_tui::graphics::prepare(graphics)
-                        })
-                        .await;
-                        if let Ok(logos) = result {
-                            let _ = tx.send(logos);
-                        }
-                    });
-                    *logos_rx = Some(rx);
-                    screen.in_flight = Some(cell);
+                    *logos_rx = Some(spawn_prepare(graphics));
                 }
-            }
-            if !matches!(action, PrepareAction::Prepare { .. }) {
-                screen.in_flight = None;
             }
         }
         tokio::select! {
@@ -591,53 +669,19 @@ async fn run_loop(
                         let w = ws.width / cols;
                         let h = ws.height / rows;
                         if w > 0 && h > 0 {
-                            // The decision is one pure function, so the reference choice and the
-                            // spawn rule are tested without a terminal. The reference is `wanted`
-                            // while a prepare is in flight, so a zoom back out counts as a change
-                            // and the stale answer is discarded.
+                            // The decision is `MarkState::resize`, tested without a terminal.
+                            // The reference is `wanted` while a prepare is in flight, so a zoom
+                            // back out counts as a change and the stale answer is discarded.
                             let logos_cell = screen
                                 .mark
                                 .logos
                                 .as_ref()
                                 .and_then(|logos| logos.graphics.cell)
                                 .map(|cell| (cell.w, cell.h));
-                            match on_resize(
-                                logos_cell,
-                                screen.wanted,
-                                screen.in_flight,
-                                (w, h),
-                            ) {
-                                ResizeAction::Nothing => {}
-                                ResizeAction::SetWanted { cell, spawn } => {
-                                    screen.wanted = Some(cell);
-                                    if spawn {
-                                        // Nothing in flight: start a prepare for the new size,
-                                        // for the protocol and scale the screen was probed with,
-                                        // so a resize before the first answer does not swap the
-                                        // terminal's protocol for `None`.
-                                        let graphics = fbtt_tui::graphics::caps::Graphics {
-                                            protocol: screen.protocol,
-                                            cell: Some(fbtt_tui::graphics::caps::CellPx {
-                                                w: cell.0,
-                                                h: cell.1,
-                                            }),
-                                            scale: screen.scale,
-                                        };
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        tokio::spawn(async move {
-                                            let result =
-                                                tokio::task::spawn_blocking(move || {
-                                                    fbtt_tui::graphics::prepare(graphics)
-                                                })
-                                                .await;
-                                            if let Ok(logos) = result {
-                                                let _ = tx.send(logos);
-                                            }
-                                        });
-                                        *logos_rx = Some(rx);
-                                        screen.in_flight = Some(cell);
-                                    }
-                                }
+                            if let Some(graphics) = screen.marks.resize(logos_cell, (w, h)) {
+                                // Nothing was in flight: a prepare for the new size, for the
+                                // protocol and scale the screen was probed with.
+                                *logos_rx = Some(spawn_prepare(graphics));
                             }
                         }
                     }
@@ -734,47 +778,16 @@ async fn run_loop(
                     parts.commands.send(Command::Watch(watch.clone()));
                     last_watch = watch;
                 }
-                // The frame: the view draws the mark's placeholder or skip cells into the buffer, and
-                // the placements come back for the placer to write the image around. For kitty, the
-                // pixels the placeholders reference are transmitted before the frame is drawn, so the
-                // diff never writes a placeholder for an id the terminal does not hold yet.
-                let logos_view = screen
-                    .mark
-                    .logos
-                    .as_ref()
-                    .map(|logos| LogoView { logos: Some(logos) })
-                    .unwrap_or(LogoView::text());
-                if let Some(logos) = screen.mark.logos.as_ref() {
-                    // The pixels the frame owes the terminal before it is drawn: for kitty that is
-                    // the small mark and the large size the last frame placed, decided from the
-                    // last frame's placements, so the placeholders the diff is about to write find
-                    // their pixels already in place.
-                    let pre_bytes = screen.mark.placer.before_draw(logos, &last_placements);
-                    if !pre_bytes.is_empty() {
-                        let backend = terminal.backend_mut();
-                        let _ = std::io::Write::write_all(backend, &pre_bytes);
-                    }
+                if let Err(problem) = draw_frame(
+                    terminal,
+                    model,
+                    snap,
+                    screen.mark.logos.as_deref(),
+                    screen.mark.placer,
+                    &mut last_placements,
+                ) {
+                    return Outcome::Quit(Quit::Failed(problem));
                 }
-                let mut placements = Vec::new();
-                let done = match terminal.draw(|frame| {
-                    placements = view::draw_with(frame, model, snap, logos_view);
-                }) {
-                    Ok(done) => done,
-                    Err(error) => {
-                        return Outcome::Quit(Quit::Failed(format!("the terminal failed: {error}")));
-                    }
-                };
-                let area = done.area.into();
-                if let Some(logos) = screen.mark.logos.as_ref() {
-                    // The frame's after-draw answer: which cells are owed a repaint, and the
-                    // image bytes the image protocols write. The repaint cells are copied out of
-                    // the frame's buffer before the terminal is written to, because the buffer is
-                    // borrowed from it; a frame with nothing to repaint copies nothing.
-                    let after = screen.mark.placer.after_draw(&placements, area, logos);
-                    let cells = repaint_cells(done.buffer, &after);
-                    write_logo_bytes(terminal, &cells, &after.bytes);
-                }
-                last_placements = placements;
             },
             _ = once(signal.wait.as_mut()) => return Outcome::Quit(Quit::Ok),
         }
@@ -1162,28 +1175,83 @@ fn cell_size_changed(current: (u16, u16), estimated: (u16, u16)) -> bool {
     (w_min > 0 && w_diff * 100 > w_min * 10) || (h_min > 0 && h_diff * 100 > h_min * 10)
 }
 
-/// The logo's bytes after a frame is drawn: the cells a removed placement used to cover, repainted
-/// from the frame's own buffer, and the image the image protocols write over the skipped cells.
-/// Every frame that leaves a mark behind, and every frame that takes one down - the frame the
-/// `Saving...` screen draws is one of those - goes through this, so the screen never has the ghost
-/// of a mark its last frame did not draw.
+/// One frame of the screen, in the order the terminal needs its bytes: the pixels kitty must already
+/// hold, the frame's own cells, and then whatever the frame could only decide by being drawn.
 ///
-/// The pixels the frame's placeholders reference are transmitted before the frame is drawn (see the
-/// frame tick, which calls [`Placer::before_draw`] with the previous frame's placements), so this
-/// writes only what a frame owes after it is drawn: for kitty that is the one case where the help's
-/// chosen large size changed this frame, because the size is not known until the frame has decided
-/// to place it; for the image protocols it is the image itself, written over the skipped cells.
+/// 1. Before the draw, [`Placer::before_draw`] gets the placements of the *previous* frame
+///    (`last_placements`): for kitty that sends the small mark, and the large mark when the last
+///    frame placed one, so the placeholder cells the diff is about to write find their pixels.
+/// 2. `terminal.draw` writes the view's cells; the placements this frame chose come back.
+/// 3. After the draw, [`Placer::after_draw`] gets this frame's placements. For kitty it transmits a
+///    large mark that is newly chosen or resized in this frame (the help just opened, or a smaller
+///    size picked), which was not known before the draw; the terminal draws the placeholders it
+///    just received as soon as the pixels arrive, in the same flush. The image protocols write
+///    their image here, and the cells a removed placement covered are repainted.
+///
+/// `last_placements` is replaced with this frame's. An error is the terminal failing, worded for
+/// the person.
+fn draw_frame<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    model: &Model,
+    snap: &Snapshot,
+    logos: Option<&PreparedLogos>,
+    placer: &mut Placer,
+    last_placements: &mut Vec<Placement>,
+) -> Result<(), String>
+where
+    B: ratatui::backend::Backend + std::io::Write,
+    B::Error: std::fmt::Display,
+{
+    let logos_view = logos
+        .map(|logos| LogoView { logos: Some(logos) })
+        .unwrap_or(LogoView::text());
+    if let Some(logos) = logos {
+        let pre_bytes = placer.before_draw(logos, last_placements);
+        if !pre_bytes.is_empty() {
+            let _ = std::io::Write::write_all(terminal.backend_mut(), &pre_bytes);
+        }
+    }
+    let mut placements = Vec::new();
+    let done = terminal
+        .draw(|frame| {
+            placements = view::draw_with(frame, model, snap, logos_view);
+        })
+        .map_err(|error| format!("the terminal failed: {error}"))?;
+    let area = done.area.into();
+    if let Some(logos) = logos {
+        // The repaint cells are copied out of the frame's buffer before the terminal is written
+        // to, because the buffer is borrowed from it; a frame with nothing to repaint copies
+        // nothing.
+        let after = placer.after_draw(&placements, area, logos);
+        let cells = repaint_cells(done.buffer, &after);
+        write_logo_bytes(terminal, &cells, &after.bytes);
+    }
+    *last_placements = placements;
+    Ok(())
+}
+
+/// The logo's bytes after a frame is drawn: the cells a removed placement used to cover, repainted
+/// from the frame's own buffer, and what [`Placer::after_draw`] answered with. Every frame that
+/// leaves a mark behind, and every frame that takes one down - the frame the `Saving...` screen
+/// draws is one of those - goes through this, so the screen never has the ghost of a mark its last
+/// frame did not draw.
+///
+/// The bytes are the image the image protocols write over the skipped cells, and for kitty the
+/// pixels of a large mark this frame newly chose (see [`draw_frame`]). What kitty needs before the
+/// frame is transmitted before it, by [`Placer::before_draw`].
 ///
 /// `repaint_cells` are the cells a removed placement used to cover, copied out of the frame's
 /// buffer by the caller, which is where the decision of which cells are owed a repaint lives - the
 /// frame's buffer is borrowed from the terminal, so the cells are read out before the terminal is
 /// written to. The buffer is never cloned for the frame as a whole: only the cells that are owed a
 /// repaint are copied, and a frame with nothing to repaint copies nothing.
-fn write_logo_bytes(
-    terminal: &mut DefaultTerminal,
+fn write_logo_bytes<B>(
+    terminal: &mut ratatui::Terminal<B>,
     repaint_cells: &[(u16, u16, ratatui::buffer::Cell)],
     bytes: &[u8],
-) {
+) where
+    B: ratatui::backend::Backend + std::io::Write,
+{
     // The image protocols write the image over the skipped cells, and the cells a removed placement
     // used to cover are repainted from the buffer the frame just drew - before the image, so a cell
     // that is text again shows the text and not the ghost of an image.
@@ -1343,7 +1411,10 @@ pub(crate) fn on_prepared(
     let _ = in_flight; // the answer's own size is what it is worth, not what it was asked for
     match wanted {
         None => PrepareAction::Swap,
-        Some(w) if !cell_size_changed(w, answered_for) => PrepareAction::Swap,
+        // `(0, 0)` is the size of a prepare that had no probed cell: never the size wanted.
+        Some(w) if answered_for != (0, 0) && !cell_size_changed(w, answered_for) => {
+            PrepareAction::Swap
+        }
         Some(w) => PrepareAction::Prepare { cell: w },
     }
 }
@@ -1778,10 +1849,7 @@ mod tests {
             model: &mut model,
             snap: &mut snap,
             mark: &mut mark,
-            wanted: None,
-            in_flight: None,
-            protocol: fbtt_tui::graphics::caps::Protocol::None,
-            scale: 1,
+            marks: super::MarkState::new(fbtt_tui::graphics::caps::Protocol::None, 1),
         };
         let switched = switch_onward(
             &work,
@@ -1865,10 +1933,7 @@ mod tests {
             model: &mut model,
             snap: &mut snap,
             mark: &mut mark,
-            wanted: None,
-            in_flight: None,
-            protocol: fbtt_tui::graphics::caps::Protocol::None,
-            scale: 1,
+            marks: super::MarkState::new(fbtt_tui::graphics::caps::Protocol::None, 1),
         };
         let switched = switch_onward(
             &work,
@@ -1939,10 +2004,7 @@ mod tests {
             model: &mut model,
             snap: &mut snap,
             mark: &mut mark,
-            wanted: None,
-            in_flight: None,
-            protocol: fbtt_tui::graphics::caps::Protocol::None,
-            scale: 1,
+            marks: super::MarkState::new(fbtt_tui::graphics::caps::Protocol::None, 1),
         };
         let switched = switch_onward(
             &work,
@@ -2150,5 +2212,313 @@ mod tests {
         assert!(line.starts_with("Could not save "));
         assert!(line.contains("ui.yaml"));
         assert!(line.ends_with(": Read-only file system"));
+    }
+    // ---- the frame's byte order, driven through the function the loop calls ----
+
+    use super::{Answer, MarkState, adopt_startup_prepare, draw_frame};
+    use fbtt_tui::graphics::caps::{CellPx, Graphics, Protocol};
+    use fbtt_tui::graphics::kitty;
+    use fbtt_tui::graphics::place::{LogoSize, Placement, Placer, PreparedLogos};
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::Rect;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+
+    /// A writer that keeps every byte it is handed, in order.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("the recording").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A terminal of `height` rows over a recording writer, with a fixed viewport so the test
+    /// does not ask a real tty for its size. The recording is read through the returned handle.
+    fn recording_terminal(height: u16) -> (Terminal<CrosstermBackend<Recorder>>, Recorder) {
+        let recorder = Recorder::default();
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(recorder.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 100, height)),
+            },
+        )
+        .expect("a recording terminal");
+        (terminal, recorder)
+    }
+
+    /// Every byte written since the last call.
+    fn take(recorder: &Recorder) -> Vec<u8> {
+        std::mem::take(&mut *recorder.0.lock().expect("the recording"))
+    }
+
+    /// The offset of the first occurrence of `needle` in `haystack`.
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn snapshot() -> fbtt_core::Snapshot {
+        fbtt_core::Snapshot {
+            connection: fbtt_core::Connection::Local,
+            torrents: Vec::new(),
+            totals: fbtt_core::Totals {
+                down_rate: 0,
+                up_rate: 0,
+                dht_nodes: None,
+            },
+            limits: fbtt_core::LiveLimits {
+                download_kib: 0,
+                upload_kib: 0,
+                active_downloads: None,
+                active_seeds: None,
+                active_total: None,
+            },
+            detail: None,
+            default_dir: std::path::PathBuf::new(),
+            dirs: None,
+            devices: None,
+        }
+    }
+
+    fn kitty_logos() -> PreparedLogos {
+        fbtt_tui::graphics::prepare(Graphics {
+            protocol: Protocol::Kitty,
+            cell: Some(CellPx { w: 8, h: 16 }),
+            scale: 1,
+        })
+    }
+
+    /// The first byte of a kitty placeholder cell: U+10EEEE, which nothing else on the screen is.
+    fn placeholder_bytes() -> Vec<u8> {
+        let first = kitty::placeholder(0, 0)
+            .chars()
+            .next()
+            .expect("a placeholder has a character");
+        first.to_string().into_bytes()
+    }
+
+    /// The transmit's own opening, which carries the id: how the bytes of one image are told from
+    /// another's.
+    fn transmit_of(id: u32) -> Vec<u8> {
+        format!("\x1b_Ga=t,q=2,f=32,i={id},").into_bytes()
+    }
+
+    /// The first frame, and the first frame after `invalidate()` (on a cleared screen, as the diff
+    /// then rewrites every cell): the pixels of the mark the placeholders reference are in the
+    /// bytes before the first placeholder cell, because that is the order a terminal needs.
+    #[test]
+    fn the_frame_transmits_kitty_pixels_before_its_first_placeholder() {
+        let logos = kitty_logos();
+        let snap = snapshot();
+        let model = Model::new();
+        let mut placer = Placer::new(Protocol::Kitty);
+        let mut last: Vec<Placement> = Vec::new();
+        let (mut terminal, recorder) = recording_terminal(40);
+
+        for frame in ["the first frame", "the first frame after invalidate()"] {
+            if frame != "the first frame" {
+                placer.invalidate();
+                terminal
+                    .resize(Rect::new(0, 0, 100, 40))
+                    .expect("a cleared screen");
+            }
+            take(&recorder);
+            draw_frame(
+                &mut terminal,
+                &model,
+                &snap,
+                Some(&logos),
+                &mut placer,
+                &mut last,
+            )
+            .expect("a drawn frame");
+            let bytes = take(&recorder);
+            let transmit = find(&bytes, &transmit_of(kitty::SMALL_ID))
+                .unwrap_or_else(|| panic!("{frame}: the small mark is transmitted"));
+            let placeholder = find(&bytes, &placeholder_bytes())
+                .unwrap_or_else(|| panic!("{frame}: the header's placeholders are written"));
+            assert!(
+                transmit < placeholder,
+                "{frame}: the transmit (at {transmit}) comes before the first placeholder cell \
+                 (at {placeholder})"
+            );
+        }
+    }
+
+    /// A large mark the frame chooses itself - the help just opened, then a smaller size on a
+    /// shorter screen - is transmitted in that same frame, after the draw, and a frame that places
+    /// the same size again sends nothing.
+    #[test]
+    fn a_newly_chosen_large_mark_is_transmitted_in_the_same_frame() {
+        let logos = kitty_logos();
+        let snap = snapshot();
+        let mut model = Model::new();
+        let mut placer = Placer::new(Protocol::Kitty);
+        let mut last: Vec<Placement> = Vec::new();
+        let (mut terminal, recorder) = recording_terminal(40);
+        let rows = |placements: &[Placement]| {
+            placements
+                .iter()
+                .find_map(|placement| match placement.size {
+                    LogoSize::Large(rows) => Some(rows),
+                    LogoSize::Small => None,
+                })
+        };
+
+        // A frame without help: the large mark is nowhere.
+        draw_frame(
+            &mut terminal,
+            &model,
+            &snap,
+            Some(&logos),
+            &mut placer,
+            &mut last,
+        )
+        .expect("a drawn frame");
+        assert_eq!(rows(&last), None);
+        let before = take(&recorder);
+        assert!(find(&before, &transmit_of(kitty::LARGE_ID)).is_none());
+
+        // The help opens: its mark is placed by this frame, so it is transmitted by this frame,
+        // and the transmit follows the draw (the placeholders it references are already out).
+        model.modal = Some(fbtt_tui::Modal::Help);
+        draw_frame(
+            &mut terminal,
+            &model,
+            &snap,
+            Some(&logos),
+            &mut placer,
+            &mut last,
+        )
+        .expect("a drawn frame");
+        let tall = rows(&last).expect("the help places its mark on a 40-row screen");
+        let bytes = take(&recorder);
+        let transmit = find(&bytes, &transmit_of(kitty::LARGE_ID))
+            .expect("the help's mark is transmitted in the frame that places it");
+        let placeholder = find(&bytes, &placeholder_bytes()).expect("the placeholders are written");
+        assert!(
+            placeholder < transmit,
+            "a newly chosen mark's transmit follows the draw, as it could not be known before it"
+        );
+
+        // The same help again: nothing is sent twice.
+        draw_frame(
+            &mut terminal,
+            &model,
+            &snap,
+            Some(&logos),
+            &mut placer,
+            &mut last,
+        )
+        .expect("a drawn frame");
+        let steady = take(&recorder);
+        assert!(
+            find(&steady, b"\x1b_G").is_none(),
+            "a steady frame transmits nothing"
+        );
+
+        // A shorter screen makes the help pick a smaller size: its pixels are transmitted in the
+        // frame that picks it, the bitmap of that size and not the taller one's.
+        let mut found = None;
+        for height in (10..40).rev() {
+            terminal
+                .resize(Rect::new(0, 0, 100, height))
+                .expect("a resized screen");
+            take(&recorder);
+            draw_frame(
+                &mut terminal,
+                &model,
+                &snap,
+                Some(&logos),
+                &mut placer,
+                &mut last,
+            )
+            .expect("a drawn frame");
+            let bytes = take(&recorder);
+            if let Some(small) = rows(&last)
+                && small != tall
+            {
+                found = Some((small, bytes));
+                break;
+            }
+        }
+        let (small, bytes) = found.expect("a shorter screen picks a smaller mark");
+        let prepared = logos
+            .large
+            .iter()
+            .find(|prepared| prepared.dims.rows == small)
+            .expect("the mark of the chosen size");
+        assert!(
+            find(&bytes, &prepared.payload).is_some(),
+            "the {small}-row mark's own pixels go out in the frame that picks it"
+        );
+    }
+
+    /// The startup prepare is remembered as in flight for the probed cell, so a resize before it
+    /// answers does not start a second prepare; and when it does start one later, it keeps the
+    /// probed protocol and scale.
+    #[tokio::test]
+    async fn the_startup_prepare_is_in_flight_and_a_re_prepare_keeps_the_protocol() {
+        let mut state = MarkState::new(Protocol::Kitty, 2);
+        let handle = tokio::task::spawn_blocking(|| fbtt_tui::graphics::prepare(Graphics::none()));
+        let rx = adopt_startup_prepare(&mut state, Some(handle), Some((16, 34)));
+        assert!(rx.is_some(), "the startup prepare has a receiver");
+        assert_eq!(
+            state.in_flight,
+            Some((16, 34)),
+            "the startup prepare is in flight for the probed cell"
+        );
+
+        // A real zoom before it answers: remembered, and no second prepare beside the first.
+        assert_eq!(state.resize(None, (24, 34)), None);
+        assert_eq!(state.wanted, Some((24, 34)));
+        // The answer (for 16x34) is stale against what was wanted: prepare 24x34, for the
+        // protocol and scale the screen was probed with.
+        match state.answered(None) {
+            Answer::Prepare(graphics) => {
+                assert_eq!(graphics.protocol, Protocol::Kitty);
+                assert_eq!(graphics.scale, 2);
+                assert_eq!(graphics.cell, Some(CellPx { w: 24, h: 34 }));
+            }
+            Answer::Swap => panic!("a stale answer is not swapped in"),
+        }
+        assert_eq!(state.in_flight, Some((24, 34)));
+        // And its answer is the one that is swapped in.
+        assert_eq!(state.answered(None), Answer::Swap);
+        assert_eq!(state.in_flight, None);
+
+        // With nothing in flight, a resize starts a prepare that keeps the protocol too.
+        let graphics = state
+            .resize(Some((24, 34)), (16, 34))
+            .expect("nothing in flight: a prepare starts");
+        assert_eq!((graphics.protocol, graphics.scale), (Protocol::Kitty, 2));
+    }
+
+    /// With no probed cell size, the startup prepare is still a prepare running: the first resize
+    /// remembers the size it wants and does not start a second prepare beside the first.
+    #[tokio::test]
+    async fn a_first_resize_without_a_probed_cell_does_not_restart_the_prepare() {
+        let mut state = MarkState::new(Protocol::Sixel, 1);
+        let handle = tokio::task::spawn_blocking(|| fbtt_tui::graphics::prepare(Graphics::none()));
+        let _rx = adopt_startup_prepare(&mut state, Some(handle), None);
+        assert!(state.in_flight.is_some(), "a startup prepare is in flight");
+        assert_eq!(
+            state.resize(None, (16, 34)),
+            None,
+            "the first resize does not start a second prepare"
+        );
+        assert_eq!(
+            state.wanted,
+            Some((16, 34)),
+            "but it remembers the size wanted"
+        );
+        // The startup prepare had no cell size to be made for, so its answer is never the wanted one.
+        assert!(matches!(state.answered(None), Answer::Prepare(_)));
     }
 }
