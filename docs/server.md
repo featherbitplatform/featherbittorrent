@@ -13,6 +13,12 @@ authentication on an untrusted network belong to a gateway or reverse proxy in f
 other way: an address that starts with `https` is verified against the public root certificates, and
 there is no setting yet for trusting a private certificate authority of your own.
 
+To have `serve` running before anybody logs in, or restarting itself after a crash, put it under a service
+manager: [docs/autostart.md](autostart.md) walks through systemd (a system unit and a user one), launchd and
+Windows Task Scheduler one command at a time. Nothing this project ships installs or enables any of them; the
+example files ship as documentation, in `/usr/share/doc/featherbittorrent/examples/` inside the Linux packages
+and under `examples/` inside the archives, and the guide names the directory to copy each one to.
+
 ## The first run: the wizard
 
 `serve` asks these before anything is on disk, and writes the answers to `config.yaml`:

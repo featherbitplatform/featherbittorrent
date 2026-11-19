@@ -32,6 +32,12 @@ fbtt-tui = { path = "crates/fbtt-tui" }
 # Joins the table now that the binary depends on it for `serve`.
 fbtt-server = { path = "crates/fbtt-server" }
 clap = { version = "4.6", features = ["derive"] }
+# The man pages and shell completions the packages install, written by the hidden `generate-assets`
+# subcommand from the same `Command` that prints `--help`, so they cannot drift from the flags.
+# Both ask for clap `^4.6.6`, the workspace's 4.6 line, so the tree keeps one `clap` and one
+# `clap_builder` (`cargo tree -d` shows no duplicate).
+clap_complete = "4"
+clap_mangen = "0.3"
 # The TUI stack. crossterm is the version ratatui's own backend uses (its default),
 # so `ratatui::crossterm` and our `crossterm` are one crate, not two: two versions in
 # one tree means a `KeyEvent` that does not match the terminal driving it.
