@@ -83,12 +83,7 @@ impl Backend {
         // order the local endpoint and its engine go in (see `crate::local`). A relay
         // that was never started is nothing, and its stop signal is the one this
         // connection already asked to stop on.
-        let relay_to_shutdown = self
-            .relay
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(relay) = relay_to_shutdown {
+        if let Some(relay) = self.relay.take() {
             relay.shutdown().await;
         }
         // End this client's own session before going: a device that is not connected any more should stop

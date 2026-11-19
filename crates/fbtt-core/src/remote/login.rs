@@ -214,10 +214,27 @@ impl Auth {
         }
     }
 
+    /// Says only the gateway's token is no good, so the next gateway call renews it. This is what the
+    /// relay's `401` path calls (see [`super::http::Api::invalidate_gateway`]): a `Kind::Server` session
+    /// is the TUI's, and the relay never sent it, so a `401` on the relay's forward must not throw it
+    /// away.
+    pub(crate) fn invalidate_gateway(&mut self) {
+        if let Kind::Gateway(gateway) = &mut self.kind {
+            gateway.live = None;
+        }
+    }
+
     /// Whether this target signs to a gateway rather than to the server itself, which changes what a `403`
     /// means (see [`super::http::Api::refused`]) and what a notice about a refusal should say.
     pub(crate) fn signs_for_a_gateway(&self) -> bool {
         matches!(self.kind, Kind::Gateway(_) | Kind::Basic { .. })
+    }
+
+    /// Whether this login's relay credential can be renewed after a `401`: only `Kind::Gateway`
+    /// holds a bearer the gateway can re-issue. A `Kind::Server` session is the TUI's, and the relay
+    /// never sent it, so a `401` on the relay's forward cannot be about the session.
+    pub(crate) fn gateway_token_kind(&self) -> bool {
+        matches!(self.kind, Kind::Gateway(_))
     }
 
     /// The credential the relay may send on a stream forward: only the gateway's proof, never the

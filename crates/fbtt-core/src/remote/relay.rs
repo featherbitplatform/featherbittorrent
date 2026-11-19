@@ -319,9 +319,11 @@ async fn forward(
     let body_stop_wait = async move {
         let mut rx = body_stop;
         // End the stream when the stop signal flips, or when the sender is dropped
-        // (the relay is gone). `wait_for` returns `Ok(true)` when the value changes
-        // to `true` and `Err` when the sender is dropped; both end the stream.
-        while rx.wait_for(|stopped| *stopped).await.is_ok() {}
+        // (the relay is gone). `wait_for` returns `Ok` as soon as the value is `true`
+        // and `Err` when the sender is dropped; a single await ends the stream on
+        // either. It checks the current value first, so a body that starts after the
+        // stop ends at once.
+        let _ = rx.wait_for(|stopped| *stopped).await;
     };
     let body = body.take_until(body_stop_wait);
     let mut reply = Response::new(axum::body::Body::from_stream(body));

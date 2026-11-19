@@ -64,13 +64,13 @@ pub(crate) fn checked_stream_path<'a>(
         return None;
     }
     // The id must be exactly 40 lowercase hex characters before we build any path from it:
-    // a hostile id with a newline, a `/`, an upper-case letter, or a different length
-    // would change the authority or the shape of the prefix we compare against.
+    // a hostile id with a newline, a `/`, an upper-case letter, a `g` to `z`, or a different
+    // length would change the authority or the shape of the prefix we compare against.
     let id_str = &id.0;
     if id_str.len() != 40
         || !id_str
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     {
         return None;
     }
@@ -163,27 +163,20 @@ impl Backend {
 
     /// The relay's URL for the server address `checked`: the relay is started on the
     /// first ask, kept for the run, and the URL is issued from its own token store.
-    async fn relay_url_for(&self, checked: &str) -> Result<crate::client::StreamUrl, String> {
+    async fn relay_url_for(&mut self, checked: &str) -> Result<crate::client::StreamUrl, String> {
         use crate::remote::relay;
-        {
-            let guard = self
-                .relay
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(relay) = guard.as_ref() {
-                return Ok(relay.url_for(checked));
-            }
+        if let Some(relay) = self.relay.as_ref() {
+            return Ok(relay.url_for(checked));
         }
-        // The bind is the only await the lock does not cross.
+        // The bind is the only await: commands are answered one at a time by the loop,
+        // so a second `Stream` cannot race this one onto the loopback. A plain field
+        // holds the relay for the run; there is no lock to take, and no second `Stream`
+        // to race a bind with.
         let api = Arc::clone(&self.api);
         let started = relay::Relay::start(api).await?;
-        let mut guard = self
-            .relay
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(started);
-        let relay = guard.as_ref().expect("just set");
-        Ok(relay.url_for(checked))
+        let url = started.url_for(checked);
+        self.relay = Some(started);
+        Ok(url)
     }
 }
 
@@ -394,8 +387,10 @@ mod tests {
     }
 
     /// A hostile torrent id in `checked_stream_path`: the id must be exactly 40 lowercase
-    /// hex characters before any path is built from it. Newline, `?`, `/`, upper case, and
-    /// a different length are all refused.
+    /// hex characters before any path is built from it. Each hostile id is checked against
+    /// the path built *from that id itself*, so the check is what refuses it, not a
+    /// prefix mismatch. Newline, `?`, `/`, upper case, a `g`-to-`z` letter, and a
+    /// different length are all refused.
     #[test]
     fn hostile_torrent_id_is_refused() {
         let id = id();
@@ -403,25 +398,36 @@ mod tests {
         // The valid id passes.
         assert_eq!(checked_stream_path(&bare, &id, 0), Some(bare.as_str()));
 
-        // A newline in the id: a request smuggling vector.
-        let newline = TorrentId("0123456789abcdef0123456789abcdef012345\n7".to_string());
-        assert_eq!(checked_stream_path(&bare, &newline, 0), None);
-        // A `?` in the id: a query smuggling vector.
-        let question = TorrentId("0123456789abcdef0123456789abcdef0123456?".to_string());
-        assert_eq!(checked_stream_path(&bare, &question, 0), None);
-        // A `/` in the id: a path smuggling vector.
-        let slash = TorrentId("0123456789abcdef0123456789abcdef0123456/".to_string());
-        assert_eq!(checked_stream_path(&bare, &slash, 0), None);
-        // Upper case in the id: another spelling.
-        let upper = TorrentId("0123456789ABCDEF0123456789abcdef01234567".to_string());
-        assert_eq!(checked_stream_path(&bare, &upper, 0), None);
-        // 64 hex characters (a SHA-256): the wrong length.
-        let sha256 = TorrentId(
-            "0123456789abcdef0123456789abcdef012345670123456789abcdef0123456789abcdef".to_string(),
-        );
-        assert_eq!(checked_stream_path(&bare, &sha256, 0), None);
-        // 39 characters: too short.
-        let short = TorrentId("0123456789abcdef0123456789abcdef0123456".to_string());
-        assert_eq!(checked_stream_path(&bare, &short, 0), None);
+        // Each hostile id: build the path from the id itself, so a refusal is the hex
+        // check firing, not the prefix failing to match.
+        let cases = [
+            // A newline in the id: a request smuggling vector.
+            TorrentId("0123456789abcdef0123456789abcdef012345\n7".to_string()),
+            // A `?` in the id: a query smuggling vector.
+            TorrentId("0123456789abcdef0123456789abcdef0123456?".to_string()),
+            // A `/` in the id: a path smuggling vector.
+            TorrentId("0123456789abcdef0123456789abcdef0123456/".to_string()),
+            // Upper case in the id: another spelling.
+            TorrentId("0123456789ABCDEF0123456789abcdef01234567".to_string()),
+            // A `g` to `z` in the id: lowercase, but not a hex digit.
+            TorrentId("0123456789abcdef0123456789abcdef0123456g".to_string()),
+            // 40 `z`s: the same shape, none of them a hex digit.
+            TorrentId("z".repeat(40)),
+            // 64 hex characters (a SHA-256): the wrong length.
+            TorrentId(
+                "0123456789abcdef0123456789abcdef012345670123456789abcdef0123456789abcdef"
+                    .to_string(),
+            ),
+            // 39 characters: too short.
+            TorrentId("0123456789abcdef0123456789abcdef0123456".to_string()),
+        ];
+        for hostile in &cases {
+            let hostile_path = crate::stream::stream_path(hostile, 0);
+            assert_eq!(
+                checked_stream_path(&hostile_path, hostile, 0),
+                None,
+                "the hostile id is refused even against its own path: {hostile_path}"
+            );
+        }
     }
 }

@@ -9,7 +9,7 @@
 //! One credential does not come from a login: the short-lived token that opens one file's stream, which a
 //! media player cannot send as a header and so carries in its URL. It is checked here too, on the file-stream
 //! route alone, against the exact path it was issued for - never as a bearer token and never on the event
-//! stream ([`stream_route`]). It opens one file; a session is the whole API.
+//! stream (`stream_route`). It opens one file; a session is the whole API.
 //!
 //! With nobody signing in there is still one question to answer - which name the request says it came to,
 //! and where it says it came from - because that is all that separates this server's own user from a page
@@ -302,7 +302,7 @@ impl FbttAuth {
         &self.challenge_limiter
     }
 
-    /// The tokens that open this server's files: issued by [`crate::routes`]' stream-token route, checked
+    /// The tokens that open this server's files: issued by the `crate::routes` stream-token route, checked
     /// here on the way in. One store for both, so a token this server handed out is accepted by this server
     /// and nowhere else.
     pub fn stream_tokens(&self) -> &Arc<StreamTokens> {

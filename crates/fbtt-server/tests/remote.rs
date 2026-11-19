@@ -3055,22 +3055,30 @@ async fn relay_is_bounded() {
         9,
         "all nine requests got an answer: {statuses:?}"
     );
-    // Eight of the nine get their first bytes: the body is held open by the upstream,
-    // so the relay's slot is held for the whole body, not the head.
-    let held = results
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .filter(|response| response.status() == StatusCode::OK)
-        .count();
+    // Eight of the nine are `200` (held open), one is `503` (refused). Separate them:
+    // the eight player-side responses are read a first chunk from and held here, so the
+    // permit-release assertion can drop one (the player hanging up); the refused one is
+    // checked for its `Retry-After`.
+    let mut held_responses: Vec<reqwest::Response> = Vec::new();
+    let mut refused: Option<reqwest::Response> = None;
+    for result in results {
+        let response = result.expect("all nine requests were answered");
+        if response.status() == StatusCode::OK {
+            held_responses.push(response);
+        } else if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            refused = Some(response);
+        } else {
+            panic!(
+                "an unexpected status in the nine concurrent requests: {}",
+                response.status()
+            );
+        }
+    }
     assert_eq!(
-        held, 8,
+        held_responses.len(),
+        8,
         "eight of nine concurrent requests hold a slot: {statuses:?}"
     );
-    // The ninth is refused before it reaches the upstream.
-    let refused = results
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .find(|response| response.status() == StatusCode::SERVICE_UNAVAILABLE);
     let Some(refused) = refused else {
         panic!("exactly one of nine concurrent requests should be refused: {statuses:?}");
     };
@@ -3090,28 +3098,229 @@ async fn relay_is_bounded() {
         Some("1"),
         "the refusal says when to wait"
     );
-
-    // Drop one of the eight held-open bodies: the test drops its oneshot sender, the
-    // body stream ends, the relay's permit is released, and a tenth request succeeds
-    // within two seconds. This proves the permit is released when the body ends, not
-    // earlier and not never.
-    {
-        let mut senders = held_senders.lock().expect("the test state");
-        assert_eq!(senders.len(), 8, "eight held-open bodies: one sender each");
-        senders.remove(0); // drop the first sender, ending that body
+    // Each of the eight held responses received its first bytes: the body is held open
+    // by the upstream, so the relay's slot is held for the whole body, not the head.
+    for held in &mut held_responses {
+        let Ok(Some(chunk)) = within(held.chunk()).await else {
+            panic!("the held request's first chunk was not delivered");
+        };
+        assert!(
+            !chunk.is_empty(),
+            "the held request received its first bytes: {chunk:?}"
+        );
     }
-    let tenth = within(http().get(url).send())
-        .await
-        .expect("the tenth request was answered");
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "one of nine concurrent requests is refused, not two: {statuses:?}"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "the refusal says when to wait"
+    );
+
+    // The player hangs up: drop one of the eight player-side responses, keeping every
+    // upstream sender alive. The relay must notice the client's EOF while its body poll
+    // is pending, end the body, and release the permit. Poll the tenth request for up
+    // to two seconds until it is no longer a `503`; this removes the race between the
+    // release travelling through reqwest and the relay and the tenth request arriving.
+    held_responses.remove(0); // the first player hangs up
+    let url_owned = url.to_string();
+    let mut tenth = None;
+    for _ in 0..20 {
+        let response = within(http().get(&url_owned).send())
+            .await
+            .expect("the tenth request was answered");
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            tenth = Some(response);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some(tenth) = tenth else {
+        panic!("the tenth request never stopped being a 503: the permit was not released");
+    };
     assert_eq!(
         tenth.status(),
         StatusCode::OK,
-        "the tenth request succeeds after a body ends: {}",
+        "the tenth request succeeds after the player hangs up: {}",
         tenth.status()
     );
+    drop(tenth);
 
-    // The upstream's body that the seven held open ends with the test: the client goes,
-    // and with it the relay, and with the relay the bodies it was forwarding.
+    // Quitting while a player streams: seven bodies are still held open. Measuring
+    // `shutdown` with an instant proves it returns in well under the two-second abort:
+    // the stop signal ends every relayed body at once, so the graceful shutdown does
+    // not wait for the seven held-open connections.
+    let started = std::time::Instant::now();
+    shutdown(&mut client).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "shutdown with held-open bodies returned in under 1 s: {elapsed:?}"
+    );
+}
+
+/// After `shutdown` with a held-open body in flight, the relayed response's body ends:
+/// the player's next chunk read returns within a second, rather than blocking for as
+/// long as the upstream holds the body open. This is the per-connection half of the
+/// stop: the relay's own stop signal ends every relayed body, not just the listener.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_shutdown_ends_a_held_body() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream holds its body open: one chunk, then the body never ends until the
+    // relay's stop signal does.
+    let hold = Arc::new(AtomicBool::new(true));
+    let hold_clone = Arc::clone(&hold);
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get({
+                let hold = Arc::clone(&hold_clone);
+                move |_request: axum::extract::Request| {
+                    let hold = Arc::clone(&hold);
+                    async move {
+                        if hold.load(Ordering::SeqCst) {
+                            // One chunk, then the body is held open by a channel the
+                            // test never feeds: the body never ends until the relay's
+                            // stop signal ends it.
+                            let (_tx, mut rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+                            let first = futures::stream::once(async {
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                    b"0123456789abcdef",
+                                ))
+                            });
+                            let rest = futures::stream::poll_fn(move |cx| match rx.poll_recv(cx) {
+                                std::task::Poll::Ready(Some(chunk)) => {
+                                    std::task::Poll::Ready(Some(Ok(chunk)))
+                                }
+                                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                                std::task::Poll::Pending => std::task::Poll::Pending,
+                            });
+                            (
+                                [
+                                    (header::CONTENT_TYPE, "application/octet-stream"),
+                                    (header::ACCEPT_RANGES, "bytes"),
+                                ],
+                                axum::body::Body::from_stream(first.chain(rest)),
+                            )
+                                .into_response()
+                        } else {
+                            "0123456789abcdef".into_response()
+                        }
+                    }
+                }
+            }),
+        );
+    let addr = serve(upstream).await;
+
+    let mut remote = target(addr, LoginMethod::GatewayBasic, Some("quit-user"), None);
+    remote.gateway_key_header = Some("x-gw".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("quit-pass".to_string().into()),
+        Some("quit-key".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // The player's request: the first chunk arrives, then the body is held open.
+    let mut response = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    let Ok(Some(first)) = within(response.chunk()).await else {
+        panic!("the first chunk was not delivered");
+    };
+    assert_eq!(
+        first.as_ref(),
+        b"0123456789abcdef".as_slice(),
+        "the player received the first chunk"
+    );
+
+    // Quitting: the relay's stop signal ends the held-open body, so the player's next
+    // chunk read ends within a second rather than blocking for as long as the upstream
+    // holds on.
+    let started = std::time::Instant::now();
+    let next = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+        .await
+        .expect("the held body ended within 1 s of quit");
+    let _ = next;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the held body ended within 1 s of quit: {:?}",
+        started.elapsed()
+    );
+
     shutdown(&mut client).await;
 }
 
@@ -3252,10 +3461,12 @@ async fn relay_does_not_send_session_bearer() {
     const STREAM: &str =
         "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
 
-    // The upstream records every `Authorization` header it sees on the stream route,
-    // and answers the login and stream routes.
+    // The upstream records every `Authorization` and `x-gw-key` header it sees on the
+    // stream route, and answers the login and stream routes.
     let saw_auth = Arc::new(Mutex::new(Vec::new()));
     let saw_auth_clone = Arc::clone(&saw_auth);
+    let saw_key = Arc::new(Mutex::new(Vec::new()));
+    let saw_key_clone = Arc::clone(&saw_key);
     let upstream = Router::new()
         .route(
             "/api/v1/fs/roots",
@@ -3320,8 +3531,10 @@ async fn relay_does_not_send_session_bearer() {
             "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
             get({
                 let saw_auth = Arc::clone(&saw_auth_clone);
+                let saw_key = Arc::clone(&saw_key_clone);
                 move |request: axum::extract::Request| {
                     let saw_auth = Arc::clone(&saw_auth);
+                    let saw_key = Arc::clone(&saw_key);
                     async move {
                         let auth = request
                             .headers()
@@ -3329,7 +3542,14 @@ async fn relay_does_not_send_session_bearer() {
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_string)
                             .unwrap_or_default();
+                        let key = request
+                            .headers()
+                            .get("x-gw-key")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_default();
                         saw_auth.lock().expect("the test state").push(auth);
+                        saw_key.lock().expect("the test state").push(key);
                         ("0123456789abcdef".to_string()).into_response()
                     }
                 }
@@ -3375,11 +3595,175 @@ async fn relay_does_not_send_session_bearer() {
     let _ = within(first.bytes()).await.expect("the body arrived");
 
     // The upstream saw no `Authorization: Bearer` header: the relay sent only the
-    // gateway key header, never the server's session bearer.
+    // gateway key header, never the server's session bearer. The list is not empty:
+    // `all` on an empty list passes, so assert the request actually arrived.
     let saw = saw_auth.lock().expect("the test state").clone();
+    assert!(!saw.is_empty(), "the stream route was reached: {saw:?}");
     assert!(
         saw.iter().all(|auth| !auth.starts_with("Bearer")),
         "the relay did not send the session bearer: {saw:?}"
+    );
+    // The gateway key header went on its own, with the value the client was given: a
+    // relay that sent no credentials at all would not have it.
+    let saw_key = saw_key.lock().expect("the test state").clone();
+    assert!(
+        !saw_key.is_empty(),
+        "the stream route saw the key header: {saw_key:?}"
+    );
+    assert!(
+        saw_key.iter().all(|key| key == "gw-key-value"),
+        "the gateway key header reached the upstream with its value: {saw_key:?}"
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A `401` on the relay's forward is a bad stream token, not a refused session: the
+/// relay answers `502`, and the server's session-login counter does not increase. A
+/// `Password` login behind a key header has a `Kind::Server` session the relay never
+/// sent, so a `401` cannot be about it - and it must not be thrown away.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_401_does_not_drop_the_session() {
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STREAM: &str =
+        "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
+
+    // The upstream counts its session logins and answers the stream route with `401`:
+    // a bad stream token, the case the ruling is about.
+    let logins = Arc::new(AtomicUsize::new(0));
+    let logins_clone = Arc::clone(&logins);
+    let upstream = Router::new()
+        .route(
+            "/api/v1/fs/roots",
+            get(|| async { Json(vec!["/tmp".to_string()]) }),
+        )
+        .route(
+            "/api/v1/torrents",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
+        .route(
+            "/api/v1/session",
+            get(|| async { Json(json!({"version": "test", "dht_nodes": null, "torrents": 0})) }),
+        )
+        .route(
+            "/api/v1/session/queue",
+            get(|| async {
+                Json(json!({
+                    "active_downloads": 1,
+                    "active_seeds": null,
+                    "active_limit": null,
+                    "dont_count_slow_torrents": true,
+                    "inactive_down_rate": 1024,
+                    "inactive_up_rate": 1024,
+                    "startup_grace": 30.0,
+                    "interval": 1.0,
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/events",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: ready\ndata: {}\n\n",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/torrents/{id}/files",
+            get(|| async {
+                Json(json!([{"index":0,"path":"payload.bin","len":16,"pad":false}])).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/stream-tokens",
+            post(|| async {
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "path": STREAM, "expires_in": 60 })),
+                )
+                    .into_response()
+            }),
+        )
+        // The login route: counts the session logins and answers `401` from the second
+        // call on. The first call is the initial session; if the relay's `401` dropped
+        // the session, the next call would re-login and answer `401` - a sign the session
+        // was thrown away for a bad stream token.
+        .route(
+            "/api/v1/auth/session",
+            post({
+                let logins = Arc::clone(&logins_clone);
+                move || async move {
+                    let count = logins.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count == 1 {
+                        Json(json!({"token": "session-token-123", "expires_in": 3600}))
+                            .into_response()
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "the session was dropped").into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream",
+            get(|| async { (StatusCode::UNAUTHORIZED, "the stream token is bad").into_response() }),
+        );
+    let addr = serve(upstream).await;
+
+    // A Password login (server session) with a `gateway_key_header` and a key: the
+    // client signs to a gateway, so it routes streams through the relay.
+    let mut remote = target(addr, LoginMethod::Password, Some("token-user"), None);
+    remote.gateway_key_header = Some("x-gw-key".to_string());
+    let mut client = RemoteBackend::start(
+        remote,
+        Secret::Password("token-pass".to_string().into()),
+        Some("gw-key-value".to_string().into()),
+    );
+    wait_for_state(&mut client, true).await;
+
+    let id = TorrentId(ID.to_string());
+    assert!(client.send(Command::Stream { id, file: None }));
+    let source = source_of(notice_that(&mut client, |notice| play_source(notice).is_some()).await);
+    let fbtt_core::PlaySource::Url(url) = &source else {
+        panic!("the relay's URL: {source:?}");
+    };
+    let url = url.as_str();
+
+    // The player's request: the upstream answers `401` (a bad stream token), and the
+    // relay maps it to a `502` for the player.
+    let first = within(http().get(url).send())
+        .await
+        .expect("the relay answered");
+    assert_eq!(
+        first.status(),
+        StatusCode::BAD_GATEWAY,
+        "a 401 on a non-gateway login is a 502 for the player, not a retry: {}",
+        first.status()
+    );
+    let _ = within(first.bytes()).await.expect("the body arrived");
+
+    // The relay logged in once to start (the refresh loop's session). The `401` on the
+    // relay's forward must not add another: a bad stream token is not a dropped session,
+    // and throwing the TUI's session away for it is a login storm. Poll the counter for
+    // a moment; if the session had been invalidated, the next ordinary call would re-login
+    // and the counter would climb (and, on the second login, answer `401` too).
+    let before = logins.load(Ordering::SeqCst);
+    assert_eq!(
+        before, 1,
+        "the initial session login happened exactly once: {before}"
+    );
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = logins.load(Ordering::SeqCst);
+        if after != before {
+            panic!("a 401 on the relay logged the session in again: before={before} after={after}");
+        }
+    }
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        1,
+        "a 401 on the relay did not log the session in again"
     );
 
     shutdown(&mut client).await;
