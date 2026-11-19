@@ -2338,6 +2338,8 @@ mod tests {
     /// `get_cursor_position()` read the real tty, which a test never does (and which fails with
     /// `WouldBlock` where there is none). Everything that writes goes to the inner backend, so the
     /// recording holds the exact bytes the real backend would send.
+    // The size is fixed at construction, so after `terminal.resize` a clear sees a stale size; that
+    // only affects the cleared bytes, which the tests discard.
     struct FixedBackend {
         inner: CrosstermBackend<Recorder>,
         size: Size,
