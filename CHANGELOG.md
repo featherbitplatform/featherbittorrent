@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - On Windows, the featherbit mark is now drawn as an image in terminals that support sixel and report their cell size (fbterm 0.11 or newer, for one), where before every Windows terminal got the text title. ([#13](https://github.com/featherbitplatform/featherbittorrent/pull/13))
+- The terminal probe now runs in raw mode on macOS and Linux. Before, the terminal's replies could arrive too late to be read there, and the text title showed. ([#13](https://github.com/featherbitplatform/featherbittorrent/pull/13))
 
 ## [0.2.1] - 2026-11-20
 
