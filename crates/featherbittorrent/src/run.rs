@@ -269,7 +269,9 @@ pub async fn run() -> ExitCode {
         model: &mut model,
         snap: &mut snap,
         mark: &mut mark,
-        marks: crate::switch::MarkState::new(graphics.protocol, graphics.scale),
+        // The state machine is made from the probed verdict itself, so a re-prepare a resize or
+        // a stale answer starts keeps the protocol and scale the terminal answered with.
+        marks: crate::switch::MarkState::for_graphics(&graphics),
     };
     let (quit, screen, running) = run_session(
         terminal.get_mut(),
