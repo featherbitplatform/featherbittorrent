@@ -996,6 +996,44 @@ mod tests {
         );
     }
 
+    /// The same rule for the other protocol that has no placeholder: iTerm2 writes its image over the
+    /// cells the frame skipped, so a new placement owes those cells a repaint before the image goes on
+    /// them.
+    #[test]
+    fn a_new_iterm2_placement_repaints_its_cells_first() {
+        let logos = iterm2_logos();
+        let mut placer = Placer::new(Protocol::Iterm2);
+
+        // The text title's frame: no placement, so nothing to write and nothing to repaint.
+        let text = placer.after_draw(&[], SCREEN, &logos);
+        assert!(
+            text.bytes.is_empty() && text.repaint.is_empty(),
+            "a frame that places nothing writes nothing: {text:?}"
+        );
+
+        // The logos answer on the next frame, over the same cells the text frames filled.
+        let placement = small_placement(&logos);
+        let drawn = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert_eq!(
+            drawn.repaint,
+            vec![placement.rect],
+            "a new iterm2 placement did not repaint the cells under it"
+        );
+        assert!(
+            !drawn.bytes.is_empty(),
+            "the new placement still writes its image"
+        );
+
+        // The next frame is the same one: neither half of the answer goes out twice.
+        let steady = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert!(
+            steady.repaint.is_empty() && steady.bytes.is_empty(),
+            "a mark already on the screen is written once, not twice: repaint {:?}, {} bytes",
+            steady.repaint,
+            steady.bytes.len()
+        );
+    }
+
     /// The same question on a screen the frame has not seen before, which is the case the skipped
     /// cells are never let off: a screen of another size is a cleared screen, and ratatui has redrawn
     /// every cell of it that it writes itself, but these are cells it skips. Guarding the new
