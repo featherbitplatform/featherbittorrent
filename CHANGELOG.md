@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client of `featherbittorrent serve` that sends a request body too slowly can no longer hold a connection forever: a body must arrive within 20 seconds, plus one second for every 500 bytes received, or the connection is closed, with a `408` answer when one can still be sent. This comes with fbt-lib 0.11.0. ([#10](https://github.com/featherbitplatform/featherbittorrent/pull/10))
 - Logging in to a server with a body over the size limit now gets the 413 answer instead of a reset connection (seen as `ConnectionAborted` on Windows): both login routes read the refused body up to a bound before answering, as the stream-token route already did. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
 - A refused request clears only the session or gateway token it was sent with, so a late refusal of an older request no longer throws away a token a newer login just stored. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
 - With the image logo in a kitty terminal, the `Saving...` screen no longer writes any image bytes, and a zoom with the help screen open sends the large mark once per frame instead of twice. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
