@@ -322,6 +322,12 @@ pub struct Placer {
     /// The screen `last` was placed on: a different one is a cleared screen for the protocols that write
     /// images at a cursor, and cleared screens do not keep images.
     last_screen: Option<Size>,
+    /// The terminal cleared its image cache since the last frame: a logos swap after a cell-size
+    /// change (a resize never does this - the bitmaps it has sent are still the right size for a
+    /// screen whose cells did not move). The previous frame's large size is no longer the one this
+    /// frame draws, so it is not pre-sent before the draw - the size the frame picks is sent once,
+    /// by the step that knows it.
+    cleared: bool,
 }
 
 /// A placement and the image it carried, as the last frame left it on the screen.
@@ -344,6 +350,7 @@ impl Placer {
             sent_large: None,
             last: Vec::new(),
             last_screen: None,
+            cleared: false,
         }
     }
 
@@ -356,11 +363,17 @@ impl Placer {
     ///
     /// `placements` is what the frame can be expected to draw, which the caller knows only from the
     /// frame before: the placements the last frame put on the screen. The small mark is sent
-    /// whatever they are; the help screen's large mark, whose three sizes share one id, is sent
-    /// here only when the last frame placed it, so a frame that draws the same help again finds
-    /// its pixels in place. A large mark the frame newly chooses (help just opened, or a size
-    /// change) is not known until the frame is drawn, and is transmitted by
-    /// [`Placer::after_draw`] in the same frame, right after the draw.
+    /// whatever they are, because they are the previous frame's, and this frame's own placeholders
+    /// for the small mark reference the id before the frame is drawn. The `Saving...` screen never
+    /// calls this: it draws only its centred line, so it owes no pixels before the draw. The help
+    /// screen's large mark, whose three
+    /// sizes share one id, is sent here at the size the last frame placed it, when the terminal
+    /// has not cleared its cache: a large mark the frame newly chooses (help just opened, or a
+    /// different size after a zoom) is not known until the frame is drawn, and is transmitted by
+    /// [`Placer::after_draw`] in the same frame, right after the draw. After a clear the previous
+    /// frame's large size is no longer the one drawn, so it is not pre-sent here: pre-sending it
+    /// would put two bitmaps of the same id out in one frame, and the second one - the one the
+    /// placeholders reference - would win.
     ///
     /// For the other two protocols there is nothing to write before the frame: their image goes out
     /// after it, because it goes where the frame has decided to put it.
@@ -375,25 +388,48 @@ impl Placer {
         if self.protocol != Protocol::Kitty || logos.graphics.protocol != self.protocol {
             return Vec::new();
         }
-        self.transmit(logos, placements)
+        // The small mark goes out whatever the placements are: they are the previous frame's, and
+        // this frame's placeholders for the small mark reference its id before the frame is drawn.
+        // The large mark is pre-sent only when the terminal has not cleared its cache: after a
+        // clear, the previous frame's large size is no longer the one this frame draws, so it is
+        // not pre-sent - the size the frame picks is sent once, after the draw, by the step that
+        // knows it. The flag is cleared here, so the next frame pre-sends the large mark again.
+        let large = !self.cleared;
+        self.cleared = false;
+        self.transmit(logos, placements, true, large)
     }
 
     /// The pixels a kitty frame owes the terminal: every mark the frame will show that the terminal
     /// does not already hold under its id, in the order the screen will show them - the header's
-    /// first, the help screen's after. The small mark is transmitted whenever the terminal can draw
-    /// one, because the frame's placeholders for it reference the id before the frame is drawn, and
-    /// the placements this frame places are not known until it is drawn: a frame that does not place
-    /// the mark this time still needs its pixels held for the next one that does. A new cell size is
-    /// a new bitmap under the same id, so the first frame after one transmits everything again.
-    fn transmit(&mut self, logos: &PreparedLogos, placements: &[Placement]) -> Vec<u8> {
+    /// first, the help screen's after. A new cell size is a new bitmap under the same id, so the
+    /// first frame after one transmits everything again.
+    ///
+    /// `small` and `large` name the marks this frame owes pixels for, and only those. The small
+    /// mark is sent when `small` is true, whatever the placements are: they are the previous
+    /// frame's, so this frame's placeholders for the small mark reference the id before the frame
+    /// is drawn. The `Saving...` screen never calls [`Placer::before_draw`]. The large mark is
+    /// sent when `large` is true, at the size of the large placement among `placements` - the
+    /// previous frame's size, when this is a [`Placer::before_draw`], or this frame's own, when it
+    /// is a [`Placer::after_draw`]. After the draw the small mark is owed to nobody (its frame
+    /// paid for it before the draw, or places it not at all), and a size the frame already sent in
+    /// this frame is not sent a second time (see [`Placer::after_draw`]).
+    fn transmit(
+        &mut self,
+        logos: &PreparedLogos,
+        placements: &[Placement],
+        small: bool,
+        large: bool,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
-        // The header's mark: transmitted whenever the terminal can draw it, so the placeholders the
-        // frame is about to write find their pixels already in place.
-        let small = logos.small.clone();
-        let large = placements
-            .iter()
-            .find(|placement| matches!(placement.size, LogoSize::Large(_)))
-            .and_then(|placement| logos.logo(placement).cloned());
+        let small = small.then(|| logos.small.clone()).flatten();
+        let large = large
+            .then(|| {
+                placements
+                    .iter()
+                    .find(|placement| matches!(placement.size, LogoSize::Large(_)))
+                    .and_then(|placement| logos.logo(placement).cloned())
+            })
+            .flatten();
         for prepared in [small, large].into_iter().flatten() {
             let slot = match prepared.size {
                 LogoSize::Small => &mut self.sent_small,
@@ -415,6 +451,13 @@ impl Placer {
     /// them as soon as it holds the pixels, so the transmit goes out in the same flush. Pixels
     /// already sent are not sent again, so a steady frame writes nothing here.
     ///
+    /// The small mark is never sent here: its frame paid for it before the draw. A size the frame
+    /// already sent in this frame's [`Placer::before_draw`] is not a new choice either: a zoom with
+    /// the help open changes the large mark's size while a fresh bitmap is in flight, and the frame
+    /// that picks the new size is the one that sends it, once. After a clear, the previous frame's
+    /// large size was not pre-sent, so the size this frame picks is the large mark's only transmit
+    /// in the frame, and it goes out here.
+    ///
     /// For iTerm2 and sixel, an image is written for every placement that is new - a different rect, a
     /// different image, or a screen of a different size, which is the one ratatui cleared - and the
     /// placements that were there before and are not now come back as `repaint`: the image that was on
@@ -429,13 +472,17 @@ impl Placer {
     ) -> AfterDraw {
         if logos.graphics.protocol != self.protocol || self.protocol == Protocol::Kitty {
             // Kitty keeps no placement bookkeeping: its placeholders are ordinary cells. What it
-            // may still owe is the pixels of a large mark this frame has just chosen. The frame
-            // still tells the placer what the screen is now, so a next frame of a different
-            // protocol knows the screen changed.
+            // may still owe is the pixels of a large mark this frame has just chosen - not the
+            // small one, whose frame either placed it (and paid for it before the draw) or owes
+            // none at all. The frame still tells the placer what the screen is now, so a next
+            // frame of a different protocol knows the screen changed.
             self.last_screen = Some(screen);
             self.last.clear();
             let bytes = if logos.graphics.protocol == self.protocol {
-                self.transmit(logos, placements)
+                // The large mark, when the frame placed one: a size the frame just chose is owed
+                // its pixels once, here; the payload slot marks it sent, so a frame that already
+                // transmitted this size in its [`Placer::before_draw`] sends nothing.
+                self.transmit(logos, placements, false, true)
             } else {
                 Vec::new()
             };
@@ -504,6 +551,20 @@ impl Placer {
         self.sent_large = None;
         self.last.clear();
         self.last_screen = None;
+        self.cleared = true;
+    }
+
+    /// The marks this placer still remembers as sent, the way a frame can see them: the payloads
+    /// held under each id, by payload identity, and the large mark's rows. It exists for tests: a
+    /// production caller asks for bytes, not for the bookkeeping behind them.
+    #[doc(hidden)]
+    pub fn sent(&self) -> (Option<&[u8]>, Option<u16>) {
+        (
+            self.sent_small
+                .as_ref()
+                .map(|prepared| prepared.payload.as_ref()),
+            self.sent_large.as_ref().map(|prepared| prepared.dims.rows),
+        )
     }
 
     /// The bytes to write before the terminal is put back.
@@ -1035,6 +1096,174 @@ mod tests {
             LogoView::text()
                 .draw_into(&placement, &mut buffer)
                 .is_none()
+        );
+    }
+
+    /// A `Saving...` frame is a frame with no placements at all: it writes no kitty bytes.
+    /// A frame that places nothing cannot owe pixels to the terminal, after the draw or
+    /// before it, and a frame that places the small mark pays for it before the draw, not
+    /// after.
+    #[test]
+    fn the_saving_frame_writes_no_kitty_bytes() {
+        let logos = kitty_logos();
+        let mut placer = Placer::new(Protocol::Kitty);
+        let small = small_placement(&logos);
+        // The small mark's id, carried by the transmit's own opening: how one image's bytes
+        // are told from another's.
+        let small_id = format!("\x1b_Ga=t,q=2,f=32,i={}", kitty::SMALL_ID);
+        let owes_small = |bytes: &[u8]| {
+            bytes
+                .windows(small_id.len())
+                .any(|w| w == small_id.as_bytes())
+        };
+
+        // A frame that places the header's mark transmits it before the draw: the
+        // placeholders the frame is about to write reference its id.
+        let first = placer.before_draw(&logos, std::slice::from_ref(&small));
+        assert!(
+            !first.is_empty(),
+            "the first frame transmits the mark it places"
+        );
+        assert!(
+            owes_small(&first),
+            "the first frame transmits the small mark, under its own id"
+        );
+
+        // The `Saving...` screen: no placements at all. Nothing is owed, before or after
+        // the draw, because the small mark was already sent by the first frame.
+        let saving = placer.before_draw(&logos, &[]);
+        assert!(
+            saving.is_empty(),
+            "a frame with no placements writes no pixels before the draw"
+        );
+        let after = placer.after_draw(&[], SCREEN, &logos);
+        assert!(
+            after.bytes.is_empty(),
+            "a frame with no placements writes no pixels after the draw"
+        );
+        assert!(after.repaint.is_empty(), "kitty repaints no cells");
+
+        // And a frame that places the small mark pays for it before the draw, not after:
+        // the first frame transmitted it, so this one only writes its placeholders.
+        let steady = placer.before_draw(&logos, std::slice::from_ref(&small));
+        assert!(
+            steady.is_empty(),
+            "a frame that places the mark finds its pixels already held, and sends nothing"
+        );
+        let steady_after = placer.after_draw(std::slice::from_ref(&small), SCREEN, &logos);
+        assert!(
+            steady_after.bytes.is_empty(),
+            "the small mark is never sent after the draw"
+        );
+
+        // The terminal clears its image cache: a logos swap after a cell-size change. A
+        // resize never does this - the bitmaps it has sent are still the right size for a
+        // screen whose cells did not move. The placer forgets what it sent, and the next
+        // frame's after-draw must not owe the small mark either: the small mark is paid
+        // for before the draw, by the frame's own placeholders, never after.
+        placer.invalidate();
+        let drawn_after = placer.after_draw(std::slice::from_ref(&small), SCREEN, &logos);
+        assert!(
+            drawn_after.bytes.is_empty(),
+            "the small mark is never sent after the draw, even after a clear"
+        );
+        assert!(
+            !owes_small(&drawn_after.bytes),
+            "and no small-mark id in the bytes after a clear either"
+        );
+
+        // The `Saving...` screen after a clear: no placements at all. The after-draw owes no
+        // pixels, because no placeholders reference an id and the small mark is never sent after
+        // the draw.
+        placer.invalidate();
+        let saving_after = placer.after_draw(&[], SCREEN, &logos);
+        assert!(
+            saving_after.bytes.is_empty(),
+            "the saving frame after a clear writes no pixels after the draw"
+        );
+        assert!(
+            !owes_small(&saving_after.bytes),
+            "and no small-mark id in the saving frame's after-draw bytes either"
+        );
+    }
+
+    /// A zoom with the help open, in the frame that answers it: the terminal holds the large
+    /// mark's pixels once and only once. The fresh bitmap goes out in the same frame as the
+    /// placeholders that reference it (after the draw, because only the drawn frame knows the
+    /// size it picks), so a size the frame already transmitted in this frame is not sent a
+    /// second time.
+    #[test]
+    fn a_zoom_with_help_open_sends_the_large_mark_once() {
+        let small = kitty_logos(); // 8 x 16 cells
+        let big = prepare(graphics(Protocol::Kitty, CellPx { w: 16, h: 34 })); // a zoom
+        let mut placer = Placer::new(Protocol::Kitty);
+        // The count of the transmit of `id` in `bytes`: its own opening, which carries the
+        // id, is what one image's pixels are told from another's by.
+        let transmit_of =
+            |id: u32| -> Vec<u8> { format!("\x1b_Ga=t,q=2,f=32,i={id},").into_bytes() };
+        let (small_needle, large_needle) =
+            (transmit_of(kitty::SMALL_ID), transmit_of(kitty::LARGE_ID));
+        let counts = |bytes: &[u8]| -> (u32, u32) {
+            (
+                bytes
+                    .windows(small_needle.len())
+                    .filter(|w| *w == small_needle.as_slice())
+                    .count() as u32,
+                bytes
+                    .windows(large_needle.len())
+                    .filter(|w| *w == large_needle.as_slice())
+                    .count() as u32,
+            )
+        };
+
+        // The help is open at the ten-row mark, at the small cell size: the ten-row bitmap
+        // goes out before the draw, because the placeholders the frame is about to write
+        // reference its id.
+        let ten = large_placement(&small, 10);
+        let before = placer.before_draw(&small, std::slice::from_ref(&ten));
+        let after = placer.after_draw(std::slice::from_ref(&ten), SCREEN, &small);
+        assert_eq!(
+            counts(&before),
+            (1, 1),
+            "the first help frame transmits both marks"
+        );
+        assert!(
+            after.bytes.is_empty(),
+            "a size the frame already sent before the draw is not sent again after it"
+        );
+
+        // The zoom: a new cell size is a new bitmap under the same id, and the terminal
+        // cleared the screen, so the placer forgets what it sent. `before_draw` gets the
+        // placements of the *previous* frame - the ten-row mark, at the old screen size -
+        // and the view, on the bigger cells, picks the six-row mark for this frame. The
+        // large mark must go out exactly once, by the step that knows this frame's size:
+        // the old size is no longer the one drawn, so it is not pre-sent before the draw.
+        placer.invalidate();
+        let ten_big = large_placement(&big, 10);
+        let six_big = large_placement(&big, 6);
+        let before = placer.before_draw(&big, std::slice::from_ref(&ten_big));
+        let after = placer.after_draw(std::slice::from_ref(&six_big), SCREEN, &big);
+        let (before_small, before_large) = counts(&before);
+        let (after_small, after_large) = counts(&after.bytes);
+        assert_eq!(
+            before_small + after_small,
+            1,
+            "the zoom frame transmits the small mark once"
+        );
+        assert_eq!(
+            before_large + after_large,
+            1,
+            "large mark sent twice in one frame: the old size was pre-sent before the draw and the new size after it"
+        );
+
+        // The frame after the zoom is steady: the view still places the six-row mark, and
+        // the pixels are held, so nothing goes out before or after the draw.
+        let six_big = large_placement(&big, 6);
+        let before = placer.before_draw(&big, std::slice::from_ref(&six_big));
+        let after = placer.after_draw(std::slice::from_ref(&six_big), SCREEN, &big);
+        assert!(
+            before.is_empty() && after.bytes.is_empty(),
+            "a steady frame sends nothing: the pixels are held"
         );
     }
 }
