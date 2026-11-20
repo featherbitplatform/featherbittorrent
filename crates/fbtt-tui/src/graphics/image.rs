@@ -215,11 +215,12 @@ pub fn render(src: &Rgba, dims: &LogoDims, canvas: [u8; 3]) -> Rgba {
     }
 }
 
-/// One channel of a pixel with `alpha` over an opaque `over`: the source's share plus the canvas's
-/// share, rounded half up. With `alpha` 255 this returns the source channel unchanged, which is what
-/// keeps an already-opaque mark exactly as it was; each product is at most 255 * 255 and their sum at
-/// most twice that, so a `u32` holds it.
-fn composite(c: u8, alpha: u32, over: u8) -> u8 {
+/// One channel of a pixel with `alpha` painted over an opaque `over`: the source's share plus
+/// `over`'s share, rounded half up. With `alpha` 255 this returns the source channel unchanged,
+/// which is what keeps an already-opaque mark exactly as it was; each product is at most 255 * 255
+/// and their sum at most twice that, so a `u32` holds it. A format with no partial alpha paints a
+/// pixel this way: the colour it would show over `over`, as one solid colour.
+pub(crate) fn composite(c: u8, alpha: u32, over: u8) -> u8 {
     let mixed = u32::from(c) * alpha + u32::from(over) * (255 - alpha);
     // 255 is odd, so adding 127 before dividing rounds exactly half up.
     u8::try_from((mixed + 127) / 255).unwrap_or(u8::MAX)

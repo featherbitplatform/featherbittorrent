@@ -129,13 +129,13 @@ fn prepared(
     Some(Prepared {
         size,
         dims,
-        payload: Arc::from(payload_for(graphics.protocol, &img, &dims)),
+        payload: Arc::from(payload_for(graphics.protocol, &img, &dims, canvas)),
     })
 }
 
-/// The image a protocol writes for a prepared mark: the transmit-plus-place for kitty, the inline image
-/// for iTerm2, the encoded sixel for sixel.
-fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims) -> Vec<u8> {
+/// The image a protocol writes for a prepared mark: the transmit-plus-place for kitty, the inline
+/// image for iTerm2, the encoded sixel for sixel, painted against `canvas`.
+fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims, canvas: [u8; 3]) -> Vec<u8> {
     match protocol {
         Protocol::None => Vec::new(),
         // The transmit carries the id the placement puts on the screen, and the placement is `U=1`: a
@@ -153,7 +153,7 @@ fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims) -> Vec<u8> {
         // The inline image fills the cells it is placed over, and the bitmap is exactly those cells'
         // device pixel size, so `preserveAspectRatio=0` draws it 1:1.
         Protocol::Iterm2 => iterm2::inline(&iterm2::encode_png(img), dims.cols, dims.rows),
-        Protocol::Sixel => sixel::encode(&sixel::quantize(img)),
+        Protocol::Sixel => sixel::encode(&sixel::quantize(img, canvas)),
     }
 }
 
