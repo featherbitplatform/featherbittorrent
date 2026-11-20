@@ -66,10 +66,14 @@ futures-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 # The logo probe's tty read (see `probe.rs`): `poll` and `read` on stdin, so the bytes answering the queries
-# are never held in a buffer crossterm cannot see. Unix only: a Windows console is not a byte stream
-# crossterm leaves to us, and there the probe never runs at all (decision 9 of the milestone 3 plan).
+# are never held in a buffer crossterm cannot see.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["std", "stdio", "event"] }
+
+# The logo probe's tty read on Windows: a console's input events are where the terminal's replies arrive,
+# one key event per character, so the probe reads the console record by record (see `probe.rs`).
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi.workspace = true
 
 [dev-dependencies]
 # The test process holds `LibraryLock` to make the binary's second acquire lose, and `fbtt_core::scratch`

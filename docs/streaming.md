@@ -179,5 +179,7 @@ The minimal view has no logo, and a dialog opened over the header takes the mark
 
 The probe is skipped, and the text title stays, inside tmux and other terminal multiplexers (their
 answers belong to the multiplexer, which rewrites or swallows them), with `TERM=dumb`, when stdin is not
-a terminal, on Windows, and with `logo: off`. A terminal that never answers costs 300 ms of startup; once
-its answer has started arriving the wait extends to one second.
+a terminal, and with `logo: off`. On Windows the probe reads the terminal's answers from the console's
+input queue, and a terminal there that answers DA1 with sixel and reports its cell size, such as fbterm
+0.11 or newer, gets the image like one on any other platform. A terminal that never answers costs 300 ms
+of startup; once its answer has started arriving the wait extends to one second.

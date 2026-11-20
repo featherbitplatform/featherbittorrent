@@ -1462,6 +1462,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "crossterm_winapi",
  "fbt",
  "fbtt-core",
  "fbtt-server",

@@ -1,18 +1,28 @@
 //! The one question round the binary asks the terminal before the event loop exists.
 //!
 //! [`detect`] writes [`PROBE_QUERY`] once, reads what comes back byte by byte, and hands those bytes to the
-//! pure decision table in `fbtt_tui::graphics` (decision 10). It runs after raw mode is on and before
-//! `EventStream` exists because it owns the tty for those few milliseconds: crossterm's reader would take
-//! stdin with its own buffer, and a keystroke typed while the queries are in flight has to survive for that
-//! reader rather than be swallowed here. So the read is done with `rustix` (Unix only), one byte per call,
-//! and it stops at the first complete DA1 answer - the one reply every terminal sends, which is why DA1 is
-//! last in the query string (decision 9).
+//! pure decision table in `fbtt_tui::graphics` (decision 10). It runs before `EventStream` exists because
+//! it owns the tty for those few milliseconds: crossterm's reader would take stdin with its own buffer,
+//! and a keystroke typed while the queries are in flight has to survive for that reader rather than be
+//! swallowed here. So the read takes one byte per call - with `rustix` on Unix, and from the console's
+//! input events on Windows, where a terminal's reply arrives one key event per character - and it stops at
+//! the first complete DA1 answer, the one reply every terminal sends, which is why DA1 is last in the query
+//! string (decision 9).
+//!
+//! On Unix the read needs raw mode, which is not on yet: the terminal enters it later, in
+//! `Terminal::setup`. A canonical-mode tty would hold a reply without a newline - DA1's answer has none -
+//! until a line ends, and would echo the replies onto the screen. So `detect` turns raw mode on around the
+//! round through a guard that puts it back on every path, and a terminal it cannot put in raw mode gets the
+//! no-answer verdict instead of a query nobody will read. On Windows crossterm's raw mode changes only the
+//! input mode flags, and the console's input queue hands back the replies in either mode, so the Windows
+//! round needs nothing more.
 //!
 //! Two deadlines bound the read, both measured from the write: 300 ms, extended to one second once an answer
 //! has started flowing. Nothing else about this module is unbounded: at most 4096 bytes are read, no
 //! allocation grows past that, a terminal that answers nothing costs the shorter deadline, and nothing is
 //! ever printed to the terminal on the way in or out.
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
@@ -40,7 +50,6 @@ const MAX_BYTES: usize = 4_096;
 
 /// The reasons [`skip_reason`] answers with. They say why a run has no image logo, for whoever ends up
 /// logging or printing them; on screen the effect is only that the text title stays where it is.
-const SKIP_WINDOWS: &str = "windows";
 const SKIP_LOGO_OFF: &str = "logo off";
 const SKIP_NOT_A_TTY: &str = "stdin is not a terminal";
 const SKIP_TMUX: &str = "tmux";
@@ -149,22 +158,116 @@ fn readable(revents: PollFlags) -> io::Result<bool> {
     Ok(false)
 }
 
-/// The tty the probe uses where stdin is not a byte stream: writes go nowhere and nothing ever arrives.
+/// The process's own console, read through the console's input events (Windows).
 ///
-/// `skip_reason` never lets a Windows run as far as this (decision 9), so it is never actually asked
-/// anything; it exists so that one `probe` compiles on every platform instead of two.
-#[cfg(not(unix))]
+/// A Windows console program never sees the terminal's replies as raw bytes on stdin: the console
+/// layer hands them back as ordinary console key events, one character per event. That is where the
+/// replies to the queries are, so this tty takes them out of the console's input queue - `crossterm`
+/// reads the same events through its own reader afterwards, which is why reading one record at a
+/// time is what leaves a keystroke typed after the answers to `EventStream`, the promise the Unix
+/// path keeps for bytes.
+#[cfg(windows)]
 #[derive(Debug)]
-struct IdleTty;
+struct ConsoleTty {
+    /// The console's input queue, polled for events and read one record at a time.
+    console: crossterm_winapi::Console,
+    /// Reply bytes taken out of key events but not yet handed to the probe: one key event can carry
+    /// more bytes than the next call wants, and a call can want more than the event on hand.
+    pending: VecDeque<u8>,
+    /// Virtual terminal output processing, turned on before the first write (see `write_all`); the
+    /// flag spares the second call the round trip it would otherwise take.
+    vt_enabled: bool,
+}
 
-#[cfg(not(unix))]
-impl Tty for IdleTty {
-    fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
-        Ok(())
+#[cfg(windows)]
+impl Tty for ConsoleTty {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+
+        if !self.vt_enabled {
+            // The queries are escape sequences, and a process started from cmd.exe or Windows PowerShell 5.1
+            // has virtual terminal output processing off until crossterm turns it on in `ratatui::try_init`
+            // - which is after this write. Without it the queries print as literal text on the screen, so
+            // enable it first, the same way crossterm does a moment later.
+            let out = crossterm_winapi::Handle::current_out_handle()
+                .map(crossterm_winapi::ConsoleMode::from)?;
+            out.set_mode(out.mode()? | VT_OUTPUT)?;
+            self.vt_enabled = true;
+        }
+        let mut stdout = std::io::stdout();
+        stdout.write_all(bytes)?;
+        // The flush is part of "on the wire": without it the queries could still be in the process's own
+        // buffer while this run waits for an answer that will only be produced by what they say.
+        stdout.flush()
     }
 
-    fn read_byte(&mut self, _wait: Duration) -> io::Result<Option<u8>> {
-        Ok(None)
+    fn read_byte(&mut self, wait: Duration) -> io::Result<Option<u8>> {
+        // A byte an earlier key event left behind is already here: no event to wait for.
+        if let Some(byte) = self.pending.pop_front() {
+            return Ok(Some(byte));
+        }
+        // No bytes on hand: wait for an input event, at most `wait`, and then read records until one
+        // yields a byte or the wait runs out. `wait` is at most a second (`probe` owns the deadline),
+        // so the 5 ms poll steps below can take the whole wait without ever overshooting it.
+        let deadline = Instant::now() + wait;
+        loop {
+            // The deadline is checked before every read, not only before a sleep: a stream of records
+            // that yield no byte - key ups, mouse moves - would otherwise keep this call inside
+            // `read_byte` past its `wait`, and `probe` owns the deadline, not the tty.
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            if self.console.number_of_console_input_events()? > 0 {
+                // One record per call on purpose: a keystroke typed after the answers keeps its place in
+                // the queue for `EventStream`'s reader.
+                let record = self.console.read_single_input_event()?;
+                if let crossterm_winapi::InputRecord::KeyEvent(key) = record
+                    && key.key_down
+                    && key.u_char != 0
+                {
+                    // A character the console decoded: its UTF-16 unit as the UTF-8 bytes it is.
+                    // Replies are ASCII, so this is normally one byte per event.
+                    push_key_char(key.u_char, &mut self.pending);
+                    if let Some(byte) = self.pending.pop_front() {
+                        return Ok(Some(byte));
+                    }
+                }
+                // Any other record - a key release, a mouse move, a focus or a resize, the menu - says
+                // nothing about the answers: read the next record straight away, because the queue it
+                // came from still holds the rest of the replies and sleeping here would spend the
+                // deadline on records that are already waiting.
+                continue;
+            }
+            // Nothing is waiting: sleep, but not past the deadline, which is what decides.
+            std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_STEP));
+        }
+    }
+}
+
+/// The console input queue is asked about this often while nothing is in it: short enough that the
+/// wait feels like a wait rather than a loop, long enough that a full second of silence is a
+/// hundred polls rather than a busy one.
+#[cfg_attr(not(windows), allow(dead_code))]
+const POLL_STEP: Duration = Duration::from_millis(5);
+
+/// The console output mode flag that makes the console interpret escape sequences instead of
+/// printing them as text: `ENABLE_VIRTUAL_TERMINAL_PROCESSING`.
+#[cfg(windows)]
+const VT_OUTPUT: u32 = 0x0004;
+
+/// The UTF-8 bytes one UTF-16 unit is worth, pushed onto `out`; a lone surrogate, which is no
+/// character by itself, pushes nothing.
+///
+/// Pulled out of the console tty because it is the one step that turns a Windows console event into
+/// bytes, and it is pure: a test can exercise it on any platform without a console.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn push_key_char(unit: u16, out: &mut VecDeque<u8>) {
+    // `from_u32` is the constructor `char` has: a unit past `char::MAX` - impossible here, where
+    // it is a `u16` - answers no character just like a lone surrogate does.
+    if let Some(character) = char::from_u32(u32::from(unit)) {
+        // `encode_utf8` writes into the buffer and names what it wrote: the bytes, not the string.
+        out.extend(character.encode_utf8(&mut [0u8; 4]).as_bytes());
     }
 }
 
@@ -219,11 +322,13 @@ pub fn probe(tty: &mut dyn Tty, now: impl Fn() -> Instant) -> Vec<u8> {
 
 /// Whether this run should leave the text title where it is, and why; `None` means probe the terminal.
 ///
-/// Decision 9's skip list, in the order it is worth knowing about: a Windows console, `logo: off`, stdin
-/// that is not a terminal at all, tmux and GNU screen - which rewrite or swallow the responses, so waiting
-/// for them costs the deadline for nothing - a `TERM` naming one of them anyway, which is the same
-/// situation reached from a side where `TMUX` or `STY` did not survive into this environment, and
-/// `TERM=dumb`.
+/// Decision 9's skip list, in the order it is worth knowing about: `logo: off`, stdin that is not a
+/// terminal at all, tmux and GNU screen - which rewrite or swallow the responses, so waiting for them
+/// costs the deadline for nothing - a `TERM` naming one of them anyway, which is the same situation
+/// reached from a side where `TMUX` or `STY` did not survive into this environment, and `TERM=dumb`.
+/// Windows is no longer on the list: the console's input events carry a terminal's replies to the
+/// queries (see `ConsoleTty`, the Windows half of this module), so a Windows terminal that answers DA1
+/// with sixel and reports its cell size gets the image like any other.
 ///
 /// `env` is a lookup rather than `std::env::var` so a test can name the environment it wants without putting
 /// anything in this process's real one.
@@ -232,11 +337,6 @@ pub fn skip_reason(
     stdin_is_tty: bool,
     logo_off: bool,
 ) -> Option<&'static str> {
-    // A Windows console is not a byte stream crossterm leaves to us, so there is nothing here for the
-    // probe to read (decision 9). The checks below still compile and are what a Unix run answers.
-    if cfg!(not(unix)) {
-        return Some(SKIP_WINDOWS);
-    }
     // The person's own way out, asked before anything is spent finding out what the terminal can do.
     if logo_off {
         return Some(SKIP_LOGO_OFF);
@@ -270,6 +370,49 @@ pub fn skip_reason(
     None
 }
 
+/// The raw mode the probe round found, so the guard puts back only what it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawMode {
+    /// The terminal was in raw mode already: whoever put it there keeps it, and the round ends with it
+    /// still on.
+    WasOn,
+    /// The round turned raw mode on: it goes back the way it was when the round ends.
+    TurnedOn,
+}
+
+/// Raw mode around the probe round: it goes back the way it was on every path out of the round, a
+/// clean one, an early return and a panic alike, because a terminal left in raw mode is a terminal
+/// whose next character nobody will see.
+#[derive(Debug)]
+struct RawGuard(RawMode);
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        if self.0 == RawMode::TurnedOn
+            && let Err(error) = crossterm::terminal::disable_raw_mode()
+        {
+            eprintln!("the probe could not put the terminal back into normal mode: {error}");
+        }
+    }
+}
+
+impl RawGuard {
+    /// Raw mode around the probe round, or `None` when the tty cannot be put in raw mode: a terminal
+    /// that will not go raw cannot answer the queries byte by byte, so the round does not run.
+    fn around() -> Option<RawGuard> {
+        match crossterm::terminal::is_raw_mode_enabled() {
+            Ok(true) => Some(RawGuard(RawMode::WasOn)),
+            Ok(false) => crossterm::terminal::enable_raw_mode()
+                .is_ok()
+                .then_some(RawGuard(RawMode::TurnedOn)),
+            // No way to tell whether the tty is raw: a tty in cooked mode holds a reply without a
+            // newline until a line ends, and that reply would arrive after the round, so the no-answer
+            // verdict is the only one this run can trust.
+            Err(_) => None,
+        }
+    }
+}
+
 /// The graphics verdict for the terminal this process is attached to: [`skip_reason`] first, then one probe
 /// round, then the decision table over what was answered and this terminal's own sizes.
 ///
@@ -281,6 +424,11 @@ pub fn detect(logo_off: bool) -> Graphics {
     if skip_reason(&env, std::io::stdin().is_terminal(), logo_off).is_some() {
         return Graphics::none();
     }
+    // The round runs in raw mode on every platform, so the answers arrive one byte at a time instead of
+    // line by line (see the module doc). A tty it cannot put in raw mode answers nothing at all.
+    let Some(guard) = RawGuard::around() else {
+        return Graphics::none();
+    };
     // The grid and the window size are what `choose` divides when no query answered a cell size directly
     // (decision 11); a terminal that answers neither of these ioctls gets `(0, 0)`, which chooses nothing.
     let grid = crossterm::terminal::size().unwrap_or((0, 0));
@@ -288,23 +436,45 @@ pub fn detect(logo_off: bool) -> Graphics {
         .ok()
         .as_ref()
         .and_then(window_pixels);
-    choose(&parse_replies(&ask()), grid, pixels)
+    let answers = ask();
+    drop(guard);
+    choose(&parse_replies(&answers), grid, pixels)
 }
 
 /// The probe round on this process's own tty: the queries out through stdout, the answers back in through
-/// fd 0. Unix only; `IdleTty` is the twin this compiles against everywhere else.
+/// fd 0.
 #[cfg(unix)]
 fn ask() -> Vec<u8> {
     let mut tty = StdinTty;
     probe(&mut tty, Instant::now)
 }
 
-/// Windows console input is not a byte stream crossterm leaves to us, so `skip_reason` has already said skip
-/// by the time this could run (decision 9); an empty answer is what keeps one `detect` compiling here.
-#[cfg(not(unix))]
+/// The probe round on this process's own console: the queries out through stdout, the answers back in
+/// through the console's input events, one key event per character. A process whose `is_terminal` is
+/// true without a console - an MSYS or Cygwin pty pipe is one - has nothing to read from, and an empty
+/// answer is what the text title comes from.
+#[cfg(windows)]
 fn ask() -> Vec<u8> {
-    let mut tty = IdleTty;
-    probe(&mut tty, Instant::now)
+    match ConsoleTty::console() {
+        Ok(mut tty) => probe(&mut tty, Instant::now),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+impl ConsoleTty {
+    /// This process's console, opened for the input events the probe reads from it.
+    fn console() -> io::Result<Self> {
+        // `CONIN$`, the console's own input handle: it is the queue the terminal's replies arrive in,
+        // and crossterm's reader works from the same one, so both this run and `EventStream` see the
+        // events in the order they were typed.
+        let console = crossterm_winapi::Handle::current_in_handle()?;
+        Ok(Self {
+            console: console.into(),
+            pending: VecDeque::new(),
+            vt_enabled: false,
+        })
+    }
 }
 
 /// The window's device pixel size in the shape `choose` wants, or `None` when either side is zero.
@@ -319,6 +489,7 @@ fn window_pixels(size: &WindowSize) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
 
     /// The answer a kitty sends to the graphics query.
@@ -676,9 +847,7 @@ mod tests {
         );
         assert!(skip_reason(&plain, true, true).is_some(), "logo: off");
 
-        // Which reason each one says. Unix only: on Windows the platform rule answers first whatever the
-        // environment says.
-        #[cfg(unix)]
+        // Which reason each one says.
         {
             assert_eq!(skip_reason(&tmux, true, false), Some(SKIP_TMUX));
             assert_eq!(skip_reason(&tmux_term_only, true, false), Some(SKIP_TMUX));
@@ -692,9 +861,26 @@ mod tests {
             assert_eq!(skip_reason(&plain, true, true), Some(SKIP_LOGO_OFF));
         }
 
-        // The one case that gets probed. On Windows `skip_reason` always skips (decision 9), so the same
-        // call answers differently there and this says so instead of pretending otherwise.
-        assert_eq!(skip_reason(&plain, true, false).is_none(), cfg!(unix));
+        // The one case that gets probed, on every platform.
+        assert_eq!(skip_reason(&plain, true, false), None);
+    }
+
+    #[test]
+    fn a_key_char_becomes_its_utf8_bytes() {
+        // An ASCII character is its one byte: replies are ASCII, and this is the common case.
+        let mut out = VecDeque::new();
+        push_key_char(u16::from(b'['), &mut out);
+        assert_eq!(out, [b'[']);
+        // A BMP character above ASCII becomes its UTF-8 bytes, in order.
+        let mut out = VecDeque::new();
+        push_key_char(0x2192, &mut out);
+        assert_eq!(out, [0xE2, 0x86, 0x92]);
+        // A lone surrogate is no character: it pushes nothing rather than a half of one.
+        for unit in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
+            let mut out = VecDeque::new();
+            push_key_char(unit, &mut out);
+            assert!(out.is_empty(), "{unit:#06x} is a lone surrogate");
+        }
     }
 
     #[test]
