@@ -102,15 +102,31 @@ pub fn prepare(graphics: Graphics) -> PreparedLogos {
         };
     };
     let src = image::mark();
-    let canvas = rgb(theme::INK_950);
+    // Sixel has no alpha: `quantize` turns each pixel's alpha into a colour composited over the
+    // canvas it is given, so a mark's anti-aliased edges are the colour of the ground it was prepared
+    // for. Each mark is prepared against the ground it is actually drawn on. The header's mark stands
+    // on the canvas every frame fills the screen with (`INK_950`). The help screen's mark stands
+    // inside the help box, which is filled with its own surface, `INK_850` (`modal::draw_box`), and
+    // one canvas for both would carry the wrong ground's colour in one of their edges.
+    let header_ground = rgb(theme::INK_950);
+    let help_ground = rgb(theme::INK_850);
 
     PreparedLogos {
         graphics,
-        small: prepared(LogoSize::Small, 3, graphics, cell, &src, canvas),
+        small: prepared(LogoSize::Small, 3, graphics, cell, &src, header_ground),
         large: LARGE_ROWS
             .iter()
             .copied()
-            .filter_map(|rows| prepared(LogoSize::Large(rows), rows, graphics, cell, &src, canvas))
+            .filter_map(|rows| {
+                prepared(
+                    LogoSize::Large(rows),
+                    rows,
+                    graphics,
+                    cell,
+                    &src,
+                    help_ground,
+                )
+            })
             .collect(),
     }
 }
