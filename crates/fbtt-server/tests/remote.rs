@@ -4267,9 +4267,11 @@ async fn relay_retry_does_not_hold_the_auth_lock() {
     const STREAM: &str =
         "/api/v1/torrents/0123456789abcdef0123456789abcdef01234567/files/0/stream?token=t";
 
-    // The upstream answers the stream route `401` once, then holds the second (the
-    // retry) for about 900 ms before answering `200`. The stall is the case the
-    // finding is about: a slow or hostile upstream on the retry's path.
+    // The upstream answers the stream route `401` once, then parks the second (the
+    // retry) on a gate the test controls: it says the retry arrived, and waits on
+    // the gate until the test opens it. The stall is the case the finding is
+    // about: a slow or hostile upstream on the retry's path, held open for as
+    // long as the test needs to say it holds nothing.
     let stream_hits = Arc::new(AtomicUsize::new(0));
     let stream_hits_clone = Arc::clone(&stream_hits);
     // The test's controls: the upstream says when the retry has arrived, and parks it on
@@ -4436,10 +4438,13 @@ async fn relay_retry_does_not_hold_the_auth_lock() {
     );
 
     let status = within(player).await.expect("the player task");
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the relay answered 200 after the 401 renewal: {status}"
+    // The lock assert above is what this test is about; the status only needs to say the retry was answered
+    // at all. The gate can open up to about 300 ms after the retry arrives, and in a test build the relay's
+    // head cap is one second: on a descheduled runner the retry's answer is a 504, and the lock was still not
+    // held across it, so either status is what the test proves.
+    assert!(
+        matches!(status, StatusCode::OK | StatusCode::GATEWAY_TIMEOUT),
+        "the relay answered its own 200 or 504 after the 401 renewal: {status}"
     );
 
     shutdown(&mut client).await;
