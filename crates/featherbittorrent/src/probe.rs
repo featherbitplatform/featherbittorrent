@@ -174,6 +174,9 @@ struct ConsoleTty {
     /// Reply bytes taken out of key events but not yet handed to the probe: one key event can carry
     /// more bytes than the next call wants, and a call can want more than the event on hand.
     pending: VecDeque<u8>,
+    /// Virtual terminal output processing, turned on before the first write (see `write_all`); the
+    /// flag spares the second call the round trip it would otherwise take.
+    vt_enabled: bool,
 }
 
 #[cfg(windows)]
@@ -181,11 +184,20 @@ impl Tty for ConsoleTty {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write as _;
 
-        let mut out = std::io::stdout();
-        out.write_all(bytes)?;
+        if !self.vt_enabled {
+            // The queries are escape sequences, and a process started from cmd.exe or Windows PowerShell 5.1
+            // has virtual terminal output processing off until crossterm turns it on in `ratatui::try_init`
+            // - which is after this write. Without it the queries print as literal text on the screen, so
+            // enable it first, the same way crossterm does a moment later.
+            let out = crossterm_winapi::Handle::current_out_handle().map(crossterm_winapi::ConsoleMode::from)?;
+            out.set_mode(out.mode()? | VT_OUTPUT)?;
+            self.vt_enabled = true;
+        }
+        let mut stdout = std::io::stdout();
+        stdout.write_all(bytes)?;
         // The flush is part of "on the wire": without it the queries could still be in the process's own
         // buffer while this run waits for an answer that will only be produced by what they say.
-        out.flush()
+        stdout.flush()
     }
 
     fn read_byte(&mut self, wait: Duration) -> io::Result<Option<u8>> {
@@ -198,9 +210,6 @@ impl Tty for ConsoleTty {
         // so the 5 ms poll steps below can take the whole wait without ever overshooting it.
         let deadline = Instant::now() + wait;
         loop {
-            // The wait is what decides, not a sleep: `GetNumberOfConsoleInputEvents` says whether
-            // anything is on the wire, and sleeping in 5 ms steps is the whole cost of polling.
-            let left = deadline.saturating_duration_since(Instant::now());
             if self.console.number_of_console_input_events()? > 0 {
                 // One record per call on purpose: a keystroke typed after the answers keeps its place in
                 // the queue for `EventStream`'s reader.
@@ -217,13 +226,17 @@ impl Tty for ConsoleTty {
                     }
                 }
                 // Any other record - a key release, a mouse move, a focus or a resize, the menu - says
-                // nothing about the answers, so the wait keeps going.
+                // nothing about the answers: read the next record straight away, because the queue it
+                // came from still holds the rest of the replies and sleeping here would spend the
+                // deadline on records that are already waiting.
+                continue;
             }
+            // Nothing is waiting: sleep, but not past the deadline, which is what decides.
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(left.min(POLL_STEP));
+            std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_STEP));
         }
     }
 }
@@ -231,15 +244,20 @@ impl Tty for ConsoleTty {
 /// The console input queue is asked about this often while nothing is in it: short enough that the
 /// wait feels like a wait rather than a loop, long enough that a full second of silence is a
 /// hundred polls rather than a busy one.
-#[allow(dead_code)] // the Windows-only console tty is the one that sleeps in steps of it
+#[cfg_attr(not(windows), allow(dead_code))]
 const POLL_STEP: Duration = Duration::from_millis(5);
+
+/// The console output mode flag that makes the console interpret escape sequences instead of
+/// printing them as text: `ENABLE_VIRTUAL_TERMINAL_PROCESSING`.
+#[cfg(windows)]
+const VT_OUTPUT: u32 = 0x0004;
 
 /// The UTF-8 bytes one UTF-16 unit is worth, pushed onto `out`; a lone surrogate, which is no
 /// character by itself, pushes nothing.
 ///
 /// Pulled out of the console tty because it is the one step that turns a Windows console event into
 /// bytes, and it is pure: a test can exercise it on any platform without a console.
-#[allow(dead_code)] // only the Windows tty calls it; the tests keep it alive on the other platforms
+#[cfg_attr(not(windows), allow(dead_code))]
 fn push_key_char(unit: u16, out: &mut VecDeque<u8>) {
     // `from_u32` is the constructor `char` has: a unit past `char::MAX` - impossible here, where
     // it is a `u16` - answers no character just like a lone surrogate does.
@@ -417,7 +435,6 @@ pub fn detect(logo_off: bool) -> Graphics {
     choose(&parse_replies(&answers), grid, pixels)
 }
 
-
 /// The probe round on this process's own tty: the queries out through stdout, the answers back in through
 /// fd 0.
 #[cfg(unix)]
@@ -427,27 +444,30 @@ fn ask() -> Vec<u8> {
 }
 
 /// The probe round on this process's own console: the queries out through stdout, the answers back in
-/// through the console's input events, one key event per character.
+/// through the console's input events, one key event per character. A process whose `is_terminal` is
+/// true without a console - an MSYS or Cygwin pty pipe is one - has nothing to read from, and an empty
+/// answer is what the text title comes from.
 #[cfg(windows)]
 fn ask() -> Vec<u8> {
-    let mut tty = ConsoleTty::console();
-    probe(&mut tty, Instant::now)
+    match ConsoleTty::console() {
+        Ok(mut tty) => probe(&mut tty, Instant::now),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(windows)]
 impl ConsoleTty {
     /// This process's console, opened for the input events the probe reads from it.
-    fn console() -> Self {
+    fn console() -> io::Result<Self> {
         // `CONIN$`, the console's own input handle: it is the queue the terminal's replies arrive in,
         // and crossterm's reader works from the same one, so both this run and `EventStream` see the
         // events in the order they were typed.
-        let console = crossterm_winapi::Handle::current_in_handle()
-            .map(crossterm_winapi::Console::from)
-            .expect("a TUI run has a console to read its terminal's replies from");
-        Self {
-            console,
+        let console = crossterm_winapi::Handle::current_in_handle()?;
+        Ok(Self {
+            console: console.into(),
             pending: VecDeque::new(),
-        }
+            vt_enabled: false,
+        })
     }
 }
 
