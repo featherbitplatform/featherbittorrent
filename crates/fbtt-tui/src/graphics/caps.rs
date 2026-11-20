@@ -1028,4 +1028,22 @@ mod tests {
             Some(CellPx { w: 13, h: 32 })
         );
     }
+
+    /// The bytes a run in fbterm 0.11 on Windows reads back from the console: the kitty answer
+    /// dropped by the console layer apart from a stray `\`, then the `CSI 16 t` answer (a 10 x 20
+    /// pixel cell) and DA1 claiming sixel. The decision table has to get the logo from what survives.
+    #[test]
+    fn fbterm_on_windows_picks_sixel_from_its_console_replies() {
+        let replies = b"\x1b_Gi=31;OK\\_\x1b[6;20;10t\x1b[?62;4;22c";
+        let verdict = choose(&parse_replies(replies), (80, 24), None);
+        assert_eq!(
+            verdict,
+            Graphics {
+                protocol: Protocol::Sixel,
+                cell: Some(CellPx { w: 10, h: 20 }),
+                scale: 1
+            },
+            "fbterm's Windows replies did not pick sixel"
+        );
+    }
 }
