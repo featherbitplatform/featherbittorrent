@@ -189,7 +189,8 @@ impl Tty for ConsoleTty {
             // has virtual terminal output processing off until crossterm turns it on in `ratatui::try_init`
             // - which is after this write. Without it the queries print as literal text on the screen, so
             // enable it first, the same way crossterm does a moment later.
-            let out = crossterm_winapi::Handle::current_out_handle().map(crossterm_winapi::ConsoleMode::from)?;
+            let out = crossterm_winapi::Handle::current_out_handle()
+                .map(crossterm_winapi::ConsoleMode::from)?;
             out.set_mode(out.mode()? | VT_OUTPUT)?;
             self.vt_enabled = true;
         }
@@ -398,7 +399,9 @@ impl RawGuard {
     fn around() -> Option<RawGuard> {
         match crossterm::terminal::is_raw_mode_enabled() {
             Ok(true) => Some(RawGuard(RawMode::WasOn)),
-            Ok(false) => crossterm::terminal::enable_raw_mode().is_ok().then_some(RawGuard(RawMode::TurnedOn)),
+            Ok(false) => crossterm::terminal::enable_raw_mode()
+                .is_ok()
+                .then_some(RawGuard(RawMode::TurnedOn)),
             // No way to tell whether the tty is raw: a tty in cooked mode holds a reply without a
             // newline until a line ends, and that reply would arrive after the round, so the no-answer
             // verdict is the only one this run can trust.
