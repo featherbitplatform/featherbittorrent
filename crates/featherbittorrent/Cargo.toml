@@ -117,7 +117,10 @@ assets = [
 # /usr/share/licenses. `doc = true` marks the documentation files so removal owns them with the package.
 # The requirements are cargo-generate-rpm's automatic ones, read from the packaged binary itself:
 # dev/package-linux.sh prints `rpm -qpR` and refuses anything the deb `depends` above does not cover
-# too. No script keys here either, for the same reason as above.
+# too. No script keys here either, for the same reason as above. The package owns its files but not the
+# directories they sit in: cargo-generate-rpm 0.21.1 cannot emit a `%dir` entry (its `dir = true` asset
+# goes through rpm's `with_file`, which refuses a directory), so `dnf remove` leaves the emptied doc and
+# license directories behind. That is harmless, and dev/smoke-linux.sh prints a note about it.
 [package.metadata.generate-rpm]
 name = "featherbittorrent"
 summary = "BitTorrent client for the terminal, with a headless server"

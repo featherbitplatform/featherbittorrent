@@ -388,6 +388,15 @@ impl MarkState {
         }
     }
 
+    /// A state for the probed `graphics` verdict: its protocol and scale, so every prepare this
+    /// run makes - the startup one and the re-prepares a resize or a stale answer starts - is
+    /// made for the protocol the terminal can draw and the scale it reports, not for a
+    /// `Protocol::None` the mark would die on.
+    #[must_use]
+    pub fn for_graphics(graphics: &fbtt_tui::graphics::caps::Graphics) -> Self {
+        MarkState::new(graphics.protocol, graphics.scale)
+    }
+
     /// The startup prepare is running, for the probed `cell` (or for none known).
     pub fn start(&mut self, cell: Option<(u16, u16)>) {
         self.in_flight = Some(cell.unwrap_or((0, 0)));
@@ -425,6 +434,27 @@ impl MarkState {
                 }
             }
         }
+    }
+
+    /// A terminal resize that answered with a cell size `estimate`, with the screen's `placer`.
+    ///
+    /// The estimate is compared against the size the screen is currently preparing toward by
+    /// [`MarkState::resize`]: within the rounding tolerance nothing moves, and a real change
+    /// is remembered in `wanted` and, with no prepare in flight, answered by a fresh prepare
+    /// for the probed protocol and scale (which is the graphics to start).
+    ///
+    /// A resize never invalidates `placer`: the bitmaps it has sent are still the right size
+    /// for a screen whose cells did not move, and only a change the frame itself cannot see -
+    /// a new cell size - is owed a fresh bitmap. The parameter is the resize's, not the
+    /// decision's, so that the rule is where it can be broken and pinned.
+    pub fn on_terminal_resize(
+        &mut self,
+        logos_cell: Option<(u16, u16)>,
+        estimate: (u16, u16),
+        placer: &mut fbtt_tui::graphics::place::Placer,
+    ) -> Option<fbtt_tui::graphics::caps::Graphics> {
+        let _ = placer; // a resize never invalidates the placer (see above)
+        self.resize(logos_cell, estimate)
     }
 
     /// The running prepare answered, with logos made for `logos_cell` (`None` when they carry no
@@ -673,10 +703,9 @@ async fn run_loop(
                     // divided by the new grid. What that division answers is an estimate, and
                     // the estimate wobbles by a pixel or two as the window is dragged; only a
                     // real change, a font or zoom that moved the cells, is remembered in
-                    // `wanted`. A resize never invalidates the placer by itself (that is the
-                    // screen-size rule's to do), and it starts a prepare only when none is in
-                    // flight: a prepare already running is the one that will answer, and the
-                    // answer is matched against `wanted`, not against this resize.
+                    // `wanted`. The decision, and the rule that a resize never invalidates
+                    // the placer by itself, is `MarkState::on_terminal_resize`, tested
+                    // without a terminal.
                     if cols > 0
                         && rows > 0
                         && let Ok(ws) = crossterm::terminal::window_size()
@@ -686,16 +715,17 @@ async fn run_loop(
                         let w = ws.width / cols;
                         let h = ws.height / rows;
                         if w > 0 && h > 0 {
-                            // The decision is `MarkState::resize`, tested without a terminal.
-                            // The reference is `wanted` while a prepare is in flight, so a zoom
-                            // back out counts as a change and the stale answer is discarded.
                             let logos_cell = screen
                                 .mark
                                 .logos
                                 .as_ref()
                                 .and_then(|logos| logos.graphics.cell)
                                 .map(|cell| (cell.w, cell.h));
-                            if let Some(graphics) = screen.marks.resize(logos_cell, (w, h)) {
+                            if let Some(graphics) = screen.marks.on_terminal_resize(
+                                logos_cell,
+                                (w, h),
+                                screen.mark.placer,
+                            ) {
                                 // Nothing was in flight: a prepare for the new size, for the
                                 // protocol and scale the screen was probed with.
                                 *logos_rx = Some(spawn_prepare(graphics));
@@ -2686,5 +2716,98 @@ mod tests {
         );
         // The startup prepare had no cell size to be made for, so its answer is never the wanted one.
         assert!(matches!(state.answered(None), Answer::Prepare(_)));
+    }
+
+    /// The probed verdict is what the state machine is made from: the protocol and scale the
+    /// terminal answered with, so a re-prepare a resize or a stale answer starts is made for
+    /// the protocol the terminal can draw, not for a `Protocol::None` the mark would die on.
+    #[test]
+    fn the_mark_state_is_made_from_the_probed_graphics() {
+        let graphics = Graphics {
+            protocol: Protocol::Kitty,
+            cell: Some(CellPx { w: 8, h: 16 }),
+            scale: 2,
+        };
+        let mut state = MarkState::for_graphics(&graphics);
+        assert_eq!(state.protocol, Protocol::Kitty, "the probed protocol");
+        assert_eq!(state.scale, 2, "the probed scale");
+
+        // A real zoom with nothing in flight starts a re-prepare, and the prepare is made for
+        // the protocol and scale the screen was probed with.
+        let reprepare = state
+            .resize(Some((8, 16)), (16, 34))
+            .expect("nothing in flight: a prepare starts");
+        assert_eq!(reprepare.protocol, Protocol::Kitty);
+        assert_eq!(reprepare.scale, 2);
+        assert_eq!(reprepare.cell, Some(CellPx { w: 16, h: 34 }));
+    }
+
+    /// The help screen's mark at `rows` of `logos`, centred in a 100-column box: the shape the
+    /// view's `help_placement` builds, so a test that drives the placer with it is driving it
+    /// with a placement the view actually makes.
+    fn large_placement(logos: &PreparedLogos, rows: u16) -> Placement {
+        let prepared = logos
+            .large
+            .iter()
+            .find(|prepared| prepared.dims.rows == rows)
+            .expect("the help mark at these rows")
+            .clone();
+        let x = 100u16.saturating_sub(prepared.dims.cols) / 2;
+        Placement {
+            size: LogoSize::Large(rows),
+            rect: Rect::new(x, 4, prepared.dims.cols, rows),
+            dims: prepared.dims,
+            prepared: Some(std::sync::Arc::new(prepared)),
+        }
+    }
+
+    /// A resize whose cell estimate is within the rounding tolerance changes nothing on the
+    /// mark: no prepare starts, and the placer keeps the bitmaps it sent, so the frame after
+    /// the resize sends no pixels at all. Only a new cell size - which invalidates the placer,
+    /// not a resize - is owed a fresh bitmap.
+    #[test]
+    fn a_resize_without_a_cell_change_keeps_the_sent_marks() {
+        let logos = kitty_logos(); // 8 x 16 cells
+        let mut marks = MarkState::new(Protocol::Kitty, 1);
+        let mut placer = Placer::new(Protocol::Kitty);
+
+        // A frame with the help open at the ten-row mark: the small and the large bitmaps are
+        // on their way, and the placer remembers both as sent for the 8 x 16 cell.
+        let small_payload = logos
+            .small
+            .as_ref()
+            .expect("the header's mark")
+            .payload
+            .as_ref();
+        let ten = large_placement(&logos, 10);
+        assert!(
+            !placer
+                .before_draw(&logos, std::slice::from_ref(&ten))
+                .is_empty()
+        );
+        assert_eq!(
+            placer.sent(),
+            (Some(small_payload), Some(10)),
+            "the small and the ten-row mark are sent"
+        );
+
+        // A window drag that only moves the pixels by a pixel or two: the estimate is within
+        // ten percent of the cell the logos were made for, so nothing is owed, and the placer
+        // keeps the bitmaps it sent.
+        let graphics = marks.on_terminal_resize(Some((8, 16)), (8, 17), &mut placer);
+        assert!(
+            graphics.is_none(),
+            "a one-pixel move is rounding, not a new prepare"
+        );
+        assert_eq!(
+            marks.resize(Some((8, 16)), (8, 16)),
+            None,
+            "an unchanged estimate is no change at all"
+        );
+        assert_eq!(
+            placer.sent(),
+            (Some(small_payload), Some(10)),
+            "the resize invalidated the placer's sent marks"
+        );
     }
 }

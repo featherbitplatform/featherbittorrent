@@ -692,4 +692,78 @@ mod tests {
         handle(&mut model, press(KeyCode::Esc), &snap);
         assert_eq!(model.filter, "", "escape left the filter behind");
     }
+
+    /// A mark wider than the box's inner width is not placed, even though it is narrower than
+    /// the screen itself: the guard measures the box as built - the key list's width plus the
+    /// padding and the two border columns - not the screen, so a mark the screen holds but the
+    /// box does not never stands above the keys. With the mark's own 24-column cap no real
+    /// terminal produces such a mark, which is what made the guard worth pinning with a
+    /// synthetic one.
+    #[test]
+    fn a_mark_wider_than_the_help_box_but_not_the_screen_is_not_placed() {
+        use crate::graphics::caps::Graphics;
+        use crate::graphics::image::LogoDims;
+        use crate::graphics::place::{Prepared, PreparedLogos};
+
+        // A tall screen: the key list is one column, so the box the list needs is `list + 4`
+        // - and the guard measures that, not the screen. The box never grows, so at a screen
+        // wider than the box the mark is still wider than the box, while the screen could
+        // hold it: a guard against the screen would let it stand outside the box.
+        let list = help::lines(Rect::new(0, 0, 100, 40), LogoView::text());
+        let widest = list
+            .iter()
+            .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
+            .max()
+            .unwrap_or(0);
+        let box_width = widest + 4;
+        let mark_cols = box_width + 1;
+        let half = crate::keys::KEYS.len().div_ceil(2);
+        let (left, right) = crate::keys::KEYS.split_at(half);
+        let area = Rect::new(0, 0, box_width + 5, 80);
+        assert!(
+            !help::columns(area, left, right),
+            "the list is one column at this width"
+        );
+        assert_eq!(
+            box_rect(area, &list).width,
+            box_width,
+            "the box is the list plus its padding, however wide the screen"
+        );
+        assert!(
+            u32::from(mark_cols) + 4 > u32::from(box_width),
+            "the mark plus the box's padding does not fit the box"
+        );
+        assert!(
+            u32::from(mark_cols) + 2 <= u32::from(area.width),
+            "but the screen is wide enough to hold the mark, which is what the guard is not"
+        );
+        let wide = Prepared {
+            size: LogoSize::Large(10),
+            dims: LogoDims {
+                cols: mark_cols,
+                rows: 10,
+                px_w: 8 * mark_cols as u32,
+                px_h: 160,
+                img_w: 8 * mark_cols as u32,
+                img_h: 160,
+            },
+            payload: std::sync::Arc::from(Vec::new()),
+        };
+        let logos = PreparedLogos {
+            graphics: Graphics::none(),
+            small: None,
+            large: vec![wide],
+        };
+
+        assert!(
+            help_placement(
+                area,
+                LogoView {
+                    logos: Some(&logos)
+                }
+            )
+            .is_none(),
+            "a mark the box cannot hold is not placed, even though the screen could hold it"
+        );
+    }
 }

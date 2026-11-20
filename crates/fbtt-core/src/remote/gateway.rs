@@ -46,6 +46,16 @@ pub(crate) struct Live {
     renew_at: Instant,
 }
 
+#[cfg(test)]
+impl Live {
+    /// A credential just bought for a test, with the same shape a real fetch answers: long enough to be
+    /// good for a while, renewal window the default. The login tests hold one of these to ask what a
+    /// `401` may or may not clear; the clock is not the subject of those tests.
+    pub(crate) fn bought_now(token: String) -> Live {
+        Self::bought(token, 3_600)
+    }
+}
+
 /// `Debug` says how long it lives and not what it is: a session token, a gateway token and a password are
 /// all the same shape here, and none of them belongs in a log line.
 impl std::fmt::Debug for Live {

@@ -29,12 +29,14 @@ use std::sync::{Arc, Mutex};
 use std::sync::{Condvar, OnceLock};
 
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
+use futures_util::StreamExt;
 use serde::Serialize;
 use ssh_key::PublicKey;
 #[cfg(feature = "test-support")]
@@ -563,6 +565,59 @@ impl From<PathRejection> for RouteError {
     }
 }
 
+/// A request body of at most `keep` bytes, or `413 body_too_large` once the client has finished sending one
+/// that is bigger - as long as it finished within `drain`. A body declared bigger than `drain` is refused
+/// before any of it is read, and one that turns out bigger stops being read there: either way the
+/// connection that carried it is over.
+///
+/// The cap is enforced by the reader rather than by an extractor, because an extractor stops reading at its
+/// limit and answers with the rest of the request still unread: the operating system turns a connection
+/// closed that way into a reset, and a client still writing sees a failed send rather than the `413` that
+/// was already on its way. Reading a refused body to its end - within `drain` - is what lets it see the
+/// answer. `what` names the body in that `413`'s message, in the words the route that called it uses.
+///
+/// Nothing past `keep` is kept either way, so the room a request may make this server hold does not change
+/// when a body is refused: `drain` is only how far the reading goes, not how much is held.
+pub(crate) async fn read_capped(
+    headers: &HeaderMap,
+    body: Body,
+    keep: usize,
+    drain: usize,
+    what: &str,
+) -> Result<Bytes, RouteError> {
+    let too_large = || {
+        RouteError::rejection(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{what} is at most {keep} bytes"),
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > drain as u64) {
+        return Err(too_large());
+    }
+    let mut stream = body.into_data_stream();
+    let mut kept = Vec::new();
+    let mut read = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| RouteError::invalid_request("the request body could not be read"))?;
+        read = read.saturating_add(chunk.len());
+        if read > drain {
+            return Err(too_large());
+        }
+        if read <= keep {
+            kept.extend_from_slice(&chunk);
+        }
+    }
+    if read > keep {
+        return Err(too_large());
+    }
+    Ok(Bytes::from(kept))
+}
+
 impl IntoResponse for RouteError {
     fn into_response(self) -> Response {
         if self.status.is_server_error() {
@@ -606,9 +661,12 @@ struct ErrorDetail {
 /// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
 /// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    // The two login calls carry their own body limit, far smaller than the 32 MiB fbt-api keeps for
-    // uploading a `.torrent`: they are the two places this server takes bytes from someone it has not
-    // yet decided is anybody, and all three fields of a key login fit in a few hundred bytes.
+    // The two login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
+    // for uploading a `.torrent`: they are the two places this server takes bytes from someone it has not
+    // yet decided is anybody, and all three fields of a key login fit in a few hundred bytes. The limit
+    // still on the challenge route bounds its inner `Json` re-extraction - of bytes already kept under it,
+    // so it never refuses; on the session route the handler uses no body extractor, so it bounds nothing, and
+    // it stays only so a future extractor there inherits the same cap.
     let logins = Router::new()
         .route(
             "/api/v1/auth/challenge",
@@ -631,8 +689,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/api/v1/fs/list", get(fs::list))
         // The one route here that hands out a credential, so it needs a session exactly like everything else
         // that is not a login. Its body is two short fields and fbt-api's 32 MiB is room for uploading a
-        // `.torrent`, so it gets a cap of its own: with logins off this route answers whoever reaches the
-        // address, and a megabyte of JSON naming one file is not a request worth buffering.
+        // `.torrent`, so it gets a cap of its own, which the route reads with in [`read_capped`]: with logins
+        // off this route answers whoever reaches the address, and a megabyte of JSON naming one file is not
+        // a request worth buffering. The limit still on the route only bounds the handler's inner `Json`
+        // re-extraction of bytes it already kept under the same cap, so a second refusal there is impossible.
         .route(
             "/api/v1/stream-tokens",
             post(stream::issue).layer(DefaultBodyLimit::max(stream::MAX_TOKEN_BODY)),
