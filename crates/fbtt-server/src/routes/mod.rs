@@ -20,6 +20,7 @@ mod login;
 mod stream;
 
 use std::collections::BTreeMap;
+use std::io;
 // Only the test-support counters and the hold they update need these; the fields they belong to exist only
 // with that feature too.
 #[cfg(feature = "test-support")]
@@ -441,7 +442,8 @@ impl DeviceTable {
 
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
-/// `forbidden`, `not_found`, `already_exists`, `too_many_requests`, `busy`, `internal`) and a message.
+/// `forbidden`, `not_found`, `request_timeout`, `already_exists`, `too_many_requests`, `busy`,
+/// `internal`) and a message.
 #[derive(Debug)]
 pub(crate) struct RouteError {
     status: StatusCode,
@@ -493,6 +495,18 @@ impl RouteError {
     /// `404 not_found`.
     fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
+    }
+
+    /// `408 request_timeout`: a request body fbt-lib stopped reading because it arrived too slowly.
+    /// fbt-api's own routes answer this same client this way, and so do these: the two login calls
+    /// and the stream-token call read their bodies through [`read_capped`], which sorts a body-read
+    /// failure from a broken one with [`is_body_timeout`].
+    fn request_timeout() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "the request body arrived too slowly",
+        )
     }
 
     /// `409 already_exists`: a name the list already has.
@@ -565,6 +579,23 @@ impl From<PathRejection> for RouteError {
     }
 }
 
+/// Whether `err` is the error of a body that arrived too slowly: whether its `source()` chain,
+/// starting at `err` itself, holds an [`io::Error`] of kind [`io::ErrorKind::TimedOut`], what fbt-lib
+/// leaves there when it cuts a body off at its deadline, however many layers of axum wrap it. The
+/// same walk fbt-api's `error.rs` makes to give the same answer on its own routes.
+fn is_body_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut node = Some(err);
+    while let Some(cur) = node {
+        if let Some(io_err) = cur.downcast_ref::<io::Error>()
+            && io_err.kind() == io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        node = cur.source();
+    }
+    false
+}
+
 /// A request body of at most `keep` bytes, or `413 body_too_large` once the client has finished sending one
 /// that is bigger - as long as it finished within `drain`. A body declared bigger than `drain` is refused
 /// before any of it is read, and one that turns out bigger stops being read there: either way the
@@ -602,8 +633,15 @@ pub(crate) async fn read_capped(
     let mut kept = Vec::new();
     let mut read = 0usize;
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| RouteError::invalid_request("the request body could not be read"))?;
+        // A chunk that arrives too slowly is fbt-lib's deadline answering, not a client that sent a
+        // broken body: it gets the `408` fbt-api's routes give for the same client, not a `400`.
+        let chunk = chunk.map_err(|err| {
+            if is_body_timeout(&err) {
+                RouteError::request_timeout()
+            } else {
+                RouteError::invalid_request("the request body could not be read")
+            }
+        })?;
         read = read.saturating_add(chunk.len());
         if read > drain {
             return Err(too_large());
@@ -698,4 +736,74 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             post(stream::issue).layer(DefaultBodyLimit::max(stream::MAX_TOKEN_BODY)),
         )
         .with_state(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, StatusCode};
+    use futures::stream::iter;
+
+    use super::{login, read_capped};
+
+    /// [`read_capped`] over a body that sends one chunk and then fails, under the same caps the login
+    /// route reads under: the two answers these routes give for a body that stops mid-flight.
+    ///
+    /// fbt-lib's body deadline leaves an [`std::io::Error`] of kind `TimedOut` in the error axum
+    /// reports, and fbt-api's own routes answer that with `408 request_timeout`. These routes read
+    /// their bodies here instead of through an extractor, so the split has to be made here too: the
+    /// same slow client must not get `408` from `/api/v1/torrents` and `400` from `/api/v1/auth/session`.
+    #[tokio::test]
+    async fn a_timed_out_body_is_a_408() {
+        let body = Body::from_stream(iter([
+            Ok(Bytes::from("{}")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request body too slow",
+            )),
+        ]));
+        let answer = read_capped(
+            &HeaderMap::new(),
+            body,
+            login::MAX_LOGIN_BODY,
+            login::MAX_LOGIN_REFUSED_BODY,
+            "a login request",
+        )
+        .await
+        .expect_err("a body that stops at an error is refused, not accepted");
+        assert_eq!(
+            answer.status,
+            StatusCode::REQUEST_TIMEOUT,
+            "a body that timed out was not answered 408"
+        );
+        assert_eq!(answer.code, "request_timeout");
+    }
+
+    /// A body that fails for any other reason - the connection reset under it, say - is still the
+    /// broken body it always was, and gets the answer it always got.
+    #[tokio::test]
+    async fn another_body_error_is_still_a_400() {
+        let body = Body::from_stream(iter([
+            Ok(Bytes::from("{}")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        ]));
+        let answer = read_capped(
+            &HeaderMap::new(),
+            body,
+            login::MAX_LOGIN_BODY,
+            login::MAX_LOGIN_REFUSED_BODY,
+            "a login request",
+        )
+        .await
+        .expect_err("a body that stops at an error is refused, not accepted");
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "a body that failed for another reason was not answered 400"
+        );
+        assert_eq!(answer.code, "invalid_request");
+    }
 }
