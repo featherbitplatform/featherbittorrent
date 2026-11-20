@@ -1029,12 +1029,12 @@ mod tests {
         );
     }
 
-    /// The bytes a run in fbterm 0.11 on Windows reads back from the console: the kitty answer
-    /// dropped by the console layer apart from a stray `\`, then the `CSI 16 t` answer (a 10 x 20
-    /// pixel cell) and DA1 claiming sixel. The decision table has to get the logo from what survives.
+    /// The bytes a run in fbterm 0.11 on Windows reads back from the console: the kitty answer is
+    /// dropped by the console layer, all but a stray `\`, and what survives is the `CSI 16 t` answer
+    /// (a 10 x 20 pixel cell) and DA1 claiming sixel. The decision table has to get the logo from that.
     #[test]
     fn fbterm_on_windows_picks_sixel_from_its_console_replies() {
-        let replies = b"\x1b_Gi=31;OK\\_\x1b[6;20;10t\x1b[?62;4;22c";
+        let replies = b"\\\x1b[6;20;10t\x1b[?62;4;22c";
         let verdict = choose(&parse_replies(replies), (80, 24), None);
         assert_eq!(
             verdict,
