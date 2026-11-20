@@ -211,6 +211,13 @@ impl Tty for ConsoleTty {
         // so the 5 ms poll steps below can take the whole wait without ever overshooting it.
         let deadline = Instant::now() + wait;
         loop {
+            // The deadline is checked before every read, not only before a sleep: a stream of records
+            // that yield no byte - key ups, mouse moves - would otherwise keep this call inside
+            // `read_byte` past its `wait`, and `probe` owns the deadline, not the tty.
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
             if self.console.number_of_console_input_events()? > 0 {
                 // One record per call on purpose: a keystroke typed after the answers keeps its place in
                 // the queue for `EventStream`'s reader.
@@ -233,10 +240,6 @@ impl Tty for ConsoleTty {
                 continue;
             }
             // Nothing is waiting: sleep, but not past the deadline, which is what decides.
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
             std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_STEP));
         }
     }
