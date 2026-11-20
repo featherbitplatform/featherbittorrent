@@ -519,9 +519,13 @@ mod tests {
 
     /// A full store evicts the least recently *used* token, never the most recently
     /// used one. A player that keeps seeking holds a token it is still using; a newer
-    /// play must not evict it. The test keeps the first token in use by checking it,
-    /// fills the store, issues one more, and asserts the first token still checks while
-    /// the least recently used token is gone.
+    /// play must not evict it. This test evicts the LRU even when it is not the oldest
+    /// inserted, to prove the eviction policy is last-use not FIFO.
+    ///
+    /// Token 1 is issued first and then token 2 is checked first, making token 2 the LRU
+    /// even though token 1 was inserted earlier. The oldest-inserted entry (token 1) must
+    /// survive while the least-recently-used (token 2) is evicted, so the test distinguishes
+    /// LRU from FIFO.
     ///
     /// The clock is advanced between each use, so the last-use ordering is unambiguous.
     #[test]
@@ -530,53 +534,58 @@ mod tests {
         let cap = 4;
         let tokens = StreamTokens::with_clock(cap, clock);
 
-        // Token 1: the player's. It is checked (used) first, so its last-use is the
-        // oldest of everything issued after it.
-        let path_1 = stream_path(&id(), 0);
-        let t1 = tokens.issue(path_1.clone());
+        // Tokens 0..=3 are issued first. Token 1 will be checked first later.
+        let path_0 = stream_path(&id(), 0);
+        let path_1 = stream_path(&id(), 1);
+        let path_2 = stream_path(&id(), 2);
+        let path_3 = stream_path(&id(), 3);
+        let t0 = tokens.issue(path_0.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
-        assert!(tokens.check(&t1, &path_1), "the player's token is used");
-
-        // Tokens 2..=4 are issued and used after token 1, so each is more recently used
-        // than token 1. The store is now full at the cap.
-        let path_2 = stream_path(&id(), 1);
-        let path_3 = stream_path(&id(), 2);
-        let path_4 = stream_path(&id(), 3);
+        let t1 = tokens.issue(path_1.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
         let t2 = tokens.issue(path_2.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
-        assert!(tokens.check(&t2, &path_2));
-        *handle.lock().expect("the test clock") += Duration::from_secs(1);
         let t3 = tokens.issue(path_3.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
-        assert!(tokens.check(&t3, &path_3));
+
+        // Token 1 is checked first, making it the least recently used although token 0
+        // was inserted first. The oldest-inserted token 0 must survive this eviction.
+        assert!(tokens.check(&t1, &path_1), "token 1 is used and becomes LRU");
+
+        // Fill the store to capacity.
+        let path_4 = stream_path(&id(), 4);
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
         let t4 = tokens.issue(path_4.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
-        assert!(tokens.check(&t4, &path_4));
         assert_eq!(tokens.len(), cap, "the store is full at its cap");
 
-        // A 5th play. The store is full, so it must evict the least recently used token.
-        // Token 1 was checked first, so it is the least recently used; token 4 was used
-        // last, so it is the most recently used. The eviction must drop token 1.
-        let path_5 = stream_path(&id(), 4);
+        // A 5th play. The store is full, so it must evict the least recently used token,
+        // which is token 1 in this case (it was checked first). Token 0 is the oldest by
+        // insertion, so if eviction were FIFO, token 0 would die; but the policy is LRU,
+        // so token 1 dies instead.
+        let path_5 = stream_path(&id(), 5);
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
         let t5 = tokens.issue(path_5.clone());
         *handle.lock().expect("the test clock") += Duration::from_secs(1);
         assert!(tokens.check(&t5, &path_5), "the newest token is live");
         assert_eq!(tokens.len(), cap, "the cap is not exceeded");
 
-        // Token 1, the least recently used, is evicted. Token 4, the most recently used,
-        // and the middle tokens survive.
+        // Token 1, the least recently used, is evicted. Token 0, the oldest-inserted,
+        // survives. Token 4, the most recently used, and the middle tokens also survive.
         assert!(
             !tokens.check(&t1, &path_1),
-            "the least recently used token is evicted"
+            "the least recently used token is evicted, NOT the oldest inserted"
         );
+        assert!(tokens.check(&t0, &path_0), "the oldest-inserted token survives");
         assert!(tokens.check(&t2, &path_2), "a middle token survives");
         assert!(tokens.check(&t3, &path_3), "a middle token survives");
         assert!(
             tokens.check(&t4, &path_4),
             "the most recently used token is not evicted"
+        );
+        assert!(
+            tokens.check(&t5, &path_5),
+            "the newly issued token is live"
         );
     }
 

@@ -208,7 +208,7 @@ fn stream_press(model: &mut Model, rows: &[&TorrentRow], snap: &Snapshot) -> Vec
             // Without a file list there is nothing to name; the state says why.
             if is_metadata {
                 model.push_notice(
-                    Notice::Error("The torrent has no metadata yet".to_string()),
+                    Notice::Error("the torrent has no metadata yet".to_string()),
                     Instant::now(),
                 );
             }
@@ -225,7 +225,7 @@ fn stream_press(model: &mut Model, rows: &[&TorrentRow], snap: &Snapshot) -> Vec
     };
     if matches!(row.state, RowState::Metadata) {
         model.push_notice(
-            Notice::Error("The torrent has no metadata yet".to_string()),
+            Notice::Error("the torrent has no metadata yet".to_string()),
             Instant::now(),
         );
         return Vec::new();

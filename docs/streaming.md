@@ -10,7 +10,7 @@ machine is doing the downloading.
 - In the torrent table, `s` plays the largest file of the selected torrent. Pad files are skipped; on
   a tie the earlier file wins. The common case is one video plus small extras.
 - Nothing selected sends nothing. A torrent still fetching its metadata gets one line on the footer,
-  `The torrent has no metadata yet`, and nothing else happens.
+  `the torrent has no metadata yet`, and nothing else happens.
 
 ## Where the bytes come from
 
