@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 # Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -155,3 +155,9 @@ color_quant = "2"
 # version so this adds no versions to Cargo.lock. Unix only: see the binary's
 # `[target.'cfg(unix)'.dependencies]`.
 rustix = "1.1.6"
+# The logo probe on Windows (the fix for the Windows skip): the console's input events are where a
+# Windows terminal's replies to the queries arrive, one key event per character. Already in the
+# tree through crossterm 0.29, which resolves to crossterm_winapi 0.9.1 - named at that exact version
+# so this adds no versions to Cargo.lock. Windows only: see the binary's
+# `[target.'cfg(windows)'.dependencies]`.
+crossterm_winapi = "0.9.1"
