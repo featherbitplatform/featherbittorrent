@@ -9,7 +9,8 @@ client, the engine runs in that process, and there is nothing to install beside 
 the server role (`serve`), the remote backend, authentication and streaming, shipped the first release,
 [0.1.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0);
 [docs/server.md](docs/server.md) and [docs/reverse-proxy.md](docs/reverse-proxy.md) describe it. Release
-[0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4.
+[0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4, and
+[0.2.1](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1) fixes what came after them.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
 files, each carrying man pages, shell completions, the licenses and the docs. Every artifact is built and
