@@ -223,6 +223,7 @@ impl Tty for ConsoleTty {
 /// The console input queue is asked about this often while nothing is in it: short enough that the
 /// wait feels like a wait rather than a loop, long enough that a full second of silence is a
 /// hundred polls rather than a busy one.
+#[allow(dead_code)] // the Windows-only console tty is the one that sleeps in steps of it
 const POLL_STEP: Duration = Duration::from_millis(5);
 
 /// The UTF-8 bytes one UTF-16 unit is worth, pushed onto `out`; a lone surrogate, which is no
@@ -230,6 +231,7 @@ const POLL_STEP: Duration = Duration::from_millis(5);
 ///
 /// Pulled out of the console tty because it is the one step that turns a Windows console event into
 /// bytes, and it is pure: a test can exercise it on any platform without a console.
+#[allow(dead_code)] // only the Windows tty calls it; the tests keep it alive on the other platforms
 fn push_key_char(unit: u16, out: &mut VecDeque<u8>) {
     // `from_u32` is the constructor `char` has: a unit past `char::MAX` - impossible here, where
     // it is a `u16` - answers no character just like a lone surrogate does.
@@ -295,8 +297,8 @@ pub fn probe(tty: &mut dyn Tty, now: impl Fn() -> Instant) -> Vec<u8> {
 /// costs the deadline for nothing - a `TERM` naming one of them anyway, which is the same situation
 /// reached from a side where `TMUX` or `STY` did not survive into this environment, and `TERM=dumb`.
 /// Windows is no longer on the list: the console's input events carry a terminal's replies to the
-/// queries (see [`ConsoleTty`]), so a Windows terminal that answers DA1 with sixel and reports its
-/// cell size gets the image like any other.
+/// queries (see `ConsoleTty`, the Windows half of this module), so a Windows terminal that answers DA1
+/// with sixel and reports its cell size gets the image like any other.
 ///
 /// `env` is a lookup rather than `std::env::var` so a test can name the environment it wants without putting
 /// anything in this process's real one.
