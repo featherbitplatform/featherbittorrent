@@ -32,9 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::body::Bytes;
-use axum::extract::rejection::{BytesRejection, JsonRejection};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, FromRequest, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine as _;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
@@ -49,6 +47,18 @@ use crate::auth::{bearer, keys, password};
 /// are, so the room a request may make the server hold is capped well below what the API reserves for
 /// uploading a `.torrent`.
 pub(crate) const MAX_LOGIN_BODY: usize = 64 * 1024;
+
+/// How much of a login body over [`MAX_LOGIN_BODY`] is still read, and thrown away, before the `413` goes
+/// out.
+///
+/// A server that answers without reading the rest of a request closes a connection with unread bytes on it,
+/// and the operating system turns that into a reset: on Windows the client's next write fails with
+/// `WSAECONNABORTED`, on macOS and Linux with `ECONNRESET`, and the client reports a failed send instead of
+/// the `413` that was already on its way. Reading a refused body to its end is what lets an ordinary client
+/// see the answer. This bound is what keeps that from being an invitation: past it the rest is not read, the
+/// connection closes, and whoever sent a body that size gets the reset it asked for. Nothing past
+/// [`MAX_LOGIN_BODY`] is kept either way, so the room one request may make this server hold does not change.
+pub(crate) const MAX_LOGIN_REFUSED_BODY: usize = 256 * 1024;
 
 /// The nonce's and token's spelling: base64url without padding, the same one session tokens use, so
 /// one decoder handles both.
@@ -69,13 +79,30 @@ fn encoded(bytes: &[u8]) -> String {
 pub(super) async fn challenge(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    given: Result<Json<ChallengeRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<ChallengeResponse>, RouteError> {
     let peer = peer.ip();
-    // A body that is not JSON of this shape, or bigger than this route takes, comes back as this API's
-    // error rather than in axum's plain-text one - and costs the address nothing, because there was no ask
-    // in it to count.
-    let Json(body) = given?;
+    // The body is read here under the route's own cap rather than by the `Json` extractor, because the
+    // extractor stops at the cap and leaves the rest unread (see [`MAX_LOGIN_REFUSED_BODY`]): answering
+    // with bytes still owed would close the connection the client is still writing on. What is kept is
+    // then handed to the same extractor, so a body that is not JSON of this shape - a wrong content type
+    // included - gets the answer it always got, in this API's error shape rather than axum's plain-text
+    // one - and costs the address nothing, because there was no ask in it to count.
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let kept = super::read_capped(
+        &headers,
+        body,
+        MAX_LOGIN_BODY,
+        MAX_LOGIN_REFUSED_BODY,
+        "a login request",
+    )
+    .await?;
+    let Json(body) = Json::<ChallengeRequest>::from_request(
+        Request::from_parts(parts, axum::body::Body::from(kept)),
+        &(),
+    )
+    .await?;
     // Taken before any work on the key: a limit that ran after the parsing would still let an address spend
     // the server's time while it was being refused, and one that counted afterwards would let every request
     // in a burst through the same question at once.
@@ -101,7 +128,9 @@ pub(super) async fn challenge(
 /// `POST /api/v1/auth/session`: a session token, from a password or from an answered challenge.
 ///
 /// With `Authorization: Basic <user:password>` the body is not read as anything; without it the body is
-/// the key login's `{public_key, nonce, signature}`. Once a body this route accepts has arrived, the
+/// the key login's `{public_key, nonce, signature}`. A body over the route's cap is read to its end -
+/// within [`MAX_LOGIN_REFUSED_BODY`] - before it is refused, so a client still sending gets the `413`
+/// rather than a reset. Once a body this route accepts has arrived, the
 /// address's attempt is taken before any credential is looked at: ten of them in a five-minute window close
 /// the door to guessing from that address, and one refused after the budget went costs this server no work.
 /// The answer is the same shape either way, `{token, expires_in, subject}`, where `subject` is this
@@ -114,13 +143,24 @@ pub(super) async fn challenge(
 pub(super) async fn session(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> Result<Json<SessionResponse>, RouteError> {
     let peer = peer.ip();
-    // A body bigger than this route allows is refused here, in this API's error shape, rather than in
-    // axum's plain-text one. Nothing was read out of it to find that out, so it costs the address nothing.
-    let body = body?;
+    // The body is read here under the route's own cap rather than by the extractor (see
+    // [`MAX_LOGIN_REFUSED_BODY`]): answering with bytes still owed would close the connection the client is
+    // still writing on. A body over the cap is refused in this API's error shape rather than axum's
+    // plain-text one, read and discarded up to the bound first, and no attempt is taken for it, so it costs
+    // the address nothing.
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let body = super::read_capped(
+        &headers,
+        body,
+        MAX_LOGIN_BODY,
+        MAX_LOGIN_REFUSED_BODY,
+        "a login request",
+    )
+    .await?;
     // From here on the request carries a credential this server has not looked at, and everything that
     // follows is work spent on somebody else's guess: choosing a hash, running an Argon2 verify, spending a
     // challenge. Taking the attempt now is what makes "ten per window" mean ten however they arrive - a

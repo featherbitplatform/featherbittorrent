@@ -204,12 +204,38 @@ impl Auth {
         }
     }
 
-    /// Says the credential we hold is no good, so the next request earns a new one. A server that answered
-    /// `401` has ended a session without telling us; this is how we find that out instead of assuming it.
-    pub(crate) fn invalidate(&mut self) {
+    /// Says the credential `sent` - the one the refused request actually carried - is no good, and gives
+    /// up only what it is: the session or token still held when another call in flight has already earned a
+    /// different one stays held.
+    ///
+    /// This is the same compare-and-swap the relay uses for its gateway token (see [`Self::gateway_token_is`]):
+    /// two calls can be refused at once, and the refusal of the older credential must not throw away the
+    /// session the newer one just bought - an Argon2 verify or a device signature round, or a gateway token
+    /// fetch, spent again for no reason. A `Basic` credential is resent on every call, so there is nothing
+    /// cached to clear for it; `Open` holds nothing at all. The compare is on the token string: a `Bearer`
+    /// holds its secret in a type that carries a password elsewhere, and deriving equality on that type to
+    /// compare one field is what this check is not for.
+    pub(crate) fn invalidate_if(&mut self, sent: &Credential) {
+        let Credential::Bearer(token) = sent else {
+            return;
+        };
         match &mut self.kind {
-            Kind::Server(server) => server.session = None,
-            Kind::Gateway(gateway) => gateway.live = None,
+            Kind::Server(server)
+                if server
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.token == *token) =>
+            {
+                server.session = None;
+            }
+            Kind::Gateway(gateway)
+                if gateway
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.token == *token) =>
+            {
+                gateway.live = None;
+            }
             _ => {}
         }
     }
@@ -283,7 +309,7 @@ impl Auth {
 
     /// The credential in hand right now, without signing in: what the event stream is allowed to send, and
     /// `None` when a request would first have to log in or fetch a token. The stream takes this rather than
-    /// [`Self::credential`] so that only the refresh loop ever spends a login (see [`super::sse`]).
+    /// [`Self::credential`] so that only the refresh loop ever spends a login (see [`crate::remote::sse`]).
     pub(crate) fn held(&self) -> Option<Credential> {
         match &self.kind {
             Kind::Open => Some(Credential::Open),
@@ -353,6 +379,13 @@ impl std::fmt::Debug for Auth {
 }
 
 impl Server {
+    /// A session the login tests hold in place of a real one: long enough to be good, renewal window the
+    /// default. See [`Auth::holding`].
+    #[cfg(test)]
+    fn holding_session(token: &str) -> Option<Live> {
+        Some(Live::bought_now(token.to_string()))
+    }
+
     /// One login to this server, answered with the token it hands out.
     ///
     /// Every request here goes past the same front door as the requests that carry the token afterwards: a
@@ -526,4 +559,125 @@ fn named(value: &Option<String>, what: &str) -> Result<String, String> {
 /// A login request that never got an answer.
 pub(crate) fn reached(problem: reqwest::Error) -> String {
     format!("the sign-in request did not reach the server: {problem}")
+}
+
+/// A holder with exactly one thing held: a `Kind::Server` session, a `Kind::Gateway` token or a
+/// `Basic` credential, and nothing else. Built only to test the compare-and-swap in
+/// [`Auth::invalidate_if`], where signing in over a real login would cost an Argon2 verify or a
+/// gateway round the test does not want to wait for.
+#[cfg(test)]
+fn holding(kind: Kind) -> Auth {
+    Auth {
+        client: reqwest::Client::new(),
+        base: String::new(),
+        gateway: None,
+        kind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Credential, Gateway, Kind, Live, Server, holding};
+    use crate::ui_state::LoginMethod;
+    use zeroize::Zeroizing;
+
+    /// What a held credential is: the token, or nothing. A `Credential` cannot be compared whole (it
+    /// carries a password elsewhere in its variants), so the tests compare the string that matters.
+    fn bearer_of(held: Option<Credential>) -> Option<String> {
+        match held {
+            Some(Credential::Bearer(token)) => Some(token),
+            _ => None,
+        }
+    }
+
+    /// A `Kind::Server` login holding the session `token`, nothing else to look at.
+    fn server_session(token: &str) -> Kind {
+        Kind::Server(Server {
+            login: LoginMethod::Password,
+            user: Some("alice".to_string()),
+            key_path: None,
+            secret: crate::remote::Secret::Password(Zeroizing::new(String::new())),
+            session: Server::holding_session(token),
+        })
+    }
+
+    /// A `Kind::Gateway` login holding the token `token`, nothing else to look at.
+    fn gateway_token(token: &str) -> Kind {
+        Kind::Gateway(Gateway {
+            token_url: "http://127.0.0.1:1/token".to_string(),
+            client_id: "test".to_string(),
+            key_path: None,
+            secret: crate::remote::Secret::KeyPassphrase(None),
+            live: Some(Live::bought_now(token.to_string())),
+        })
+    }
+
+    // A `401` clears only the credential the refused call sent. Two calls in flight can both be refused:
+    // the one that sent the older credential must not throw away the session the newer one just earned,
+    // which would cost a fresh login - an Argon2 verify or a device signature round, or a gateway token
+    // fetch - for a refusal that had already been overtaken.
+
+    /// The refusal of the session still held clears it.
+    #[test]
+    fn a_refusal_of_the_held_session_clears_it() {
+        let mut auth = holding(server_session("a"));
+        auth.invalidate_if(&Credential::Bearer("a".to_string()));
+        assert!(auth.held().is_none(), "the sent session is cleared");
+    }
+
+    /// The refusal of an older session leaves a newer one, earned in the meantime, still held.
+    #[test]
+    fn a_refusal_of_an_older_session_keeps_a_newer_one() {
+        let mut auth = holding(server_session("b"));
+        auth.invalidate_if(&Credential::Bearer("a".to_string()));
+        assert_eq!(
+            bearer_of(auth.held()),
+            Some("b".to_string()),
+            "the session the newer call earned is kept"
+        );
+    }
+
+    /// The same, for the gateway's token: a refusal of the token still held clears it.
+    #[test]
+    fn a_refusal_of_the_held_gateway_token_clears_it() {
+        let mut auth = holding(gateway_token("a"));
+        auth.invalidate_if(&Credential::Bearer("a".to_string()));
+        assert_eq!(bearer_of(auth.held()), None, "the sent token is cleared");
+    }
+
+    /// The refusal of an older gateway token leaves a newer one, fetched in the meantime, still held.
+    #[test]
+    fn a_refusal_of_an_older_gateway_token_keeps_a_newer_one() {
+        let mut auth = holding(gateway_token("b"));
+        auth.invalidate_if(&Credential::Bearer("a".to_string()));
+        assert_eq!(
+            bearer_of(auth.held()),
+            Some("b".to_string()),
+            "the token the newer call fetched is kept"
+        );
+    }
+
+    /// A credential with nothing cached behind it clears nothing: a `Basic` is resent on every call, and
+    /// an `Open` target holds nothing at all, so a refusal of either one may not touch what is held.
+    #[test]
+    fn a_refusal_with_nothing_cached_clears_nothing() {
+        let mut auth = holding(server_session("a"));
+        auth.invalidate_if(&Credential::Basic(
+            "alice".to_string(),
+            Zeroizing::new(String::new()),
+        ));
+        assert_eq!(
+            bearer_of(auth.held()),
+            Some("a".to_string()),
+            "a basic refusal does not touch the held session"
+        );
+
+        let mut auth = holding(server_session("a"));
+        auth.invalidate_if(&Credential::Open);
+        assert_eq!(
+            bearer_of(auth.held()),
+            Some("a".to_string()),
+            "an open refusal does not touch the held session"
+        );
+    }
 }

@@ -19,14 +19,13 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{FromRequest, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use fbt::{InfoHashV1, InfoHashV2, InfoHashes, SessionError};
 use fbtt_core::client::TorrentId;
 use fbtt_core::stream::stream_path;
 use fbtt_core::stream::tokens::FIRST_USE;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::{RouteError, Shared, clean};
@@ -67,7 +66,14 @@ pub(super) async fn issue(
     // in this API's error shape rather than axum's plain-text one.
     let (parts, body) = request.into_parts();
     let headers = parts.headers.clone();
-    let kept = read_body(&headers, body).await?;
+    let kept = super::read_capped(
+        &headers,
+        body,
+        MAX_TOKEN_BODY,
+        MAX_REFUSED_BODY,
+        "a stream-token request",
+    )
+    .await?;
     let Json(body) =
         Json::<StreamTokenRequest>::from_request(Request::from_parts(parts, Body::from(kept)), &())
             .await?;
@@ -136,44 +142,6 @@ pub(super) async fn issue(
             expires_in: FIRST_USE.as_secs(),
         }),
     ))
-}
-
-/// A request body of at most [`MAX_TOKEN_BODY`] bytes, or `413 body_too_large` once the client has finished
-/// sending one that is bigger - as long as it finished within [`MAX_REFUSED_BODY`]. A body declared bigger
-/// than that is refused before any of it is read, and one that turns out bigger stops being read there:
-/// either way the connection that carried it is over.
-async fn read_body(headers: &HeaderMap, body: Body) -> Result<Bytes, RouteError> {
-    let too_large = || {
-        RouteError::rejection(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("a stream-token request is at most {MAX_TOKEN_BODY} bytes"),
-        )
-    };
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    if declared.is_some_and(|length| length > MAX_REFUSED_BODY as u64) {
-        return Err(too_large());
-    }
-    let mut stream = body.into_data_stream();
-    let mut kept = Vec::new();
-    let mut read = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| RouteError::invalid_request("the request body could not be read"))?;
-        read = read.saturating_add(chunk.len());
-        if read > MAX_REFUSED_BODY {
-            return Err(too_large());
-        }
-        if read <= MAX_TOKEN_BODY {
-            kept.extend_from_slice(&chunk);
-        }
-    }
-    if read > MAX_TOKEN_BODY {
-        return Err(too_large());
-    }
-    Ok(Bytes::from(kept))
 }
 
 /// Who asked, for the log line: this server's own name for whoever holds the session token that

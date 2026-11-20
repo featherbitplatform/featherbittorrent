@@ -283,8 +283,10 @@ impl Api {
                     _ => "the credential this connection presents is not accepted".to_string(),
                 }));
             }
-            // Drop the held credential so the next attempt earns a new one.
-            self.invalidate().await;
+            // Drop the credential this attempt sent - only if it is still the one held, never one a call in
+            // flight has already replaced it with (see [`Self::invalidate_if_held`]) - so the next attempt
+            // earns a new one.
+            self.invalidate_if_held(&credential).await;
         }
         unreachable!("the second attempt always returns")
     }
@@ -556,9 +558,15 @@ impl Api {
         gateway && answer.is_none()
     }
 
-    /// Says the credential this client holds is no good, so that the next call renews it.
-    async fn invalidate(&self) {
-        self.auth.lock().await.invalidate();
+    /// Says the credential `sent` is no good, so that the next call renews it - if it is still the one held.
+    ///
+    /// This is a compare-and-swap the relay already uses for its gateway token (see
+    /// [`Self::renew_gateway_credential`]): two calls in flight can both be refused, and the one that
+    /// refused the *older* credential must not throw away the session the newer one just earned. Unconditional
+    /// invalidation would pay for that with a fresh login - an Argon2 verify or a device signature round, or
+    /// a gateway token fetch - for a refusal that had already been overtaken.
+    async fn invalidate_if_held(&self, sent: &Credential) {
+        self.auth.lock().await.invalidate_if(sent);
     }
 
     /// Whether this client's login is a `Kind::Gateway` token, the only kind whose relay credential

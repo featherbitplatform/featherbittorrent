@@ -2584,6 +2584,128 @@ async fn a_refused_stream_token_body_is_read_before_the_answer() {
     served.stop().await;
 }
 
+/// A body over the session route's cap is read to its end - within a bound - before the `413` goes out, so
+/// a client still sending when the server decides gets the answer rather than a reset. The old behaviour
+/// answered `413` the moment more than the cap had been read, whatever was still to come: a client that
+/// was still sending got the answer a second before it finished. Spelled out over a raw socket with the
+/// reader and writer split: the body goes out in 8 KiB chunks with a 30 ms pause after each, a reader
+/// thread takes the first response byte while the body is still going out and times it, and the test
+/// asserts the first byte did not arrive before the last chunk was written, no chunk write failed, and
+/// the answer is the `413` with `body_too_large`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_login_body_is_read_before_the_answer() {
+    use std::io::{Read as _, Write as _};
+    use std::time::Instant;
+
+    let served = Served::start("login-refused-body", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let addr = served.server.local_addr();
+
+    // 200 KiB: over the route's 64 KiB cap, under the bound on what it reads of a refused body, so the
+    // route takes it all and answers once the body is in - while a server that answers at the cap gets
+    // its answer out a good second before the last chunk is written.
+    let body =
+        serde_json::json!({ "public_key": "ssh-ed25519 AAAA", "nonce": "x".repeat(200 * 1024) })
+            .to_string();
+    assert!(body.len() > 64 * 1024, "a body over the route's cap");
+    let head = format!(
+        "POST /api/v1/auth/session HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    let chunks = body.len().div_ceil(8 * 1024);
+    let (answer, first_byte_at, last_chunk_started_at, failed_chunk) =
+        within(tokio::task::spawn_blocking(move || {
+            let socket = std::net::TcpStream::connect(addr).expect("connect to the server");
+            let mut writer = socket.try_clone().expect("a socket for the writer");
+            let reader = socket.try_clone().expect("a socket for the reader");
+            writer.write_all(head.as_bytes()).expect("send the head");
+            writer.flush().expect("flush the head");
+
+            // The reader takes the first byte while the writer is still sending, and times it: the
+            // moment the read of one byte comes back, the answer is on its way.
+            let reader = std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut first = [0u8; 1];
+                let mut rest = Vec::new();
+                let first_byte_at = match reader.read(&mut first) {
+                    Ok(n) if n >= 1 => {
+                        let at = Instant::now();
+                        rest.extend_from_slice(&first[..n]);
+                        Some(at)
+                    }
+                    Ok(_) => None,
+                    Err(problem) => {
+                        eprintln!("the reader ended early: {problem}");
+                        None
+                    }
+                };
+                let _ = reader.read_to_end(&mut rest);
+                (first_byte_at, rest)
+            });
+
+            // The writer sends the body in chunks, pausing after each, and keeps the first write error
+            // (with its chunk index) rather than panicking on it: the assertions below decide what fails.
+            // The timestamp is taken BEFORE the write that sends the chunk: once the write has returned the
+            // kernel holds the bytes, so a correct server may read them, answer and have the reader time
+            // the first byte before this thread is scheduled again to read the clock. Taken before the
+            // write, the instant cannot be later than any answer a correct server gives, whatever the
+            // scheduler does, because the server cannot have read the final bytes before they were sent.
+            let chunk = 8 * 1024;
+            let mut last_chunk_started_at = Instant::now();
+            let mut failed_at: Option<(usize, std::io::Error)> = None;
+            for (index, pos) in (0..body.len()).step_by(chunk).enumerate() {
+                let end = (pos + chunk).min(body.len());
+                last_chunk_started_at = Instant::now();
+                let sent = writer
+                    .write_all(&body.as_bytes()[pos..end])
+                    .and_then(|()| writer.flush());
+                if let Err(problem) = sent {
+                    failed_at = Some((index, problem));
+                    break;
+                }
+                if end < body.len() {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+            drop(writer);
+
+            let (first_byte_at, rest) = reader.join().expect("the reader thread");
+            (
+                String::from_utf8_lossy(&rest).into_owned(),
+                first_byte_at,
+                last_chunk_started_at,
+                failed_at,
+            )
+        }))
+        .await
+        .expect("the raw client");
+
+    let first_byte_at = first_byte_at.unwrap_or_else(|| {
+        panic!("the server closed before the body was read: no response byte arrived")
+    });
+    assert!(
+        first_byte_at >= last_chunk_started_at,
+        "the server answered before the body was read: first byte {first_byte_at:?} before the last chunk started {last_chunk_started_at:?}"
+    );
+    if let Some((index, problem)) = &failed_chunk {
+        panic!(
+            "a write failed: chunk {} of {chunks} did not go out: {problem}",
+            index + 1
+        );
+    }
+    assert!(
+        answer.starts_with("HTTP/1.1 413"),
+        "a body this route has no use for: {answer}"
+    );
+    assert!(answer.contains("body_too_large"), "{answer}");
+
+    served.stop().await;
+}
+
 /// What a request can get wrong: an id that is not this library's (`404`), an index past the end of the file
 /// list (`404`, the same answer fbt-api's own stream route gives for one), an id that is not hex at all
 /// (`400 invalid_id`, the same code fbt-api uses), and a body far bigger than two short fields (`413`).

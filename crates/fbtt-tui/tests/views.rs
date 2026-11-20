@@ -408,7 +408,7 @@ fn s_without_metadata_is_a_notice() {
     assert_eq!(
         model.notice(),
         Some(&Notice::Error(
-            "The torrent has no metadata yet".to_string()
+            "the torrent has no metadata yet".to_string()
         ))
     );
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-20
+
+### Fixed
+
+- A client of `featherbittorrent serve` that sends a request body too slowly can no longer hold a connection forever: a body must arrive within 20 seconds, plus one second for every 500 bytes received, or the connection is closed, with a `408` answer when one can still be sent. The login and stream-token routes this server adds answer that `408` too, so a slow body gets the same answer from every route. This comes with fbt-lib `v0.11.0`. ([#10](https://github.com/featherbitplatform/featherbittorrent/pull/10))
+- Logging in to a server with a body over the size limit now gets the 413 answer instead of a reset connection (seen as `ConnectionAborted` on Windows): both login routes read the refused body up to a bound before answering, as the stream-token route already did. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- A refused request clears only the session or gateway token it was sent with, so a late refusal of an older request no longer throws away a token a newer login just stored. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- With the image logo in a kitty terminal, the `Saving...` screen no longer writes any image bytes, and a zoom with the help screen open sends the large mark once per frame instead of twice. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- The no-metadata notice starts lower-case, like the other notices. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+
 ## [0.2.0] - 2026-11-20
 
 ### Added
@@ -41,5 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.2.1]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0
 [0.1.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0
