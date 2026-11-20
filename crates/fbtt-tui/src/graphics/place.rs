@@ -258,13 +258,16 @@ impl LogoView<'_> {
                         });
                     }
                     Protocol::Iterm2 | Protocol::Sixel => {
-                        // The cell is the canvas, and it is not written: the image goes over it. The
-                        // style is left as the frame drew it - a `Reset` here would ask the terminal
-                        // for a colour this palette never named - with only the canvas's ground
-                        // named, since the ground is what shows while the image is being sent.
-                        cell.set_symbol(" ")
-                            .set_bg(theme::INK_950)
-                            .set_diff_option(CellDiffOption::Skip);
+                        // The cell is the ground the frame drew, and it is not written: the image goes
+                        // over it. Its style is left exactly as the frame left it - the header's
+                        // canvas, the help box's own surface - because the image is transparent and
+                        // whatever is on the cell shows around the mark. Naming a ground here would
+                        // paint a rectangle of it wherever a mark stands, and a `Reset` would ask the
+                        // terminal for a colour this palette never named. That the cells hold the text
+                        // of the frame before this one, rather than this frame's blank, is the placer's
+                        // question, not the cell's: a new placement's rect is a repaint rect (see
+                        // [`Placer::after_draw`]).
+                        cell.set_symbol(" ").set_diff_option(CellDiffOption::Skip);
                     }
                     Protocol::None => {}
                 }
@@ -1199,6 +1202,48 @@ mod tests {
                 .draw_into(&placement, &mut buffer)
                 .is_none()
         );
+    }
+
+    /// The help screen's mark stands inside the help box, on the surface the box is filled with, and
+    /// its cells keep it. Forcing the canvas colour under a transparent image paints a darker
+    /// rectangle in the middle of the box, and in a terminal whose own background is that colour, a
+    /// hole in the box.
+    #[test]
+    fn the_help_mark_keeps_the_help_box_ground() {
+        use ratatui::buffer::Buffer;
+
+        let logos = sixel_logos();
+        let view = LogoView {
+            logos: Some(&logos),
+        };
+        let placement = large_placement(&logos, 10);
+
+        // The help box's surface, cell for cell, the way `modal::draw_box` fills the box the mark
+        // stands at the top of.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, SCREEN.width, SCREEN.height));
+        for y in 0..SCREEN.height {
+            for x in 0..SCREEN.width {
+                buffer[(x, y)].set_bg(theme::INK_850);
+            }
+        }
+
+        view.draw_into(&placement, &mut buffer)
+            .expect("the help mark draws");
+        for y in placement.rect.top()..placement.rect.bottom() {
+            for x in placement.rect.left()..placement.rect.right() {
+                let cell = &buffer[(x, y)];
+                assert_eq!(
+                    cell.bg,
+                    theme::INK_850,
+                    "the help mark forced the canvas colour under it at column {x}, row {y}"
+                );
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "the mark's own cells stay blank: the image goes over them"
+                );
+            }
+        }
     }
 
     /// A `Saving...` frame is a frame with no placements at all: it writes no kitty bytes.
