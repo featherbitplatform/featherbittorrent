@@ -795,6 +795,72 @@ mod tests {
         );
     }
 
+    /// The two payloads `prepared`'s bitmap could have been written from: the same pixels quantized
+    /// against each ground, in the order `prepare` builds them.
+    fn sixel_payloads_over_each_ground(src: &Rgba, prepared: &Prepared) -> (Vec<u8>, Vec<u8>) {
+        let img = image::render(src, &prepared.dims);
+        (
+            sixel::encode(&sixel::quantize(&img, rgb(theme::INK_950))),
+            sixel::encode(&sixel::quantize(&img, rgb(theme::INK_850))),
+        )
+    }
+
+    /// Sixel carries no alpha, so `quantize` paints a pixel the colour `composite` makes of it over
+    /// the canvas at that pixel's own alpha: a mark's anti-aliased edges are the colour of the ground
+    /// it was prepared for. The header's mark stands on the canvas every frame fills the screen with
+    /// and every help mark inside the help box, so each is prepared against the ground it sits on.
+    ///
+    /// How this observes the ground: the bitmap each size was painted from is rebuilt and encoded
+    /// once against each ground, and the two encodings are compared with the bytes the terminal gets.
+    /// For this mark the two are never the same, and a size without a semi-transparent pixel fails
+    /// that guard instead of passing quietly, so a payload that is one ground's bytes is that
+    /// ground's choice and not an accident.
+    #[test]
+    fn each_mark_is_painted_over_the_ground_it_sits_on() {
+        let src = image::mark();
+        let logos = prepare(graphics(Protocol::Sixel, CellPx { w: 8, h: 16 }));
+
+        let small = logos.small.as_ref().expect("the header's mark");
+        let (on_canvas, on_box) = sixel_payloads_over_each_ground(&src, small);
+        assert!(
+            on_canvas != on_box,
+            "the header's mark has a pixel whose colour the ground decides, or this test could not \
+             tell the two grounds apart"
+        );
+        assert_eq!(
+            &small.payload[..],
+            &on_canvas[..],
+            "the header's mark is not painted over the canvas it stands on"
+        );
+        assert_ne!(
+            &small.payload[..],
+            &on_box[..],
+            "and it is not painted over the help box's ground"
+        );
+
+        for large in &logos.large {
+            let (on_canvas, on_box) = sixel_payloads_over_each_ground(&src, large);
+            assert!(
+                on_canvas != on_box,
+                "the help mark at {} rows has a pixel whose colour the ground decides, or this \
+                 test could not tell the two grounds apart",
+                large.dims.rows
+            );
+            assert_eq!(
+                &large.payload[..],
+                &on_box[..],
+                "the help mark at {} rows is not painted over the help box's ground",
+                large.dims.rows
+            );
+            assert_ne!(
+                &large.payload[..],
+                &on_canvas[..],
+                "and the help mark at {} rows is not painted over the canvas",
+                large.dims.rows
+            );
+        }
+    }
+
     #[test]
     fn placer_sends_once() {
         let logos = sixel_logos();
