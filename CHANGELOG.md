@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Logging in to a server with a body over the size limit now gets the 413 answer instead of a reset connection (seen as `ConnectionAborted` on Windows): both login routes read the refused body up to a bound before answering, as the stream-token route already did. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- A refused request clears only the session or gateway token it was sent with, so a late refusal of an older request no longer throws away a token a newer login just stored. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- With the image logo in a kitty terminal, the `Saving...` screen no longer writes any image bytes, and a zoom with the help screen open sends the large mark once per frame instead of twice. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+- The no-metadata notice starts lower-case, like the other notices. ([#9](https://github.com/featherbitplatform/featherbittorrent/pull/9))
+
 ## [0.2.0] - 2026-11-20
 
 ### Added
