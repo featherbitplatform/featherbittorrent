@@ -612,7 +612,7 @@ impl Backend {
         let files = match torrent.files().await {
             Ok(files) => files,
             Err(fbt::SessionError::NoMetadata) => {
-                return self.notify(Notice::Error("The torrent has no metadata yet".to_owned()));
+                return self.notify(Notice::Error("the torrent has no metadata yet".to_owned()));
             }
             Err(error) => return self.notify(Notice::Error(map::clean(&error.to_string()))),
         };
