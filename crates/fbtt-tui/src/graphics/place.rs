@@ -5,8 +5,9 @@
 //! are ordinary text that ratatui diffs like anything else, and the pixels travel once per id and size
 //! ([`Placer::before_draw`]). iTerm2 and sixel have no placeholders, so the view marks its cells as
 //! skipped and the placer writes the image over them after the frame is drawn
-//! ([`Placer::after_draw`]) - only when the placement is new, or when a placement that was there before
-//! is gone and its cells must be repainted from the buffer itself.
+//! ([`Placer::after_draw`]) - only when the placement is new, and then over the frame's own cells
+//! written there first, or when a placement that was there before is gone and its cells must be
+//! repainted from the buffer itself.
 //!
 //! Everything here is a byte question, so it is tested without a terminal: a `Placer` given the same
 //! placement on three frames answers with bytes only on the first.
@@ -283,13 +284,18 @@ fn id_for(size: LogoSize) -> u32 {
 
 /// What [`Placer::after_draw`] answers with.
 ///
-/// `repaint` are the cells whose previous contents were an image rather than text: ratatui will not
-/// write them again, because in its eyes they have not changed, so the image would stay on the screen as
-/// a ghost. The binary copies those cells out of the just-drawn buffer and writes them to the backend.
+/// `repaint` are the cells ratatui's own diff leaves alone and the terminal must not be left holding
+/// what it last saw there: the cells of a placement that is gone now, which still carry the image that
+/// was on them, and the cells of a placement this frame puts on the screen for the first time under an
+/// image written over skipped cells, where whatever the frame before drew is still on the terminal and
+/// shows through a transparent image. The binary copies those cells out of the just-drawn buffer and
+/// writes them to the backend before the image bytes, so an image lands on the frame's own cells and
+/// never on the text under them.
 /// `bytes` are the images to write, already positioned, in the order to write them.
 #[derive(Debug, Clone, Default)]
 pub struct AfterDraw {
-    /// The cells to repaint from the drawn buffer, because the image that was on them is gone.
+    /// The cells to repaint from the drawn buffer, because ratatui does not write them: the ones a
+    /// removed image left behind, and the ones a new image is about to go over.
     pub repaint: Vec<Rect>,
     /// The image bytes to write, already positioned around the cursor.
     pub bytes: Vec<u8>,
@@ -459,11 +465,15 @@ impl Placer {
     /// in the frame, and it goes out here.
     ///
     /// For iTerm2 and sixel, an image is written for every placement that is new - a different rect, a
-    /// different image, or a screen of a different size, which is the one ratatui cleared - and the
-    /// placements that were there before and are not now come back as `repaint`: the image that was on
-    /// those cells must be taken off them by writing the cells back, because ratatui will not write them
-    /// again. The bytes are wrapped in a cursor save and restore, positioned at the placement's top-left,
-    /// so nothing the frame just drew is moved.
+    /// different image, or a screen of a different size, which is the one ratatui cleared - and that
+    /// placement's cells come back as `repaint` with it: ratatui never writes a skipped cell, not even
+    /// on a screen it just cleared, so the image would otherwise land on whatever the frame before drew
+    /// there and let that text show through it. The placements that were there before and are not now
+    /// come back as `repaint` too: the image that was on those cells must be taken off them by writing
+    /// the cells back, because ratatui will not write them again. The binary writes the repaint cells
+    /// out of the drawn buffer before the image bytes, so an image always lands on this frame's cells.
+    /// The bytes are wrapped in a cursor save and restore, positioned at the placement's top-left, so
+    /// nothing the frame just drew is moved.
     pub fn after_draw(
         &mut self,
         placements: &[Placement],
@@ -492,9 +502,13 @@ impl Placer {
             };
         }
 
-        // A screen of a different size is a cleared screen: ratatui has already redrawn every cell of
-        // it, so no cells are owed a repaint from the just-drawn buffer.
+        // A screen of a different size is a cleared screen: ratatui has already redrawn every cell it
+        // writes itself, so none of those are owed a repaint from the just-drawn buffer. The cells it
+        // skips are owed one either way, which is what the new placements below add.
         let screen_changed = self.last_screen != Some(screen);
+        // Every rect below is painted on this screen, and a rect from a larger screen is not a rect of
+        // it: the cells beyond this screen's edge are not cells the drawn buffer holds.
+        let screen_rect = Rect::new(0, 0, screen.width, screen.height);
 
         // The previous placements that are gone now: their cells still hold their image on the screen, so
         // they are repainted from the drawn buffer instead of left as ghosts. Each rect is clipped to the
@@ -502,7 +516,6 @@ impl Placer {
         // cells beyond this screen's edge are not cells the drawn buffer holds.
         let mut repaint = Vec::new();
         if !screen_changed {
-            let screen_rect = Rect::new(0, 0, screen.width, screen.height);
             for placed in &self.last {
                 if !placements
                     .iter()
@@ -516,6 +529,13 @@ impl Placer {
             }
         }
 
+        // An image that goes over skipped cells is put where the cursor is set, and ratatui never wrote
+        // those cells on this frame - not even on a screen it just cleared - so they still hold what the
+        // frame before left there: at startup, the text title, showing through the transparent mark.
+        // A new placement's cells are repaint cells too, so the binary writes this frame's cells there
+        // first and the image on top of them. Kitty is not in this group at all (it returns above): its
+        // placeholders are ordinary cells, which the diff writes.
+        let image_over_skipped_cells = matches!(self.protocol, Protocol::Sixel | Protocol::Iterm2);
         let mut bytes = Vec::new();
         for placement in placements {
             // A placement is new when its rect, its image or the screen itself has changed since the last
@@ -527,6 +547,12 @@ impl Placer {
                     .any(|placed| placed.rect == placement.rect && placed.dims == placement.dims);
             if new {
                 bytes.extend_from_slice(&wrapped_at(placement.rect, logos, placement));
+                if image_over_skipped_cells {
+                    let clipped = placement.rect.intersection(screen_rect);
+                    if !clipped.is_empty() {
+                        repaint.push(clipped);
+                    }
+                }
             }
         }
 
@@ -753,14 +779,17 @@ mod tests {
     #[test]
     fn placer_sends_once() {
         let logos = sixel_logos();
+        let placement = small_placement(&logos);
         let mut placer = Placer::new(Protocol::Sixel);
-        let mut frame = || {
-            let placement = small_placement(&logos);
-            placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos)
-        };
+        let mut frame = || placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
 
         let first = frame();
         assert!(!first.bytes.is_empty(), "the first frame writes the image");
+        assert_eq!(
+            first.repaint,
+            vec![placement.rect],
+            "the frame that places the mark repaints the cells its image goes over"
+        );
         let second = frame();
         assert!(
             second.bytes.is_empty(),
@@ -771,8 +800,10 @@ mod tests {
             third.bytes.is_empty(),
             "the same placement on the third frame writes nothing"
         );
-        assert!(first.repaint.is_empty());
-        assert!(second.repaint.is_empty());
+        assert!(
+            second.repaint.is_empty(),
+            "a placement already on the screen owes no cells a second time"
+        );
         assert!(third.repaint.is_empty());
     }
 
@@ -837,6 +868,68 @@ mod tests {
         assert!(
             removed.bytes.is_empty(),
             "nothing is placed this frame, so nothing is written"
+        );
+    }
+
+    /// The startup case, in order: the frames before the logos answer draw the text title, and the
+    /// frame that first places the mark puts its image over cells ratatui never writes. Whatever the
+    /// text frames left on them is still on the terminal, and a transparent mark lets it show through.
+    /// The frame's own cells have to be written there first, then the image on top.
+    #[test]
+    fn a_new_sixel_placement_repaints_its_cells_first() {
+        let logos = sixel_logos();
+        let mut placer = Placer::new(Protocol::Sixel);
+
+        // The text title's frame: no placement, so nothing to write and nothing to repaint.
+        let text = placer.after_draw(&[], SCREEN, &logos);
+        assert!(
+            text.bytes.is_empty() && text.repaint.is_empty(),
+            "a frame that places nothing writes nothing: {text:?}"
+        );
+
+        // The logos answer on the next frame: the mark goes over cells this frame marked skipped, and
+        // the frame before it drew `featherbittorrent` and the rates on them.
+        let placement = small_placement(&logos);
+        let drawn = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert_eq!(
+            drawn.repaint,
+            vec![placement.rect],
+            "a new sixel placement did not repaint the cells under it"
+        );
+        assert!(
+            !drawn.bytes.is_empty(),
+            "the new placement still writes its image"
+        );
+
+        // The next frame is the same one: neither half of the answer goes out twice.
+        let steady = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert!(
+            steady.repaint.is_empty() && steady.bytes.is_empty(),
+            "a mark already on the screen is written once, not twice: repaint {:?}, {} bytes",
+            steady.repaint,
+            steady.bytes.len()
+        );
+    }
+
+    /// Kitty keeps its image inside the buffer: its placeholder cells are ordinary cells the diff
+    /// writes like any other text, so a new kitty placement owes no cells a repaint at all. The rects
+    /// this frame's skipped cells need are the image protocols' question alone.
+    #[test]
+    fn a_kitty_placement_needs_no_repaint() {
+        let logos = kitty_logos();
+        let mut placer = Placer::new(Protocol::Kitty);
+        let text = placer.after_draw(&[], SCREEN, &logos);
+        assert!(
+            text.repaint.is_empty(),
+            "a frame that places nothing repaints nothing: {text:?}"
+        );
+
+        let placement = small_placement(&logos);
+        let drawn = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert!(
+            !drawn.repaint.contains(&placement.rect),
+            "a new kitty placement's cells are written by the diff, not owed a repaint: {:?}",
+            drawn.repaint
         );
     }
 
@@ -984,16 +1077,25 @@ mod tests {
             "the first frame writes the image"
         );
 
-        // The terminal shrank to 60 x 20: the screen is cleared, the buffer is 60 x 20, and the
-        // mark's old rect (cols x 3 at 0, 0) still sits inside it, so nothing is owed a repaint -
-        // ratatui has already redrawn every cell of the smaller screen. The placement is new on the
-        // new screen, so the image goes out once more.
+        // The terminal shrank to 60 x 20: the screen is cleared, the buffer is 60 x 20, and no cell
+        // ratatui writes itself is owed a repaint - it has already redrawn every one of them. The mark's
+        // cells are owed one even here, because ratatui skips those and never writes them, and they are
+        // clipped to the screen they are painted on: the mark stands on columns 0..80 of the frame it was
+        // placed on, and columns past 60 are not cells the drawn buffer holds. The image goes out too,
+        // because this frame places the mark on a screen that has not had it.
         let shrunk = Size::new(60, 20);
-        let placement = small_placement(&logos);
-        let shrunken = placer.after_draw(std::slice::from_ref(&placement), shrunk, &logos);
-        assert!(
-            shrunken.repaint.is_empty(),
-            "a cleared screen owes no repaint: {shrunken:?}"
+        let wide = Placement {
+            size: LogoSize::Small,
+            rect: Rect::new(0, 0, 80, 3),
+            dims: first.dims,
+            prepared: first.prepared.clone(),
+        };
+        let shrunken = placer.after_draw(std::slice::from_ref(&wide), shrunk, &logos);
+        assert_eq!(
+            shrunken.repaint,
+            vec![Rect::new(0, 0, 60, 3)],
+            "the mark's cells are repainted, clipped to the screen they are painted on: {:?}",
+            shrunken.repaint
         );
         assert!(
             !shrunken.bytes.is_empty(),
