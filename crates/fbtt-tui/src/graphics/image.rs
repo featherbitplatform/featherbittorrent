@@ -146,15 +146,21 @@ fn round_div(n: u64, d: u64) -> Option<u32> {
     u32::try_from((n.checked_mul(2)?.checked_add(d)?) / (d * 2)).ok()
 }
 
-/// The pixels to hand a terminal: the mark area-averaged down to `img_w x img_h`, composited over
-/// `canvas` (the theme's ink), centred on a `px_w x px_h` field of that same colour.
+/// The pixels to hand a terminal: the mark area-averaged down to `img_w x img_h`, centred on a
+/// transparent `px_w x px_h` field.
 ///
 /// Downscaling averages whole source pixels by the exact fraction of each one the destination pixel
 /// covers, in premultiplied alpha so a half-transparent edge darkens its neighbour the way it should
-/// rather than ringing. The output is opaque: the terminal draws this on the canvas colour it already
-/// has, and an alpha channel here would only invite whatever that terminal does with one.
+/// rather than ringing, and the average is un-premultiplied back out to straight RGBA with integer
+/// rounding and no division by zero: each pixel keeps its own colour and its own alpha, and a pixel
+/// with none is `[0, 0, 0, 0]`.
+///
+/// The output carries alpha because the terminal draws the mark over whatever background it has,
+/// including a translucent or blurred one. Flattening the mark onto a fixed canvas colour here would
+/// paint a dark box over that background; keeping the alpha lets the screen show through around the
+/// mark instead.
 #[must_use]
-pub fn render(src: &Rgba, dims: &LogoDims, canvas: [u8; 3]) -> Rgba {
+pub fn render(src: &Rgba, dims: &LogoDims) -> Rgba {
     let (px_w, px_h) = (dims.px_w, dims.px_h);
     let Some(len) = usize::try_from(u64::from(px_w) * u64::from(px_h) * 4).ok() else {
         return Rgba {
@@ -163,15 +169,10 @@ pub fn render(src: &Rgba, dims: &LogoDims, canvas: [u8; 3]) -> Rgba {
             px: Vec::new(),
         };
     };
-    // The field first, entirely in the canvas colour: that is what reaches the edge beside and below
-    // the mark once it is centred, and it is what makes every output pixel opaque.
+    // The field first, entirely transparent: that is what reaches the edge beside and below the mark
+    // once it is centred, and the terminal's own background, translucent or not, is what shows
+    // through it. A zeroed buffer is already `[0, 0, 0, 0]` at every pixel.
     let mut px = vec![0u8; len];
-    for pixel in px.as_chunks_mut::<4>().0 {
-        pixel[0] = canvas[0];
-        pixel[1] = canvas[1];
-        pixel[2] = canvas[2];
-        pixel[3] = 255;
-    }
 
     // A `LogoDims` from `logo_dims` never exceeds its own cell area. Clamping costs nothing and keeps
     // a hand-built one - or an empty source - from drawing past the edge of the field.
@@ -196,16 +197,14 @@ pub fn render(src: &Rgba, dims: &LogoDims, canvas: [u8; 3]) -> Rgba {
     );
     let field_w = usize::try_from(px_w).unwrap_or(0);
     for y in 0..rows {
-        // `area_average` returns exactly four bytes for each of these pixels.
+        // `area_average` returns exactly four bytes for each of these pixels, already in the straight
+        // form the field wants: copy the colour and its alpha through unchanged.
         let from = y * cols * 4;
         let into_row = ((off_y + y) * field_w + off_x) * 4;
         for x in 0..cols {
             let at = from + x * 4;
             let into = into_row + x * 4;
-            let alpha = u32::from(small[at + 3]);
-            px[into] = composite(small[at], alpha, canvas[0]);
-            px[into + 1] = composite(small[at + 1], alpha, canvas[1]);
-            px[into + 2] = composite(small[at + 2], alpha, canvas[2]);
+            px[into..into + 4].copy_from_slice(&small[at..at + 4]);
         }
     }
     Rgba {
@@ -340,9 +339,6 @@ fn clamp_channel(v: u64) -> u8 {
 mod tests {
     use super::*;
 
-    /// The canvas the logo is composited over: `theme::INK_950`, `#0b0b0e`.
-    const CANVAS: [u8; 3] = [0x0b, 0x0b, 0x0e];
-
     /// A source with varying colour and varying alpha, so a render that forgets one of them shows.
     fn swatch(w: u32, h: u32) -> Rgba {
         let mut px = Vec::with_capacity(usize::try_from(w * h * 4).expect("a test swatch fits"));
@@ -381,24 +377,90 @@ mod tests {
     }
 
     #[test]
-    fn render_is_exact_size_and_opaque() {
+    fn render_is_exact_size() {
         // 30 x 120 into three rows of 8 x 16 cells: the mark is 12 x 48 inside a 16 x 48 field, so it
-        // is centred with two canvas columns either side.
+        // is centred with two transparent columns either side.
         let src = swatch(30, 120);
         let dims =
             logo_dims(3, CellPx { w: 8, h: 16 }, 1, (src.w, src.h)).expect("three rows fits");
         assert_eq!((dims.img_w, dims.px_w), (12, 16));
-        let img = render(&src, &dims, CANVAS);
+        let img = render(&src, &dims);
         assert_eq!((img.w, img.h), (dims.px_w, dims.px_h));
         assert_eq!(
             img.px.len(),
             usize::try_from(dims.px_w * dims.px_h * 4).expect("a logo fits")
         );
-        for pixel in img.px.as_chunks::<4>().0 {
-            assert_eq!(pixel[3], 255, "the composite is opaque");
-        }
-        // The centring: the canvas reaches the edge of the field beside the mark.
-        assert_eq!(&img.px[..4], &[0x0b, 0x0b, 0x0e, 255]);
+        // The centring: the transparent field reaches the edge beside the mark.
+        assert_eq!(&img.px[..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_logo_field_is_transparent() {
+        // A 2 x 2 mark, one pixel fully opaque, centred in a 4 x 4 field.
+        let src = Rgba {
+            w: 2,
+            h: 2,
+            px: vec![
+                200, 100, 50, 255, 10, 20, 30, 0, 40, 50, 60, 0, 70, 80, 90, 128,
+            ],
+        };
+        let dims = LogoDims {
+            cols: 1,
+            rows: 1,
+            px_w: 4,
+            px_h: 4,
+            img_w: 2,
+            img_h: 2,
+        };
+        let img = render(&src, &dims);
+        // The mark sits at (1, 1) through (2, 2), so the field's first and last pixels are outside
+        // it, and outside the mark the field is fully transparent.
+        assert_eq!(
+            &img.px[..4],
+            &[0, 0, 0, 0],
+            "the logo field is not transparent"
+        );
+        let last = (3 * 4 + 3) * 4;
+        assert_eq!(
+            &img.px[last..last + 4],
+            &[0, 0, 0, 0],
+            "the logo field is not transparent"
+        );
+        // And the fully opaque source pixel is kept exactly, colour and alpha: it lands on field
+        // pixel (1, 1), index (1 * field width + column) * 4 with a field width of 4.
+        let at = (4 + 1) * 4;
+        assert_eq!(
+            &img.px[at..at + 4],
+            &[200, 100, 50, 255],
+            "an opaque source pixel did not keep its colour and alpha"
+        );
+    }
+
+    #[test]
+    fn a_half_transparent_logo_pixel_keeps_its_colour() {
+        // One source pixel at alpha 128, rendered 1:1 into a one-pixel field. The area average has
+        // already un-premultiplied it, so the colour comes back as it went in and the alpha is kept.
+        let src = Rgba {
+            w: 1,
+            h: 1,
+            px: vec![134, 59, 255, 128],
+        };
+        let dims = LogoDims {
+            cols: 1,
+            rows: 1,
+            px_w: 1,
+            px_h: 1,
+            img_w: 1,
+            img_h: 1,
+        };
+        let img = render(&src, &dims);
+        let [r, g, b, a] =
+            <[u8; 4]>::try_from(img.px.as_slice()).expect("one pixel in, one pixel out");
+        assert_eq!(a, 128, "a half transparent pixel lost its alpha");
+        assert!(
+            r.abs_diff(134) <= 1 && g.abs_diff(59) <= 1 && b.abs_diff(255) <= 1,
+            "a half transparent pixel did not keep its colour: got [{r}, {g}, {b}, {a}]"
+        );
     }
 
     #[test]

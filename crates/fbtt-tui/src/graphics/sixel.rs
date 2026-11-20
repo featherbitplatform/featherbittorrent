@@ -458,11 +458,11 @@ mod tests {
     #[test]
     fn quantize_caps_at_256() {
         // The mark at the help screen's twelve rows has far more colours than a palette allows: the
-        // anti-aliased edges and the gradient over the canvas are thousands of them.
+        // anti-aliased edges and the gradient are thousands of them.
         let src = mark();
         let dims =
             logo_dims(12, CellPx { w: 8, h: 16 }, 1, (src.w, src.h)).expect("twelve rows fits");
-        let img = render(&src, &dims, [0x0b, 0x0b, 0x0e]);
+        let img = render(&src, &dims);
         assert!(
             img.w * img.h > 256,
             "the rendered mark has room for many colours"

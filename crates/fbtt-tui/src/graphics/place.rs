@@ -125,7 +125,7 @@ fn prepared(
     canvas: [u8; 3],
 ) -> Option<Prepared> {
     let dims = image::logo_dims(rows, cell, 1, (src.w, src.h))?;
-    let img = image::render(src, &dims, canvas);
+    let img = image::render(src, &dims);
     Some(Prepared {
         size,
         dims,
@@ -157,9 +157,9 @@ fn payload_for(protocol: Protocol, img: &Rgba, dims: &LogoDims, canvas: [u8; 3])
     }
 }
 
-/// The ink the theme's ground is, for the canvas a mark is composited over when the token it is
-/// given is not an `Rgb` the theme would draw a canvas in. Derived from the theme's own token
-/// rather than a hard-coded hex, so the two cannot drift.
+/// The ink the theme's ground is, for the canvas sixel paints against when the token it is given is
+/// not an `Rgb` the theme would draw a canvas in. Derived from the theme's own token rather than a
+/// hard-coded hex, so the two cannot drift.
 const GROUND: [u8; 3] = ground_rgb(theme::INK_950);
 
 const fn ground_rgb(color: Color) -> [u8; 3] {
@@ -172,7 +172,7 @@ const fn ground_rgb(color: Color) -> [u8; 3] {
     }
 }
 
-/// The RGB of one of the theme's tokens, for the canvas a mark is composited over.
+/// The RGB of one of the theme's tokens, for the canvas sixel paints against.
 ///
 /// The theme keeps every token as `Rgb`, so this is a match on the theme's own type: a token that
 /// is not `Rgb` is not a ground this palette would draw a canvas in, and rather than invent a
