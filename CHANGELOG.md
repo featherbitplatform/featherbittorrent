@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-20
+
 ### Fixed
 
 - On Windows, the featherbit mark is now drawn as an image in terminals that support sixel and report their cell size (fbterm 0.11 or newer, for one), where before every Windows terminal got the text title. ([#13](https://github.com/featherbitplatform/featherbittorrent/pull/13))
@@ -57,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.2.2]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2
 [0.2.1]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0
 [0.1.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.1.0
