@@ -930,6 +930,60 @@ mod tests {
         );
     }
 
+    /// The same question on a screen the frame has not seen before, which is the case the skipped
+    /// cells are never let off: a screen of another size is a cleared screen, and ratatui has redrawn
+    /// every cell of it that it writes itself, but these are cells it skips. Guarding the new
+    /// placement's cells with "did the screen change" would leave the old text under the mark here,
+    /// and no other test would notice.
+    #[test]
+    fn a_new_sixel_placement_on_a_new_screen_repaints_its_cells() {
+        let logos = sixel_logos();
+        let placement = small_placement(&logos);
+        let mut placer = Placer::new(Protocol::Sixel);
+
+        // The mark on this screen, so the frame after it has something to be compared against. Only
+        // its image is asserted here, so the failure below names the changed screen and nothing else.
+        let placed = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert!(
+            !placed.bytes.is_empty(),
+            "the frame that places the mark writes its image"
+        );
+
+        // The terminal was resized to 60 x 20 and cleared, and the mark is placed on the new screen.
+        // Its cells are inside this screen, so they are owed whole.
+        let other = Size::new(60, 20);
+        let resized = placer.after_draw(std::slice::from_ref(&placement), other, &logos);
+        assert_eq!(
+            resized.repaint,
+            vec![
+                placement
+                    .rect
+                    .intersection(Rect::new(0, 0, other.width, other.height))
+            ],
+            "a new placement on a changed screen did not repaint its cells: {:?}",
+            resized.repaint
+        );
+        assert!(
+            !resized.bytes.is_empty(),
+            "and the mark is written on the new screen too"
+        );
+
+        // The other way a placement becomes new on a screen this size: a logos swap, which clears the
+        // terminal's image cache and what the placer remembers of the screen. Same answer owed.
+        placer.invalidate();
+        let swapped = placer.after_draw(std::slice::from_ref(&placement), SCREEN, &logos);
+        assert_eq!(
+            swapped.repaint,
+            vec![placement.rect],
+            "a new placement on a screen the placer forgot did not repaint its cells: {:?}",
+            swapped.repaint
+        );
+        assert!(
+            !swapped.bytes.is_empty(),
+            "and the mark is written after that clear too"
+        );
+    }
+
     /// Kitty keeps its image inside the buffer: its placeholder cells are ordinary cells the diff
     /// writes like any other text, so a new kitty placement owes no cells a repaint at all. The rects
     /// this frame's skipped cells need are the image protocols' question alone.
