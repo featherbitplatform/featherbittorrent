@@ -1,13 +1,21 @@
 //! The one question round the binary asks the terminal before the event loop exists.
 //!
 //! [`detect`] writes [`PROBE_QUERY`] once, reads what comes back byte by byte, and hands those bytes to the
-//! pure decision table in `fbtt_tui::graphics` (decision 10). It runs after raw mode is on and before
-//! `EventStream` exists because it owns the tty for those few milliseconds: crossterm's reader would take
-//! stdin with its own buffer, and a keystroke typed while the queries are in flight has to survive for that
-//! reader rather than be swallowed here. So the read takes one byte per call - with `rustix` on Unix, and
-//! from the console's input events on Windows, where a terminal's reply arrives one key event per
-//! character - and it stops at the first complete DA1 answer, the one reply every terminal sends, which is
-//! why DA1 is last in the query string (decision 9).
+//! pure decision table in `fbtt_tui::graphics` (decision 10). It runs before `EventStream` exists because
+//! it owns the tty for those few milliseconds: crossterm's reader would take stdin with its own buffer,
+//! and a keystroke typed while the queries are in flight has to survive for that reader rather than be
+//! swallowed here. So the read takes one byte per call - with `rustix` on Unix, and from the console's
+//! input events on Windows, where a terminal's reply arrives one key event per character - and it stops at
+//! the first complete DA1 answer, the one reply every terminal sends, which is why DA1 is last in the query
+//! string (decision 9).
+//!
+//! On Unix the read needs raw mode, which is not on yet: the terminal enters it later, in
+//! `Terminal::setup`. A canonical-mode tty would hold a reply without a newline - DA1's answer has none -
+//! until a line ends, and would echo the replies onto the screen. So `detect` turns raw mode on around the
+//! round through a guard that puts it back on every path, and a terminal it cannot put in raw mode gets the
+//! no-answer verdict instead of a query nobody will read. On Windows crossterm's raw mode changes only the
+//! input mode flags, and the console's input queue hands back the replies in either mode, so the Windows
+//! round needs nothing more.
 //!
 //! Two deadlines bound the read, both measured from the write: 300 ms, extended to one second once an answer
 //! has started flowing. Nothing else about this module is unbounded: at most 4096 bytes are read, no
@@ -340,6 +348,47 @@ pub fn skip_reason(
     None
 }
 
+/// The raw mode the probe round found, so the guard puts back only what it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawMode {
+    /// The terminal was in raw mode already: whoever put it there keeps it, and the round ends with it
+    /// still on.
+    WasOn,
+    /// The round turned raw mode on: it goes back the way it was when the round ends.
+    TurnedOn,
+}
+
+/// Raw mode around the probe round: it goes back the way it was on every path out of the round, a
+/// clean one, an early return and a panic alike, because a terminal left in raw mode is a terminal
+/// whose next character nobody will see.
+#[derive(Debug)]
+struct RawGuard(RawMode);
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        if self.0 == RawMode::TurnedOn
+            && let Err(error) = crossterm::terminal::disable_raw_mode()
+        {
+            eprintln!("the probe could not put the terminal back into normal mode: {error}");
+        }
+    }
+}
+
+impl RawGuard {
+    /// Raw mode around the probe round, or `None` when the tty cannot be put in raw mode: a terminal
+    /// that will not go raw cannot answer the queries byte by byte, so the round does not run.
+    fn around() -> Option<RawGuard> {
+        match crossterm::terminal::is_raw_mode_enabled() {
+            Ok(true) => Some(RawGuard(RawMode::WasOn)),
+            Ok(false) => crossterm::terminal::enable_raw_mode().is_ok().then_some(RawGuard(RawMode::TurnedOn)),
+            // No way to tell whether the tty is raw: a tty in cooked mode holds a reply without a
+            // newline until a line ends, and that reply would arrive after the round, so the no-answer
+            // verdict is the only one this run can trust.
+            Err(_) => None,
+        }
+    }
+}
+
 /// The graphics verdict for the terminal this process is attached to: [`skip_reason`] first, then one probe
 /// round, then the decision table over what was answered and this terminal's own sizes.
 ///
@@ -351,6 +400,11 @@ pub fn detect(logo_off: bool) -> Graphics {
     if skip_reason(&env, std::io::stdin().is_terminal(), logo_off).is_some() {
         return Graphics::none();
     }
+    // The round runs in raw mode on every platform, so the answers arrive one byte at a time instead of
+    // line by line (see the module doc). A tty it cannot put in raw mode answers nothing at all.
+    let Some(guard) = RawGuard::around() else {
+        return Graphics::none();
+    };
     // The grid and the window size are what `choose` divides when no query answered a cell size directly
     // (decision 11); a terminal that answers neither of these ioctls gets `(0, 0)`, which chooses nothing.
     let grid = crossterm::terminal::size().unwrap_or((0, 0));
@@ -358,8 +412,11 @@ pub fn detect(logo_off: bool) -> Graphics {
         .ok()
         .as_ref()
         .and_then(window_pixels);
-    choose(&parse_replies(&ask()), grid, pixels)
+    let answers = ask();
+    drop(guard);
+    choose(&parse_replies(&answers), grid, pixels)
 }
+
 
 /// The probe round on this process's own tty: the queries out through stdout, the answers back in through
 /// fd 0.
