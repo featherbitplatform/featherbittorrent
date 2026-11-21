@@ -20,6 +20,7 @@ const headerProps = (over: Partial<HeaderProps>): HeaderProps => ({
   dhtNodes: 123,
   signedIn: true,
   onSignOut: () => {},
+  onAdd: () => {},
   ...over,
 })
 

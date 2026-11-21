@@ -48,6 +48,7 @@
  * @module components/TorrentTable
  */
 import { useId, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { ArrowDown, ArrowUp } from 'lucide-react'
 import { displaySafe, filledPercent, formatPercent, formatRate } from '../format'
 import type { RowState, TorrentRow } from '../live'
@@ -57,6 +58,8 @@ export interface TorrentTableProps {
   rows: TorrentRow[]
   selectedId: string | null
   onPick?: (id: string) => void
+  /** What the screen puts at the right end of the toolbar: the actions that work on the row that is chosen. A slot rather than six more props because the actions belong to the screen that owns the selection and the dialogs: the table's job is to hold the row at the same height the filter field has, at the same end of the row the prototype drew them, and to know nothing about pause or delete. */
+  actions?: ReactNode
   /** The scroll box's height in pixels. Given by tests because jsdom lays nothing out; measured from the box otherwise. */
   viewportHeight?: number
 }
@@ -183,6 +186,7 @@ export default function TorrentTable({
   rows,
   selectedId,
   onPick,
+  actions,
   viewportHeight,
 }: TorrentTableProps) {
   const filterId = useId()
@@ -335,6 +339,9 @@ export default function TorrentTable({
             </>
           )}
         </span>
+        {actions !== undefined && actions !== null && (
+          <div className="ml-auto flex flex-wrap items-center gap-2">{actions}</div>
+        )}
       </div>
 
       <div

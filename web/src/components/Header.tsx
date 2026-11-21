@@ -10,9 +10,8 @@
  * the total rates summed over every row with the arrows muted and the numbers strong the way the
  * terminal states them, the DHT node count beside them, muted and giving way to the rates below
  * 768 px, and the actions at the end. The Add torrent button is the violet fill the plan names for
- * the primary action, and it answers nothing yet: it is present so the header is the header the
- * finished screen will have. Sign out appears only when there is a session to end, because on a
- * server with logins off there is nobody signed in.
+ * the primary action, and it opens the Add dialog the screen mounts. Sign out appears only when there
+ * is a session to end, because on a server with logins off there is nobody signed in.
  *
  * The visible version is this bundle's own build constant. The remote text here is the tooltip's
  * engine version and the DHT count, both from this server's own `/session` route; the pill's words
@@ -39,6 +38,8 @@ export interface HeaderProps {
   /** Whether there is a session to end. */
   signedIn: boolean
   onSignOut(): void
+  /** Opens the Add torrent dialog. */
+  onAdd(): void
 }
 
 /** The pill's words while a retry pause is running: it counts down once per second and, when the pause is spent, says the retry is happening rather than showing a frozen number. The header keys it on the loop's failure count rather than on the pause, because the top of the ladder repeats: two 30-second pauses in a row are two failures, and the second one starts its count over instead of inheriting the first one's spent zero. */
@@ -64,6 +65,7 @@ export default function Header({
   dhtNodes,
   signedIn,
   onSignOut,
+  onAdd,
 }: HeaderProps) {
   const lost = link.phase === 'lost'
   return (
@@ -99,7 +101,7 @@ export default function Header({
       </div>
 
       <div className="flex items-center gap-2">
-        <Button disabled>
+        <Button onClick={onAdd}>
           <Plus className="h-4 w-4" aria-hidden="true" />
           Add torrent
         </Button>

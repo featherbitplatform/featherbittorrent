@@ -28,6 +28,8 @@
  * @module api/client
  */
 import type { components, operations } from './schema'
+import { displaySafe } from '../format'
+import { UNREACHABLE_COPY } from '../live'
 import { session } from '../session'
 
 /** One torrent, as the list and the detail screens will draw it. */
@@ -65,11 +67,27 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The sentence to show a person about a call that did not take.
+ *
+ * An `ApiError` already carries the server's own words, and those are the ones worth reading: "that
+ * torrent is already in the list" tells a person what to do next in a way "the server answered 409"
+ * does not. Anything else that came out of a call is a failure with no answer behind it - no
+ * response, no body, nothing the server said - and the one thing that is true of all of them is the
+ * line the unreachable screen already uses, so it is shared rather than paraphrased here.
+ *
+ * Every branch goes through `displaySafe`: an error message is remote text like any other, and a
+ * server that echoes something back can put control characters in it.
+ */
+export function errorMessage(cause: unknown): string {
+  if (cause instanceof ApiError) return displaySafe(cause.message)
+  return UNREACHABLE_COPY
+}
+
 /** The JSON body of an operation's 200 answer. */
 type Json200<Op> = Op extends { responses: { 200: { content: { 'application/json': infer T } } } }
   ? T
   : never
-
 /** The JSON body of an operation's 201 answer. */
 type Json201<Op> = Op extends { responses: { 201: { content: { 'application/json': infer T } } } }
   ? T

@@ -18,24 +18,36 @@
  * every half minute and on mount - the version the header displays instead ships inside the bundle,
  * injected at build time - and none of it earns a place in the once-a-second round.
  *
- * The header's Add torrent button answers nothing yet: the dialog comes with the actions task. The
- * selected row is remembered here because the detail pane under the table reads through it, and
+ * The header's Add torrent button and the toolbar over the table are the two ways into the server's
+ * write side. The toolbar belongs to the chosen row: Pause and Remove go with any choice, Resume only
+ * with a row that says it is paused, and all three go quiet while a request is on the wire so nobody
+ * presses a fourth time at something already happening. Removal is a question rather than a click
+ * (`ConfirmDelete`), and Add is a dialog of its own (`AddTorrent`). Each of them makes its own call
+ * and reports its own failure where it happened - inside the dialog for a dialog, in the banner above
+ * the filters for the toolbar - and every one the server accepted wakes the refresh loop, which is the
+ * difference between a row that changes while the person is looking at it and one that changes a
+ * second later.
+ *
+ * The selected row is remembered here because the detail pane under the table reads through it, and
  * the pane's heartbeat is this screen's: `startLive` bumps `tick` once per live round, and the pane
  * re-reads its tab on that bump, so it shares the loop's cadence, its hidden-page pause and its
  * backoff instead of keeping a timer of its own.
  *
  * @module screens/Torrents
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import AddTorrent from '../components/AddTorrent'
 import Banner from '../components/Banner'
+import Button from '../components/Button'
+import ConfirmDelete from '../components/ConfirmDelete'
 import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
 import StateFilters from '../components/StateFilters'
 import TorrentTable from '../components/TorrentTable'
-import { api } from '../api/client'
+import { api, errorMessage } from '../api/client'
 import type { Api, SessionInfo } from '../api/client'
-import { startLive } from '../live'
-import type { LinkState, TorrentRow } from '../live'
+import { announcePolite, startLive } from '../live'
+import type { LinkState, LiveHandle, TorrentRow } from '../live'
 import { filterCounts, matchesFilter } from '../filters'
 import type { FilterKey } from '../filters'
 
@@ -70,6 +82,15 @@ export default function Torrents({
   // when this moves, so the pane's cadence, hidden-page pause and backoff are exactly the table's,
   // with no second timer anywhere near the same server.
   const [tick, setTick] = useState(0)
+  // The dialogs the toolbar and the header open, and the toolbar's own failure. An action's error is
+  // not the sign-out notice's slot: the two can be true at once and they mean different things.
+  const [addOpen, setAddOpen] = useState(false)
+  const [confirming, setConfirming] = useState<{ id: string; name: string } | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  // True while an action is on the wire: a toolbar that stayed live during a pause is a toolbar that
+  // lets the person press it four more times.
+  const [busy, setBusy] = useState(false)
+  const liveRef = useRef<LiveHandle | null>(null)
 
   useEffect(() => {
     const live = startLive(
@@ -100,7 +121,13 @@ export default function Torrents({
       // An environment without EventSource (a test jsdom) simply gets no stream.
       eventSource: () => (typeof EventSource === 'function' ? new EventSource(EVENTS_URL) : null),
     })
-    return live.stop
+    // The handle stays reachable because the toolbar needs it after the effect that started the loop
+    // is long gone: the read a pause earns happens on a click, not on a mount.
+    liveRef.current = live
+    return () => {
+      liveRef.current = null
+      live.stop()
+    }
   }, [client])
 
   useEffect(() => {
@@ -133,11 +160,75 @@ export default function Torrents({
     }
     return { down, up }
   }, [rows])
-  const selectedName = useMemo(() => {
-    if (selectedId === null) return null
-    const row = rows.find((torrent) => torrent.id === selectedId)
-    return row === undefined ? null : row.name
-  }, [rows, selectedId])
+  // The chosen row, read from every row rather than from the filtered ones: a pause can take a torrent
+  // out of the filter that is showing while the person is still looking at it in the pane beside the
+  // table, and a toolbar that went quiet then would be refusing to act on a torrent that is chosen.
+  const selectedRow = useMemo(
+    () => rows.find((torrent: TorrentRow) => torrent.id === selectedId) ?? null,
+    [rows, selectedId],
+  )
+  const selectedName = selectedRow?.name ?? null
+
+  /** Ask the refresh loop for the table again, the way a stream event does. */
+  const wake = useCallback((): void => {
+    liveRef.current?.wake()
+  }, [])
+
+  async function act(kind: 'pause' | 'resume'): Promise<void> {
+    const target = selectedRow
+    if (target === null || busy) return
+    setBusy(true)
+    setActionError(null)
+    try {
+      if (kind === 'pause') await client.pause(target.id)
+      else await client.resume(target.id)
+      // The server said yes: the row should look different before the person looks away from it.
+      wake()
+    } catch (cause) {
+      // The toolbar's own failure, in the banner above the filters and through the polite region, so
+      // it reaches somebody whose hands are on the keyboard and somebody who is not looking.
+      const why = errorMessage(cause)
+      setActionError(why)
+      announcePolite(why)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const toolbar = (
+    <>
+      <Button
+        size="sm"
+        variant="secondary"
+        disabled={selectedRow === null || busy}
+        onClick={() => {
+          void act('pause')
+        }}
+      >
+        Pause
+      </Button>
+      <Button
+        size="sm"
+        variant="secondary"
+        disabled={selectedRow === null || selectedRow.rowState !== 'paused' || busy}
+        onClick={() => {
+          void act('resume')
+        }}
+      >
+        Resume
+      </Button>
+      <Button
+        size="sm"
+        variant="danger"
+        disabled={selectedRow === null || busy}
+        onClick={() => {
+          if (selectedRow !== null) setConfirming({ id: selectedRow.id, name: selectedRow.name })
+        }}
+      >
+        Remove
+      </Button>
+    </>
+  )
 
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden">
@@ -149,16 +240,25 @@ export default function Torrents({
         dhtNodes={sessionInfo?.dht_nodes ?? null}
         signedIn={signedIn}
         onSignOut={onSignOut}
+        onAdd={() => {
+          setAddOpen(true)
+        }}
       />
-      {signOutError !== null && (
-        <div className="shrink-0 px-5 pt-3">
-          <Banner tone="danger">{signOutError}</Banner>
+      {(signOutError !== null || actionError !== null) && (
+        <div className="flex shrink-0 flex-col gap-2 px-5 pt-3">
+          {signOutError !== null && <Banner tone="danger">{signOutError}</Banner>}
+          {actionError !== null && <Banner tone="danger">{actionError}</Banner>}
         </div>
       )}
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <StateFilters counts={counts} active={filter} onChange={setFilter} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <TorrentTable rows={shown} selectedId={selectedId} onPick={setSelectedId} />
+          <TorrentTable
+            rows={shown}
+            selectedId={selectedId}
+            onPick={setSelectedId}
+            actions={toolbar}
+          />
           <DetailPane
             id={selectedId}
             client={client}
@@ -176,6 +276,35 @@ export default function Torrents({
           />
         </main>
       </div>
+
+      {addOpen && (
+        <AddTorrent
+          client={client}
+          onAdded={() => {
+            // The new torrent is on the server now: the wake is what puts it in the table. The
+            // dialog closes itself and says so through the polite region.
+            wake()
+          }}
+          onClose={() => {
+            setAddOpen(false)
+          }}
+        />
+      )}
+      {confirming !== null && (
+        <ConfirmDelete
+          key={confirming.id}
+          id={confirming.id}
+          name={confirming.name}
+          client={client}
+          onClose={() => {
+            setConfirming(null)
+          }}
+          onRemoved={(goneId) => {
+            setSelectedId((current) => (current === goneId ? null : current))
+            wake()
+          }}
+        />
+      )}
     </div>
   )
 }

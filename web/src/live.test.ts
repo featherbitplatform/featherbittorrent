@@ -442,6 +442,59 @@ it('a_closed_event_stream_is_reopened_with_backoff', async () => {
   expect(w.streams.length, 'the stream reopened after the screen went away').toBe(opens)
 })
 
+/**
+ * The trigger the screens call after they change something on the server: the row a person just
+ * paused should be a paused row in front of them now, not one second later. The wake is the same
+ * wake the event stream pulls: coalesced to one extra read while a read is in flight, useless while
+ * the link is lost and the backoff owns the next read, and silent after `stop`.
+ */
+it('a_wake_from_the_page_reads_the_table_at_once', async () => {
+  const w = world()
+  const { answers, client } = roundRobinClient()
+  const live = startLive(client, () => {}, () => {}, w.injected)
+  await w.settle()
+  answers[0].resolve([])
+  await w.settle()
+  expect(answers.length, 'the loop did not read the table at once').toBe(1)
+
+  // Nothing is due: the next read is a second away. A wake is the difference between a row that
+  // changes when the person acts on it and one that changes a second later.
+  await w.advance(999)
+  expect(answers.length, 'the loop read before its second without being woken').toBe(1)
+  live.wake()
+  await w.advance(0)
+  expect(answers.length, 'the wake trigger did not ask the server for the table at once').toBe(2)
+
+  // Three wakes in a row while a read is in flight are one extra read, exactly like three events.
+  live.wake()
+  live.wake()
+  live.wake()
+  answers[1].resolve([])
+  await w.settle()
+  await w.advance(0)
+  expect(answers.length, 'wakes from the page bought more than one extra read').toBe(3)
+
+  // The cadence picks up where the extra read left it.
+  answers[2].resolve([])
+  await w.settle()
+  await w.advance(1_000)
+  expect(answers.length, 'a wake broke the once a second cadence').toBe(4)
+
+  // While the link is lost the ladder owns the next read, so a wake waits with everything else.
+  answers[3].reject(new Error('server gone'))
+  await w.settle()
+  live.wake()
+  await w.settle()
+  await w.advance(999)
+  expect(answers.length, 'a wake cut in front of the backoff pause').toBe(4)
+
+  // And a stopped loop is stopped: a wake after `stop` starts nothing.
+  live.stop()
+  live.wake()
+  await w.advance(60_000)
+  expect(answers.length, 'a stopped loop read the table again after a wake').toBe(4)
+})
+
 it('rows_get_the_tuis_state_rule', () => {
   const stalled = new Map<string, number>()
   const first = deriveRows([torrent({ id: 'a', download_rate: 0 })], stalled, 1_000)

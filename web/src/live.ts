@@ -226,9 +226,18 @@ export interface WakeStream {
   readonly readyState: number
 }
 
-/** The running loop: the one way to stop it. */
+/** The running loop: the one way to stop it, and the one way to ask it for a read before its second is up. */
 export interface LiveHandle {
   stop(): void
+  /**
+   * Ask for a read now, exactly the way a stream event does: coalesced into one extra read while one
+   * is already in flight, and dropped while the link is lost and the backoff ladder owns the next one.
+   *
+   * A screen calls it the moment the server agrees to something the person asked for - a pause, a
+   * resume, an add, a removal - because the row they just acted on should change while they are looking
+   * at it, and not a second later when the next round happens to come round.
+   */
+  wake(): void
 }
 
 /** The only call the loop makes. The screen hands it the page's client; a test hands it a fake that answers when the test says so. */
@@ -308,6 +317,12 @@ export function deriveRows(
  * A lost link is on its own schedule: while the loop is waiting out a backoff pause, wakes do not
  * apply - neither stream events nor the page coming back - because cutting in front of the ladder
  * is how a down server gets stampeded. The backoff timer decides when the next read goes out.
+ *
+ * `wake()` on the handle is the third source of them, and the only one a screen controls: a pause, a
+ * resume, an add or a removal that the server accepted asks for the table again at once, so the row
+ * a person acted on changes under their hands instead of a second later. It follows the same rule as
+ * the other two, coalesced per read in flight and silent while the ladder owns the next one, so a
+ * person who clicks Pause six times does not book six reads.
  *
  * `onRows` comes only from a good read, so a server that stops answering keeps the last table on
  * the screen, which is what the header's "Reconnecting in N s" is for; `onLink` says how the link
@@ -445,5 +460,8 @@ export function startLive(
       stream = null
       // Scheduled calls outlive `stop` (nothing cancels them); they check `stopped` and do nothing.
     },
+    // The screen's own wake-up, on the same rule as a stream event and the page coming back: the
+    // person acted, so the table should know before the second is up.
+    wake,
   }
 }
