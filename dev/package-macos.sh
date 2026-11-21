@@ -63,7 +63,7 @@ if [[ "$variant" == full ]]; then build_features=(--features web-ui); fi
 # Apple silicon, so the smoke below runs the arm64 slice of what it builds; the x86_64 slice is checked by
 # lipo -archs here and by the machine that downloads it.
 for triple in aarch64-apple-darwin x86_64-apple-darwin; do
-  cargo build --locked --release -p featherbittorrent "${build_features[@]}" --target "$triple"
+  cargo build --locked --release -p featherbittorrent ${build_features[@]+"${build_features[@]}"} --target "$triple"
 done
 
 rm -rf "$stage" "$dist/$targz.tar.gz" "$dist/$targz.tar.gz.sha256"

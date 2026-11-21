@@ -102,6 +102,9 @@ jobs:
       fail-fast: false
       matrix:
         variant: [full, headless]
+        arch: [x86_64, aarch64]
+        # arch is a real axis; an include that matches an existing combination only adds keys, whereas
+        # includes that set arch themselves overwrite each other and drop one architecture.
         include:
           - arch: x86_64
             runner: ubuntu-24.04
@@ -279,6 +282,9 @@ jobs:
       fail-fast: false
       matrix:
         variant: [full, headless]
+        arch: [x86_64, aarch64]
+        # arch is a real axis; an include that matches an existing combination only adds keys, whereas
+        # includes that set arch themselves overwrite each other and drop one architecture.
         include:
           - arch: x86_64
             runner: windows-latest

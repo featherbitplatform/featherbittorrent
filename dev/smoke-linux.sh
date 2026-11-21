@@ -242,7 +242,7 @@ rm -f "$cli_log"
 if [[ "$distro_id" == debian && "$format" != tar.gz ]]; then
   apt-get install -y -qq --no-install-recommends systemd man-db
   useradd --system featherbittorrent
-  unit=/usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service
+  unit=/usr/share/doc/$prefix/examples/systemd/system/featherbittorrent.service
   status=0
   verify_out="$(systemd-analyze verify "$unit" 2>&1)" || status=$?
   userdel featherbittorrent
@@ -287,7 +287,7 @@ if [[ "$format" != tar.gz ]]; then
     # gone, so the list comes from what is present rather than from two remembered names. A find that fails
     # on a directory that *is* there still says so, because that one is worth stopping for.
     empty_dirs=''
-    for d in "/usr/share/doc/$prefix" /usr/share/licenses/featherbittorrent; do
+    for d in "/usr/share/doc/$prefix" "/usr/share/licenses/$prefix"; do
       if [[ -d "$d" ]]; then
         status=0
         listed="$(find "$d" -type d | sort)" || status=$?
