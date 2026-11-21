@@ -547,7 +547,7 @@ impl RouteError {
     }
 
     /// `404 not_found`.
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
@@ -602,7 +602,7 @@ impl RouteError {
     }
 
     /// `500 internal`: something this server could not do, said as briefly as it can be.
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 

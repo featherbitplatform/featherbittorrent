@@ -21,6 +21,18 @@ jobs:
         os: [macos-15, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      # The front end is built before anything cargo runs, because `--all-features` below turns
+      # `web-ui` on and that feature embeds `web/dist`: its build script refuses to compile the crate
+      # without the built page in it, so a job that skipped this would fail for a missing artifact
+      # rather than for anything wrong in the change under test.
+      - uses: actions/setup-node@v4
+        with:
+          # `web/package.json` says `>=22`, and this is what it is built with.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,6 +48,42 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm --prefix web ci
+      - name: Lint
+        run: npm --prefix web run lint
+      - name: Types
+        run: npm --prefix web run typecheck
+      - name: Test
+        # vitest with `--passWithNoTests`, which is what the npm script says: Task 5 is where the
+        # front end gets its own tests, and until then this step is the harness being proven.
+        run: npm --prefix web run test
+      - name: Build
+        # `build` is `tsc --noEmit && vite build`, and `size` below measures what it emits, so it has
+        # to run first: a budget checked against no files is not a budget checked.
+        run: npm --prefix web run build
+      - name: Bundle size
+        # The plan's budget: the built JS plus CSS, gzipped, under 300 KB, fonts excluded.
+        run: npm --prefix web run size
+      - name: Dependencies
+        run: npm --prefix web run audit
+      - name: Generated API types
+        # `src/api/schema.ts` is checked in because the app imports it, and it is generated rather than
+        # typed by hand. fbt-api's document is pinned byte for byte by
+        # `crates/fbtt-server/tests/openapi_snapshot.rs`, so a schema that no longer matches what the
+        # generator makes from it means one of the two moved without the other noticing.
+        run: npm --prefix web run gen:api && git diff --exit-code web/src/api/schema.ts
+
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -45,6 +93,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # No node setup here, and no front end build: `cargo doc` without `--all-features` does not turn
+      # `web-ui` on, so it neither compiles `web.rs` nor asks for `web/dist`.
       - run: cargo doc --workspace --no-deps
 
   # No MSRV job: rust-toolchain.toml pins stable, and that file overrides a job

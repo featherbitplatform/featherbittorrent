@@ -19,8 +19,10 @@
 //!
 //! With nobody signing in there is still one question to answer - which name the request says it came to,
 //! and where it says it came from - because that is all that separates this server's own user from a page
-//! somebody else opened in a browser on the same machine (see [`FbttAuth`]). With logins on every
-//! request carries a credential instead, and no web page picks up a bearer token by accident.
+//! somebody else opened in a browser on the same machine (see [`FbttAuth`]). With logins on every request
+//! carries a credential instead - except the browser UI's page and its files, which are what a person
+//! reads before they have one, and whose exemption `static_route` states - and no web page picks up a
+//! bearer token by accident.
 //!
 //! Everything here is in memory, behind a [`Mutex`] with nothing slow inside it, because of two
 //! facts about how it is used. fbt-api calls [`Authenticator::authorize`] synchronously on the
@@ -87,6 +89,34 @@ fn login_route(method: &Method, matched_path: Option<&str>) -> bool {
     LOGIN_ROUTES
         .iter()
         .any(|(route, path)| route == method && matched_path == Some(path))
+}
+
+/// The matched-path templates of the browser UI's own routes: the page, the icon it names, and the
+/// built files under `/assets/`. They are written as templates because that is what is compared, the
+/// same reason [`STREAM_ROUTE`] is spelled with `{id}` in it.
+#[cfg(feature = "web-ui")]
+const STATIC_TEMPLATES: [&str; 3] = ["/", "/favicon.png", "/assets/{*path}"];
+
+/// Whether `(method, matched_path)` names one of the browser UI's files: `GET` and `HEAD` only, because
+/// those are the two a route built with `routing::get` answers, and by exact equality with the template
+/// it is mounted at, for the same reason [`login_route`] refuses a suffix match.
+///
+/// The page is where the sign-in form is, so it cannot ask for a session first: a page that answered
+/// `401` to somebody who has not signed in could never be signed in to. The built files are exempt for
+/// the same reason one step later - a browser has to load them to draw the form at all - and a file
+/// under `/assets/` that turns out not to exist still has to reach its own `404` rather than answer
+/// `401`, which is what matching on the template rather than on a file that was found gets right.
+///
+/// Only these templates, and only these two methods: `POST /` is not a way to change anything here and
+/// gets the credential check like any other path with no route on it. And a build with no front end -
+/// or one with it switched off - has no route that matches any of them, so this says nothing there and
+/// such a request keeps answering the way it always did.
+#[cfg(feature = "web-ui")]
+fn static_route(method: &Method, matched_path: Option<&str>) -> bool {
+    (*method == Method::GET || *method == Method::HEAD)
+        && STATIC_TEMPLATES
+            .iter()
+            .any(|path| matched_path == Some(path))
 }
 
 /// The authorization scheme a session token is presented in, matched without regard to case.
@@ -534,6 +564,14 @@ impl Authenticator for FbttAuth {
         if login_route(request.method, request.matched_path) {
             return Ok(());
         }
+        // The browser UI's own files, on the two methods that ask for a file: the page the sign-in form
+        // is on, and the script and stylesheet that draw it. See [`static_route`] for why these are open
+        // and for why nothing else is - and note that this is reached only with logins on, since the line
+        // above answers everything else when nobody has to sign in.
+        #[cfg(feature = "web-ui")]
+        if static_route(request.method, request.matched_path) {
+            return Ok(());
+        }
         // A stream token is a player's credential for one file, so it is tried first exactly where a player
         // could have been sent one: the two methods of the file-stream route, against the path it was issued
         // for, and only when there is no header for it to answer behind. Nowhere else - not
@@ -776,6 +814,88 @@ mod tests {
         let printed = format!("{auth:?}");
         assert!(!printed.contains("alice"), "{printed}");
         assert!(printed.contains("sessions"), "{printed}");
+    }
+
+    /// The browser UI's page and files are open to somebody who has not signed in, and how little that
+    /// costs is the point of the test: three templates, two methods, and everything else about this
+    /// server's rules unchanged. Over http the same rules are checked in `tests/web_ui.rs`; here they are
+    /// checked where they live, including the cases a browser does not send.
+    #[cfg(feature = "web-ui")]
+    #[test]
+    fn the_page_and_its_files_are_open_before_signing_in() {
+        let closed = FbttAuth::new(&server(true));
+        let none = HeaderMap::new();
+
+        // The templates the front end is mounted at, on the two methods a route built with
+        // `routing::get` answers. A built file that is not in the build still gets this far: the
+        // comparison is with the template it matched, and that one is the same whether the file was
+        // found or not, which is how a missing asset reaches its own `404` rather than a `401`.
+        for template in ["/", "/favicon.png", "/assets/{*path}"] {
+            for method in [&Method::GET, &Method::HEAD] {
+                assert!(
+                    closed
+                        .authorize(&request(method, Some(template), &none))
+                        .is_ok(),
+                    "{method} {template} is what a person reads before they have a session",
+                );
+            }
+        }
+
+        // A method those routes do not answer, and three paths that merely look like one of them: a
+        // template that ends where the page's does, one that stops short of the wildcard's slash, one
+        // that has the wildcard's template as a prefix of its own. The comparison is of whole templates
+        // for the same reason `login_route`'s is.
+        for (method, template) in [
+            (&Method::POST, "/"),
+            (&Method::OPTIONS, "/"),
+            (&Method::PUT, "/favicon.png"),
+            (&Method::GET, "/m/"),
+            (&Method::GET, "/assets"),
+            (&Method::GET, "/x/assets/{*path}"),
+        ] {
+            assert!(
+                matches!(
+                    closed.authorize(&request(method, Some(template), &none)),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{method} {template} is not one of the front end's files",
+            );
+        }
+
+        // A server with no front end on it - a headless build, or a full one with `server.web_ui: false` -
+        // answers `/` with no matched path at all. That request wants a credential exactly as it did
+        // before these routes existed: the exemption is of a template, and there is none here.
+        assert!(
+            matches!(
+                closed.authorize(&request(&Method::GET, None, &none)),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "no route matched, so nothing is exempt",
+        );
+
+        // With logins off none of this is reached: the name the request carries is the only credential
+        // there is, and it decides the page too. `tests/web_ui.rs` checks the same pair over http.
+        let open = FbttAuth::new(&server(false));
+        assert!(
+            open.authorize(&request(
+                &Method::GET,
+                Some("/"),
+                &headers("127.0.0.1:8090", None),
+            ))
+            .is_ok(),
+            "a page named by a place this server answers",
+        );
+        assert!(
+            matches!(
+                open.authorize(&request(
+                    &Method::GET,
+                    Some("/"),
+                    &headers("evil.example", None),
+                )),
+                Err(AuthRejection::Forbidden)
+            ),
+            "the page is open to whoever has a session, not to whoever has a name",
+        );
     }
 
     /// A stream token opens one file and nothing else: the two methods that fetch a file, on the exact path

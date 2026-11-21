@@ -18,11 +18,12 @@ workspace = true
 # library away from where its config points needs it in a release build too. The `server` test target below
 # requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
 test-support = []
-# The browser UI: this build carries the web front end and serves it beside the API. Empty for
-# now - the asset embed, the build script and the static routes arrive with web UI Task 4 - so
-# today this feature only says which build that is, which is what `featherbittorrent`'s own
-# `web-ui` feature and its version marker build on.
-web-ui = []
+# The browser UI: this build serves the built `web/dist` on the API's own origin. The release
+# executable carries the bytes; a debug build reads the folder from disk on each request, which is
+# what makes editing the front end without recompiling work and what makes a debug run whose
+# `web/dist` went away answer `500` where the shipped binary could not (`src/web.rs`'s module doc
+# says the same at more length). The headless build pays for neither.
+web-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 # The password hashes.
@@ -30,6 +31,18 @@ argon2.workspace = true
 # The routes: `Router`, the body and query extractors, and the `http` types an `AuthRequest` carries.
 # fbt-api turns the serving half on for the tree; these are the parts our own code names.
 axum = { workspace = true, features = ["json", "query"] }
+# The built front end. Only with `web-ui`: the headless build carries no assets, and `build.rs` skips
+# the change-tracking line for it, so a missing `web/dist` is not even an error there.
+#
+# `default-features = false` is spelled out because the feature worth deciding is `debug-embed`, and
+# it is not asked for: `rust-embed` 8.14 declares no `default` in its `[features]`, and with
+# `debug-embed` off its derive keeps the bytes behind `cfg(not(debug_assertions))` and a
+# disk-reading implementation behind `cfg(debug_assertions)`, which is the pair the feature comment
+# above and `src/web.rs`'s module doc describe.
+rust-embed = { workspace = true, optional = true, default-features = false }
+# What type an asset is served as, from its extension. Vite hashes the names but keeps the
+# extensions, and the hash is exactly why the extension is the only thing left to ask.
+mime_guess = { workspace = true, optional = true }
 # Session tokens and challenge nonces, spelled in base64.
 base64.workspace = true
 # `fbt::display_safe`, because a folder name or a config device name is remote text by the time a
