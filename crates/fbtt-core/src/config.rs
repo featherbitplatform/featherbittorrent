@@ -9,6 +9,9 @@
 //! listens, which folders its API may name, and whether anyone has to sign in; it is
 //! written only by a run that chose to serve (`serve`, the setup wizard, `user` or
 //! `device`), so a config the TUI saves for itself carries none - see [`Config::server`].
+//! A full build's browser UI follows this section too: [`ServerConfig::web_ui_on`] is the
+//! question the server asks it, and [`web_ui_env_override`] says how `FBTT_WEB_UI` can
+//! overrule the file before that question is asked.
 //! A file that cannot be parsed does not stop the app. It runs on this library's defaults, and
 //! the file it could not read is kept aside as `config.yaml.bad` so the next save cannot
 //! overwrite what we never understood.
@@ -45,6 +48,9 @@ const MIB: u64 = 1024 * 1024;
 const MAX_PLAYER_ARGS: usize = 32;
 /// The most bytes a single extra argument may be, for the same reason.
 const MAX_PLAYER_ARG_BYTES: usize = 1024;
+
+/// The name of the one environment variable `serve` reads about the browser UI.
+const WEB_UI_ENV: &str = "FBTT_WEB_UI";
 
 /// What can go wrong finding, reading or writing the config.
 #[derive(Debug, Error)]
@@ -144,6 +150,30 @@ pub enum LogoSetting {
     Off,
 }
 
+/// Whether the browser session cookie carries the `Secure` flag.
+///
+/// `Auto` (the default) takes the flag from the request itself: `Secure` when it says it
+/// arrived over https, through `X-Forwarded-Proto` or `Forwarded`. A person behind a proxy
+/// that forwards neither header sets `Always` and says so, rather than having the cookie
+/// quietly drop the flag the browser needs to send it over plain http at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CookieSecure {
+    /// `Secure` when the request says it arrived over https, and not otherwise.
+    #[default]
+    Auto,
+    /// `Secure` whatever the request says.
+    Always,
+}
+
+impl CookieSecure {
+    /// Whether this is the default. `skip_serializing_if` uses it to keep a config that
+    /// never chose a cookie rule silent about one.
+    fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
 /// The running limits, in the units a person thinks in.
 ///
 /// A rate of 0 KiB/s is unlimited; a queue count of `None` is unlimited too.
@@ -180,7 +210,8 @@ impl Default for Limits {
 }
 
 /// Where `featherbittorrent serve` listens, which folders its API may name, which host names it answers
-/// when nobody signs in, and who has to sign in to use it.
+/// when nobody signs in, who has to sign in to use it, and whether the browser UI rides along on the
+/// API's own origin.
 ///
 /// The address decides the login rule ([`auth_on`](Self::auth_on)): a port on loopback is already
 /// reachable only by someone sitting at this machine, who owns the library anyway; a port on any
@@ -214,18 +245,34 @@ pub struct ServerConfig {
     pub allowed_hosts: Vec<String>,
     /// Whether login is on, and who may use it.
     pub auth: AuthConfig,
+    /// Whether `serve` also serves the browser UI, as far as the config gets a say.
+    ///
+    /// Left out of the file and `Some(true)` are both on; only `Some(false)` turns the UI off,
+    /// and [`ServerConfig::web_ui_on`] is the one question the server asks this value.
+    /// `FBTT_WEB_UI` can replace the file's answer before the server ever asks (see
+    /// [`web_ui_env_override`]). Which build has a UI to serve at all is the cargo feature
+    /// `web-ui` on `fbtt-server`, not something a config file can reach: a headless build
+    /// accepts this key, ignores what it says, and logs one line when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui: Option<bool>,
+    /// When the browser session cookie carries the `Secure` flag. See [`CookieSecure`].
+    #[serde(default, skip_serializing_if = "CookieSecure::is_auto")]
+    pub cookie_secure: CookieSecure,
 }
 
 impl Default for ServerConfig {
     /// Loopback on port 8090, the download folder as the only root (filled in by
     /// [`Config::resolve`]), no host names beside `localhost` and an address (logins are on off-loopback
-    /// anyway), and login left to [`ServerConfig::auth_on`] to decide.
+    /// anyway), login left to [`ServerConfig::auth_on`] to decide, the browser UI left on by silence and
+    /// the cookie rule left to `auto` - so a fresh section writes neither of those keys.
     fn default() -> Self {
         ServerConfig {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_SERVER_PORT)),
             allowed_roots: Vec::new(),
             allowed_hosts: Vec::new(),
             auth: AuthConfig::default(),
+            web_ui: None,
+            cookie_secure: CookieSecure::default(),
         }
     }
 }
@@ -238,6 +285,33 @@ impl ServerConfig {
     /// explicit `enabled: false`, not something a missing field does by accident.
     pub fn auth_on(&self) -> bool {
         self.auth.enabled.unwrap_or(!self.bind.ip().is_loopback())
+    }
+
+    /// Whether the browser UI is served, as far as the config gets a say.
+    ///
+    /// Yes unless the config says `web_ui: false` - and `FBTT_WEB_UI`, when it names an answer,
+    /// has replaced the file's word before the server ever asks (see
+    /// [`web_ui_env_override`]). This is the only question a server asks these values; whether
+    /// *this build* has a UI to serve at all is the cargo feature `web-ui` on `fbtt-server`,
+    /// which no config value can turn on or off.
+    pub fn web_ui_on(&self) -> bool {
+        self.web_ui != Some(false)
+    }
+}
+
+/// The browser UI's environment switch: what `FBTT_WEB_UI` holds, or `None` when it holds
+/// nothing this understands. The words `0`, `false`, `off` and `no` mean off and `1`, `true`,
+/// `on` and `yes` mean on, both lists read case-insensitively; anything else - a stranger
+/// word, or no variable at all - is no answer rather than a guess, which leaves the config
+/// in charge. It takes the lookup as an argument so the decision can be tested with an
+/// environment handed in: the process's own is read at exactly one call site (`serve`'s
+/// `open` in the binary), so no test ever has to set anything.
+pub fn web_ui_env_override(env: &dyn Fn(&str) -> Option<String>) -> Option<bool> {
+    let value = env(WEB_UI_ENV)?;
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
     }
 }
 
@@ -773,8 +847,9 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, DOWNLOADS_DIR_NAME, Limits, LogoSetting,
-        PlayerConfig, ServerConfig, UserEntry, suffixed, user_download_dir,
+        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, CookieSecure, DOWNLOADS_DIR_NAME, Limits,
+        LogoSetting, PlayerConfig, ServerConfig, UserEntry, suffixed, user_download_dir,
+        web_ui_env_override,
     };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
@@ -1233,6 +1308,7 @@ mod tests {
                     }],
                     devices: Vec::new(),
                 },
+                ..ServerConfig::default()
             }),
             ..Config::default()
         };
@@ -1243,6 +1319,153 @@ mod tests {
             ConfigLoad::Loaded(loaded) => assert_eq!(loaded, with_users),
             other => panic!("expected the saved server back, got {other:?}"),
         }
+    }
+
+    /// The browser UI is on unless somebody turns it off. A config that says nothing about it
+    /// leaves [`ServerConfig::web_ui_on`] answering yes, which is what a full build's `serve`
+    /// does with it, and the file stays silent about a choice nobody made.
+    #[test]
+    fn web_ui_is_on_by_default() {
+        let defaults = ServerConfig::default();
+        assert_eq!(
+            defaults.web_ui, None,
+            "the file names the switch only when somebody chooses: {:?}",
+            defaults.web_ui
+        );
+        assert!(
+            defaults.web_ui_on(),
+            "a server serves the browser UI unless the config turns it off"
+        );
+    }
+
+    /// `web_ui: false` is the only word that turns the browser UI off, and it has to be said:
+    /// an absence is yes, and `Some(true)` only spells out what silence already meant.
+    #[test]
+    fn the_config_turns_the_web_ui_off() {
+        let off = ServerConfig {
+            web_ui: Some(false),
+            ..ServerConfig::default()
+        };
+        assert!(!off.web_ui_on(), "`web_ui: false` turns the browser UI off");
+        let on = ServerConfig {
+            web_ui: Some(true),
+            ..ServerConfig::default()
+        };
+        assert!(
+            on.web_ui_on(),
+            "`web_ui: true` is the default spelled out, not a change"
+        );
+    }
+
+    /// The words `FBTT_WEB_UI` takes, and only these: the off words mean off, the on words mean
+    /// on, case-insensitively, and anything else - a stranger word, or no variable at all - is
+    /// no answer, which leaves the config in charge. See [`web_ui_env_override`].
+    #[test]
+    fn the_environment_override_parses_its_words() {
+        let env = |value: &'static str| {
+            move |name: &str| (name == "FBTT_WEB_UI").then_some(value.to_string())
+        };
+        for word in ["0", "false", "off", "no"] {
+            assert_eq!(
+                web_ui_env_override(&env(word)),
+                Some(false),
+                "`{word}` means off"
+            );
+        }
+        for word in ["1", "true", "on", "yes"] {
+            assert_eq!(
+                web_ui_env_override(&env(word)),
+                Some(true),
+                "`{word}` means on"
+            );
+        }
+        // Case-insensitive: the same words spelled other ways answer the same.
+        for (word, want) in [
+            ("OFF", Some(false)),
+            ("False", Some(false)),
+            ("nO", Some(false)),
+            ("ON", Some(true)),
+            ("tRuE", Some(true)),
+            ("YeS", Some(true)),
+        ] {
+            assert_eq!(
+                web_ui_env_override(&env(word)),
+                want,
+                "`{word}` parses wrong"
+            );
+        }
+        // A word this does not take is no answer at all rather than a guess.
+        assert_eq!(
+            web_ui_env_override(&env("maybe")),
+            None,
+            "`maybe` is neither on nor off, so it says nothing"
+        );
+        // No variable at all is the same no-answer.
+        assert_eq!(
+            web_ui_env_override(&|_name| None),
+            None,
+            "an unset FBTT_WEB_UI says nothing"
+        );
+    }
+
+    /// The two new server keys round-trip: a file that names them reads as the config that
+    /// writes them back, with the same lines the file had; and a config that names neither
+    /// writes neither key, so a save never adds lines nobody chose.
+    #[test]
+    fn web_ui_and_cookie_secure_round_trip_in_yaml() {
+        let dir = ScratchDir::new("config_web_ui_round_trip");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        fs::write(&path, "server:\n  web_ui: false\n  cookie_secure: always\n")
+            .expect("write a config naming the two new keys");
+        let ConfigLoad::Loaded(chosen) = Config::load(&paths).expect("read the new keys") else {
+            panic!("a config naming the new keys is still a config");
+        };
+        let server = chosen.server.as_ref().expect("naming them gives a section");
+        assert_eq!(server.web_ui, Some(false), "`web_ui: false` reads as off");
+        assert_eq!(
+            server.cookie_secure,
+            CookieSecure::Always,
+            "`cookie_secure: always` reads as always"
+        );
+
+        // What that config saves, the next run reads back unchanged, and both keys are in the
+        // file the save wrote.
+        chosen.save(&path).expect("save the chosen config");
+        let written = fs::read_to_string(&path).expect("read the save back");
+        assert!(
+            written.contains("web_ui: false"),
+            "the switch is written back as the config has it: {written}"
+        );
+        assert!(
+            written.contains("cookie_secure: always"),
+            "the cookie rule is spelled in lowercase: {written}"
+        );
+        let ConfigLoad::Loaded(again) = Config::load(&paths).expect("read the save back") else {
+            panic!("the save wrote a config");
+        };
+        assert_eq!(again, chosen, "the round trip is the identity");
+
+        // And a config that chose neither key writes neither line: the default switch is on
+        // without saying so, and the default cookie rule is auto without saying so.
+        let quiet = Config {
+            server: Some(ServerConfig::default()),
+            ..Config::default()
+        }
+        .resolve(&paths);
+        quiet
+            .save(&path)
+            .expect("save a config that chose neither key");
+        let written = fs::read_to_string(&path).expect("read the silent save back");
+        assert!(
+            !written.contains("web_ui"),
+            "no switch line for a config that never chose one: {written}"
+        );
+        assert!(
+            !written.contains("cookie_secure"),
+            "no cookie line for the rule nobody changed: {written}"
+        );
     }
 
     /// A config that never chose to serve - which is what the TUI saves when somebody changes a rate or a

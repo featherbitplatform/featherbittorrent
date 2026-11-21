@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The release-safe CLI smoke, shared by every packaging smoke (dev/smoke-linux.sh, dev/package-macos.sh):
 # one binary, one scratch home, and nothing that reaches outside the machine. Checks in order, each failure a
-# clear line on stderr and exit 1: --version prints exactly `featherbittorrent <version>`; --help names serve,
+# clear line on stderr and exit 1: --version starts with `featherbittorrent <version>` (a build marker like
+# ` (headless)` or ` (full)` may follow the version, so that check matches by prefix); --help names serve,
 # user and device; serve --help shows none of the debug-only flags; serve --offline is refused with exit 2,
 # which is what proves the artifact is a release build; then user set with a piped password and user list
 # write and read back an argon2id login in the platform's own config directory, which holds the hash and not
@@ -59,11 +60,14 @@ fi
 # words are easier to read than mixed into the text being compared. The stdin they get is /dev/null, so running
 # this smoke by hand from a terminal cannot let a command reach for the keyboard.
 
-# 1. The version the artifact was built with, spelled the way the release page names it.
+# 1. The version the artifact was built with, spelled the way the release page names it. A build marker
+# may follow the version (` (headless)` or ` (full)`), so this check is a prefix one; the version argument
+# is refused above unless it is plain version characters, none of which bash treats as pattern syntax,
+# so only the trailing `*` below patterns.
 status=0; printed="$( "${scratch[@]}" "$bin" --version </dev/null )" || status=$?
 [[ $status -eq 0 ]] || fail "--version exited $status (expected 0): $(one_line "$printed")"
-[[ "$printed" == "featherbittorrent $version" ]] || fail "--version printed '$(one_line "$printed")', expected 'featherbittorrent $version'"
-echo "ok: --version prints featherbittorrent $version"
+[[ "$printed" == "featherbittorrent $version"* ]] || fail "--version printed '$(one_line "$printed")', expected output starting with 'featherbittorrent $version'"
+echo "ok: --version starts with featherbittorrent $version"
 
 # 2. Help that names what the binary can do. Word boundaries, because a help text about a "server" is not one
 # that mentions the serve subcommand.

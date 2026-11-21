@@ -59,9 +59,20 @@ EXIT STATUS:
   holds this library.
 "#;
 
+/// What `--version` prints: the workspace version, and which of the two builds this binary is.
+/// The `web-ui` build carries the browser UI and says `(full)`; the build without it is today's
+/// binary and says `(headless)`. The packaging smokes match the `featherbittorrent <version>`
+/// prefix of this line (see `dev/smoke-cli.sh`), so the marker is not part of what a version
+/// mismatch is judged on - which build shipped is.
+const VERSION: &str = if cfg!(feature = "web-ui") {
+    concat!(env!("CARGO_PKG_VERSION"), " (full)")
+} else {
+    concat!(env!("CARGO_PKG_VERSION"), " (headless)")
+};
+
 /// BitTorrent client for the terminal.
 #[derive(Parser)]
-#[command(name = "featherbittorrent", version, after_long_help = LONG_HELP_AFTER)]
+#[command(name = "featherbittorrent", version = VERSION, after_long_help = LONG_HELP_AFTER)]
 struct Cli {
     /// What to run. With nothing, the terminal client.
     #[command(subcommand)]

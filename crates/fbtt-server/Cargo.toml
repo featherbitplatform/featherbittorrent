@@ -18,6 +18,11 @@ workspace = true
 # library away from where its config points needs it in a release build too. The `server` test target below
 # requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
 test-support = []
+# The browser UI: this build carries the web front end and serves it beside the API. Empty for
+# now - the asset embed, the build script and the static routes arrive with web UI Task 4 - so
+# today this feature only says which build that is, which is what `featherbittorrent`'s own
+# `web-ui` feature and its version marker build on.
+web-ui = []
 
 [dependencies]
 # The password hashes.

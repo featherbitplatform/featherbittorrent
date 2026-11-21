@@ -203,10 +203,12 @@ case "$format" in
 esac
 check_no_service_state
 
-# 5. The shared CLI smoke, run against whatever this format put in front of us: --version, the help texts,
-# serve --offline refused with exit 2 (the release-build proof) and a login written and read back through
-# the platform's own paths. Its last two lines are the version and the config file it created; the config
-# path is kept for step 7. Output goes to a file first so a failure still shows every line it printed.
+# 5. The shared CLI smoke, run against whatever this format put in front of us: --version matched by prefix
+# against this run's version (the binary may print a build marker after it, ` (headless)` or ` (full)`),
+# the help texts, serve --offline refused with exit 2 (the release-build proof) and a login written and
+# read back through the platform's own paths. Its last two lines are the version and the config file it
+# created; the config path is kept for step 7. Output goes to a file first so a failure still shows every
+# line it printed.
 rm -rf "$scratch_home"
 mkdir -p "$scratch_home"
 cli_log="$(mktemp)" || fail "could not make a temporary file for dev/smoke-cli.sh's output"

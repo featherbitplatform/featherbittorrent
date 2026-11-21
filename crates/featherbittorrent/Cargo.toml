@@ -11,6 +11,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The full build: `serve` answers the browser UI on the API's origin beside the API itself, and
+# `--version` says `(full)`. Without this feature the binary is the headless one, today's build,
+# and says `(headless)`. The feature is off by default so a plain `cargo build -p
+# featherbittorrent` stays the headless artifact; the release ships both (plan
+# 2026-11-21-web-ui-milestone-1).
+web-ui = ["fbtt-server/web-ui"]
+
 [dependencies]
 # `string` is for `assets.rs`: it builds a command again from the name and text of one that was already
 # built, and those are owned strings rather than `'static` literals.

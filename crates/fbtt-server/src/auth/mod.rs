@@ -466,6 +466,7 @@ mod tests {
                 users: Vec::new(),
                 devices: Vec::new(),
             },
+            ..ServerConfig::default()
         }
     }
 

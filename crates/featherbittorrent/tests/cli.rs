@@ -7,16 +7,25 @@ use std::time::{Duration, Instant};
 
 use fbtt_core::{Config, LibraryLock};
 
+/// `--version` names the binary, its version, and which build this is. The marker comes from
+/// the same feature that decides what the run serves (`web-ui` is the full build), and the
+/// test target is compiled with exactly the features its binary was built with, so the two
+/// agree here in both builds.
 #[test]
-fn version_prints_name_and_version() {
+fn version_prints_name_version_and_build() {
     let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
         .arg("--version")
         .output()
         .unwrap();
     assert!(out.status.success());
+    let marker = if cfg!(feature = "web-ui") {
+        "(full)"
+    } else {
+        "(headless)"
+    };
     assert_eq!(
         String::from_utf8(out.stdout).unwrap().trim(),
-        format!("featherbittorrent {}", env!("CARGO_PKG_VERSION"))
+        format!("featherbittorrent {} {}", env!("CARGO_PKG_VERSION"), marker)
     );
 }
 
