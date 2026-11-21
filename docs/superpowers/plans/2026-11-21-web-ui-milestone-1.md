@@ -34,8 +34,8 @@ Everything in `CLAUDE.md` applies, plus these:
 - **Off switch.** A full build's `serve` serves the web UI unless `server.web_ui: false` is in the config or `FBTT_WEB_UI=0` is in the environment. The environment wins over the file. A headless build accepts `server.web_ui`, ignores it, and logs one line when it is set. **[owner]**
 - **Browser sessions.**
   - An HttpOnly cookie `fbtt_session`, with `SameSite=Strict` and `Path=/`.
-  - It is `Secure` when the request came over https (`X-Forwarded-Proto: https`).
-  - `Max-Age` is the session's lifetime.
+  - It is `Secure` per `server.cookie_secure`: `always`, or under `auto` when `X-Forwarded-Proto` or `Forwarded` says https.
+  - `Max-Age` is 7 days, and the server's session expiry decides.
   - Every state-changing request (any method but GET, HEAD and OPTIONS) authenticated by the cookie must carry `X-CSRF-Token` equal to that session's CSRF token. The comparison is constant-time.
   - No session token is ever readable by script. **[owner: cookie]**
 - **Unchanged paths.** Bearer headers, query tokens and stream tokens keep working exactly as now for the TUI and players. A request with an `Authorization` header never falls back to the cookie.
