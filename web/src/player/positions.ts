@@ -33,7 +33,8 @@ export function positionKey(id: string, file: number): string {
 export function loadPosition(id: string, file: number): number | null {
   try {
     const stored = storage().getItem(positionKey(id, file))
-    if (stored === null) return null
+    // An empty string is not a position: `Number('')` is `0`, and a file would be reopened at the start.
+    if (stored === null || stored === '') return null
     const seconds = Number(stored)
     return Number.isFinite(seconds) && seconds >= 0 ? seconds : null
   } catch {
@@ -48,6 +49,8 @@ export function loadPosition(id: string, file: number): number | null {
 export function savePosition(id: string, file: number, seconds: number, duration: number): void {
   const key = positionKey(id, file)
   try {
+    // A position that is not a number is not written: `String(NaN)` would store a word, not a time.
+    if (!Number.isFinite(seconds)) return
     if (duration > 0 && seconds >= duration - FINISHED_WITHIN) {
       storage().removeItem(key)
       return

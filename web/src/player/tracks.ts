@@ -75,7 +75,8 @@ export function chooseTracks(
 
   const video = probe.tracks.find((track) => track.kind === 'video')
   if (video === undefined) {
-    return { kind: 'unplayable', codec: 'video' }
+    // There is no video to name; the first track, or none at all, is what the message can show.
+    return { kind: 'unplayable', codec: probe.tracks[0]?.codec ?? 'unknown' }
   }
 
   const videoMime = remuxMime(video, supported)

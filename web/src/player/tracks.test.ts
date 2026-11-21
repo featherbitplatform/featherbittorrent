@@ -71,13 +71,33 @@ it('plays_a_vp9_webm_natively', () => {
   expect(choice, 'a VP9 WebM was not played natively').toEqual({ kind: 'native' })
 })
 
-it('refuses_a_webm_the_browser_cannot_play_natively', () => {
-  const av1 = track({ id: 1, kind: 'video', codec: 'av01', mime_codecs: [], default: true })
+it('remuxes_a_vp9_webm_when_the_browser_refuses_webm', () => {
+  const vp9 = track({ id: 1, kind: 'video', codec: 'vp9', mime_codecs: ['vp09.00.10.08'], default: true })
+  const choice = chooseTracks(probe({ container: 'webm', tracks: [vp9] }), chromeSupports, canPlayNothing)
+  expect(choice.kind, 'a VP9 WebM the browser cannot play natively was not remuxed').toBe('remux')
+  if (choice.kind !== 'remux') return
+  expect(choice.videoMime, 'the VP9 video was not remuxed to the mp4 form').toBe('video/mp4; codecs="vp09.00.10.08"')
+})
+
+it('remuxes_an_av1_webm_instead_of_playing_it_natively', () => {
+  const av1 = track({ id: 1, kind: 'video', codec: 'av01', mime_codecs: ['av01.0.04M.08'], default: true })
   const choice = chooseTracks(probe({ container: 'webm', tracks: [av1] }), chromeSupports, canPlayWebm)
-  expect(choice, 'a WebM outside the native codecs was not claimed native').toEqual({
+  expect(choice.kind, 'an AV1 WebM was claimed native where it is not a native codec').toBe('remux')
+  if (choice.kind !== 'remux') return
+  expect(choice.videoMime, 'the AV1 video was not remuxed to the mp4 form').toBe('video/mp4; codecs="av01.0.04M.08"')
+})
+
+it('names_the_codec_of_a_file_without_video', () => {
+  const audioOnly = track({ id: 1, kind: 'audio', codec: 'opus', mime_codecs: ['opus'], default: true })
+  const choice = chooseTracks(probe({ tracks: [audioOnly] }), chromeSupports, canPlayNothing)
+  expect(choice, 'a file with no video was not named by a codec it does not have').toEqual({
     kind: 'unplayable',
-    codec: 'av01',
+    codec: 'opus',
   })
+  expect(
+    chooseTracks(probe({ tracks: [] }), chromeSupports, canPlayNothing),
+    'a file with no tracks was not named by a made-up codec',
+  ).toEqual({ kind: 'unplayable', codec: 'unknown' })
 })
 
 it('prefers_the_audio_track_the_person_chose', () => {

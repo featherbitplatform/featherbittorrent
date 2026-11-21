@@ -30,9 +30,8 @@ it('evicts_only_what_lies_far_behind_the_playhead', () => {
   expect(evictRanges([[0, 200]], 100), 'a range across the keep line was not cut to it').toEqual([[0, 40]])
   expect(
     evictRanges([[0, 30], [50, 60], [80, 200]], 100),
-    'a range that does not cross the keep line was evicted',
-  ).toEqual([])
-  expect(evictRanges([[100, 200]], 100), 'a range that only touches the keep line was evicted').toEqual([])
-  expect(evictRanges([[0, 200]], 0), 'a range fully behind the playhead was kept').toEqual([])
+    'a range wholly behind the keep line was not evicted, or one across it was not cut to it',
+  ).toEqual([[0, 30]])
+  expect(evictRanges([[100, 200]], 100), 'a range that starts at the keep line was evicted').toEqual([])
   expect(evictRanges([], 100), 'nothing buffered evicts nothing').toEqual([])
 })

@@ -180,6 +180,15 @@ const TORRENTS = '/api/v1/torrents'
 const MEDIA = '/api/v1/media'
 const STREAM_TOKENS = '/api/v1/stream-tokens'
 
+/**
+ * A time the query string carries, in whole source milliseconds: the wire names them as non-negative
+ * integers, so a fractional, negative, or non-finite value is clamped to the whole number it means
+ * rather than sent as a number the route would refuse.
+ */
+function wholeMs(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
 /** The document's own JSON shape for a magnet add, named once so the method below says what it sends. */
 type AddTorrentRequest = components['schemas']['AddTorrentRequest']
 
@@ -293,7 +302,7 @@ export function createClient(
     cues: (id, file, track, fromMs, toMs) =>
       json(
         `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/cues` +
-          `?from_ms=${encodeURIComponent(fromMs)}&to_ms=${encodeURIComponent(toMs)}`,
+          `?from_ms=${encodeURIComponent(wholeMs(fromMs))}&to_ms=${encodeURIComponent(wholeMs(toMs))}`,
         'GET',
       ),
     subtitleFile: (id, file, sub) =>
@@ -302,11 +311,14 @@ export function createClient(
     // answer names; it already carries `?token=` when a token came with it, and nothing else to add.
     streamToken: async (id, file) => {
       const body = JSON.stringify({ torrent: id, file } satisfies { torrent: string; file: number })
-      const answer = (await json(STREAM_TOKENS, 'POST', body, 'application/json')) as { path: string }
+      const answer = (await json(STREAM_TOKENS, 'POST', body, 'application/json')) as { path?: string }
+      if (typeof answer.path !== 'string') {
+        throw new Error('the stream token answer had no path')
+      }
       return answer.path
     },
     mediaStreamUrl: (id, file, track, startMs) =>
-      `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(startMs)}`,
+      `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(wholeMs(startMs))}`,
   }
 }
 

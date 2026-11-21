@@ -19,6 +19,15 @@ it('asks_for_a_window_from_the_first_unfetched_point_inside_its_horizon', () => 
   ).toEqual([61000, 121000])
 })
 
+it('fills_a_gap_before_a_later_window', () => {
+  // A later fetched window must not make the point skip the gap before it: the window that fills
+  // the gap starts where the first window ends, not at the end of the later one.
+  expect(
+    nextWindow(50000, [[0, 61000], [200000, 260000]]),
+    'the gap before a later window was skipped, and nothing would ever load it',
+  ).toEqual([61000, 121000])
+})
+
 it('refuses_to_fetch_beyond_its_horizon', () => {
   expect(
     nextWindow(1000, [[0, 61000], [61000, 121000], [121000, 181000]]),

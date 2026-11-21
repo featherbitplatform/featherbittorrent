@@ -23,17 +23,25 @@ const AHEAD_MS = 20_000
  * The next window to fetch, or null when there is no point to fetch from yet: the first source
  * millisecond inside `AHEAD_MS` of `currentMs` that no window in `fetched` covers. The window it
  * returns covers that point for `WINDOW_MS` and nothing before it is asked for twice.
+ *
+ * The start walks forward from the playhead: wherever a fetched window still covers the point, the
+ * point moves to that window's end, so a gap before a later window is reached rather than skipped.
  */
 export function nextWindow(currentMs: number, fetched: [number, number][]): [number, number] | null {
   const horizon = currentMs + AHEAD_MS
-  const start =
-    fetched
-      .filter(([, end]) => end > currentMs)
-      .map(([, end]) => end)
-      .reduce((latest, end) => Math.max(latest, end), 0)
-  const from = Math.max(currentMs, start)
-  if (from > horizon) return null
-  return [from, from + WINDOW_MS]
+  let point = currentMs
+  let advanced = true
+  while (advanced) {
+    advanced = false
+    for (const [start, end] of fetched) {
+      if (start <= point && point < end) {
+        point = end
+        advanced = true
+      }
+    }
+  }
+  if (point > horizon) return null
+  return [point, point + WINDOW_MS]
 }
 
 /** The key of a cue: what makes two fetched cues the same cue. */

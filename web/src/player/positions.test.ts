@@ -89,6 +89,17 @@ it('saves_nothing_below_the_minimum', () => {
   ).toBeNull()
 })
 
+it('refuses_a_position_that_is_not_a_number', () => {
+  savePosition(ID, FILE, Number.NaN, DURATION)
+  expect(
+    fake?.getItem(positionKey(ID, FILE)),
+    'a NaN position was written to storage',
+  ).toBeNull()
+
+  fake?.setItem(positionKey(ID, FILE), '')
+  expect(loadPosition(ID, FILE), 'an empty stored position was read as the start of the file').toBeNull()
+})
+
 it('clears_a_position_when_the_file_is_done', () => {
   savePosition(ID, FILE, 120, DURATION)
   savePosition(ID, FILE, DURATION - 10, DURATION)

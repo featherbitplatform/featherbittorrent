@@ -35,8 +35,9 @@ export function createReadGate(): (bufferedAheadSeconds: number) => boolean {
 }
 
 /**
- * The buffered ranges that lie more than `EVICT_BEHIND` seconds behind `currentTime`, ready to be
- * removed. Ranges that still touch the keep window are shortened to it, and the rest are dropped.
+ * What lies more than `EVICT_BEHIND` seconds behind `currentTime`, ready to be removed. A range
+ * wholly behind the keep line is evicted whole; one that crosses it is shortened to it; one that
+ * starts at or after it is kept.
  */
 export function evictRanges(
   buffered: [number, number][],
@@ -45,8 +46,8 @@ export function evictRanges(
   const keepFrom = currentTime - EVICT_BEHIND
   const dropped: [number, number][] = []
   for (const [start, end] of buffered) {
-    if (start < keepFrom && end > keepFrom) {
-      dropped.push([start, keepFrom])
+    if (start < keepFrom) {
+      dropped.push([start, Math.min(end, keepFrom)])
     }
   }
   return dropped
