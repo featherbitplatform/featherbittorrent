@@ -8,7 +8,8 @@
 //! libraries" rule asks of it.
 //!
 //! Everything a file claims is treated as untrusted: sizes are bounded by [`CappedLen`] and
-//! [`ELEMENT_CAP`], and a file that lies about itself yields a [`MediaError`], never a panic.
+//! [`ELEMENT_CAP`], the calls a header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], and a
+//! file that lies about itself yields a [`MediaError`], never a panic.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +17,7 @@ pub mod capped;
 pub mod codec;
 pub mod probe;
 
-pub use capped::{CappedLen, ReadBudget};
+pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind};
 pub use probe::{MediaInfo, TrackInfo, probe};
 

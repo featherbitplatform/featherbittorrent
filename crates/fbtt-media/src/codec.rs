@@ -208,14 +208,17 @@ pub(crate) fn mp4_codec(entry: &atom::Codec) -> (Codec, Vec<String>) {
             let dec = &entry.esds.es_desc.dec_config;
             let object_type = dec.object_type_indication;
             match object_type {
-                // AAC of any object type: MPEG-4, and the MPEG-2 backwards compatible ones.
+                // AAC of any object type: MPEG-4, and the MPEG-2 backwards compatible ones. A
+                // descriptor with no `DecoderSpecificInfo` still names a codec, so it gets the
+                // string AAC-LC carries in practice rather than none: `mime_codecs` is empty only
+                // for codecs fbtt does not remux, and this one it does.
                 0x40 | 0x66 | 0x67 | 0x68 => (
                     Codec::Aac,
                     dec.dec_specific
                         .as_ref()
                         .and_then(|specific| audio_specific_config_string(&specific.raw))
                         .map(|string| vec![string])
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| vec!["mp4a.40.2".to_string()]),
                 ),
                 // MPEG Layer III, and its MPEG-1 source.
                 0x6b => (Codec::Mp3, vec!["mp4a.6B".to_string()]),
@@ -467,11 +470,35 @@ mod tests {
         assert!(!codec.remuxable(), "nothing remuxes 0xDD");
         assert!(strings.is_empty(), "so a manifest has nothing to name");
 
-        // AAC whose descriptor carries no config: still AAC, but the file never
-        // stated an object type, so there is no string to hand a browser.
+        // AAC whose descriptor carries no config: still AAC, and still a codec fbtt
+        // remuxes, so the string AAC-LC carries in practice goes with it.
         let (codec, strings) = mp4_codec(&mp4a(0x40, None));
         assert_eq!(codec, Codec::Aac);
-        assert!(strings.is_empty(), "no config, no object type, no string");
+        assert_eq!(
+            strings,
+            ["mp4a.40.2"],
+            "no config is not an empty manifest list"
+        );
+    }
+
+    /// A descriptor that names AAC but holds no `DecoderSpecificInfo`.
+    ///
+    /// `TrackInfo::mime_codecs` is empty only for codecs fbtt does not remux, and an
+    /// `mp4a` without a config is still remuxable AAC, so it gets the object type
+    /// such files carry in practice, AAC-LC, rather than nothing a browser can name.
+    #[test]
+    fn mp4a_aac_without_config_is_lc() {
+        let (codec, strings) = mp4_codec(&mp4a(0x40, None));
+        assert_eq!(codec, Codec::Aac);
+        assert!(
+            codec.remuxable(),
+            "the track is still AAC an fMP4 can carry"
+        );
+        assert_eq!(
+            strings,
+            ["mp4a.40.2"],
+            "AAC-LC, what a configless descriptor means in practice"
+        );
     }
 
     /// A zero `general_profile_compatibility_flags` is printed as `0`, not dropped.

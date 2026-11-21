@@ -19,7 +19,8 @@ use std::thread;
 use std::time::Duration;
 
 use fbtt_media::{
-    CappedLen, Codec, Container, ELEMENT_CAP, MediaError, MediaInfo, ReadBudget, TrackKind, probe,
+    CappedLen, Codec, Container, ELEMENT_CAP, MAX_HEADER_OPS, MediaError, MediaInfo, ReadBudget,
+    TrackKind, probe,
 };
 use serde_json::Value;
 
@@ -659,10 +660,11 @@ fn probe_seek_position_overflow_is_malformed() {
 
     match probe(Cursor::new(matroska_file(&head))) {
         Ok(info) => panic!("a SeekPosition of 0xFFFFFFFFFFFFFFF0 was accepted: {info:?}"),
-        Err(MediaError::Malformed(what)) => assert_eq!(
-            what, "matroska header",
-            "an addition that overflows inside the header parse is reported as a malformed header"
-        ),
+        // What the file gets is a refusal either way: the debug build catches the overflowing
+        // add and reports "matroska header", and a release build wraps it and refuses whatever
+        // position the wrapped sum lands on. Accept any Malformed; a panic escaping the open or
+        // an acceptance of the file is what this test is about, and both still fail here.
+        Err(MediaError::Malformed(_)) => {}
         Err(error) => panic!(
             "a SeekPosition that overflows the offset arithmetic is Malformed, got {error:?}"
         ),
@@ -672,26 +674,19 @@ fn probe_seek_position_overflow_is_malformed() {
 /// A `SeekHead` whose only entry names the `SeekHead` it sits in, at its own position.
 ///
 /// The loop at `lib.rs:1893-1925` re-reads the head an entry names and then the entries of the
-/// head it queued, so an entry naming its own head has no exit and nothing about it is illegal:
-/// only the read budget ends it, because every pass through it reads bytes.
+/// head it queued, so an entry naming its own head has no exit and nothing about it is illegal.
+/// It is also cheap per pass: the whole file is about fifty bytes, a pass reads a few dozen of
+/// them, and a byte budget of [`ELEMENT_CAP`] alone would allow around 520 million passes before
+/// it said no, which is hours on a blocking reader. The call budget is what ends this: a
+/// [`ReadBudget`] counts [`MAX_HEADER_OPS`] read and seek calls beside its bytes.
 ///
-/// The head carries a `DocType` string claiming 200 MiB, which the demuxer reads on every pass.
-/// Without something that big to read, a pass costs a dozen bytes of element headers, and
-/// [`ELEMENT_CAP`] spent a dozen bytes at a time is a hundred million passes, which is slow in a
-/// way that is indistinguishable from the hang this test is about. It is run in a thread and given
-/// five seconds, because the failure mode being tested is one that never returns.
+/// Run in a thread with a five second channel timeout: the failure mode is a loop that does
+/// return, just far too slowly, and only a wall clock can tell that from one that does not.
 #[test]
 fn probe_self_referencing_seekhead_ends() {
-    let head = ebml(
-        &SEEK_HEAD,
-        &[
-            seek_entry(&SEEK_HEAD, 0),
-            ebml_declaring(&DOC_TYPE, TWO_HUNDRED_MIB, &[]),
-        ]
-        .concat(),
-    );
-    let read_so_far = Arc::new(AtomicU64::new(0));
-    let stream = LazyZeros::new(matroska_file(&head), FOUR_GIB, Arc::clone(&read_so_far));
+    let head = ebml(&SEEK_HEAD, &seek_entry(&SEEK_HEAD, 0));
+    let calls = Arc::new(AtomicU64::new(0));
+    let stream = CountCalls::new(Cursor::new(matroska_file(&head)), Arc::clone(&calls));
 
     let (tx, rx) = channel();
     thread::spawn(move || {
@@ -706,20 +701,63 @@ fn probe_self_referencing_seekhead_ends() {
                 !what.is_empty(),
                 "the refusal should say what it refused: {what}"
             );
-            let read = read_so_far.load(Ordering::Relaxed);
+            let calls = calls.load(Ordering::Relaxed);
+            // What the budget allows is MAX_HEADER_OPS CappedLen calls; what the reader under
+            // it counts is more, because one CappedLen::seek(End(0)) is about three calls there
+            // and a sniff or two comes free with the probe. Four times is the ceiling the
+            // shapes leave room for.
             assert!(
-                read <= ELEMENT_CAP + (1 << 20),
-                "the budget is what ends the loop, so {read} bytes read is more than it allows"
+                calls <= MAX_HEADER_OPS * 4,
+                "the call budget is what ends this loop, and {calls} inner calls is more than \
+                 {MAX_HEADER_OPS} CappedLen calls can make"
             );
         }
         Ok(Err(error)) => panic!("a budget spent inside a header read is Malformed, got {error:?}"),
         Err(RecvTimeoutError::Timeout) => panic!(
             "a SeekHead pointing at itself did not end within 5 seconds, which is the hang the \
-             read budget exists to end"
+             call budget exists to end"
         ),
         Err(RecvTimeoutError::Disconnected) => {
             panic!("the thread reading the self referencing SeekHead died instead of answering")
         }
+    }
+}
+
+/// 20000 `CuePoint`s, which is more than a 2 hour file with one a second carries.
+///
+/// `MatroskaFile::open` parses the whole `Cues` table the moment a `SeekHead` entry points at
+/// one (`lib.rs:1489`), and every cue point costs a handful of read and seek calls, so the call
+/// budget has to fit a cue heavy file with room to spare rather than merely refuse a looping
+/// one. The lower bound on the call count is the guard that this fixture really put a cue
+/// table in front of the parser: cues the file never shows it would pass this test on 50 calls.
+#[test]
+fn probe_many_cue_points_is_ok() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let file = matroska_file(&indexed_segment_with_cues(
+        &ebml(&TRACKS, &plain_track()),
+        20_000,
+    ));
+    let stream = CountCalls::new(Cursor::new(file), Arc::clone(&calls));
+
+    let outcome = probe(stream);
+    let calls = calls.load(Ordering::Relaxed);
+
+    match outcome {
+        Ok(info) => {
+            assert_eq!(
+                info.tracks.len(),
+                1,
+                "the one video track is still reported"
+            );
+            assert!(
+                calls >= 20_000,
+                "the cue table is parsed at open (lib.rs:1489), so {calls} calls says it was read"
+            );
+        }
+        Err(error) => panic!(
+            "20000 cue points are a fraction of the {MAX_HEADER_OPS} call budget, and the probe \
+             refused with {error} after {calls} calls"
+        ),
     }
 }
 
@@ -957,6 +995,35 @@ fn ebml_declaring(id: &[u8], declared: u64, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A reader that counts the `read` and `seek` calls made on it.
+///
+/// A byte counter cannot see a loop that reads thirty bytes at a time forever: the call budget
+/// is about how many times a file gets to ask, so the tests that bound calls count asks.
+struct CountCalls<R> {
+    inner: R,
+    calls: Arc<AtomicU64>,
+}
+
+impl<R> CountCalls<R> {
+    fn new(inner: R, calls: Arc<AtomicU64>) -> Self {
+        Self { inner, calls }
+    }
+}
+
+impl<R: Read> Read for CountCalls<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for CountCalls<R> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, IoError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.seek(pos)
+    }
+}
+
 /// The element ids these fixtures are assembled from, spelled as EBML spells them.
 const EBML_HEADER: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
 const SEGMENT: [u8; 4] = [0x18, 0x53, 0x80, 0x67];
@@ -979,6 +1046,12 @@ const MULTIPLEXING_APP: [u8; 2] = [0x4D, 0x80];
 const WRITE_APP: [u8; 2] = [0x57, 0x41];
 const TIMECODE_SCALE: [u8; 3] = [0x2A, 0xD7, 0xB1];
 const CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+const CUES: [u8; 4] = [0x1C, 0x53, 0xBB, 0x6B];
+const CUE_POINT: [u8; 1] = [0xBB];
+const CUE_TIME: [u8; 1] = [0xB3];
+const CUE_TRACK_POSITIONS: [u8; 1] = [0xB7];
+const CUE_TRACK: [u8; 1] = [0xF7];
+const CUE_CLUSTER_POSITION: [u8; 1] = [0xF1];
 
 /// The `EBMLHeader` every fixture in this file starts with.
 fn ebml_header() -> Vec<u8> {
@@ -1032,17 +1105,22 @@ fn seek_entry(id: &[u8], at: u64) -> Vec<u8> {
     )
 }
 
+/// A `SeekHead` naming `entries`, each an element id and the position it sits at.
+fn seek_head_named(entries: &[(&[u8], u64)]) -> Vec<u8> {
+    let body: Vec<u8> = entries
+        .iter()
+        .flat_map(|(id, at)| seek_entry(id, *at))
+        .collect();
+    ebml(&SEEK_HEAD, &body)
+}
+
 /// A `SeekHead` pointing at the three top level elements `open` indexes by name.
 fn seek_head(tracks_at: u64, info_at: u64, cluster_at: u64) -> Vec<u8> {
-    ebml(
-        &SEEK_HEAD,
-        &[
-            seek_entry(&TRACKS, tracks_at),
-            seek_entry(&INFO, info_at),
-            seek_entry(&CLUSTER, cluster_at),
-        ]
-        .concat(),
-    )
+    seek_head_named(&[
+        (&TRACKS, tracks_at),
+        (&INFO, info_at),
+        (&CLUSTER, cluster_at),
+    ])
 }
 
 /// A `Segment` body: a `SeekHead` naming the three elements `open` looks up, then those elements.
@@ -1075,6 +1153,79 @@ fn indexed_segment(tracks: Vec<u8>) -> Vec<u8> {
     );
 
     [head, tracks, info, cluster].concat()
+}
+
+/// A `Segment` body whose `SeekHead` also names a `Cues` element: head, tracks, info, cluster,
+/// cues.
+///
+/// Same placeholder trick as [`indexed_segment`], with a fourth entry. It is load bearing that
+/// the head names `Cues`: `MatroskaFile::open` only parses the cue table when the head points at
+/// one (`lib.rs:1489`), and an unindexed cue table is a table the probe never reads. Every cue
+/// point carries fixed-width payloads, so the cue count changes the file's size but never the
+/// head's, which is what keeps the offsets knowable before the head is written.
+fn indexed_segment_with_cues(tracks: &[u8], cue_count: usize) -> Vec<u8> {
+    let info = info_element();
+    let cluster = cluster_element();
+
+    let placeholder = seek_head_named(&[(&TRACKS, 0), (&INFO, 0), (&CLUSTER, 0), (&CUES, 0)]);
+    let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
+    let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
+    let cluster_at = info_at + u64::try_from(info.len()).expect("Info under 4 GiB");
+    let cues_at = cluster_at + u64::try_from(cluster.len()).expect("Cluster under 4 GiB");
+
+    let head = seek_head_named(&[
+        (&TRACKS, tracks_at),
+        (&INFO, info_at),
+        (&CLUSTER, cluster_at),
+        (&CUES, cues_at),
+    ]);
+    assert_eq!(
+        head.len(),
+        placeholder.len(),
+        "a four entry SeekHead is its own length whatever its entries point at"
+    );
+
+    let cues = cues(cue_count, cluster_at);
+    [head, tracks.to_vec(), info, cluster, cues].concat()
+}
+
+/// A `Cues` element holding `count` `CuePoint`s at one second apart on track 1, each pointing at
+/// the cluster sitting at `cluster_at`.
+fn cues(count: usize, cluster_at: u64) -> Vec<u8> {
+    let mut points = Vec::new();
+    for index in 0..count {
+        let time = u64::try_from(index)
+            .expect("a cue count fits a u64")
+            .saturating_mul(1000);
+        let positions = ebml(
+            &CUE_TRACK_POSITIONS,
+            &[
+                ebml(&CUE_TRACK, &[1]),
+                ebml(&CUE_CLUSTER_POSITION, &cluster_at.to_be_bytes()),
+            ]
+            .concat(),
+        );
+        let point = ebml(
+            &CUE_POINT,
+            &[ebml(&CUE_TIME, &time.to_be_bytes()), positions].concat(),
+        );
+        points.extend_from_slice(&point);
+    }
+    ebml(&CUES, &points)
+}
+
+/// A `TrackEntry` carrying only what a video track needs to be a track.
+fn plain_track() -> Vec<u8> {
+    ebml(
+        &TRACK_ENTRY,
+        &[
+            ebml(&TRACK_NUMBER, &[1]),
+            ebml(&TRACK_UID, &[1]),
+            ebml(&TRACK_TYPE, &[1]),
+            ebml(&CODEC_ID, b"V_MPEG4/ISO/AVC"),
+        ]
+        .concat(),
+    )
 }
 
 /// A `TrackEntry` on a video track whose `CodecPrivate` claims `claim` bytes of data without

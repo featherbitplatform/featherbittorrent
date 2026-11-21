@@ -118,13 +118,15 @@ pub(crate) fn open_matroska<R: Read + Seek>(
     let wrapped = CappedLen::new(reader, ELEMENT_CAP, budget);
     // `open` takes the reader with it, so a panic in the middle of the parse drops the reader and
     // everything it had allocated, which is why unwinding here is safe to ignore.
+    // Relies on panics unwinding: a profile that sets panic = "abort" would undo this.
     match catch_unwind(AssertUnwindSafe(|| MatroskaFile::open(wrapped))) {
         Ok(opened) => opened.map_err(matroska_error),
         Err(_) => Err(MediaError::Malformed("matroska header".to_string())),
     }
 }
 
-/// The Matroska or WebM header, read by [`open_matroska`] under a budget of one element.
+/// The Matroska or WebM header, read by [`open_matroska`] under a budget of one element's bytes
+/// and [`MAX_HEADER_OPS`](crate::MAX_HEADER_OPS) calls.
 fn probe_matroska<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
     // One element's worth is the whole header's budget: the cap alone is per element, so a file
     // with eight tracks each claiming 200 MiB of `CodecPrivate` would read 1.6 GiB of the same
