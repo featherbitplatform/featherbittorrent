@@ -104,7 +104,13 @@ function Harness({ client, events }: { client: Api; events: string[] }) {
   return (
     <>
       <div role="status" aria-live="polite" />
-      <button ref={focusOnAttach} type="button">
+      <button
+        ref={focusOnAttach}
+        type="button"
+        onClick={() => {
+          setOpen(true)
+        }}
+      >
         Add torrent
       </button>
       {open && (
@@ -279,6 +285,17 @@ describe('the folder the torrent goes into', () => {
       rowPaths(container).join(','),
       'the folder picker drew a child folder under its bare name instead of the parent path joined with it',
     ).toBe('/downloads,/downloads/films,/downloads/music space')
+
+    // A child row draws the folder's own name - a row of parent paths is a row of truncations - and
+    // keeps the joined path where the server reads it: the tooltip, the data attribute, the request.
+    const childRow = container.querySelector('[data-folder="/downloads/music space"] span[title]')
+    const rootRow = container.querySelector('[data-folder="/downloads"] span[title]')
+    expect(
+      (childRow?.textContent ?? '') === 'music space' &&
+        (childRow?.getAttribute('title') ?? '') === '/downloads/music space' &&
+        (rootRow?.textContent ?? '') === '/downloads',
+      'a row did not draw the folder name with the full path kept in its tooltip',
+    ).toBe(true)
 
     // Opening that row asks the server about the joined path - never about the bare name - and the
     // names it answers with join the same way.
@@ -713,6 +730,30 @@ describe('the keyboard', () => {
     expect(
       screen.queryByRole('dialog') === null && document.activeElement === opener,
       'closing the add dialog did not give the focus back to the button that opened it',
+    ).toBe(true)
+  })
+
+  it('a_dialog_reopens_after_escape', async () => {
+    const { client } = server()
+    openDialog(client)
+    await flush()
+
+    // Chrome's Escape is the dialog's own close request: a cancelable `cancel` event on the element,
+    // and a native close unless the event is prevented. Answering it through the screen's `onClose`
+    // is what ends the dialog, so element and state go away together and the element is not left
+    // mounted, closed, and impossible to reopen.
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    await flush()
+    expect(screen.queryByRole('dialog'), 'the add dialog did not close when Escape asked it to').toBeNull()
+
+    // And the opener is the handle again: pressing it must mount a fresh dialog and `showModal()`
+    // it - the second click cannot nudge a stale value into opening a stale element.
+    fireEvent.click(screen.getByRole('button', { name: 'Add torrent' }))
+    await flush()
+    const reopened = screen.queryByRole('dialog')
+    expect(
+      reopened !== null && (reopened as HTMLDialogElement).open === true,
+      'the add dialog did not open again when the button that opens it was pressed a second time',
     ).toBe(true)
   })
 })

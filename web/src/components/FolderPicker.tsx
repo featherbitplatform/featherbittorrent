@@ -13,8 +13,12 @@
  * the server about `music space` and be told it is outside the allowed folders.
  *
  * The picked folder and everything above it stay open, so a pick is visible instead of remembered
- * somewhere off screen. The two notes the prototype draws are here too: `default` on the folder the
- * server picks when asked to choose, `allowed root` on a root that is browsable but is not that one.
+ * somewhere off screen. A child row draws the folder's own name - the parent path on the end of
+ * every row would leave nothing but "/var/.../media/music sp..." to read - and keeps the full path
+ * in the row's tooltip, its data attribute and the request, where a root row, having no parent to
+ * borrow one from, draws its whole path. The two notes the prototype draws are here too: `default`
+ * on the folder the server picks when asked to choose, `allowed root` on a root that is browsable
+ * but is not that one.
  *
  * @module components/FolderPicker
  */
@@ -52,6 +56,8 @@ function ancestorsOf(path: string): string[] {
 interface RowProps {
   client: Api
   path: string
+  /** What the row draws: a child's own name, a root's whole path (`roots()` gave no parent to trim one from). */
+  label: string
   depth: number
   /** The row is the server's default download folder. */
   isDefault: boolean
@@ -68,6 +74,7 @@ interface RowProps {
 function FolderRow({
   client,
   path,
+  label,
   depth,
   isDefault,
   isRoot,
@@ -128,7 +135,9 @@ function FolderRow({
         ) : (
           <Folder className="h-3.75 w-3.75 flex-none" aria-hidden="true" />
         )}
-        <span className="min-w-0 truncate font-mono text-[12px]">{displaySafe(path)}</span>
+        <span className="min-w-0 truncate font-mono text-[12px]" title={path}>
+          {displaySafe(label)}
+        </span>
         {note !== null && <span className="ml-auto flex-none text-[12px] text-muted">{note}</span>}
       </button>
       {open && error !== null && (
@@ -147,13 +156,15 @@ function FolderRow({
       {open && dirs !== null && dirs.length > 0 && (
         <ul role="list">
           {dirs.map((name: string) => {
-            // `list()` named the folder; only this join makes it a path the server recognises.
+            // `list()` named the folder; only this join makes it a path the server recognises. The
+            // row shows the name and keeps the joined path for the request, the tooltip and the key.
             const child = childPath(path, name)
             return (
               <FolderRow
                 key={child}
                 client={client}
                 path={child}
+                label={name}
                 depth={depth + 1}
                 isDefault={false}
                 isRoot={false}
@@ -257,6 +268,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
               key={root}
               client={client}
               path={root}
+              label={root}
               depth={0}
               isDefault={index === 0}
               isRoot

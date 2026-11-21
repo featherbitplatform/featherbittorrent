@@ -17,8 +17,9 @@
  * error that emptied the form made the person rebuild the thing they had just asked for.
  *
  * The dialog is a real `<dialog>`: `useModalDialog` opens it before paint, holds the keyboard inside
- * it, and hands the focus back to the header button that opened it when it goes away. Escape closes it
- * and asks the server nothing - and while its request is on the wire the dialog cannot be closed at
+ * it, and hands the focus back to the header button that opened it when it goes away. Escape arrives
+ * as the element's own close request and is answered through the screen's `onClose`, so the state
+ * and the element end together - and while its request is on the wire the dialog cannot be closed at
  * all, by Escape, by the close button or by Cancel, because the answer is still owed.
  *
  * @module components/AddTorrent
@@ -110,8 +111,10 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
   // twice. A ref is true the moment the request starts, and it is what Close, Cancel and Escape read.
   const submittingRef = useRef(false)
 
-  // Escape and the close X answer the way Cancel already does: not at all while a request is owed an
-  // answer. The ref, not the state, because the guard has to hold from the instant the request starts.
+  // The one way out: the close X, Cancel, and - through `useModalDialog`'s answer to the element's
+  // own `cancel` event - Escape all end here, in the screen's `onClose`, so the state that mounted
+  // this dialog is the state that unmounts it. The ref, not the state, because the guard has to hold
+  // from the instant the request starts.
   function requestClose(): void {
     if (submittingRef.current) return
     onClose()
@@ -329,7 +332,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
             Start paused
           </label>
           <div className="ml-auto flex items-center gap-2.5">
-            <Button variant="secondary" onClick={onClose} disabled={busy}>
+            <Button variant="secondary" onClick={requestClose} disabled={busy}>
               Cancel
             </Button>
             <Button type="submit" disabled={!canAdd}>
