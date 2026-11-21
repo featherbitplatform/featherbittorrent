@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-21
+
 ### Fixed
 
 - The featherbit mark no longer shows the first letters of the text header through it when it appears after startup: the cells under a mark that has just appeared are rewritten blank before the image is drawn over them, so there is no old text left for the transparent image to let through. The help screen's mark now sits on the help box's own colour instead of a darker rectangle in the middle of the box. ([#17](https://github.com/featherbitplatform/featherbittorrent/pull/17))
