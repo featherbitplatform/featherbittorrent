@@ -14,8 +14,9 @@
  * on the event stream or when the page comes back into view, and on a doubling pause when the
  * server stops answering - and while it backs off, nothing cuts in front of the pause. A lost
  * server is the header pill's news, not the table's: the last rows stay while the loop backs off.
- * The version and the DHT count ride the session row, re-read every half minute and on mount; they
- * are header decoration, and they do not earn a place in the once-a-second round.
+ * The engine version behind the header's tooltip and the DHT count ride the session row, re-read
+ * every half minute and on mount - the version the header displays instead ships inside the bundle,
+ * injected at build time - and none of it earns a place in the once-a-second round.
  *
  * The header's Add torrent button answers nothing yet: the dialog comes with the actions task. The
  * selected row is remembered here because the detail pane that will use it mounts beside this
@@ -122,7 +123,7 @@ export default function Torrents({
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden">
       <Header
-        version={sessionInfo?.version ?? null}
+        engineVersion={sessionInfo?.version ?? null}
         link={link}
         totalDown={totals.down}
         totalUp={totals.up}

@@ -151,12 +151,37 @@ describe('the windowed table', () => {
     for (const tr of Array.from(container.querySelectorAll('tbody tr[data-row]'))) {
       expect(tr.getAttribute('style'), 'a body row is not exactly 40px tall').toBe('height: 40px;')
       for (const td of Array.from(tr.querySelectorAll('td'))) {
-        expect(
-          td.className.includes('shadow-[inset_0_-1px_0_var(--color-ink-750)'),
-          'the row rule was drawn where it can add height',
-        ).toBe(true)
+        // The exact 40 is built into each cell: `box-border h-10` makes the row height the cell's
+        // own border-box height (padding included), and `leading-5` pins one line of text to
+        // 20 px, so padding-plus-text is 40 and nothing a cell holds can exceed the height it
+        // declares. A row is as tall as its tallest cell - exactly `ROW_HEIGHT`, whole pixels, in
+        // a browser that lays tables out for real. The inset rule adds nothing.
+        for (const token of [
+          'shadow-[inset_0_-1px_0_var(--color-ink-750)',
+          'box-border',
+          'h-10',
+          'leading-5',
+        ]) {
+          expect(
+            td.className.includes(token),
+            `a cell does not cap itself to the row height (${token} missing)`,
+          ).toBe(true)
+        }
       }
     }
+
+    // Headings stand over their columns the way the cells below them align: left for name,
+    // progress and state, right for the three number columns. A centred heading over right-aligned
+    // rates makes every row look misread.
+    const headings = Array.from(container.querySelectorAll('thead th'))
+    expect(headings.length === 6, 'there are not six headings to check').toBe(true)
+    headings.forEach((th, index) => {
+      const wants = index === 2 || index === 3 || index === 4 ? 'text-right' : 'text-left'
+      expect(
+        th.className.includes(wants),
+        `heading ${index} does not share its column's alignment (${wants} missing)`,
+      ).toBe(true)
+    })
 
     // A 255-character error is one line of dots with the whole sentence in its title, not a
     // paragraph that wraps the row past 40px.
@@ -344,6 +369,14 @@ describe('phone width', () => {
         `the filter column does not become a row at phone width (${token} missing)`,
       ).toBe(true)
     }
+
+    // The row's items-centring must be undone at desktop width, or the column's buttons shrink to
+    // their labels and the whole sidebar - heading, items, counts - reads centred in 240 px.
+    // Stretched, each button spans the column and its count rides the right edge.
+    expect(
+      nav.className.includes('md:items-stretch'),
+      'the sidebar centres its filters instead of pushing counts right at desktop width',
+    ).toBe(true)
 
     // The table keeps its own horizontal scroll instead of squashing columns to nothing.
     expect(

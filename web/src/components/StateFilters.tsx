@@ -11,9 +11,10 @@
  * Below 768 px the whole sidebar stacks above the table as a scrolling row. That is the one layout
  * rule this component owns, and it lives in the classes on the `nav`: mobile-first, it is a row of
  * buttons with `overflow-x-auto` so six of them fit a phone, and `md:` turns it into the wide
- * column with its right-hand rule. The screen gives the table its bounded height, so the box under
- * it is what scrolls at every width. The active pill is the soft violet wash the prototype gives
- * the chosen filter; it never moves.
+ * column with its right-hand rule - `md:items-stretch` undoing the row's centring there, so every
+ * button spans the column and the count rides its right edge, the shape the prototype draws. The
+ * screen gives the table its bounded height, so the box under it is what scrolls at every width.
+ * The active pill is the soft violet wash the prototype gives the chosen filter; it never moves.
  *
  * Which row counts in which bucket is not this file's business - it lives in `filters.ts`, next
  * to the rule it copies from the terminal.
@@ -43,7 +44,7 @@ export default function StateFilters({ counts, active, onChange }: StateFiltersP
       aria-label="Torrents"
       className={
         'flex shrink-0 flex-row items-center gap-1 overflow-x-auto border-b border-rule bg-sunken px-2 py-2 ' +
-        'md:w-60 md:basis-auto md:flex-col md:gap-px md:border-r md:border-b-0 md:px-3 md:py-4'
+        'md:w-60 md:basis-auto md:flex-col md:items-stretch md:gap-px md:border-r md:border-b-0 md:px-3 md:py-4'
       }
     >
       <span className="shrink-0 px-2.5 py-1.5 text-[11px] uppercase tracking-[0.06em] text-muted">

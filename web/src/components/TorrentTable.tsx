@@ -7,7 +7,10 @@
  * and the width of the bar are the same number (`filledPercent`), the state's word and colour come
  * straight from `live.ts`'s reading of the TUI's rule, and names and error strings go through
  * `displaySafe` before they are drawn, because every one of them came from somewhere else. A name
- * the server left empty gets its hash, the way both TUI backends do it.
+ * the server left empty gets its hash, the way both TUI backends do it. Each header shares its
+ * column's alignment - the number headers sit right with the rates, the rest sit left with their
+ * cells - because alignment is a property of the column, said once in `COLUMNS`, and never the
+ * browser's default of centring a header over cells that are not centred.
  *
  * Twenty rows render twenty rows; two thousand render a window of them. The box scrolls, the rows
  * below and above the window are replaced by two spacer rows sized to keep the scrollbar honest,
@@ -19,10 +22,14 @@
  * fallback where one is missing), so a banner appearing, the sidebar wrapping, or the phone
  * turning sideways all move the window before the next read rather than after the next reload.
  *
- * Every row is exactly `ROW_HEIGHT` tall, because the spacer arithmetic only tells the truth if
- * it can multiply a constant: `border-separate` with zero spacing so a border never adds to a
- * row, the rule drawn as an inset shadow so it costs no height, and every cell `truncate` with
- * the full text in a `title` - a 255-character error is one line of dots, not a wrapped paragraph.
+ * Every row is exactly `ROW_HEIGHT` tall, because the spacer arithmetic only tells the truth if it
+ * can multiply a constant - and in a real browser it is the cells that make it so, not the row:
+ * `border-separate` with zero spacing so nothing collapses or adds between cells, the rule drawn as
+ * an inset shadow so it costs no height, and every cell `box-border` with the row height as its own
+ * height and `leading-5` so one line of text is exactly 20 px. Padding 10, text 20, padding 10 is
+ * then exactly 40: nothing a cell holds can exceed its declared 40, and a row is as tall as its
+ * tallest cell, whole pixels at any zoom. Every cell `truncate` with the full text in a `title`
+ * keeps it to that one line - a 255-character error is dots, not a wrapped paragraph.
  *
  * Rows are keyboard citizens, not click-only targets: each is focusable, Enter and Space pick it,
  * Arrow Up and Down move the selection through the current order, and the drawn window follows
@@ -60,13 +67,14 @@ const ROW_RULE_SELECTED =
 
 type SortColumn = 'name' | 'progress' | 'down' | 'up' | 'peers' | 'state'
 
+/** The columns with the alignment their header and their cells share. A `th` left to itself centres, so the alignment is said once here and taken from the same token by both. */
 const COLUMNS: { key: SortColumn; label: string; className: string }[] = [
-  { key: 'name', label: 'Name', className: 'px-5' },
-  { key: 'progress', label: 'Progress', className: 'w-[220px] px-3' },
+  { key: 'name', label: 'Name', className: 'px-5 text-left' },
+  { key: 'progress', label: 'Progress', className: 'w-[220px] px-3 text-left' },
   { key: 'down', label: 'Down', className: 'px-3 text-right' },
   { key: 'up', label: 'Up', className: 'px-3 text-right' },
   { key: 'peers', label: 'Peers', className: 'px-3 text-right' },
-  { key: 'state', label: 'State', className: 'px-5' },
+  { key: 'state', label: 'State', className: 'px-5 text-left' },
 ]
 
 /** The one-word state labels, the terminal's (`state_label` in `fbtt-tui/src/view/mod.rs`). */
@@ -390,10 +398,15 @@ export default function TorrentTable({
                   }
                   style={{ height: ROW_HEIGHT }}
                 >
-                  <td className={`max-w-[420px] truncate px-5 py-2.5 text-body ${rule}`} title={name}>
+                  <td
+                    className={`box-border h-10 leading-5 max-w-[420px] truncate px-5 py-2.5 text-body ${rule}`}
+                    title={name}
+                  >
                     {name}
                   </td>
-                  <td className={`overflow-hidden px-3 py-2.5 ${rule}`}>
+                  <td
+                    className={`box-border h-10 leading-5 overflow-hidden px-3 py-2.5 ${rule}`}
+                  >
                     <div className="flex items-center gap-2.5">
                       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink-700">
                         <div
@@ -406,16 +419,25 @@ export default function TorrentTable({
                       </span>
                     </div>
                   </td>
-                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
+                  <td
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                  >
                     {formatRate(row.download_rate)}
                   </td>
-                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
+                  <td
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                  >
                     {formatRate(row.upload_rate)}
                   </td>
-                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
+                  <td
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                  >
                     {row.num_seeds} / {row.num_peers}
                   </td>
-                  <td className={`max-w-[190px] truncate px-5 py-2.5 ${rule}`} title={stateText(row)}>
+                  <td
+                    className={`box-border h-10 leading-5 max-w-[190px] truncate px-5 py-2.5 ${rule}`}
+                    title={stateText(row)}
+                  >
                     <span className={`inline-flex items-center gap-2 ${STATE_TEXT[row.rowState]}`}>
                       <span
                         aria-hidden="true"
