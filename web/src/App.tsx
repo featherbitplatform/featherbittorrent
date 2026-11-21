@@ -14,63 +14,86 @@
  * signed in with the banner saying so, because their session is still live and telling them otherwise
  * would send them to a sign-in form they do not need.
  *
- * The mark is `/favicon.png`, the one copy the server has: `web/public/` is copied into the built
- * page as it is, so this file, the sign-in screen's mark and the tab icon are the same bytes and
- * the same request. Its `alt` is empty because the word beside it is the name, and a screen reader
- * would otherwise hear it twice.
+ * The page's two live regions are mounted here as the first two things it ever renders, outside the
+ * per-phase tree, so they are the same nodes for the page's whole life no matter which screen comes
+ * or goes: announcements need a region that was already there when the news arrives, and a region
+ * inside a screen leaves with it. Every visible message stays rendered where it always was;
+ * {@link live} mirrors its text into the polite or the assertive region, which is what makes the
+ * announcement land.
  *
  * @module App
  */
+import { useEffect, useRef, useState } from 'react'
 import Banner from './components/Banner'
 import Button from './components/Button'
+import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
+import type { LiveAnnouncer } from './live'
+import { session, useSession } from './session'
 import SignIn from './screens/SignIn'
-import { useSession } from './session'
 
 export default function App() {
   const { state, signIn, signOut, refresh } = useSession()
+  const politeRef = useRef<HTMLDivElement>(null)
+  const assertiveRef = useRef<HTMLDivElement>(null)
+  const live = useRef<LiveAnnouncer | null>(null)
+  const [trying, setTrying] = useState(false)
 
-  if (state.phase === 'signedOut') {
-    return <SignIn state={state} onSignIn={signIn} />
-  }
+  // The announcer writes into the two nodes above and follows the store. The regions are React's;
+  // this only ever sets their text, and React never gives them children to fight over.
+  useEffect(() => {
+    const polite = politeRef.current
+    const assertive = assertiveRef.current
+    if (polite === null || assertive === null) return
+    const announcer = createLiveAnnouncer(session, { polite, assertive })
+    live.current = announcer
+    return () => {
+      live.current = null
+      announcer.stop()
+    }
+  }, [])
 
-  // The server gave no readable answer to the status question. No password can fix that, so this
-  // screen offers the one thing that can: asking again. The message sits in a live region marked
-  // assertive, because not reaching the server is what just happened and what the person needs to
-  // know before anything else on the page.
-  if (state.phase === 'unreachable') {
-    return (
-      <main className="flex min-h-dvh flex-col items-center justify-center gap-4">
-        <img className="h-16 w-auto" src="/favicon.png" alt="" />
-        <div role="status" aria-live="assertive" className="text-base font-medium text-strong">
-          Cannot reach the server.
-        </div>
-        <Button variant="secondary" onClick={() => void refresh()}>
-          Try again
-        </Button>
-      </main>
-    )
+  async function retry(): Promise<void> {
+    setTrying(true)
+    try {
+      await refresh()
+      // Still no answer: the same sentence has to be news twice, so blank the assertive region and
+      // let the announcer say it again. A state change announces by itself, so this is only for the
+      // case where nothing changed because nothing was there to change.
+      if (session.get().phase === 'unreachable') live.current?.reannounce()
+    } finally {
+      setTrying(false)
+    }
   }
 
   const signOutFailed = state.phase === 'signedIn' && state.error !== null
   return (
-    <main className="flex min-h-dvh flex-col items-center justify-center">
-      <img className="mb-4 h-16 w-auto" src="/favicon.png" alt="" />
-      <h1 className="text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
-      {/* Mounted whether or not there is a banner inside, so a sign-out that fails gets announced
-          rather than blinking on as a finished element nobody was told about. The margins are
-          conditional so the empty region takes no space. */}
-      <div
-        role="status"
-        aria-live="polite"
-        className={`w-full max-w-[380px]${signOutFailed ? ' mt-4' : ''}`}
-      >
-        {signOutFailed && <Banner tone="danger">{state.error}</Banner>}
-      </div>
-      {state.phase === 'signedIn' && (
-        <Button variant="secondary" className="mt-4" onClick={() => void signOut()}>
-          Sign out
-        </Button>
+    <>
+      <div ref={politeRef} role="status" aria-live="polite" className="sr-only" />
+      <div ref={assertiveRef} role="status" aria-live="assertive" className="sr-only" />
+      {state.phase === 'signedOut' ? (
+        <SignIn state={state} onSignIn={signIn} />
+      ) : state.phase === 'unreachable' ? (
+        <main className="flex min-h-dvh flex-col items-center justify-center gap-4">
+          <img className="h-16 w-auto" src="/favicon.png" alt="" />
+          <div className="text-base font-medium text-strong">{UNREACHABLE_COPY}</div>
+          <Button variant="secondary" disabled={trying} onClick={() => void retry()}>
+            {trying ? 'Trying...' : 'Try again'}
+          </Button>
+        </main>
+      ) : (
+        <main className="flex min-h-dvh flex-col items-center justify-center">
+          <img className="mb-4 h-16 w-auto" src="/favicon.png" alt="" />
+          <h1 className="text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
+          <div className={`w-full max-w-[380px]${signOutFailed ? ' mt-4' : ''}`}>
+            {signOutFailed && <Banner tone="danger">{state.error}</Banner>}
+          </div>
+          {state.phase === 'signedIn' && (
+            <Button variant="secondary" className="mt-4" onClick={() => void signOut()}>
+              Sign out
+            </Button>
+          )}
+        </main>
       )}
-    </main>
+    </>
   )
 }

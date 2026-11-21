@@ -10,11 +10,11 @@
  * box answering `localhost` is nobody else's wire.
  *
  * The two messages from the session store are its strings, shown as they are; this screen decides
- * nothing about why a sign-in failed. They render inside one live region that stays mounted whether
- * or not there is anything to say - a strip that appears together with the region around it is how
- * an announcement gets missed - and the region turns itself assertive for the failure message, which
- * is about the attempt the person just made, over anything else being read. The card carries its own
- * margins rather than sharing a column gap, so the empty region costs the layout nothing.
+ * nothing about why a sign-in failed. They are visible banners only: the page's hoisted live
+ * regions (`live.ts`, mounted in `App`) carry the same words to a screen reader, because a message
+ * that mounts together with this whole screen has no region that was already around to announce it.
+ * The card carries its own margins rather than sharing a column gap, so an empty message strip
+ * costs the layout nothing.
  *
  * @module screens/SignIn
  */
@@ -105,11 +105,7 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
         </Button>
       </form>
 
-      <div
-        role="status"
-        aria-live={state.error !== null ? 'assertive' : 'polite'}
-        className="flex w-full max-w-[380px] flex-col gap-2.5"
-      >
+      <div className="flex w-full max-w-[380px] flex-col gap-2.5">
         {state.notice !== null && <Banner>{state.notice}</Banner>}
         {state.error !== null && <Banner tone="danger">{state.error}</Banner>}
         {insecure && <Banner>{PLAIN_HTTP_WARNING}</Banner>}

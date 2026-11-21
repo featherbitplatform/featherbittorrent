@@ -4,10 +4,10 @@
  * The shape is the Sign in prototype's warning block, and the colours are its colours read back
  * through the token list: the amber is `stalled` at 45% for the rule and 8% for the fill, the red
  * is `error` the same way, and the text is the plain token. The tone chooses the colours and the
- * icon and nothing else: announcing is the job of the live region the screens wrap these in, which
- * stays mounted whether or not a strip is inside it. A `role` here would announce the whole strip as
- * it mounts, and a strip that mounts together with its text is exactly how a screen reader misses
- * being told about it.
+ * icon and nothing else: announcing is the job of the page's two hoisted live regions (`live.ts`),
+ * which are mounted for the page's whole life beside every screen and mirror these words. A `role`
+ * here would announce the whole strip as it mounts, and a strip that mounts together with its text
+ * is exactly how a screen reader misses being told about it.
  *
  * @module components/Banner
  */

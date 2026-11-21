@@ -95,7 +95,7 @@ export interface SessionStore {
   get(): SessionState
   /** Follow every later change. Returns the way to stop. */
   subscribe(listener: () => void): () => void
-  /** Ask the server what this cookie is: `open`, `signedIn`, `signedOut`, or `unreachable`. */
+  /** Ask the server what this cookie is: `open`, `signedIn`, `signedOut`, or `unreachable`. Only call it while the page is `loading` or `unreachable`: answers come back in whatever order the server sends them, and a refresh sent from a live session would let a late answer overwrite a newer sign-in. */
   refresh(): Promise<void>
   /** Try the password. True took, false shows why it did not. */
   signIn(user: string, password: string): Promise<boolean>
@@ -239,16 +239,19 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
 
   function signOutFailed(): void {
     const was = state
-    if (was.phase === 'signedIn') {
-      // The server kept the session and the cookie kept working; only this browser's request to end
-      // them failed. Staying signed in is the truth, and it keeps the next change sendable.
-      set({ ...was, error: SIGN_OUT_FAILED })
+    if (was.phase !== 'signedIn') {
+      // There is no session this request was meant to end anymore - a `401` elsewhere probably
+      // ended it while the DELETE was in flight - and a sign-in screen that nobody is typing into
+      // has nothing to be told about a request to end a session that is already over.
       return
     }
-    signedOut(SIGN_OUT_FAILED)
+    // The server kept the session and the cookie kept working; only this browser's request to end
+    // them failed. Staying signed in is the truth, and it keeps the next change sendable.
+    set({ ...was, error: SIGN_OUT_FAILED })
   }
 
   async function signOut(): Promise<void> {
+    if (state.phase !== 'signedIn') return
     const given = token
     let response: Response
     try {
@@ -263,8 +266,10 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
     }
     // A `401` here is not a failure: it says the session was already gone, which is exactly what
     // signing out was asked to bring about. Only a session that the server agrees is over ends a
-    // generation and clears the token.
+    // generation and clears the token - and only while this store is still in that session. If a
+    // `401` from elsewhere ended it mid-flight, the ending, and its notice, already happened.
     if (response.ok || response.status === 401) {
+      if (state.phase !== 'signedIn') return
       generation += 1
       token = null
       set({ phase: 'signedOut', notice: null, error: null })
