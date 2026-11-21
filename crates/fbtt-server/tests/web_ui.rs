@@ -1,5 +1,5 @@
-//! The browser UI as a browser sees it: the page without a session, the headers on it and on its
-//! assets, and the switch that removes it again.
+//! The browser UI as a browser sees it: the page without a session, the icon it names, the headers on
+//! it and on its assets, and the switch that removes it again.
 //!
 //! Only what shows up over http is checked here. Which templates are exempt from a credential, and
 //! with which methods, is checked in `src/auth/mod.rs`; what is checked here is that a page reaches a
@@ -366,6 +366,43 @@ async fn the_page_carries_the_security_headers() {
     served.stop().await;
 }
 
+/// The icon the page names is served, typed and shielded like everything else here, and it asks for
+/// no session either: a browser that has not signed in is the one looking at the tab it is drawn in.
+///
+/// It gets a test of its own rather than being one more row of the header test because it is the one
+/// file of the build whose name never changes. Vite renames everything under `assets/` after what is
+/// in it, which is what makes a year of caching the right answer for those files; this one keeps the
+/// name it was given, which is what makes a year the wrong answer for it. The body check is the
+/// cheapest way to say it is the same picture the tab icon and the page's `<img>` both ask for.
+#[tokio::test]
+async fn the_icon_is_served_without_a_session() {
+    let served = Served::start("web-icon", with_alice).await;
+    let response = get(&http(), &served.url("/favicon.png"), None, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the icon is not something a person who has not signed in may look at"
+    );
+    assert_eq!(
+        header_of(&response, header::CONTENT_TYPE).as_deref(),
+        Some("image/png"),
+        "the icon is not typed as the image it is"
+    );
+    assert_shielded(&response, "the icon");
+    assert_eq!(
+        header_of(&response, header::CACHE_CONTROL).as_deref(),
+        Some(NO_STORE),
+        "the icon has the same name in every build, so caching it for a year caches the wrong picture"
+    );
+    let body = within(response.bytes()).await.expect("a body");
+    assert!(
+        body.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the icon the server answered with is not a PNG: {} bytes",
+        body.len()
+    );
+    served.stop().await;
+}
+
 /// An asset the page does not name is a `404` and not the page: this server has no fallback route,
 /// because the front end routes with the hash and every address that is not a file it has really is
 /// missing.
@@ -498,9 +535,24 @@ async fn logins_off_still_check_the_host() {
     }
 
     // The name a rebound domain arrives with: refused, the same way on both halves of this server.
+    //
+    // The refusal comes from the guard that stands in front of every route, so it is an API answer in
+    // the API's shape, and it carries none of the front end's headers: the guard has already decided
+    // nobody gets an answer of this server, and the headers are what a browser attaches to an answer
+    // it got. Asserting the type rather than only the parsed body is what puts that limit in writing.
     for path in ["/", "/api/v1/torrents"] {
-        let (status, code) =
-            problem_of(get(&client, &served.url(path), Some("evil.example"), None).await).await;
+        let refused = get(&client, &served.url(path), Some("evil.example"), None).await;
+        assert_eq!(
+            header_of(&refused, header::CONTENT_TYPE).as_deref(),
+            Some("application/json"),
+            "{path} refused the host with something that is not the API's JSON answer"
+        );
+        assert_eq!(
+            header_of(&refused, header::CONTENT_SECURITY_POLICY),
+            None,
+            "{path} refused the host with a page's headers on an answer that is not a page"
+        );
+        let (status, code) = problem_of(refused).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,

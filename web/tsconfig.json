@@ -14,7 +14,10 @@
     "jsx": "react-jsx",
     "skipLibCheck": true,
 
-    /* The whole tree is strict, including the generated API types. */
+    /* Strict, and it applies to every file tsc actually reads. The generated API types are the one
+       file that is not read: `src/api/schema.ts` carries `@ts-nocheck`, put there by
+       `scripts/annotate-generated-api.mjs` while the OpenAPI document declares one operationId on more
+       than one operation and the generator emits that member twice. */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

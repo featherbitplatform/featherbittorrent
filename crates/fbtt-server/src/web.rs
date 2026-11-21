@@ -99,12 +99,14 @@ pub(crate) fn router() -> Router {
 async fn page() -> Result<Response, RouteError> {
     Assets::get("index.html")
         .map(|found| serve("index.html", found, false))
-        // A missing page is not a wrong request: this build was told to carry a front end and has no
-        // page in it. `web/dist` was empty when this binary was compiled, which is worth saying in as
-        // many words as a `500` message holds.
+        // A missing page is not a wrong request: this build was told to carry a front end and cannot
+        // find the page in it. Which half of `rust-embed`'s pair came up empty depends on the profile
+        // (the module doc above): a release build was compiled without `index.html` in `web/dist`, and
+        // a debug build is reading a folder that is gone or empty now. The answer says what is missing
+        // rather than which of those it is, because from here the two look the same.
         .ok_or_else(|| {
             RouteError::internal(
-                "this build carries no page: web/dist was empty when it was compiled",
+                "this build has no page to serve: no index.html in the web/dist it reads",
             )
         })
 }

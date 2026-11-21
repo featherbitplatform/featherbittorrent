@@ -167,6 +167,15 @@ crossterm_winapi = "0.9.1"
 # Declared now and joined by crates from the web UI tasks that use them (subtle from Task 2, the
 # other two from Task 4); until a crate names one it is a workspace entry with nothing depending on
 # it, which is in no build and in no Cargo.lock.
-rust-embed = "8.14"
+#
+# `rust-embed`'s defaults are turned off here rather than in the member that uses it, which is how
+# this file spells every other dependency whose default features are not wanted (`reqwest` above).
+# The feature that matters is `debug-embed`, and it is not asked for: `rust-embed` 8.14 declares no
+# `default` key in its `[features]` at all, so this changes nothing about what resolves today and
+# says out loud which side of its `cfg(debug_assertions)` pair we want. With `debug-embed` off, the
+# derive keeps the embedded bytes behind `cfg(not(debug_assertions))` and compiles a disk-reading
+# implementation behind `cfg(debug_assertions)`; `crates/fbtt-server/src/web.rs`'s module doc says
+# what that means for a debug run and a shipped one.
+rust-embed = { version = "8.14", default-features = false }
 mime_guess = "2.0"
 subtle = "2.6"

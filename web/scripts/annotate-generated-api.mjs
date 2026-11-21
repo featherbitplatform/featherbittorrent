@@ -10,10 +10,16 @@
 // looks like here.
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = new URL('..', import.meta.url).pathname;
-const target = join(root, 'src/api/schema.ts');
+// Where this file lives, and the project above it, found the way `check-bundle-size.mjs` finds the
+// folder next to it. A URL's `pathname` is not a path: it keeps percent-encoding
+// ('/Users/Some%20Name/web') and carries no drive letter on Windows, and a path handed to `tsc` or
+// used as a working directory has to be a real path in both of those ways.
+const here = dirname(fileURLToPath(import.meta.url));
+const project = join(here, '..');
+const target = join(project, 'src/api/schema.ts');
 
 const header = readFileSync(target, 'utf8');
 const banner = header.split('\n').slice(0, 4).join('\n');
@@ -38,9 +44,16 @@ const withoutMarker = header.includes(MARKER)
   : header;
 
 function typecheck() {
-  const run = spawnSync('npx', ['tsc', '-p', root, '--pretty', 'false'], {
-    cwd: root,
+  // The project is named by the config file inside it and found by the working directory, so the only
+  // things on the command line are `npx` and `tsc` and their flags. That matters because Node hands a
+  // shell its arguments unquoted - it turns quoting off for `cmd.exe` - and an absolute folder path
+  // would be one more thing for a shell to split on a space. The shell is asked for only where it is
+  // needed: `npx` is an executable on Unix and a `.cmd` shim on Windows, and Windows will not start a
+  // `.cmd` without one.
+  const run = spawnSync('npx', ['tsc', '-p', '.', '--pretty', 'false'], {
+    cwd: project,
     encoding: 'utf8',
+    shell: process.platform === 'win32',
   });
   const diagnostics = `${run.stdout ?? ''}${run.stderr ?? ''}`;
   return {

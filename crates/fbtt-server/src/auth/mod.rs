@@ -111,6 +111,13 @@ const STATIC_TEMPLATES: [&str; 3] = ["/", "/favicon.png", "/assets/{*path}"];
 /// gets the credential check like any other path with no route on it. And a build with no front end -
 /// or one with it switched off - has no route that matches any of them, so this says nothing there and
 /// such a request keeps answering the way it always did.
+///
+/// This exemption is about credentials and nothing else. It says nothing about which name a request
+/// says it came to: with logins off the address and `Host` guard runs ahead of every route, so a
+/// rebinding request is refused before any of this is asked about, and that `403` is an API answer in
+/// the API's shape (`application/json`, no `Content-Security-Policy`) because the front end's headers
+/// are put on by `crate::web`'s router and the refusal happens in front of it. `logins_off_still_check_the_host`
+/// in `tests/web_ui.rs` asserts both halves of that.
 #[cfg(feature = "web-ui")]
 fn static_route(method: &Method, matched_path: Option<&str>) -> bool {
     (*method == Method::GET || *method == Method::HEAD)

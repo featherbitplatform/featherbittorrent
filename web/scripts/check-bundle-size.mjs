@@ -3,7 +3,9 @@
  *
  * Gzipped because that is what crosses the network, and why the budget is not a byte count of the
  * files on disk. Measured with the default deflate level, which is the level Vite's own build report
- * quotes, so this and `vite build` agree about what a file costs.
+ * quotes, so this and `vite build` agree about what a file costs. KB here is 1000 bytes: the unit the
+ * plan states the budget in, and the unit `vite build` divides its sizes by when it prints them
+ * (it labels that unit `kB`).
  *
  * Only `dist/assets/*.js` and `dist/assets/*.css` are counted, which is the plan's rule: fonts and
  * images are payload the page asks for on its own terms and are not what makes a first paint slow to
@@ -19,15 +21,17 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
 
-// The budget, in bytes: 300 KiB of gzipped JavaScript and CSS together.
-const LIMIT = 300 * 1024
+// The budget, in bytes: 300 KB of gzipped JavaScript and CSS together, KB being 1000 bytes. That is
+// the unit the plan states the budget in, and the unit `vite build` divides a byte count by when it
+// prints one (that report labels the unit `kB`), so the two numbers are about the same quantity.
+const LIMIT = 300 * 1000
 
 const here = dirname(fileURLToPath(import.meta.url))
 const assetsDir = join(here, '..', 'dist', 'assets')
 
 // A byte count spelled the way a person reads one.
-function kib(bytes) {
-  return `${(bytes / 1024).toFixed(1)} KiB`
+function kb(bytes) {
+  return `${(bytes / 1000).toFixed(1)} KB`
 }
 
 async function main() {
@@ -52,16 +56,16 @@ async function main() {
     const bytes = await readFile(join(assetsDir, name))
     const gzipped = gzipSync(bytes).length
     total += gzipped
-    console.log(`  ${kib(gzipped).padStart(10)}  ${name}`)
+    console.log(`  ${kb(gzipped).padStart(10)}  ${name}`)
   }
 
   const remaining = LIMIT - total
-  console.log(`  ${kib(total).padStart(10)}  total gzipped, of ${kib(LIMIT)} budget`)
+  console.log(`  ${kb(total).padStart(10)}  total gzipped, of ${kb(LIMIT)} budget`)
   if (total > LIMIT) {
-    console.error(`the bundle is ${kib(total)} gzipped, ${kib(total - LIMIT)} over the budget`)
+    console.error(`the bundle is ${kb(total)} gzipped, ${kb(total - LIMIT)} over the budget`)
     process.exit(1)
   }
-  console.log(`${kib(remaining)} left`)
+  console.log(`${kb(remaining)} left`)
 }
 
 main().catch((problem) => {

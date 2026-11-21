@@ -32,14 +32,10 @@ argon2.workspace = true
 # fbt-api turns the serving half on for the tree; these are the parts our own code names.
 axum = { workspace = true, features = ["json", "query"] }
 # The built front end. Only with `web-ui`: the headless build carries no assets, and `build.rs` skips
-# the change-tracking line for it, so a missing `web/dist` is not even an error there.
-#
-# `default-features = false` is spelled out because the feature worth deciding is `debug-embed`, and
-# it is not asked for: `rust-embed` 8.14 declares no `default` in its `[features]`, and with
-# `debug-embed` off its derive keeps the bytes behind `cfg(not(debug_assertions))` and a
-# disk-reading implementation behind `cfg(debug_assertions)`, which is the pair the feature comment
-# above and `src/web.rs`'s module doc describe.
-rust-embed = { workspace = true, optional = true, default-features = false }
+# the change-tracking line for it, so a missing `web/dist` is not even an error there. Its features
+# are decided at the workspace entry (`rust-embed` in the root `Cargo.toml`), where `default-features
+# = false` lives with the reason for it.
+rust-embed = { workspace = true, optional = true }
 # What type an asset is served as, from its extension. Vite hashes the names but keeps the
 # extensions, and the hash is exactly why the extension is the only thing left to ask.
 mime_guess = { workspace = true, optional = true }
