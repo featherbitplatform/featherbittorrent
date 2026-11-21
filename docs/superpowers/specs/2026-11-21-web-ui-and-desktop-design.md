@@ -64,21 +64,43 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
    - devices;
    - the connect screen, on the desktop.
 2. **Browser streaming.** **[owner, 2026-11-14: "When the web UI exists, it also gets browser streaming"]** A file plays in an HTML5 `<video>` through a short-lived stream token (`POST /api/v1/stream-tokens`, already built for the TUI). If the browser cannot play the container or codec (mkv and HEVC on most browsers), the UI says so and offers the download link instead. No transcoding. **[builder's call]**
-3. **Snappy and light, like the TUI.** **[owner: the 2026-11-14 goal applies]**
+3. **A real media player for video torrents.**
+
+   Owner, 2026-11-21: "Let's not forget the media player with subtitles and multi audio support for streaming video torrents". **[owner]**
+
+   **What browsers do on their own.** Not enough:
+   - Choosing between audio tracks (`HTMLMediaElement.audioTracks`) works only in Safari. Chrome, Edge (and so the desktop app's WebView2 on Windows) and Firefox do not expose it.
+   - A browser never sees subtitles that are inside a Matroska or MP4 file. Only external WebVTT files given through `<track>` work.
+
+   **Recommended mechanism.** **[builder's call, for the owner to confirm]** The server remuxes, never transcodes:
+   - **Audio.** For a video file, the server reads its container (Matroska/WebM and MP4). It serves fragmented MP4 that carries the video track and **one chosen audio track**, copied as they are. The player fetches it through Media Source Extensions, and choosing another language reloads the audio stream at the current position.
+   - **Subtitles.** Text subtitles inside the file (SRT, ASS/SSA, mov_text) and next to it (`.srt`, `.vtt`, `.ass` in the torrent) are served as WebVTT. The player shows them as tracks it can choose. ASS styling becomes plain text.
+   - **What cannot play.** Image subtitles (PGS, VobSub) are listed but not shown. A video or audio codec the browser cannot decode (often HEVC, AC-3, DTS) gets a clear message, plus "Download" and, on the desktop, "Open in mpv or VLC".
+   - **During download.** Playback can start before the download finishes, through fbt-lib's deadline-driven reader, as streaming already does.
+   - **Cost.** Remuxing is copying, so it is light enough for the Pi. No new native dependencies, and the parsers are pure Rust, like everything else.
+
+   **The player itself:**
+   - the Graphite look and keyboard control;
+   - choosers for the audio track and the subtitles;
+   - a remembered position per file.
+
+   It lives in milestone 2, with browser streaming.
+
+4. **Snappy and light, like the TUI.** **[owner: the 2026-11-14 goal applies]**
    - Live updates come from the SSE stream; nothing polls.
    - The table renders only its visible rows, so hundreds of torrents scroll smoothly.
    - The embedded bundle stays small: a target of under 300 KB gzipped, excluding fonts. **[builder's call]**
    - The full build's server, on a Pi 2B, grows only by the static files it serves; the headless build is unchanged.
-4. **The same Graphite look.** **[owner: design-system-v2 for every UI]**
+5. **The same Graphite look.** **[owner: design-system-v2 for every UI]**
    - Dark-first ink, violet as the only accent, Geist for text and Geist Mono for every real value.
    - Lucide icons, no emoji, no em-dashes.
    - Green for seeding, amber for stalled, cyan for the connection, red for errors, as in the TUI.
-5. **Works at phone width**: the sidebar stacks, the toolbar wraps, and the table scrolls sideways. **[builder's call]**
+6. **Works at phone width**: the sidebar stacks, the toolbar wraps, and the table scrolls sideways. **[builder's call]**
 
 ## 4. Non-goals
 
 - Search across indexing sites, and one UI on several servers at once. These stay "later" exactly as in the TUI design. **[owner, 2026-11-14]**
-- Transcoding for the browser. **[builder's call]**
+- Transcoding for the browser. Remuxing is in scope (goal 3); re-encoding is not. **[builder's call]**
 - Read-only users or per-user permissions: every signed-in client may do everything. **[builder's call, as in the TUI design]**
 
 ## 5. Architecture **[builder's call, within the decisions above]**
@@ -137,7 +159,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
    - file priorities;
    - settings;
    - devices;
-   - browser streaming.
+   - browser streaming, with the media player: its audio-track and subtitle choosers, built on the server-side remux in goal 3.
 3. **The desktop app:**
    - the Tauri crate, This computer and remote servers;
    - the tray, start at login, `.torrent` file associations and the `magnet:` link handler;
@@ -164,3 +186,4 @@ The component structure, state management (plain React, or a small store), the r
 6. Answered: not now. Browsers sign in with a password, or through the gateway's OpenID Connect. **[owner, 2026-11-21]**
 7. Answered: the first desktop release has all of these: the tray, start at login, `.torrent` file associations, and the `magnet:` link handler. **[owner, 2026-11-21]**
 8. Answered: the desktop app carries featherbittorrent's version and ships in the same release. **[owner, 2026-11-21]**
+9. **Media player mechanism.** Is the server-side remux in goal 3 the right approach: one chosen audio track per stream, and text subtitles as WebVTT? Or should the player be limited to what a browser plays natively, and leave the rest to mpv or VLC?
