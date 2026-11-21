@@ -16,19 +16,17 @@ The binding design already lists "the web UI, and the Tauri desktop builds that 
 
 ## 2. What gets built
 
-**One web front end** serves three ways of running it. **[builder's call]**
+**One web front end, two builds of the binary, and a desktop app.**
 
-| Shell | What runs | Who it is for |
-|---|---|---|
-| **Headless** | `featherbittorrent serve` with the web UI served at `/` beside the API. No terminal UI. | A Raspberry Pi or a NAS, used from any browser. |
-| **Full** | The `featherbittorrent` binary, both roles. The TUI and `serve`, each able to expose the web UI. | A machine where someone wants both the terminal and a browser. |
-| **Desktop** | A Tauri app with the same front end in a native window. It runs the engine in-process ("This computer"), or connects to a server like the remote TUI does. | Desktop users who want neither a terminal nor a browser tab. |
+The two builds come from the owner, 2026-11-21: "For headless I meant only the terminal app without the embedded web ui". **[owner]**
 
-My reading of "a full version and a headless version" is two builds of the same binary:
-- **full:** TUI plus web UI, every feature;
-- **headless:** server plus web UI, with no TUI code compiled in, for the smallest footprint on a Pi.
+| Deliverable | What it is |
+|---|---|
+| **Full** | The `featherbittorrent` binary with the web UI compiled in: the TUI and `serve` as today, and `serve` also serves the web UI at `/` beside the API. |
+| **Headless** | The `featherbittorrent` binary exactly as it ships today, TUI and `serve`, with no web UI compiled in. Nothing of the front end is in it. |
+| **Desktop** | A Tauri app with the same front end in a native window. It runs the engine in-process ("This computer"), or connects to a server like the remote TUI does. |
 
-This is a guess. Question 1.
+In cargo terms the split is the `web-ui` feature: full builds turn it on, headless builds leave it off. **[builder's call]** Both builds ship for every platform in the 2026-11-14 table. How the packages are named (for example `featherbittorrent` and `featherbittorrent-headless`, or the reverse) is question 1.
 
 ## 3. Goals
 
@@ -46,7 +44,7 @@ This is a guess. Question 1.
    - Live updates come from the SSE stream; nothing polls.
    - The table renders only its visible rows, so hundreds of torrents scroll smoothly.
    - The embedded bundle stays small: a target of under 300 KB gzipped, excluding fonts. **[builder's call]**
-   - The headless server's memory on a Pi 2B grows only by the static files it serves.
+   - The full build's server, on a Pi 2B, grows only by the static files it serves; the headless build is unchanged.
 4. **The same Graphite look.** **[owner: design-system-v2 for every UI]**
    - Dark-first ink, violet as the only accent, Geist for text and Geist Mono for every real value.
    - Lucide icons, no emoji, no em-dashes.
@@ -106,10 +104,10 @@ This is a guess. Question 1.
 
 ## 7. Milestones (proposal)
 
-1. **Web UI on the headless server.**
+1. **The web UI in the full build.**
    - `web/`, the `web-ui` feature, and the torrent table and detail pane with live updates.
    - Add, pause, resume and delete, and sign-in with a password.
-   - CI and release with the front end built in.
+   - CI builds and tests both builds. The release ships the full build beside the headless one.
 2. **The rest of parity:**
    - file priorities;
    - settings;
@@ -120,7 +118,6 @@ This is a guess. Question 1.
    - the Tauri crate, This computer and remote servers;
    - the tray and file associations;
    - the release jobs.
-4. **The full and headless build split:** the feature matrix and packaging for both (question 1).
 
 ## 8. Anti-goals
 
@@ -135,7 +132,7 @@ The component structure, state management (plain React, or a small store), the r
 
 ## 10. Questions for the owner
 
-1. **"A full version and a headless version".** Is it the two builds in section 2 (full = TUI + web UI, headless = server + web UI, no TUI), or something else, for example the web UI only in the desktop app and the headless server?
+1. **Package names for the two builds.** Should the full build keep the name `featherbittorrent` and the terminal-only build become `featherbittorrent-headless`, or the reverse? Should the `.deb`, `.rpm` and archives both appear on every release?
 2. **Should `serve` expose the web UI by default?** Or only when it's turned on, with a `server.web_ui: true` setting or a wizard question?
 3. **Should the local TUI also serve the web UI** for its embedded engine, for example on `127.0.0.1` so a browser on the same machine can watch it? That means the TUI starts a server, which the 2026-11-14 design avoided unless asked for.
 4. **Desktop to a remote server:** should the webview talk to it directly (it needs CORS on the server), or go through a small Rust proxy inside the app (no server change, but a second path)?
