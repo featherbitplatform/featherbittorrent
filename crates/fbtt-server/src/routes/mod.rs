@@ -5,7 +5,7 @@
 //! (`{"error": {"code": ..., "message": ...}}`), so a client parses one shape for the whole API. They
 //! are merged into fbt-api's router by [`fbt_api::ApiServer::start_with`], which means they arrive
 //! with that server's layers on them: the [`fbt_api::Auth::Custom`] guard built from [`FbttAuth`]
-//! decides who may reach them, and so do the request body limit and CORS. Only the two login calls are
+//! decides who may reach them, and so do the request body limit and CORS. Only the three login calls are
 //! exempt from a token, and only because [`FbttAuth`] says so - see [`crate::auth`].
 //!
 //! What more than one request needs to know lives in one [`Shared`], handed to every handler as axum
@@ -18,6 +18,7 @@ mod devices;
 pub(crate) mod fs;
 mod login;
 mod stream;
+mod web_session;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -117,24 +118,13 @@ pub(crate) struct Shared {
     /// stop. The login limiter bounds how many attempts an *address* gets; this bounds what all of them
     /// together can make the machine do, which is what a distributed guess - one attempt per address, and
     /// no address over its budget - would otherwise find. An `Arc` because the permit has to be able to
-    /// outlive the request that asked for it ([`login::password_login`]).
+    /// outlive the request that asked for it ([`login::verify_password`]).
     verify_permits: Arc<tokio::sync::Semaphore>,
-    /// How many Argon2 verifications this server has run. Nothing in a run reads it; the test that
-    /// proves an unknown user name still costs a verify does.
-    #[cfg(feature = "test-support")]
-    verifies: AtomicU64,
-    /// How many verifies are running right now, and the most there have been at once: the pair of counters
-    /// a test reads to show that [`parallel_verifies`] is what actually bounds the work rather than just
-    /// what it asks for. Nothing in a run reads either.
-    #[cfg(feature = "test-support")]
-    verifying: AtomicU64,
-    #[cfg(feature = "test-support")]
-    most_verifying: AtomicU64,
-    /// The place inside the verify that a test can put there to hold a check in it ([`VerifyHold`]), so
-    /// that the test counting permits does not have to guess how long a hash takes. Set by
-    /// [`Server::park_verifies`]; absent in every run that is not one.
-    #[cfg(feature = "test-support")]
-    verify_hold: OnceLock<VerifyHold>,
+    /// What the checks report to while they run: the counts nothing in a run reads and the hold no run
+    /// arms. Its own `Arc`, because a check carries it down to the blocking pool with its permit - see
+    /// [`VerifyTally`] for why both the permit and this have to travel with the work rather than with the
+    /// request, and [`login::verify_password`] for the check that does it.
+    verify_tally: Arc<VerifyTally>,
 }
 
 impl Shared {
@@ -167,14 +157,7 @@ impl Shared {
             session,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
-            #[cfg(feature = "test-support")]
-            verifies: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            verifying: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            most_verifying: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            verify_hold: OnceLock::new(),
+            verify_tally: Arc::new(VerifyTally::new()),
         }
     }
 
@@ -241,11 +224,86 @@ impl Shared {
         known.or_else(|| self.dummy_password_hash.clone())
     }
 
+    /// How many Argon2 verifications this server has run since it started. Under `test-support` this is
+    /// how the test that says "an unknown user name costs a verify" reads the answer; in a run nothing
+    /// counts and so there is nothing to read. See [`crate::Server::password_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn password_verifies(&self) -> u64 {
+        self.verify_tally.password_verifies()
+    }
+
+    /// The most Argon2 verifies this server has had running at once. Under `test-support` this is how a test
+    /// checks that [`parallel_verifies`] bounds the work when logins arrive in a burst instead of merely
+    /// asking it to; in a run nothing counts, so there is nothing to read. See
+    /// [`crate::Server::max_concurrent_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn max_concurrent_verifies(&self) -> u64 {
+        self.verify_tally.max_concurrent_verifies()
+    }
+
+    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks are sitting
+    /// inside the verify right now, with a change to wait for. Under `test-support` only, and arming it
+    /// twice changes nothing about the checks - both watchers see the same count. See
+    /// [`Server::park_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
+        self.verify_tally.park()
+    }
+
+    /// Lets every parked check finish, and stops holding the ones that come after ([`Self::park_verifies`]).
+    /// Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn release_parked_verifies(&self) {
+        self.verify_tally.release_parked();
+    }
+}
+
+/// What the Argon2 checks report to while they run: the counts no run reads, and the hold no run arms.
+///
+/// A separate `Arc` rather than fields on [`Shared`] for one reason: a check has to carry its reporting
+/// down to the blocking pool with the permit it holds, because it is the work - not the request - that
+/// makes the memory and takes the time (see [`login::verify_password`]). The permit must be able to
+/// outlive the handler for the same reason, and it is the check's task that gets parked, not the
+/// handler's, so the hold lives beside it rather than beside the state the handler borrows.
+#[derive(Debug)]
+pub(crate) struct VerifyTally {
+    /// How many checks have run since the server started, under `test-support`. See
+    /// [`Shared::password_verifies`].
+    #[cfg(feature = "test-support")]
+    verifies: AtomicU64,
+    /// How many are running right now, and the most there has ever been at once, under `test-support`.
+    /// See [`Shared::max_concurrent_verifies`].
+    #[cfg(feature = "test-support")]
+    verifying: AtomicU64,
+    #[cfg(feature = "test-support")]
+    most_verifying: AtomicU64,
+    /// The hold a test arms, and nobody else ever does. A `OnceLock` because arming it is a one-way door:
+    /// once checks are being held, the checks that arrive after the release run through, so there is
+    /// nothing to re-arm and nothing to reset.
+    #[cfg(feature = "test-support")]
+    hold: OnceLock<VerifyHold>,
+}
+
+impl VerifyTally {
+    /// A tally no test has armed a hold on, which is what every run has.
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "test-support")]
+            verifies: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            most_verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            hold: OnceLock::new(),
+        }
+    }
+
     /// Counts one Argon2 verification as having run, and records how many are running now against the most
     /// this server has had at once. Under `test-support` that is what lets a test prove an unknown user name
     /// still costs a verify, and that the bound in [`parallel_verifies`] is real rather than asked for; in a
-    /// run nothing reads any of these counts, so this records nothing and the fields it would update are not
-    /// even there. See [`crate::Server::password_verifies`] and [`crate::Server::max_concurrent_verifies`].
+    /// run nothing reads any of these counts, so this records nothing and the counts it would update are not
+    /// even there. See [`Server::password_verifies`] and [`Server::max_concurrent_verifies`].
     pub(crate) fn verify_started(&self) {
         #[cfg(feature = "test-support")]
         {
@@ -253,14 +311,6 @@ impl Shared {
             let running = self.verifying.fetch_add(1, Ordering::Relaxed) + 1;
             self.most_verifying.fetch_max(running, Ordering::Relaxed);
         }
-    }
-
-    /// How many Argon2 verifications this server has run since it started. Under `test-support` this is
-    /// how the test that says "an unknown user name costs a verify" reads the answer; in a run nothing
-    /// counts and so there is nothing to read. See [`crate::Server::password_verifies`].
-    #[cfg(feature = "test-support")]
-    pub(crate) fn password_verifies(&self) -> u64 {
-        self.verifies.load(Ordering::Relaxed)
     }
 
     /// Says the verify [`verify_started`](Self::verify_started) counted has finished. A verify that panicked
@@ -271,44 +321,47 @@ impl Shared {
         self.verifying.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// The most Argon2 verifies this server has had running at once. Under `test-support` this is how a test
-    /// checks that [`parallel_verifies`] bounds the work when logins arrive in a burst instead of merely
-    /// asking it to; in a run nothing counts, so there is nothing to read. See
-    /// [`crate::Server::max_concurrent_verifies`].
-    #[cfg(feature = "test-support")]
-    pub(crate) fn max_concurrent_verifies(&self) -> u64 {
-        self.most_verifying.load(Ordering::Relaxed)
-    }
-
-    /// Stops this check inside the verify until a test lets it go, if a test armed a hold ([`Server::park_verifies`],
-    /// under `test-support`). Called from inside the blocking job, after [`verify_started`](Self::verify_started)
-    /// and before any hashing, so what is parked there is a check that is holding one of this server's permits.
-    /// In a run nothing has armed a hold, so there is nowhere to stop and this does nothing - which is the only
-    /// cost it ever has.
+    /// Stops this check inside the verify until a test lets it go, if a test armed a hold
+    /// ([`Server::park_verifies`], under `test-support`). Called from inside the blocking job, after
+    /// [`verify_started`](Self::verify_started) and before any hashing, so what is parked there is a check
+    /// that is holding one of this server's permits. In a run nothing has armed a hold, so there is
+    /// nowhere to stop and this does nothing - which is the only cost it ever has.
     pub(crate) fn park_inside_verify(&self) {
         #[cfg(feature = "test-support")]
         {
-            if let Some(hold) = self.verify_hold.get() {
+            if let Some(hold) = self.hold.get() {
                 hold.arrive_and_wait();
             }
         }
     }
 
-    /// Arms [`park_inside_verify`](Self::park_inside_verify) and returns the count it moves: how many checks
-    /// are sitting inside the verify right now, with a change to wait for. Under `test-support` only, and
-    /// arming it twice changes nothing about the checks - both watchers see the same count. See
-    /// [`Server::park_verifies`].
+    /// How many verifications have run, read from [`verify_started`](Self::verify_started). Under
+    /// `test-support` only, because in a run nothing counts.
     #[cfg(feature = "test-support")]
-    pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
-        let hold = self.verify_hold.get_or_init(VerifyHold::new);
+    fn password_verifies(&self) -> u64 {
+        self.verifies.load(Ordering::Relaxed)
+    }
+
+    /// The most verifications run at once, read from [`verify_started`](Self::verify_started). Under
+    /// `test-support` only, because in a run nothing counts.
+    #[cfg(feature = "test-support")]
+    fn max_concurrent_verifies(&self) -> u64 {
+        self.most_verifying.load(Ordering::Relaxed)
+    }
+
+    /// Arms [`park_inside_verify`](Self::park_inside_verify) and returns the count it moves. Under
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn park(&self) -> watch::Receiver<u64> {
+        let hold = self.hold.get_or_init(VerifyHold::new);
         hold.counts.subscribe()
     }
 
-    /// Lets every parked check finish, and stops holding the ones that come after ([`park_verifies`](Self::park_verifies)).
-    /// Under `test-support` only.
+    /// Lets every parked check finish, and stops holding the ones that come after
+    /// ([`park`](Self::park)). Under `test-support` only.
     #[cfg(feature = "test-support")]
-    pub(crate) fn release_parked_verifies(&self) {
-        if let Some(hold) = self.verify_hold.get() {
+    fn release_parked(&self) {
+        if let Some(hold) = self.hold.get() {
             hold.release();
         }
     }
@@ -443,7 +496,8 @@ impl DeviceTable {
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
 /// `forbidden`, `not_found`, `request_timeout`, `already_exists`, `too_many_requests`, `busy`,
-/// `internal`) and a message.
+/// `internal`, and `unsupported_media_type`, which no fbt-api route answers but which is spelled the
+/// same way) and a message.
 #[derive(Debug)]
 pub(crate) struct RouteError {
     status: StatusCode,
@@ -512,6 +566,18 @@ impl RouteError {
     /// `409 already_exists`: a name the list already has.
     fn already_exists(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "already_exists", message)
+    }
+
+    /// `415 unsupported_media_type`: the body is not the media type this route reads. Only the web sign-in
+    /// answers it - it is the one place here that reads JSON from someone it has not decided is anybody yet,
+    /// and the other two login calls take whatever they are handed and refuse a wrong shape as
+    /// `400 invalid_request`, which is what they have always answered.
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            message,
+        )
     }
 
     /// `429 too_many_requests`, with `Retry-After`.
@@ -699,12 +765,13 @@ struct ErrorDetail {
 /// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
 /// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    // The two login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
-    // for uploading a `.torrent`: they are the two places this server takes bytes from someone it has not
-    // yet decided is anybody, and all three fields of a key login fit in a few hundred bytes. The limit
-    // still on the challenge route bounds its inner `Json` re-extraction - of bytes already kept under it,
-    // so it never refuses; on the session route the handler uses no body extractor, so it bounds nothing, and
-    // it stays only so a future extractor there inherits the same cap.
+    // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
+    // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
+    // yet decided is anybody, and the three fields of a key login and the two of a password fit in a few
+    // hundred bytes. All three read the body themselves through [`read_capped`] and re-extract what they
+    // kept, so this limit only bounds that second step - of bytes already kept under it, so it never
+    // refuses on its own - and otherwise stays put so a future extractor on any of them inherits the same
+    // cap rather than fbt-api's.
     let logins = Router::new()
         .route(
             "/api/v1/auth/challenge",
@@ -714,6 +781,16 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             "/api/v1/auth/session",
             post(login::session)
                 .delete(login::logout)
+                .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
+        )
+        // The browser's own sign-in, and the two calls that read and end the session its cookie carries.
+        // Only the `POST` has a body; the `GET` and the `DELETE` are gated by the cookie and its CSRF token,
+        // which is [`crate::auth`]'s business, not this router's.
+        .route(
+            "/api/v1/auth/web-session",
+            post(web_session::sign_in)
+                .get(web_session::status)
+                .delete(web_session::sign_out)
                 .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
         );
     Router::new()

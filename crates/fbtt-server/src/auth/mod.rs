@@ -11,6 +11,12 @@
 //! route alone, against the exact path it was issued for - never as a bearer token and never on the event
 //! stream (`stream_route`). It opens one file; a session is the whole API.
 //!
+//! A fourth way in is a browser's: the same session token, presented as an HttpOnly cookie instead of a
+//! header. A page cannot read that cookie, so it cannot send it as a credential of its own choosing, which
+//! is why a change made with it has to prove where it came from twice over: with the session's CSRF value
+//! (`csrf_for`), which only somebody holding this session's token can compute, and with an `Origin` this
+//! server answers. Both checks are in [`FbttAuth::authorize`], next to the session check they stand beside.
+//!
 //! With nobody signing in there is still one question to answer - which name the request says it came to,
 //! and where it says it came from - because that is all that separates this server's own user from a page
 //! somebody else opened in a browser on the same machine (see [`FbttAuth`]). With logins on every
@@ -32,10 +38,15 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use axum::http::{HeaderMap, Method, header};
+use axum::http::{HeaderMap, HeaderName, Method, header};
+use base64::Engine as _;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use fbt_api::{AuthRejection, AuthRequest, Authenticator};
+use fbtt_core::CookieSecure;
 use fbtt_core::ServerConfig;
 use fbtt_core::stream::tokens::StreamTokens;
+use sha2::{Digest as _, Sha256};
+use subtle::ConstantTimeEq as _;
 
 /// The clock a store with a life keeps time by: the process's own in a run, whatever a test
 /// wants. The login stores and the core's stream tokens keep time by the same shape, so the
@@ -60,10 +71,12 @@ pub(crate) fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The routes a token is how you get one, so requiring one there would be circular. `POST` only:
-/// `DELETE /api/v1/auth/session` logs a session out and has to know whose it is.
-const LOGIN_ROUTES: [(Method, &str); 2] = [
+/// `DELETE /api/v1/auth/session` logs a session out and has to know whose it is, and the two other
+/// methods of `/api/v1/auth/web-session` are about a session a browser already has.
+const LOGIN_ROUTES: [(Method, &str); 3] = [
     (Method::POST, "/api/v1/auth/challenge"),
     (Method::POST, "/api/v1/auth/session"),
+    (Method::POST, "/api/v1/auth/web-session"),
 ];
 
 /// Whether `(method, matched_path)` names one of the login routes, by exact equality with the paths
@@ -108,6 +121,72 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let (scheme, token) = value.split_at_checked(BEARER_SCHEME.len())?;
     let token = token.strip_prefix(' ')?;
     scheme.eq_ignore_ascii_case(BEARER_SCHEME).then_some(token)
+}
+
+/// The name of the browser session's cookie: the only name [`session_cookie`] reads.
+pub(crate) const SESSION_COOKIE: &str = "fbtt_session";
+
+/// The header a change carries its session's CSRF token in.
+const CSRF_HEADER: HeaderName = HeaderName::from_static("x-csrf-token");
+
+/// What [`csrf_for`] is cut from, hashed ahead of the session token's bytes. A fixed prefix keeps this
+/// value from ever being the same thing as some other hash of the same token somewhere else in the
+/// product.
+const CSRF_NAMESPACE: &[u8] = b"fbtt-csrf\0";
+
+/// The CSRF value of one session token: base64url without padding, of SHA-256 over [`CSRF_NAMESPACE`]
+/// and the token's bytes.
+///
+/// Derived and never stored, so a session is one secret and not two, and so that showing a page its
+/// token cannot hand out something a later request needs that this server did not already have. Deriving
+/// it is not a use of the session either: it does not renew the session's hour, because it does not look
+/// the session up.
+pub(crate) fn csrf_for(token: &str) -> String {
+    let mut hashed = Sha256::new();
+    hashed.update(CSRF_NAMESPACE);
+    hashed.update(token.as_bytes());
+    BASE64_URL_SAFE_NO_PAD.encode(hashed.finalize())
+}
+
+/// Whether `method` is one that cannot change anything: the three a client sends with no intent to alter
+/// state, and the only ones a cookie alone authenticates. Everything else this server accepts from a
+/// cookie has to carry a CSRF token as well (see [`FbttAuth::authorize`]).
+fn read_only(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS
+}
+
+/// Whether the CSRF token a change carried is this session's.
+///
+/// Constant time, through `subtle`: this is the value standing between a page from somewhere else - which
+/// can make the browser send the cookie, but not read it - and everything this session may do, so the
+/// length of the match is the only thing its timing is allowed to reveal.
+fn csrf_matches(given: &str, expected: &str) -> bool {
+    bool::from(given.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+/// The session token this request's `Cookie` carries, or `None` when it carries none of this server's.
+///
+/// The name has to be followed by the `=`, so `fbtt_session_other=` is somebody else's cookie and is not
+/// read; an empty value is no token either (that is what a browser sends back for a cookie that was
+/// cleared, if it sends it at all). Several `Cookie` headers on one request are legal and all of them are
+/// read; a cookie whose value is not text is skipped, which costs a session nobody could present anyway.
+pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    for header in headers.get_all(header::COOKIE) {
+        let Ok(text) = header.to_str() else { continue };
+        for pair in text.split(';') {
+            let Some(value) = pair
+                .trim()
+                .strip_prefix(SESSION_COOKIE)
+                .and_then(|rest| rest.strip_prefix('='))
+            else {
+                continue;
+            };
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 /// The one name every server answers without a login, whatever its config says: the loopback convention,
@@ -234,14 +313,18 @@ pub(crate) fn allowed_host_problem(entry: &str) -> Option<&'static str> {
 /// With auth off no token is asked for, but every request still has to name this server - `localhost`, an
 /// address, or a host from `server.allowed_hosts` - because that is what "nobody has to sign in" means on a
 /// machine other people can reach, and the only thing keeping a hostile web page out. With auth on, only the
-/// two login routes are open and everything else needs a token these sessions issued, whatever name the
-/// request carries: a credential no web page picks up by accident is the guard there, not the `Host`.
+/// login routes are open and everything else needs a credential: a header these sessions issued, a query
+/// token on the routes that take one, or a cookie session that proved it knew its own CSRF token.
 pub struct FbttAuth {
     /// Whether anyone has to sign in: what [`ServerConfig::auth_on`] answered.
     on: bool,
     /// The host names answered without a login besides `localhost` and an address - `server.allowed_hosts`,
-    /// read once here because nothing changes it while the server runs, and consulted only with auth off.
+    /// read once here because nothing changes it while the server runs, and consulted by the `Host` and
+    /// `Origin` rules and by the cookie's origin check.
     hosts: Vec<String>,
+    /// When the browser session cookie carries `Secure`: what `server.cookie_secure` said, applied by the
+    /// sign-in route ([`crate::routes::web_session`]).
+    cookie_secure: CookieSecure,
     sessions: sessions::Sessions,
     challenges: sessions::Challenges,
     limiter: limiter::LoginLimiter,
@@ -266,6 +349,7 @@ impl FbttAuth {
         FbttAuth {
             on: server.auth_on(),
             hosts: server.allowed_hosts.clone(),
+            cookie_secure: server.cookie_secure,
             sessions: sessions::Sessions::with_clock(clock.clone()),
             challenges: sessions::Challenges::with_clock(clock.clone()),
             limiter: limiter::LoginLimiter::with_clock(clock.clone()),
@@ -277,6 +361,26 @@ impl FbttAuth {
     /// Whether anyone has to sign in here at all.
     pub fn auth_on(&self) -> bool {
         self.on
+    }
+
+    /// When a browser session cookie carries `Secure`: what `server.cookie_secure` said, which only the
+    /// sign-in route asks ([`crate::routes::web_session`]).
+    pub(crate) fn cookie_secure(&self) -> CookieSecure {
+        self.cookie_secure
+    }
+
+    /// Whether the `Origin` a browser request carries - when it carries one - names a place this server
+    /// answers: the same rule [`guard_local`] applies with logins off, because the reason to distrust a
+    /// foreign origin is the same whether or not a credential came with it. Absent is ordinary: a command
+    /// line sends none, and so does a same-origin `GET`.
+    pub(crate) fn origin_is_accepted(&self, headers: &HeaderMap) -> bool {
+        match headers.get(header::ORIGIN) {
+            None => true,
+            // A value this server cannot read as text is not a place it answers either.
+            Some(origin) => origin
+                .to_str()
+                .is_ok_and(|origin| origin_is_allowed(origin, &self.hosts)),
+        }
     }
 
     /// The sessions: what a login issues and what every accepted request renews. The login routes
@@ -342,18 +446,60 @@ impl FbttAuth {
             return Err(AuthRejection::Forbidden);
         }
         // A browser that sends an Origin is telling us where it came from; believe it only for a place this
-        // server would answer as a Host. Absent is ordinary: a command line, or a same-origin GET.
-        if let Some(origin) = request.headers.get(header::ORIGIN) {
-            let Ok(origin) = origin.to_str() else {
-                return Err(AuthRejection::Forbidden);
-            };
-            if !origin_is_allowed(origin, &self.hosts) {
-                tracing::debug!(
-                    origin = %crate::routes::clean(origin),
-                    "refused an origin this server does not answer",
-                );
-                return Err(AuthRejection::Forbidden);
-            }
+        // server would answer as a Host (see [`FbttAuth::origin_is_accepted`], which applies the same rule
+        // to the cookie's changes).
+        if !self.origin_is_accepted(request.headers) {
+            let origin = request
+                .headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            tracing::debug!(
+                origin = %crate::routes::clean(origin.unwrap_or_default()),
+                "refused an origin this server does not answer",
+            );
+            return Err(AuthRejection::Forbidden);
+        }
+        Ok(())
+    }
+
+    /// The cookie session: the last credential asked for, and the only one a browser adds without the page
+    /// choosing to.
+    ///
+    /// A cookie this server issued answers a read-only call on its own. A change has to prove two things
+    /// the page cannot manage with the cookie alone: that it knows this session's token - only somebody
+    /// holding the cookie can compute [`csrf_for`] of it - through the `x-csrf-token` header, and, if a
+    /// browser said where it came from, that it came from a place this server answers. That is the whole
+    /// defence against a page from somewhere else making this person's browser do something on their
+    /// behalf: it can send the cookie, but it can neither read it nor invent the token that goes with it.
+    fn guard_cookie(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        let Some(token) = session_cookie(request.headers) else {
+            return Err(AuthRejection::Unauthorized);
+        };
+        if self.sessions.check(token).is_none() {
+            return Err(AuthRejection::Unauthorized);
+        }
+        if read_only(request.method) {
+            return Ok(());
+        }
+        let given = request
+            .headers
+            .get(&CSRF_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if !given.is_some_and(|given| csrf_matches(given, &csrf_for(token))) {
+            tracing::debug!(
+                method = %request.method,
+                path = ?request.matched_path,
+                "refused a cookie call that did not carry its session's CSRF token",
+            );
+            return Err(AuthRejection::Unauthorized);
+        }
+        if !self.origin_is_accepted(request.headers) {
+            tracing::debug!(
+                method = %request.method,
+                path = ?request.matched_path,
+                "refused a cookie call from an origin this server does not answer",
+            );
+            return Err(AuthRejection::Forbidden);
         }
         Ok(())
     }
@@ -366,6 +512,7 @@ impl fmt::Debug for FbttAuth {
         f.debug_struct("FbttAuth")
             .field("auth", &self.on)
             .field("allowed_hosts", &self.hosts.len())
+            .field("cookie_secure", &self.cookie_secure)
             .field("sessions", &self.sessions)
             .field("challenges", &self.challenges)
             .field("limiter", &self.limiter)
@@ -381,9 +528,9 @@ impl Authenticator for FbttAuth {
             // Nobody needs a token here, so the name the request carries is the only thing left to check.
             return self.guard_local(request);
         }
-        // The two login routes are how you get a token at all, so they cannot ask for one. Everything
-        // else - including `DELETE /api/v1/auth/session`, which has to know whose session it is
-        // ending - needs one.
+        // The login routes are how you get a token at all, so they cannot ask for one - the web sign-in
+        // included, since that is the call the cookie is issued by. Everything else - including
+        // `DELETE /api/v1/auth/session`, which has to know whose session it is ending - needs one.
         if login_route(request.method, request.matched_path) {
             return Ok(());
         }
@@ -406,15 +553,23 @@ impl Authenticator for FbttAuth {
         // `None`, so this does not have to know which routes those are. Only when there is no header
         // at all: a header that is here but is not a bearer token is a wrong credential, not a missing
         // one, and letting the query token answer it would let a request pick which credential loses.
+        let offered =
+            request.headers.contains_key(header::AUTHORIZATION) || request.query_token.is_some();
         let token = match request.headers.get(header::AUTHORIZATION) {
             Some(_) => bearer(request.headers),
             None => request.query_token,
         };
         if token.is_some_and(|token| self.sessions.check(token).is_some()) {
-            Ok(())
-        } else {
-            Err(AuthRejection::Unauthorized)
+            return Ok(());
         }
+        // The cookie is the last thing asked, and it is asked only where no credential was offered at all.
+        // It is the one credential a browser adds by itself, without the page choosing it, so it may not
+        // answer behind something the page did choose: a header - whatever is in it - and a query token on
+        // a route that takes one each decide on their own, exactly as they did before the cookie existed.
+        if offered {
+            return Err(AuthRejection::Unauthorized);
+        }
+        self.guard_cookie(request)
     }
 }
 
@@ -442,10 +597,11 @@ impl TestClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthRejection, Authenticator, FbttAuth, LOCAL_HOST, LOGIN_NAMESPACE, TestClock,
-        allowed_host_problem, bearer, host_is_local_or_allowed, host_part, origin_is_allowed,
+        AuthRejection, Authenticator, FbttAuth, LOCAL_HOST, LOGIN_NAMESPACE, SESSION_COOKIE,
+        TestClock, allowed_host_problem, bearer, csrf_for, host_is_local_or_allowed, host_part,
+        origin_is_allowed, session_cookie,
     };
-    use axum::http::{HeaderMap, Method, header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, header};
     use fbtt_core::{AuthConfig, ServerConfig};
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::{Duration, Instant};
@@ -1085,5 +1241,301 @@ mod tests {
     #[test]
     fn login_namespace_is_the_shared_spelling() {
         assert_eq!(LOGIN_NAMESPACE, fbtt_core::auth::LOGIN_NAMESPACE);
+    }
+
+    /// The CSRF value is one fixed derivation of the session token: SHA-256 over `fbtt-csrf\0` and the
+    /// token, spelled in the base64url session tokens use. Pinned to a digest worked out elsewhere, so
+    /// changing the derivation is a change to the protocol and not something this file agrees with itself
+    /// about.
+    #[test]
+    fn the_csrf_value_is_a_pinned_derivation_of_the_token() {
+        let derived = csrf_for("test-session-token");
+        assert_eq!(derived, "jLuroH2e_MNbp6isOahWlmMm8apThGzu7wyO3-YhJtw");
+        assert_eq!(derived.len(), 43, "32 bytes in base64url with no padding");
+        assert!(
+            derived
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "a spelling that survives a header and a JSON string unchanged: {derived}",
+        );
+        assert_eq!(
+            csrf_for("test-session-token"),
+            derived,
+            "the same token, the same value"
+        );
+        assert_ne!(
+            csrf_for("another-session-token"),
+            derived,
+            "another token, another value",
+        );
+    }
+
+    /// The cookie is read by its exact name and nothing else: a longer name that merely starts with it is
+    /// somebody else's cookie, an empty value is no token, and a value that is not text is not this
+    /// server's either.
+    #[test]
+    fn the_cookie_token_is_read_by_its_exact_name() {
+        fn cookie(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(value).expect("a cookie header"),
+            );
+            headers
+        }
+
+        assert_eq!(session_cookie(&cookie("fbtt_session=abc")), Some("abc"));
+        assert_eq!(
+            session_cookie(&cookie("a=1; fbtt_session=abc; b=2")),
+            Some("abc"),
+            "one of several cookies",
+        );
+        assert_eq!(
+            session_cookie(&cookie("  fbtt_session=abc  ")),
+            Some("abc"),
+            "the spaces between cookies are ordinary",
+        );
+        for unusable in [
+            "fbtt_sessionx=abc",
+            "fbtt_session_x=abc",
+            "x.fbtt_session=abc",
+            "fbtt_session=",
+            "",
+            "a=1; b=2",
+        ] {
+            assert_eq!(session_cookie(&cookie(unusable)), None, "{unusable:?}");
+        }
+
+        // The first one wins when a request somehow carries two, and a value that is not text is skipped
+        // rather than guessed at.
+        let mut several = cookie("fbtt_session=first");
+        several.append(
+            header::COOKIE,
+            HeaderValue::from_str("fbtt_session=second").expect("a cookie header"),
+        );
+        assert_eq!(session_cookie(&several), Some("first"));
+        let mut not_text = HeaderMap::new();
+        not_text.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"fbtt_session=\xf0\x9f\x92\xa9")
+                .expect("bytes are a header value"),
+        );
+        assert_eq!(
+            session_cookie(&not_text),
+            None,
+            "no token anybody could present"
+        );
+    }
+
+    /// A cookie session authenticates a read-only call on its own and a change only with the CSRF value of
+    /// its own token, and only from a place this server answers: a page from elsewhere can make the
+    /// browser send the cookie, but it cannot read it and it cannot invent what goes with it.
+    #[test]
+    fn the_cookie_session_changes_only_with_its_own_csrf_token() {
+        let (_clock, handle) = TestClock::starting_at(Instant::now());
+        // `bit.local` in `allowed_hosts`, because one of the assertions below is about an origin naming it:
+        // with an empty list the only names this server answers are `localhost` and addresses.
+        let auth = FbttAuth::with_clock(&server_with(true, &["bit.local"]), handle);
+        let (token, _) = auth.sessions().issue("alice".to_string());
+        let (other, _) = auth.sessions().issue("bob".to_string());
+        let own = "127.0.0.1:8090";
+
+        /// The headers of a browser request: the Host it arrived with, an `Origin` when one was sent, the
+        /// session cookie, and the CSRF header when the call carries one. The header is named by its wire
+        /// spelling here rather than by the constant the guard uses.
+        fn browser(
+            host: &str,
+            origin: Option<&str>,
+            cookie: &str,
+            csrf: Option<&str>,
+        ) -> HeaderMap {
+            let mut headers = headers(host, origin);
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("{SESSION_COOKIE}={cookie}"))
+                    .expect("a cookie header"),
+            );
+            if let Some(csrf) = csrf {
+                headers.insert(
+                    HeaderName::from_static("x-csrf-token"),
+                    csrf.parse().expect("a csrf header value"),
+                );
+            }
+            headers
+        }
+
+        let ask = |method: &Method, headers: &HeaderMap| {
+            auth.authorize(&request(method, Some("/api/v1/torrents"), headers))
+        };
+
+        // Reading needs the cookie and nothing else.
+        for method in [&Method::GET, &Method::HEAD, &Method::OPTIONS] {
+            assert!(
+                ask(method, &browser(own, None, &token, None)).is_ok(),
+                "{method} changes nothing, so the cookie is enough",
+            );
+        }
+
+        // Changing needs this session's own CSRF value: absent, another session's, or somebody's guess are
+        // all refused; the right one gets through.
+        let mine = csrf_for(&token);
+        let theirs = csrf_for(&other);
+        for method in [&Method::POST, &Method::PUT, &Method::PATCH, &Method::DELETE] {
+            assert!(
+                matches!(
+                    ask(method, &browser(own, None, &token, None)),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{method} with no CSRF token: the cookie alone is not permission to change",
+            );
+            assert!(
+                matches!(
+                    ask(method, &browser(own, None, &token, Some(&theirs))),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{method} with another session's token",
+            );
+            assert!(
+                matches!(
+                    ask(method, &browser(own, None, &token, Some("guess"))),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{method} with a value that is not a session's",
+            );
+            assert!(
+                ask(method, &browser(own, None, &token, Some(&mine))).is_ok(),
+                "{method} with its own CSRF token",
+            );
+        }
+
+        // Where the call came from is asked of a change, and only of one: a browser that sent an `Origin`
+        // this server does not answer is refused even holding the right token, and the answer for a place
+        // it does answer - any port, any case - is yes.
+        assert!(
+            ask(
+                &Method::POST,
+                &browser(own, Some("http://evil.example"), &token, Some(&mine)),
+            )
+            .is_err(),
+            "a cross-origin change is refused with its token in hand"
+        );
+        assert!(matches!(
+            ask(
+                &Method::POST,
+                &browser(own, Some("http://evil.example"), &token, Some(&mine)),
+            ),
+            Err(AuthRejection::Forbidden)
+        ));
+        assert!(
+            ask(
+                &Method::POST,
+                &browser(own, Some("http://BIT.LOCAL:8090"), &token, Some(&mine)),
+            )
+            .is_ok(),
+            "a name the config listed answers",
+        );
+
+        // A cookie is the last thing asked, so it never answers behind a credential the request chose to
+        // present: a header this server cannot read, a header that is not one of its sessions, and a query
+        // token on a route that takes one are each refused with a live cookie on the same request.
+        let mut behind_a_header = browser(own, None, &token, None);
+        behind_a_header.insert(
+            header::AUTHORIZATION,
+            "Basic YWxpY2U6aHVudGVyMg=="
+                .parse()
+                .expect("a header value"),
+        );
+        assert!(
+            matches!(
+                ask(&Method::GET, &behind_a_header),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a cookie does not answer behind a header",
+        );
+        let mut foreign_token = browser(own, None, &token, None);
+        foreign_token.insert(
+            header::AUTHORIZATION,
+            "Bearer nobody-issued-this".parse().expect("a header value"),
+        );
+        assert!(
+            matches!(
+                ask(&Method::GET, &foreign_token),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "a wrong bearer token is not redeemed by the cookie",
+        );
+        let queried_headers = browser(own, None, &token, None);
+        let queried = fbt_api::AuthRequest::new(
+            &Method::GET,
+            Some("/api/v1/events"),
+            &queried_headers,
+            Some("not-a-token"),
+            None,
+        );
+        assert!(
+            matches!(auth.authorize(&queried), Err(AuthRejection::Unauthorized)),
+            "nor by a query token that is not one",
+        );
+
+        // And a cookie is only as good as the session behind it: an unknown token, and one whose hour has
+        // run out without anyone using it, are refused like a missing cookie is.
+        assert!(
+            matches!(
+                ask(
+                    &Method::GET,
+                    &browser(own, None, "nobody-issued-this", None)
+                ),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "not this server's cookie",
+        );
+        let (expiring, _) = auth.sessions().issue("carol".to_string());
+        _clock.advance(Duration::from_secs(60 * 60 + 1));
+        assert!(
+            matches!(
+                ask(&Method::GET, &browser(own, None, &expiring, None)),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "the hour slid, and then it ended",
+        );
+    }
+
+    /// `POST /api/v1/auth/web-session` is where a browser gets its cookie, so it cannot need one; the two
+    /// methods that use the cookie it hands out are ordinary requests behind the guard.
+    #[test]
+    fn the_web_session_post_is_a_login_route_and_its_other_methods_are_not() {
+        let (_clock, handle) = TestClock::starting_at(Instant::now());
+        let auth = FbttAuth::with_clock(&server(true), handle);
+        let none = HeaderMap::new();
+
+        assert!(
+            auth.authorize(&request(
+                &Method::POST,
+                Some("/api/v1/auth/web-session"),
+                &none
+            ))
+            .is_ok(),
+            "the sign-in is how the cookie is got",
+        );
+        for method in [&Method::GET, &Method::DELETE] {
+            assert!(
+                matches!(
+                    auth.authorize(&request(method, Some("/api/v1/auth/web-session"), &none)),
+                    Err(AuthRejection::Unauthorized)
+                ),
+                "{method} on that path is about a session the caller already has",
+            );
+        }
+        assert!(
+            matches!(
+                auth.authorize(&request(
+                    &Method::POST,
+                    Some("/admin/api/v1/auth/web-session"),
+                    &none
+                )),
+                Err(AuthRejection::Unauthorized)
+            ),
+            "the exemption is exact, as it is for the other two",
+        );
     }
 }

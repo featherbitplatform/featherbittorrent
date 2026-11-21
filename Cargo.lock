@@ -1423,6 +1423,7 @@ dependencies = [
  "sha2 0.11.1",
  "signature 3.0.0",
  "ssh-key 0.7.0-rc.12",
+ "subtle",
  "thiserror",
  "tokio",
  "tracing",

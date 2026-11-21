@@ -43,6 +43,8 @@ getrandom.workspace = true
 sha2.workspace = true
 # Device keys: the OpenSSH public key line and `sshsig`.
 ssh-key.workspace = true
+# The browser session's CSRF token is compared in constant time.
+subtle.workspace = true
 # The request and response bodies of our own routes.
 serde.workspace = true
 # `StreamExt::next`, for the stream-token route reading its body chunk by chunk under its own caps.
