@@ -26,7 +26,13 @@ The two builds come from the owner, 2026-11-21: "For headless I meant only the t
 | **Headless** | The `featherbittorrent` binary exactly as it ships today, TUI and `serve`, with no web UI compiled in. Nothing of the front end is in it. |
 | **Desktop** | A Tauri app with the same front end in a native window. It runs the engine in-process ("This computer"), or connects to a server like the remote TUI does. |
 
-In cargo terms the split is the `web-ui` feature: full builds turn it on, headless builds leave it off. **[builder's call]** Both builds ship for every platform in the 2026-11-14 table. How the packages are named (for example `featherbittorrent` and `featherbittorrent-headless`, or the reverse) is question 1.
+In cargo terms the split is the `web-ui` feature: full builds turn it on, headless builds leave it off. **[builder's call]** Both builds ship in every release, for every platform in the 2026-11-14 table. **[owner, 2026-11-21]** How the packages are named is question 1.
+
+**The web UI is on by default in a full build.** A full build's `serve` serves it unless it is turned off. **[owner, 2026-11-21]** Two ways to turn it off, either one enough:
+- the config setting `server.web_ui: false`;
+- the environment variable `FBTT_WEB_UI=0`. This one wins over the file, like `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR` do.
+
+The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless build accepts the setting and ignores it, with one log line, so one config file works with either build.
 
 ## 3. Goals
 
@@ -132,8 +138,8 @@ The component structure, state management (plain React, or a small store), the r
 
 ## 10. Questions for the owner
 
-1. **Package names for the two builds.** Should the full build keep the name `featherbittorrent` and the terminal-only build become `featherbittorrent-headless`, or the reverse? Should the `.deb`, `.rpm` and archives both appear on every release?
-2. **Should `serve` expose the web UI by default?** Or only when it's turned on, with a `server.web_ui: true` setting or a wizard question?
+1. **Package names for the two builds.** Should the full build keep the name `featherbittorrent` and the terminal-only build become `featherbittorrent-headless`, or the reverse? (Both ship in every release: answered.)
+2. Answered: on by default in a full build, off through `server.web_ui: false` or `FBTT_WEB_UI=0` (section 2).
 3. **Should the local TUI also serve the web UI** for its embedded engine, for example on `127.0.0.1` so a browser on the same machine can watch it? That means the TUI starts a server, which the 2026-11-14 design avoided unless asked for.
 4. **Desktop to a remote server:** should the webview talk to it directly (it needs CORS on the server), or go through a small Rust proxy inside the app (no server change, but a second path)?
 5. **Sessions in the browser:** a token in `sessionStorage` (sign in again per tab or after a restart), or an HttpOnly cookie that survives a restart (it needs CSRF protection)?
