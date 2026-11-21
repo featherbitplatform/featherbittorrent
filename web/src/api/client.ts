@@ -50,6 +50,52 @@ export interface DirectoryListing {
   dirs: string[]
 }
 
+/** The kind of track a file carries, as the media probe says it. */
+export type MediaTrackKind = 'video' | 'audio' | 'subtitle'
+
+/**
+ * One track of a media file, field for field with the probe answer
+ * (`GET /api/v1/media/{id}/{file}`, `crates/fbtt-server/src/routes/media.rs` at the milestone 2
+ * plan): the wire names are the server's own, so the page keeps them as they arrive.
+ */
+export interface MediaTrack {
+  id: number
+  kind: MediaTrackKind
+  codec: string
+  /** The codec strings the remux answers in `video/mp4; codecs="..."` or `audio/mp4; codecs="..."`. */
+  mime_codecs: string[]
+  language: string | null
+  name: string | null
+  default: boolean
+  forced: boolean
+  /** True for a text subtitle; image subtitles cannot be shown by the browser's WebVTT engine. */
+  text: boolean
+}
+
+/** A subtitle file of the same torrent, listed beside the tracks that live inside the video. */
+export interface ExternalSubtitle {
+  file: number
+  name: string
+  format: string
+}
+
+/** The probe answer for one file: its container, its duration, its tracks, and the subtitle files beside it. */
+export interface MediaProbe {
+  container: 'matroska' | 'webm' | 'mp4'
+  duration_ms: number
+  /** The shift every remuxed track carries, in source milliseconds. */
+  time_offset_ms: number
+  tracks: MediaTrack[]
+  external_subtitles: ExternalSubtitle[]
+}
+
+/** One subtitle cue, the wire shape of the cue routes' `{"cues":[...]}` body. */
+export interface Cue {
+  start_ms: number
+  end_ms: number
+  text: string
+}
+
 /**
  * A call the server refused. `status` and `code` are what a caller decides from (Task 7 closes the
  * detail pane on a `404`, for instance); `message` is the server's own words when it had any.
@@ -117,9 +163,22 @@ export interface Api {
   ): Promise<Json201<operations['add_torrent']>>
   roots(): Promise<string[]>
   list(path: string): Promise<DirectoryListing>
+  probe(id: string, file: number): Promise<MediaProbe>
+  cues(
+    id: string,
+    file: number,
+    track: number,
+    fromMs: number,
+    toMs: number,
+  ): Promise<{ cues: Cue[] }>
+  subtitleFile(id: string, file: number, sub: number): Promise<{ cues: Cue[] }>
+  streamToken(id: string, file: number): Promise<string>
+  mediaStreamUrl(id: string, file: number, track: number, startMs: number): string
 }
 
 const TORRENTS = '/api/v1/torrents'
+const MEDIA = '/api/v1/media'
+const STREAM_TOKENS = '/api/v1/stream-tokens'
 
 /** The document's own JSON shape for a magnet add, named once so the method below says what it sends. */
 type AddTorrentRequest = components['schemas']['AddTorrentRequest']
@@ -230,6 +289,24 @@ export function createClient(
       json(`${TORRENTS}${addQuery(savePath, paused)}`, 'POST', bytes, 'application/x-bittorrent'),
     roots: () => json('/api/v1/fs/roots', 'GET'),
     list: (path) => json(`/api/v1/fs/list?path=${encodeURIComponent(path)}`, 'GET'),
+    probe: (id, file) => json(`${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}`, 'GET'),
+    cues: (id, file, track, fromMs, toMs) =>
+      json(
+        `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/cues` +
+          `?from_ms=${encodeURIComponent(fromMs)}&to_ms=${encodeURIComponent(toMs)}`,
+        'GET',
+      ),
+    subtitleFile: (id, file, sub) =>
+      json(`${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/subtitles/${encodeURIComponent(sub)}`, 'GET'),
+    // A change: the token travels with the CSRF header. What the caller keeps is the path the
+    // answer names; it already carries `?token=` when a token came with it, and nothing else to add.
+    streamToken: async (id, file) => {
+      const body = JSON.stringify({ torrent: id, file } satisfies { torrent: string; file: number })
+      const answer = (await json(STREAM_TOKENS, 'POST', body, 'application/json')) as { path: string }
+      return answer.path
+    },
+    mediaStreamUrl: (id, file, track, startMs) =>
+      `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(startMs)}`,
   }
 }
 
