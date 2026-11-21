@@ -72,7 +72,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
    - Choosing between audio tracks (`HTMLMediaElement.audioTracks`) works only in Safari. Chrome, Edge (and so the desktop app's WebView2 on Windows) and Firefox do not expose it.
    - A browser never sees subtitles that are inside a Matroska or MP4 file. Only external WebVTT files given through `<track>` work.
 
-   **Recommended mechanism.** **[builder's call, for the owner to confirm]** The server remuxes, never transcodes:
+   **Mechanism.** **[owner agreed, 2026-11-21]** The server remuxes, never transcodes:
    - **Audio.** For a video file, the server reads its container (Matroska/WebM and MP4). It serves fragmented MP4 that carries the video track and **one chosen audio track**, copied as they are. The player fetches it through Media Source Extensions, and choosing another language reloads the audio stream at the current position.
    - **Subtitles.** Text subtitles inside the file (SRT, ASS/SSA, mov_text) and next to it (`.srt`, `.vtt`, `.ass` in the torrent) are served as WebVTT. The player shows them as tracks it can choose. ASS styling becomes plain text.
    - **What cannot play.** Image subtitles (PGS, VobSub) are listed but not shown. A video or audio codec the browser cannot decode (often HEVC, AC-3, DTS) gets a clear message, plus "Download" and, on the desktop, "Open in mpv or VLC".
@@ -186,4 +186,4 @@ The component structure, state management (plain React, or a small store), the r
 6. Answered: not now. Browsers sign in with a password, or through the gateway's OpenID Connect. **[owner, 2026-11-21]**
 7. Answered: the first desktop release has all of these: the tray, start at login, `.torrent` file associations, and the `magnet:` link handler. **[owner, 2026-11-21]**
 8. Answered: the desktop app carries featherbittorrent's version and ships in the same release. **[owner, 2026-11-21]**
-9. **Media player mechanism.** Is the server-side remux in goal 3 the right approach: one chosen audio track per stream, and text subtitles as WebVTT? Or should the player be limited to what a browser plays natively, and leave the rest to mpv or VLC?
+9. Answered: yes, the server-side remux in goal 3. **[owner, 2026-11-21: "Agreed"]**
