@@ -249,6 +249,32 @@ status=0; out="$(bash "$package_sh" --check-rpm-metadata full featherbittorrent 
 grep -qiF 'obsoletes' <<<"$out" || fail "the no-obsoletes refusal did not name the field: $out"
 echo 'ok: the .deb and .rpm metadata checks accept the right packages and refuse the wrong ones'
 
+# 7d. The ar and tar path that reads a .deb's control file when dpkg-deb is missing, once per compression
+# the control member can use. Each .deb here is a minimal ar archive, read through --read-deb-control.
+deb_dir="$fixture_dir/debs"; mkdir -p "$deb_dir/ctl"
+printf 'Package: featherbittorrent\nVersion: 0.0.0\n' > "$deb_dir/ctl/control"
+for ext in gz xz zst; do
+  case "$ext" in
+    gz)  comp=(--gzip) ;;
+    xz)  comp=(--xz) ;;
+    zst) comp=(--zstd) ;;
+  esac
+  if [[ "$ext" == zst ]] && ! command -v zstd >/dev/null; then
+    echo 'note: zstd is not installed, so the control.tar.zst read is skipped'
+    continue
+  fi
+  d="$deb_dir/$ext"; mkdir -p "$d"
+  printf '2.0\n' > "$d/debian-binary"
+  (cd "$deb_dir/ctl" && tar "${comp[@]}" -cf "$d/control.tar.$ext" ./control)
+  (cd "$d" && tar "${comp[@]}" -cf "data.tar.$ext" -T /dev/null)
+  # S: no symbol table (BSD ar would add a __.SYMDEF member and list nothing else)
+  (cd "$d" && ar rcS "pkg-$ext.deb" debian-binary "control.tar.$ext" "data.tar.$ext")
+  out="$(bash "$package_sh" --read-deb-control "$d/pkg-$ext.deb" 2>&1)" \
+    || fail "--read-deb-control could not read a control.tar.$ext: $out"
+  grep -qF 'Package: featherbittorrent' <<<"$out" || fail "--read-deb-control on control.tar.$ext did not return the control file: $out"
+done
+echo 'ok: the ar and tar control read works for each compression (gz, xz, zst)'
+
 # 8. The service examples the packages ship as documentation: no package installs, enables or starts a
 # service, so each example is a file a person copies where their own service manager looks.
 status=0; examples_out="$(bash dev/test-service-examples.sh 2>&1)" || status=$?

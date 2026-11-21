@@ -21,6 +21,7 @@
 # Test hooks that need no build and ask nothing about the platform (dev/test-packaging.sh runs them on
 # any OS): --print-versions <version> prints the deb version then the rpm version; --check-rpm-reqs
 # reads requirement lines on stdin and refuses any the declared dependencies do not cover;
+# --read-deb-control <deb> prints a .deb's control file through the ar and tar path;
 # --check-deb-control <variant> <file> and --check-rpm-metadata <variant> <name> <obsoletes-file>
 # <conflicts-file> run the metadata checks on fixture text. All refuse with one line, exit 2.
 set -euo pipefail
@@ -81,6 +82,36 @@ if [[ "${1:-}" == "--check-rpm-reqs" ]]; then
   [[ $# -eq 1 ]] || fail "usage: bash dev/package-linux.sh --check-rpm-reqs (requirement lines on stdin)"
   check_rpm_reqs
   echo 'package-linux.sh ok: every rpm requirement is covered by the declared dependencies'
+  exit 0
+fi
+# Reads the control file out of a .deb with ar and tar, for hosts with no dpkg-deb (the build image).
+# <deb> <control member name, control.tar.gz, .xz or .zst>. GNU tar reading from stdin does not
+# auto-detect the compression, so the option follows the extension; stderr stays out of the output.
+read_deb_control() {
+  local deb="$1" member="$2" out
+  local -a decomp
+  case "$member" in
+    *.gz)  decomp=(--gzip) ;;
+    *.xz)  decomp=(--xz) ;;
+    *.zst) decomp=(--zstd) ;;
+    *)     decomp=() ;;
+  esac
+  # ${decomp[@]+...} keeps an empty array legal under set -u on bash 3.2
+  out="$(ar p "$deb" "$member" 2>/dev/null | tar ${decomp[@]+"${decomp[@]}"} -xOf - ./control 2>/dev/null)" \
+    || out="$(ar p "$deb" "$member" 2>/dev/null | tar ${decomp[@]+"${decomp[@]}"} -xOf - control 2>/dev/null)" \
+    || out=''
+  printf '%s' "$out"
+}
+if [[ "${1:-}" == "--read-deb-control" ]]; then
+  # <deb>; lists the control member like the build does, then prints what read_deb_control reads
+  [[ $# -eq 2 ]] || fail "usage: bash dev/package-linux.sh --read-deb-control <deb>"
+  [[ -r "$2" ]] || fail "could not read $2"
+  hook_members="$(ar t "$2" 2>/dev/null)" || fail "ar could not list $2"
+  hook_control="$(grep '^control\.tar' <<<"$hook_members" | head -1)" || true
+  [[ -n "$hook_control" ]] || fail "$2 has no control.tar member"
+  hook_text="$(read_deb_control "$2" "$hook_control")"
+  [[ -n "$hook_text" ]] || fail "could not read the control file from $hook_control in $2"
+  printf '%s\n' "$hook_text"
   exit 0
 fi
 if [[ "${1:-}" == "--check-deb-control" ]]; then
@@ -281,25 +312,18 @@ if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --
 # "replaces" tag, so an obsoletes is what removes the first when the second installs) and must carry no
 # conflicts at all (a conflict on the obsoleted name would stop the install instead of replacing it).
 # The logic is the same the verify job's packaging test runs offline against fixtures
-# (dev/test-packaging.sh's check_deb_control and check_rpm_metadata), so a change to one is a change to
-# both.
+# (dev/test-packaging.sh runs this script's --check-deb-control and --check-rpm-metadata hooks, which
+# call the same check_deb_control and check_rpm_metadata functions), so there is one copy of the rule.
 # dpkg-deb with no field prints the whole control file (Package:, Conflicts:, Replaces:, ...); the
 # ar and tar path is the fallback the build image uses, because it carries no dpkg-deb. The control
-# member was already listed above, so $control holds its name (control.tar.gz, .xz or .zst). GNU tar
-# reading from stdin does not auto-detect the compression, so the flag follows the extension.
+# member was already listed above, so $control holds its name (control.tar.gz, .xz or .zst), and
+# read_deb_control (defined near the top, tested through --read-deb-control) picks the tar option.
 if command -v dpkg-deb >/dev/null; then
   if ! deb_control="$(dpkg-deb -f "$dist/$pkg.deb" 2>/dev/null)"; then
     fail "could not read the .deb's control member from $dist/$pkg.deb (dpkg-deb failed)"
   fi
 else
-  case "$control" in
-    *.gz)  tar_flag=-xOzf ;;
-    *.xz)  tar_flag=-xOJf ;;
-    *.zst) tar_flag=-xOaF ;;
-    *)     tar_flag=-xOf ;;
-  esac
-  deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar $tar_flag - ./control 2>/dev/null)" \
-    || deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar $tar_flag - control 2>/dev/null)"
+  deb_control="$(read_deb_control "$dist/$pkg.deb" "$control")"
   [[ -n "$deb_control" ]] || fail "could not read the .deb's control member from $dist/$pkg.deb"
 fi
 if [[ "$variant" == headless ]]; then other="featherbittorrent"; else other="featherbittorrent-headless"; fi
