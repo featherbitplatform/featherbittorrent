@@ -14,7 +14,9 @@
  * The screens keep their visible banners exactly where they are; what moved here is the
  * announcing. The mapping from a session state to a message lives in this file and is the only
  * writer of the two regions' text, and the announcer never replaces the nodes it was handed -
- * `the_live_regions_outlive_the_screens` is what keeps that promise.
+ * `the_live_regions_outlive_the_screens` is what keeps that promise. News that belongs to no
+ * session state - a torrent the pane found gone - reaches the same polite node through
+ * `announcePolite`, so there is still exactly one region per page.
  *
  * The second half is the refresh loop, `startLive`: the remote TUI's cadence (`crates/fbtt-core/
  * src/remote/mod.rs` and `backend.rs`) carried to the browser. The table is read every second,
@@ -34,6 +36,9 @@ import type { SessionState, SessionStore } from './session'
 
 /** The one line the unreachable screen says. Shared between the visible text and the announcer so the two can never drift apart. */
 export const UNREACHABLE_COPY = 'Cannot reach the server.'
+
+/** The one line a detail pane leaves behind when a `404` says the torrent it was describing is gone. Named here for the same reason as `UNREACHABLE_COPY`: the words a screen shows and the words a region announces are one string, said once. */
+export const TORRENT_REMOVED_COPY = 'That torrent was removed.'
 
 /** The two nodes the page announces through. App mounts them once; this module only ever writes text into them. */
 export interface LiveRegions {
@@ -69,6 +74,26 @@ export function messageFor(state: SessionState): { polite: string | null; assert
   }
 }
 
+/** The polite node the page's announcer was handed, while its announcer lives. `announcePolite` writes one-off news into exactly that node, so a message raised from inside a screen reaches the region App mounted rather than some node the screen brought with it. */
+let politeRegion: HTMLElement | null = null
+
+/**
+ * Say a one-off sentence through the page's polite region: the route a message that belongs to no
+ * session state - a torrent that turned out to be gone - takes to the same node the announcer
+ * writes. It writes text only, never replacing the node itself, which is the promise
+ * `the_live_regions_outlive_the_screens` keeps. Without a mounted announcer it falls back to the
+ * polite region on the page, so the words have one home in a harness and in the app alike.
+ */
+export function announcePolite(message: string): void {
+  const region =
+    politeRegion !== null
+      ? politeRegion
+      : typeof document === 'undefined'
+        ? null
+        : document.querySelector('[aria-live="polite"]')
+  if (region !== null) region.textContent = message
+}
+
 /**
  * Mount the announcer: write the current words into the given regions, then follow the store and
  * write every later change into those same nodes. `injected` are App's own persistent nodes; the
@@ -77,6 +102,7 @@ export function messageFor(state: SessionState): { polite: string | null; assert
  */
 export function createLiveAnnouncer(store: SessionStore, regions: LiveRegions): LiveAnnouncer {
   let timer: ReturnType<typeof setTimeout> | undefined
+  politeRegion = regions.polite
 
   function say(): void {
     const next = messageFor(store.get())
@@ -100,6 +126,7 @@ export function createLiveAnnouncer(store: SessionStore, regions: LiveRegions): 
     stop: () => {
       clearTimeout(timer)
       unsubscribe()
+      if (politeRegion === regions.polite) politeRegion = null
     },
     reannounce: () => {
       // Blank now, restore on the next tick: screen readers compare against what the region held

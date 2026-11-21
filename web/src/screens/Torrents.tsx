@@ -19,13 +19,16 @@
  * injected at build time - and none of it earns a place in the once-a-second round.
  *
  * The header's Add torrent button answers nothing yet: the dialog comes with the actions task. The
- * selected row is remembered here because the detail pane that will use it mounts beside this
- * screen in the next task.
+ * selected row is remembered here because the detail pane under the table reads through it, and
+ * the pane's heartbeat is this screen's: `startLive` bumps `tick` once per live round, and the pane
+ * re-reads its tab on that bump, so it shares the loop's cadence, its hidden-page pause and its
+ * backoff instead of keeping a timer of its own.
  *
  * @module screens/Torrents
  */
 import { useEffect, useMemo, useState } from 'react'
 import Banner from '../components/Banner'
+import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
 import StateFilters from '../components/StateFilters'
 import TorrentTable from '../components/TorrentTable'
@@ -63,9 +66,20 @@ export default function Torrents({
   const [filter, setFilter] = useState<FilterKey>('all')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null)
+  // Bumped once per live refresh round. It is the pane's clock: the detail pane re-reads its tab
+  // when this moves, so the pane's cadence, hidden-page pause and backoff are exactly the table's,
+  // with no second timer anywhere near the same server.
+  const [tick, setTick] = useState(0)
 
   useEffect(() => {
-    const live = startLive(client, setRows, setLink, {
+    const live = startLive(
+      client,
+      (nextRows) => {
+        setRows(nextRows)
+        setTick((n) => n + 1)
+      },
+      setLink,
+      {
       now: () => Date.now(),
       setTimeout: (fn: () => void, ms: number) => {
         setTimeout(fn, ms)
@@ -119,6 +133,11 @@ export default function Torrents({
     }
     return { down, up }
   }, [rows])
+  const selectedName = useMemo(() => {
+    if (selectedId === null) return null
+    const row = rows.find((torrent) => torrent.id === selectedId)
+    return row === undefined ? null : row.name
+  }, [rows, selectedId])
 
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden">
@@ -140,6 +159,21 @@ export default function Torrents({
         <StateFilters counts={counts} active={filter} onChange={setFilter} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <TorrentTable rows={shown} selectedId={selectedId} onPick={setSelectedId} />
+          <DetailPane
+            id={selectedId}
+            client={client}
+            tick={tick}
+            name={selectedName}
+            onDismiss={() => {
+              setSelectedId(null)
+            }}
+            onRemoved={(goneId) => {
+              // The pane closes itself; the selection goes with it, but only when this is still
+              // the selected torrent - a late 404 about one nobody chose must not close a pane
+              // that is busy describing another.
+              setSelectedId((current) => (current === goneId ? null : current))
+            }}
+          />
         </main>
       </div>
     </div>
