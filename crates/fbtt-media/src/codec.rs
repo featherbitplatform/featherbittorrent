@@ -201,12 +201,28 @@ pub(crate) fn mp4_codec(entry: &atom::Codec) -> (Codec, Vec<String>) {
         atom::Codec::Hev1(entry) => (Codec::Hevc, vec![hvc1_from(&entry.hvcc)]),
         atom::Codec::Av01(entry) => (Codec::Av1, vec![av01_from(&entry.av1c)]),
         atom::Codec::Mp4a(entry) => {
+            // The `objectTypeIndication` is what names the codec, and the AudioSpecificConfig is a
+            // detail of the AAC types: MPEG Layer III in MPEG-4 syntax, and AAC carried with ADTS
+            // headers, legitimately carry no descriptor config at all, so consulting it for the
+            // other types invents an object type the file never stated.
             let dec = &entry.esds.es_desc.dec_config;
-            let config = dec
-                .dec_specific
-                .as_ref()
-                .map(|specific| specific.raw.as_slice());
-            (Codec::Aac, mp4a_strings(dec.object_type_indication, config))
+            let object_type = dec.object_type_indication;
+            match object_type {
+                // AAC of any object type: MPEG-4, and the MPEG-2 backwards compatible ones.
+                0x40 | 0x66 | 0x67 | 0x68 => (
+                    Codec::Aac,
+                    dec.dec_specific
+                        .as_ref()
+                        .and_then(|specific| audio_specific_config_string(&specific.raw))
+                        .map(|string| vec![string])
+                        .unwrap_or_default(),
+                ),
+                // MPEG Layer III, and its MPEG-1 source.
+                0x6b => (Codec::Mp3, vec!["mp4a.6B".to_string()]),
+                0x69 => (Codec::Mp3, vec!["mp4a.69".to_string()]),
+                // Anything else in an `mp4a` sample entry is not something fbtt remuxes.
+                _ => (other(&format!("mp4a.{object_type:02X}")), Vec::new()),
+            }
         }
         atom::Codec::Mp3(_) => (Codec::Mp3, vec!["mp4a.6B".to_string()]),
         atom::Codec::Flac(_) => (Codec::Flac, vec!["flac".to_string(), "fLaC".to_string()]),
@@ -293,10 +309,15 @@ fn hvc1_from(record: &mp4_atom::Hvcc) -> String {
     };
     // The compatibility flags are written least significant bit first, so the
     // Annex reads them bit reversed: a Main profile stream flags Main10 and Main
-    // Still Picture, which is 0x60 on the wire and `6` in the string.
-    let compatibility = u32::from_be_bytes(record.general_profile_compatibility_flags);
-    let compatibility = format!("{:X}", compatibility.reverse_bits());
-    let compatibility = compatibility.trim_start_matches('0');
+    // Still Picture, which is 0x60 on the wire and `6` in the string. Annex E.6
+    // prints the field for whatever value it holds, so zero is `0` and not an
+    // absent field: `hvc1.1.0.L93`, which is the string a browser compares
+    // against when it is handed a profile with no compatibility flags.
+    let compatibility =
+        match u32::from_be_bytes(record.general_profile_compatibility_flags).reverse_bits() {
+            0 => String::from("0"),
+            flags => format!("{flags:X}"),
+        };
 
     // Constraint indicators keep their byte order, minus trailing zero bytes.
     let mut constraints: Vec<String> = record
@@ -316,7 +337,7 @@ fn hvc1_from(record: &mp4_atom::Hvcc) -> String {
     string.push_str(&record.general_profile_idc.to_string());
     if !compatibility.is_empty() {
         string.push('.');
-        string.push_str(compatibility);
+        string.push_str(&compatibility);
     }
     string.push('.');
     string.push(tier);
@@ -360,22 +381,134 @@ fn audio_object_type(config: &[u8]) -> Option<u8> {
 
 /// The `mp4a.40.N` codec string for an `AudioSpecificConfig`, where `N` is its
 /// audio object type: 2 for AAC-LC, which is the `mp4a.40.2` every browser accepts.
+///
+/// Both containers reach this with the same bytes: MP4 through the `esds`
+/// `DecoderSpecificInfo`, Matroska through a `CodecPrivate` that is the config
+/// record on its own. A track whose descriptor carries no config gets no codec
+/// string, because the file never stated which object type it holds.
 fn audio_specific_config_string(config: &[u8]) -> Option<String> {
     Some(format!("mp4a.40.{}", audio_object_type(config)?))
 }
 
-/// The codec strings for an `mp4a` sample entry. Its `esds` carries an
-/// `AudioSpecificConfig` for AAC, and nothing for ADTS AAC or MPEG Layer III in
-/// MPEG-4 syntax, whose object type indication names them instead.
-fn mp4a_strings(object_type_indication: u8, audio_specific_config: Option<&[u8]>) -> Vec<String> {
-    if let Some(string) = audio_specific_config.and_then(audio_specific_config_string) {
-        return vec![string];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `mp4_atom` re-exports the `Mp4a` and `Esds` boxes at its root but leaves the
+    // MPEG-4 object descriptors in the module they are declared in.
+    use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor};
+
+    /// An `mp4a` sample entry with `object_type` and, when `config` is `Some`, that as its
+    /// `DecoderSpecificInfo`.
+    fn mp4a(object_type: u8, config: Option<Vec<u8>>) -> mp4_atom::Codec {
+        mp4_atom::Codec::Mp4a(mp4_atom::Mp4a {
+            audio: mp4_atom::Audio {
+                data_reference_index: 1,
+                channel_count: 1,
+                sample_size: 16,
+                sample_rate: mp4_atom::FixedPoint::default(),
+            },
+            esds: mp4_atom::Esds {
+                es_desc: EsDescriptor {
+                    dec_config: DecoderConfig {
+                        object_type_indication: object_type,
+                        dec_specific: config.map(|raw| DecoderSpecific {
+                            profile: 0,
+                            freq_index: 0,
+                            chan_conf: 0,
+                            raw,
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+            btrt: None,
+            taic: None,
+        })
     }
-    match object_type_indication {
-        // MPEG Layer III, and its MPEG-2 half rate and full rate relatives.
-        0x6b => vec!["mp4a.6B".to_string()],
-        0x66 => vec!["mp4a.66".to_string()],
-        0x67 => vec!["mp4a.67".to_string()],
-        _ => Vec::new(),
+
+    /// The `esds` object type indication picks the codec, not the config record.
+    ///
+    /// 0x6B is MPEG Layer III in MPEG-4 syntax, and a file carrying it has no
+    /// `AudioSpecificConfig` to consult, so this is the case in which consulting
+    /// the config decided that the answer was AAC. 0xDD is nobody's Layer III:
+    /// it is a codec fbtt names for nobody to remux.
+    #[test]
+    fn mp4a_object_types() {
+        // Layer III, with no descriptor config at all.
+        let (codec, strings) = mp4_codec(&mp4a(0x6b, None));
+        assert_eq!(codec, Codec::Mp3, "0x6B is MPEG Layer III");
+        assert_eq!(strings, ["mp4a.6B"], "named the way RFC 6381 names it");
+        assert!(codec.remuxable(), "and a browser demuxes it from an fMP4");
+
+        // The MPEG-1 half of the same family.
+        let (codec, strings) = mp4_codec(&mp4a(0x69, None));
+        assert_eq!(codec, Codec::Mp3);
+        assert_eq!(strings, ["mp4a.69"]);
+
+        // AAC with a config: object type 2, 48 kHz, which is what ffmpeg writes.
+        let (codec, strings) = mp4_codec(&mp4a(0x40, Some(vec![0x12, 0x10])));
+        assert_eq!(codec, Codec::Aac);
+        assert_eq!(strings, ["mp4a.40.2"]);
+
+        // The MPEG-2 backwards compatible types are AAC too, and their string comes
+        // from the config like any other AAC track.
+        for object_type in [0x66_u8, 0x67, 0x68] {
+            let (codec, strings) = mp4_codec(&mp4a(object_type, Some(vec![0x12, 0x10])));
+            assert_eq!(codec, Codec::Aac, "0x{object_type:02X} is AAC");
+            assert_eq!(strings, ["mp4a.40.2"], "and the object type is its own");
+        }
+
+        // An object type fbtt does not know keeps the number it came with, is not
+        // remuxable, and gets no codec string.
+        let (codec, strings) = mp4_codec(&mp4a(0xdd, None));
+        assert_eq!(codec, Codec::Other("mp4a.DD".to_string()));
+        assert_eq!(codec.name(), "mp4a.DD");
+        assert!(!codec.remuxable(), "nothing remuxes 0xDD");
+        assert!(strings.is_empty(), "so a manifest has nothing to name");
+
+        // AAC whose descriptor carries no config: still AAC, but the file never
+        // stated an object type, so there is no string to hand a browser.
+        let (codec, strings) = mp4_codec(&mp4a(0x40, None));
+        assert_eq!(codec, Codec::Aac);
+        assert!(strings.is_empty(), "no config, no object type, no string");
+    }
+
+    /// A zero `general_profile_compatibility_flags` is printed as `0`, not dropped.
+    ///
+    /// ISO/IEC 14496-15 Annex E.6 spells a profile with no compatibility flags
+    /// `hvc1.1.0.L93`: the field is always one of the dot separated parts.
+    /// Omitting it produced `hvc1.1.L93`, which is a different string from the
+    /// one a browser's `canPlayType` or an HLS manifest's `CODECS` attribute is
+    /// compared against.
+    #[test]
+    fn hvc1_zero_compat_flags() {
+        let record = mp4_atom::Hvcc {
+            configuration_version: 1,
+            general_profile_idc: 1,
+            general_profile_compatibility_flags: [0, 0, 0, 0],
+            general_constraint_indicator_flags: [0x90, 0, 0, 0, 0, 0],
+            general_level_idc: 93,
+            ..Default::default()
+        };
+        let string = hvc1_from(&record);
+        assert!(
+            string.contains(".0.L"),
+            "a zero compatibility field is printed, not skipped: got {string}"
+        );
+        assert_eq!(
+            string, "hvc1.1.0.L93.90",
+            "the flags are printed as 0 between the profile and the level"
+        );
+
+        // A stream that does carry flags is spelled the way the fixture's real
+        // `hvcC` is: 0x60 on the wire, bit reversed to `6`.
+        let flagged = mp4_atom::Hvcc {
+            general_profile_compatibility_flags: [0x60, 0, 0, 0],
+            general_constraint_indicator_flags: [0x90, 0, 0, 0, 0, 0],
+            general_level_idc: 30,
+            ..record.clone()
+        };
+        assert_eq!(hvc1_from(&flagged), "hvc1.1.6.L30.90");
     }
 }

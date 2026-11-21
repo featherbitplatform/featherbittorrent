@@ -16,7 +16,7 @@ pub mod capped;
 pub mod codec;
 pub mod probe;
 
-pub use capped::CappedLen;
+pub use capped::{CappedLen, ReadBudget};
 pub use codec::{Codec, TrackKind};
 pub use probe::{MediaInfo, TrackInfo, probe};
 
@@ -57,6 +57,11 @@ pub const TIME_OFFSET_MS: u64 = 1000;
 /// A file states an element's size before it states its contents, so a 4 GiB `CodecPrivate` in a
 /// 200 KiB file is one `Vec::with_capacity` away from a stalled process. [`CappedLen`] is what keeps
 /// that honest.
+///
+/// This is a bound on one element. The demuxer measures the room for each element from that
+/// element's own position, so a header that states many of them needs a total as well, and
+/// [`ReadBudget`] is that: [`probe`](crate::probe::probe) reads a header with a budget of exactly
+/// this many bytes.
 pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;
 
 /// The most of a sidecar subtitle file is read: a caption track nobody can scroll is not worth

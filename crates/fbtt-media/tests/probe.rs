@@ -13,10 +13,13 @@ use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Error as IoError, ErrorKind, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use fbtt_media::{
-    CappedLen, Codec, Container, ELEMENT_CAP, MediaError, MediaInfo, TrackKind, probe,
+    CappedLen, Codec, Container, ELEMENT_CAP, MediaError, MediaInfo, ReadBudget, TrackKind, probe,
 };
 use serde_json::Value;
 
@@ -509,7 +512,11 @@ fn probe_truncated_mkv_is_an_error() {
 fn capped_len_bounds_huge_elements() {
     // A 1000 byte reader and a 100 byte cap. From position 0, End(0) reports the
     // cap rather than the 1000 bytes that are really there.
-    let mut capped = CappedLen::new(Cursor::new(vec![0_u8; 1000]), 100);
+    let mut capped = CappedLen::new(
+        Cursor::new(vec![0_u8; 1000]),
+        100,
+        ReadBudget::new(ELEMENT_CAP),
+    );
     assert_eq!(capped.seek(SeekFrom::Start(0)).expect("seek"), 0);
     assert_eq!(capped.seek(SeekFrom::End(0)).expect("End(0)"), 100);
     // The reader is left where it said it was, so its position and the length it
@@ -532,11 +539,7 @@ fn capped_len_bounds_huge_elements() {
     // demuxer that allocates on the strength of a declaration shows up in the
     // count of what was read.
     let read_so_far = Arc::new(AtomicU64::new(0));
-    let stream = LazyZeros::new(
-        lie_about_one_element(),
-        3 * 1024 * 1024 * 1024,
-        Arc::clone(&read_so_far),
-    );
+    let stream = LazyZeros::new(lie_about_one_element(), THREE_GIB, Arc::clone(&read_so_far));
     let error = match probe(stream) {
         Ok(info) => panic!("a 2 GiB element in a 3 GiB stream must be refused, got {info:?}"),
         Err(error) => error,
@@ -550,9 +553,24 @@ fn capped_len_bounds_huge_elements() {
         message.contains(TWO_GIB.to_string().as_str()),
         "the refusal should name the size the file declared: {message}"
     );
+    // The room the refusal quotes is the one the capped reader reported: a hair under
+    // `ELEMENT_CAP`, because the budget has paid for the headers read on the way here, and not
+    // the 3 GiB the stream really is. The declared 2 GiB is larger than a header may be, so the
+    // only number in the message that fits under the cap is the measured room.
+    let quoted = message
+        .split(|byte: char| !byte.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .filter(|value| *value <= ELEMENT_CAP)
+        .max()
+        .unwrap_or_else(|| panic!("the refusal should quote the room it measured: {message}"));
     assert!(
-        message.contains(ELEMENT_CAP.to_string().as_str()),
-        "the refusal should report the capped room, not the 3 GiB the stream really is: {message}"
+        quoted > ELEMENT_CAP - (1 << 20),
+        "the refusal quotes {quoted} bytes of room, which is not the capped room near {ELEMENT_CAP}: {message}"
+    );
+    assert!(
+        !message.contains(THREE_GIB.to_string().as_str()),
+        "the refusal should report the capped room, not the {THREE_GIB} bytes the stream really is: {message}"
     );
 
     // A little over a hundred bytes were read, so nothing remotely 2 GiB was
@@ -564,15 +582,284 @@ fn capped_len_bounds_huge_elements() {
     );
 }
 
+/// The cap bounds one element. A header is a list of them.
+///
+/// Eight `TrackEntry` elements each declare a 200 MiB `CodecPrivate`, which is under
+/// [`ELEMENT_CAP`] and so a claim the cap alone waves through. `matroska-demuxer` measures the
+/// room for an element from that element's own position and never from the end of the element
+/// that contains it, so all eight claims are measured against the same part of the stream, and a
+/// reader that bounds one element at a time is asked for 1.6 GiB of it. [`ReadBudget`] is the
+/// number that is not per element, and `probe` hands a header one element's worth of it, which
+/// is what makes the refusal land on the second track instead of after the eighth.
+#[test]
+fn capped_len_bounds_total_header_reads() {
+    let read_so_far = Arc::new(AtomicU64::new(0));
+    let stream = LazyZeros::new(
+        matroska_file(&indexed_segment(tracks_claiming(8, TWO_HUNDRED_MIB))),
+        FOUR_GIB,
+        Arc::clone(&read_so_far),
+    );
+
+    let outcome = probe(stream);
+    let read = read_so_far.load(Ordering::Relaxed);
+
+    let error = match outcome {
+        Ok(info) => panic!(
+            "eight claims of {TWO_HUNDRED_MIB} bytes are more than a {ELEMENT_CAP} byte header \
+             budget: probe accepted {} tracks",
+            info.tracks.len()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        read <= ELEMENT_CAP + (1 << 20),
+        "eight claims of {TWO_HUNDRED_MIB} bytes are more than a {ELEMENT_CAP} byte header \
+         budget: {read} bytes were read"
+    );
+    assert!(
+        matches!(error, MediaError::Malformed(_)),
+        "a header that outclaims the budget it is read under is Malformed, got {error:?}"
+    );
+}
+
+/// A `SeekHead` carrying two `Seek` entries that name a `SeekHead`.
+///
+/// `parse_seek_head` re-reads the head an entry names and queues the head it finds for a second
+/// pass, and it keeps room for one such queue: getting a second one is an `expect_err`
+/// (`lib.rs:1916`), which is a panic rather than an error, and a file reaches it with nothing
+/// else wrong with it. A torrent's file is attacker controlled, so every Matroska open in fbtt
+/// runs inside `catch_unwind` and the panic comes back as the refusal the file deserves.
+#[test]
+fn probe_seekhead_twice_is_malformed() {
+    let entry = seek_entry(&SEEK_HEAD, 0);
+    let head = ebml(&SEEK_HEAD, &[entry.clone(), entry].concat());
+
+    match probe(Cursor::new(matroska_file(&head))) {
+        Ok(info) => panic!("a SeekHead naming two SeekHeads was accepted: {info:?}"),
+        Err(MediaError::Malformed(what)) => assert_eq!(
+            what, "matroska header",
+            "a panic inside the header parse is reported as a malformed header"
+        ),
+        Err(error) => panic!(
+            "a SeekHead naming two SeekHeads is a panic the reader turns into Malformed, got {error:?}"
+        ),
+    }
+}
+
+/// A `SeekPosition` so large that the Segment's own offset no longer fits beside it.
+///
+/// `matroska-demuxer` adds the file's number to the segment offset where it stands
+/// (`lib.rs:1903`, and `lib.rs:1499` does the same to cue positions), so in the debug build
+/// `cargo test` runs an overflowing add is a panic. This value is sixteen bytes short of
+/// `u64::MAX`: enough to overflow the addition, not enough for the position to mean anything.
+#[test]
+fn probe_seek_position_overflow_is_malformed() {
+    let far = seek_entry(&SEEK_HEAD, 0xFFFF_FFFF_FFFF_FFF0);
+    let head = ebml(&SEEK_HEAD, &[far].concat());
+
+    match probe(Cursor::new(matroska_file(&head))) {
+        Ok(info) => panic!("a SeekPosition of 0xFFFFFFFFFFFFFFF0 was accepted: {info:?}"),
+        Err(MediaError::Malformed(what)) => assert_eq!(
+            what, "matroska header",
+            "an addition that overflows inside the header parse is reported as a malformed header"
+        ),
+        Err(error) => panic!(
+            "a SeekPosition that overflows the offset arithmetic is Malformed, got {error:?}"
+        ),
+    }
+}
+
+/// A `SeekHead` whose only entry names the `SeekHead` it sits in, at its own position.
+///
+/// The loop at `lib.rs:1893-1925` re-reads the head an entry names and then the entries of the
+/// head it queued, so an entry naming its own head has no exit and nothing about it is illegal:
+/// only the read budget ends it, because every pass through it reads bytes.
+///
+/// The head carries a `DocType` string claiming 200 MiB, which the demuxer reads on every pass.
+/// Without something that big to read, a pass costs a dozen bytes of element headers, and
+/// [`ELEMENT_CAP`] spent a dozen bytes at a time is a hundred million passes, which is slow in a
+/// way that is indistinguishable from the hang this test is about. It is run in a thread and given
+/// five seconds, because the failure mode being tested is one that never returns.
+#[test]
+fn probe_self_referencing_seekhead_ends() {
+    let head = ebml(
+        &SEEK_HEAD,
+        &[
+            seek_entry(&SEEK_HEAD, 0),
+            ebml_declaring(&DOC_TYPE, TWO_HUNDRED_MIB, &[]),
+        ]
+        .concat(),
+    );
+    let read_so_far = Arc::new(AtomicU64::new(0));
+    let stream = LazyZeros::new(matroska_file(&head), FOUR_GIB, Arc::clone(&read_so_far));
+
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let outcome = probe(stream);
+        let _ = tx.send(outcome);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(info)) => panic!("a SeekHead pointing at itself was accepted: {info:?}"),
+        Ok(Err(MediaError::Malformed(what))) => {
+            assert!(
+                !what.is_empty(),
+                "the refusal should say what it refused: {what}"
+            );
+            let read = read_so_far.load(Ordering::Relaxed);
+            assert!(
+                read <= ELEMENT_CAP + (1 << 20),
+                "the budget is what ends the loop, so {read} bytes read is more than it allows"
+            );
+        }
+        Ok(Err(error)) => panic!("a budget spent inside a header read is Malformed, got {error:?}"),
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "a SeekHead pointing at itself did not end within 5 seconds, which is the hang the \
+             read budget exists to end"
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("the thread reading the self referencing SeekHead died instead of answering")
+        }
+    }
+}
+
+/// A `moov` with no declared size in a stream longer than a header may be.
+///
+/// A box size of 0 is how ISO BMFF says the contents run to the end of the file, and `mp4_atom`
+/// reports it as `None` (`header.rs:92`); `Header::read_body` then copies the stream with
+/// `io::copy` and no bound whatsoever (`header.rs:126`), so a `moov` claiming the rest of a big
+/// file is read as the rest of a big file. The run to the end is measured here instead and
+/// refused when it is longer than a header.
+#[test]
+fn probe_mp4_moov_to_eof_is_bounded() {
+    let read_so_far = Arc::new(AtomicU64::new(0));
+    let stream = LazyZeros::new(moov_running_to_the_end(), ONE_GIB, Arc::clone(&read_so_far));
+    let outcome = probe(stream);
+    let read = read_so_far.load(Ordering::Relaxed);
+
+    let error = match outcome {
+        Ok(info) => panic!(
+            "a moov running to the end of a {ONE_GIB} byte stream must be refused on its length: \
+             probe accepted {} after {read} bytes",
+            info.container.name()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        read < 1 << 20,
+        "a moov running to the end of a {ONE_GIB} byte stream must be refused on its length: \
+         probe read {read} bytes"
+    );
+    assert!(
+        matches!(error, MediaError::Malformed(_)),
+        "a moov whose run to the end of the file is longer than a header is Malformed, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(ELEMENT_CAP.to_string().as_str()),
+        "the refusal should name the cap the run broke: {message}"
+    );
+}
+
+/// A `moov` declaring 2 GiB of contents in a stream that is 8 MiB long.
+///
+/// The stream is the short one, on purpose: what is being refused is the declaration. On a stream
+/// that could hold 2 GiB, a version of the check that only noticed the bytes on hand would pass
+/// this test while still reading 2 GiB of them.
+#[test]
+fn probe_mp4_moov_over_cap_is_refused() {
+    let read_so_far = Arc::new(AtomicU64::new(0));
+    let stream = LazyZeros::new(
+        moov_declaring_two_gib(),
+        EIGHT_MIB,
+        Arc::clone(&read_so_far),
+    );
+    let outcome = probe(stream);
+    let read = read_so_far.load(Ordering::Relaxed);
+
+    let error = match outcome {
+        Ok(info) => panic!(
+            "a moov declaring {TWO_GIB} bytes must be refused on its size: probe accepted {} after \
+             {read} bytes",
+            info.container.name()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        read < 1 << 20,
+        "a moov declaring {TWO_GIB} bytes must be refused on its size: probe read {read} bytes"
+    );
+    assert!(
+        matches!(error, MediaError::Malformed(_)),
+        "a moov declaring more than an element may be given is Malformed, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(ELEMENT_CAP.to_string().as_str()),
+        "the refusal should name the cap the declaration broke: {message}"
+    );
+}
+
+/// 5000 eight byte `free` boxes, and no `moov` anywhere in the file.
+///
+/// Skipping a box is a seek, so the walk is cheap per box, but how many there are is the file's
+/// choice, not ours: 4 GiB of 8 byte `free` boxes is 512 million headers read before the stream
+/// runs out, and a file with no `moov` in it walks every one of them.
+#[test]
+fn mp4_walk_stops_after_box_limit() {
+    let file = five_thousand_free_boxes();
+    let read_so_far = Arc::new(AtomicU64::new(0));
+    let len = u64::try_from(file.len()).expect("the fixture is under 4 GiB");
+    let outcome = probe(LazyZeros::new(file, len, Arc::clone(&read_so_far)));
+
+    match outcome {
+        Ok(info) => panic!("a file of 5000 boxes with no moov was accepted: {info:?}"),
+        Err(MediaError::Malformed(what)) => assert!(
+            what.contains("4096"),
+            "the refusal should name the box limit the walk stopped at: {what}"
+        ),
+        Err(error) => panic!(
+            "a walk of 5000 boxes with no moov must stop at the 4096 box limit as Malformed, got \
+             {error:?}"
+        ),
+    }
+
+    // The walk stopped, so it read a header for the 4097 boxes it gave up on rather than for all
+    // 5001 the file holds.
+    let read = read_so_far.load(Ordering::Relaxed);
+    assert!(
+        read < 4500 * 8,
+        "the walk gave up after 4096 boxes, and read {read} bytes of box headers doing it"
+    );
+}
+
 /// 2 GiB, which is more than [`ELEMENT_CAP`] and so more than a Matroska element
 /// may be given.
 const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
 
+/// 3 GiB, the stream these fixtures are laid on: long enough that a claim of 2 GiB is
+/// something a demuxer measuring the stream would believe.
+const THREE_GIB: u64 = 3 * 1024 * 1024 * 1024;
+
+/// 4 GiB, long enough that eight claims of 200 MiB are all plausible for the stream.
+const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+
+/// 1 GiB: more than a header may be, and little enough that a reader which ignores that reads it.
+const ONE_GIB: u64 = 1024 * 1024 * 1024;
+
+/// 8 MiB, the stream a declared 2 GiB sits in: too short to hold the claim, long enough that
+/// reading it instead of refusing it is visible in a byte count.
+const EIGHT_MIB: u64 = 8 * 1024 * 1024;
+
+/// 200 MiB: under [`ELEMENT_CAP`], so a claim this big is something the cap alone accepts,
+/// which is what makes it the size to amplify with.
+const TWO_HUNDRED_MIB: u64 = 200 * 1024 * 1024;
+
 /// A stream of `len` bytes that are lazily zero, whose first bytes are `header`.
 ///
-/// The 3 GiB length is the point: long enough that a 2 GiB element is plausible,
-/// and the bytes are never materialised, so what a demuxer asks for is visible in
-/// the counter it shares with the test.
+/// The length is the point: long enough that the claims the fixture makes are plausible
+/// for the stream, and the bytes are never materialised, so what a demuxer asks for is
+/// visible in the counter it shares with the test.
 struct LazyZeros {
     header: Vec<u8>,
     len: u64,
@@ -599,10 +886,17 @@ impl Read for LazyZeros {
         // the stream, which is what makes the tail of a long stream an EOF.
         let wanted = u64::try_from(buf.len()).expect("a buffer fits in a u64");
         let count = usize::try_from(wanted.min(left)).expect("a read is no longer than its buffer");
-        for (offset, byte) in buf[..count].iter_mut().enumerate() {
+        // Past the bytes the fixture wrote the stream is zeros, and a header that claims a
+        // few hundred megabytes of them asks for them in one read: filling that region is
+        // what makes handing it out cheap instead of a copy loop per megabyte.
+        let written = (self.header.len() as u64).saturating_sub(from);
+        let written = usize::try_from(wanted.min(left).min(written))
+            .expect("a read is no longer than its buffer");
+        for (offset, byte) in buf[..written].iter_mut().enumerate() {
             let at = usize::try_from(from + offset as u64).expect("an offset inside the stream");
-            *byte = self.header.get(at).copied().unwrap_or_default();
+            *byte = self.header[at];
         }
+        buf[written..count].fill(0);
         self.pos += count as u64;
         self.read.fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
@@ -663,59 +957,111 @@ fn ebml_declaring(id: &[u8], declared: u64, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A Matroska file that claims a 2 GiB `CodecPrivate` on its only track.
-///
-/// The EBML header, the `SeekHead` and the `Info` are what
-/// `MatroskaFile::open` walks before it looks at tracks, and the empty `Cluster`
-/// is what stops the search for a first cluster from failing first, so the
-/// biggest number the reader is asked to believe is the `CodecPrivate`
-/// declaration. The declared body is never written: past the header the stream
-/// is whatever `LazyZeros` serves.
-///
-/// A `CodecPrivate` is used because it is a binary element the demuxer knows and
-/// reads eagerly, which makes it the one place in a header where a declared size
-/// turns into an allocation. The `SeekHead` is here because without one the
-/// demuxer builds its own index by walking top level elements to the end of the
-/// stream, which on a 3 GiB stream of zeros would read 3 GiB of them and say
-/// nothing about the element being refused.
-fn lie_about_one_element() -> Vec<u8> {
-    let ebml_header = ebml(
-        &[0x1A, 0x45, 0xDF, 0xA3],
+/// The element ids these fixtures are assembled from, spelled as EBML spells them.
+const EBML_HEADER: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
+const SEGMENT: [u8; 4] = [0x18, 0x53, 0x80, 0x67];
+const SEEK_HEAD: [u8; 4] = [0x11, 0x4D, 0x9B, 0x74];
+const SEEK: [u8; 2] = [0x4D, 0xBB];
+const SEEK_ID: [u8; 2] = [0x53, 0xAB];
+const SEEK_POSITION: [u8; 2] = [0x53, 0xAC];
+const DOC_TYPE: [u8; 2] = [0x42, 0x82];
+const DOC_TYPE_VERSION: [u8; 2] = [0x42, 0x87];
+const DOC_TYPE_READ_VERSION: [u8; 2] = [0x42, 0x85];
+const TRACKS: [u8; 4] = [0x16, 0x54, 0xAE, 0x6B];
+const TRACK_ENTRY: [u8; 1] = [0xAE];
+const TRACK_NUMBER: [u8; 1] = [0xD7];
+const TRACK_UID: [u8; 2] = [0x73, 0xC5];
+const TRACK_TYPE: [u8; 1] = [0x83];
+const CODEC_ID: [u8; 1] = [0x86];
+const CODEC_PRIVATE: [u8; 2] = [0x63, 0xA2];
+const INFO: [u8; 4] = [0x15, 0x49, 0xA9, 0x66];
+const MULTIPLEXING_APP: [u8; 2] = [0x4D, 0x80];
+const WRITE_APP: [u8; 2] = [0x57, 0x41];
+const TIMECODE_SCALE: [u8; 3] = [0x2A, 0xD7, 0xB1];
+const CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+
+/// The `EBMLHeader` every fixture in this file starts with.
+fn ebml_header() -> Vec<u8> {
+    ebml(
+        &EBML_HEADER,
         &[
-            ebml(&[0x42, 0x82], b"matroska"), // DocType
-            ebml(&[0x42, 0x87], &[1]),        // DocTypeVersion
-            ebml(&[0x42, 0x85], &[1]),        // DocTypeReadVersion
+            ebml(&DOC_TYPE, b"matroska"),
+            ebml(&DOC_TYPE_VERSION, &[1]),
+            ebml(&DOC_TYPE_READ_VERSION, &[1]),
         ]
         .concat(),
-    );
+    )
+}
 
-    let track_entry = [
-        ebml(&[0xD7], &[1]),                         // TrackNumber
-        ebml(&[0x73, 0xC5], &[1]),                   // TrackUID
-        ebml(&[0x83], &[1]),                         // TrackType: video
-        ebml(&[0x86], b"V_MPEG4/ISO/AVC"),           // CodecID
-        ebml_declaring(&[0x63, 0xA2], TWO_GIB, &[]), // CodecPrivate: 2 GiB claimed
-    ]
-    .concat();
-    let tracks = ebml(&[0x16, 0x54, 0xAE, 0x6B], &ebml(&[0xAE], &track_entry));
-    let info = ebml(
-        &[0x15, 0x49, 0xA9, 0x66],
+/// A Matroska file whose `Segment` states `segment_body` as its contents.
+fn matroska_file(segment_body: &[u8]) -> Vec<u8> {
+    [ebml_header(), ebml(&SEGMENT, segment_body)].concat()
+}
+
+/// The `Info` these fixtures carry: enough for `open` to want one, and nothing that
+/// bears on what is being refused.
+fn info_element() -> Vec<u8> {
+    ebml(
+        &INFO,
         &[
-            ebml(&[0x4D, 0x80], b"fbtt"),                         // MuxingApp
-            ebml(&[0x57, 0x41], b"fbtt"),                         // WritingApp
-            ebml(&[0x2A, 0xD7, 0xB1], &[0x00, 0x0F, 0x42, 0x40]), // TimestampScale: 1 ms
+            ebml(&MULTIPLEXING_APP, b"fbtt"),
+            ebml(&WRITE_APP, b"fbtt"),
+            // TimestampScale: 1 ms, the scale every fixture here is cut on.
+            ebml(&TIMECODE_SCALE, &[0x00, 0x0F, 0x42, 0x40]),
         ]
         .concat(),
-    );
-    let cluster = ebml(&[0x1F, 0x43, 0xB6, 0x75], &[]);
+    )
+}
 
-    // A SeekHead entry is the same length whatever offset it carries, because
-    // every offset in this file fits a single byte, so the head can be built
-    // once with placeholders to learn its own length, and the offsets of the
-    // three elements it points at then follow from that.
-    // The three positions are counted from the start of the Segment's children,
-    // which is where the SeekHead sits, so the length of the EBML header and of
-    // the Segment's own header never enters them.
+/// An empty `Cluster`, so that the search for a first cluster finds one instead of
+/// walking a stream of zeros looking for it.
+fn cluster_element() -> Vec<u8> {
+    ebml(&CLUSTER, &[])
+}
+
+/// One `Seek` entry naming element id `id` at position `at`.
+///
+/// The position is eight bytes wide whatever the value. EBML would allow a shorter one for a
+/// small offset and `matroska-demuxer` reads either, and a fixed width is what makes a `SeekHead`
+/// the same length no matter what its entries point at, which is how the fixtures below know their
+/// own offsets.
+fn seek_entry(id: &[u8], at: u64) -> Vec<u8> {
+    ebml(
+        &SEEK,
+        &[ebml(&SEEK_ID, id), ebml(&SEEK_POSITION, &at.to_be_bytes())].concat(),
+    )
+}
+
+/// A `SeekHead` pointing at the three top level elements `open` indexes by name.
+fn seek_head(tracks_at: u64, info_at: u64, cluster_at: u64) -> Vec<u8> {
+    ebml(
+        &SEEK_HEAD,
+        &[
+            seek_entry(&TRACKS, tracks_at),
+            seek_entry(&INFO, info_at),
+            seek_entry(&CLUSTER, cluster_at),
+        ]
+        .concat(),
+    )
+}
+
+/// A `Segment` body: a `SeekHead` naming the three elements `open` looks up, then those elements.
+///
+/// The head is first because that is where the specification puts one and what `matroska-demuxer`
+/// looks for first, and its length has to be known before the offsets it carries can be written:
+/// it is built once with placeholder offsets to learn that length, and then again with the real
+/// ones, which are that length plus the lengths of whatever comes before each of them. The
+/// positions count from the start of the Segment's children, which is what EBML says and what the
+/// demuxer adds the Segment's own offset back to, so the width of the Segment's size marker never
+/// enters them.
+///
+/// Carrying a `SeekHead` is load bearing. Without one the demuxer indexes the segment itself by
+/// walking top level elements to the end of the stream, which on a multi gigabyte stream of zeros
+/// reads a header per zero byte and says nothing about the element under test.
+fn indexed_segment(tracks: Vec<u8>) -> Vec<u8> {
+    let info = info_element();
+    let cluster = cluster_element();
+
     let placeholder = seek_head(0, 0, 0);
     let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
     let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
@@ -725,44 +1071,81 @@ fn lie_about_one_element() -> Vec<u8> {
     assert_eq!(
         head.len(),
         placeholder.len(),
-        "a SeekHead of three one byte positions is its own length whatever they point at"
+        "a SeekHead is its own length whatever its entries point at"
     );
 
-    let body = [head, tracks, info, cluster].concat();
-    assert!(
-        body.len() <= 126,
-        "the Segment needs a one byte size for the offsets above to hold: {} bytes",
-        body.len()
-    );
-
-    [ebml_header, ebml(&[0x18, 0x53, 0x80, 0x67], &body)].concat()
+    [head, tracks, info, cluster].concat()
 }
 
-/// A `SeekHead` pointing at the three top level elements `open` asks for.
+/// A `TrackEntry` on a video track whose `CodecPrivate` claims `claim` bytes of data without
+/// carrying them. The entry declares only the bytes it writes, so nothing inside it contradicts
+/// the entry around it: only the reader spending claim after claim does.
 ///
-/// Positions are counted from the start of the Segment's children, which is what
-/// EBML says and what `matroska-demuxer` adds the Segment offset back to.
-fn seek_head(tracks_at: u64, info_at: u64, cluster_at: u64) -> Vec<u8> {
-    let entry = |id: &[u8], at: u64| {
-        ebml(
-            &[0x4D, 0xBB], // Seek
-            &[
-                ebml(&[0x53, 0xAB], id), // SeekId, the element id as a number
-                ebml(
-                    &[0x53, 0xAC],
-                    &[u8::try_from(at).expect("a SeekPosition under 256")],
-                ),
-            ]
-            .concat(),
-        )
-    };
+/// `CodecPrivate` is the element to claim with because it is binary and the demuxer reads it
+/// eagerly, which is the one place in a header where a declared size becomes an allocation.
+fn track_claiming(claim: u64) -> Vec<u8> {
     ebml(
-        &[0x11, 0x4D, 0x9B, 0x74],
+        &TRACK_ENTRY,
         &[
-            entry(&[0x16, 0x54, 0xAE, 0x6B], tracks_at),
-            entry(&[0x15, 0x49, 0xA9, 0x66], info_at),
-            entry(&[0x1F, 0x43, 0xB6, 0x75], cluster_at),
+            ebml(&TRACK_NUMBER, &[1]),
+            ebml(&TRACK_UID, &[1]),
+            ebml(&TRACK_TYPE, &[1]),
+            ebml(&CODEC_ID, b"V_MPEG4/ISO/AVC"),
+            ebml_declaring(&CODEC_PRIVATE, claim, &[]),
         ]
         .concat(),
     )
+}
+
+/// A `Tracks` element holding `count` entries that each claim `claim` bytes of `CodecPrivate`.
+fn tracks_claiming(count: usize, claim: u64) -> Vec<u8> {
+    let entries: Vec<u8> = (0..count).flat_map(|_| track_claiming(claim)).collect();
+    ebml(&TRACKS, &entries)
+}
+
+/// A Matroska file that claims a 2 GiB `CodecPrivate` on its only track.
+///
+/// The declared bytes are never written: past the header the stream is whatever `LazyZeros`
+/// serves, which is what lets a claim this big sit in a fixture this small.
+fn lie_about_one_element() -> Vec<u8> {
+    matroska_file(&indexed_segment(tracks_claiming(1, TWO_GIB)))
+}
+
+/// An MP4 `ftyp` box of eight body bytes, which is what the sniff needs to call a file MP4:
+/// bytes 4 through 8 of the head say `ftyp`, and the walk then skips the box by seeking.
+fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(body.len() + 8).expect("a test box under 4 GiB");
+    let mut out = Vec::with_capacity(body.len() + 8);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(body);
+    out
+}
+
+/// An `ftyp` and then a `moov` header that declares no size, which ISO BMFF spells as "my
+/// contents are the rest of the file": a size of 0, which `mp4_atom` reads as `None`.
+fn moov_running_to_the_end() -> Vec<u8> {
+    let mut out = mp4_box(b"ftyp", b"isom");
+    out.extend_from_slice(&0_u32.to_be_bytes());
+    out.extend_from_slice(b"moov");
+    out
+}
+
+/// An `ftyp` and then a `moov` header declaring 2 GiB of contents.
+fn moov_declaring_two_gib() -> Vec<u8> {
+    let declared = u32::try_from(TWO_GIB).expect("2 GiB fits a 32 bit box size");
+    let mut out = mp4_box(b"ftyp", b"isom");
+    out.extend_from_slice(&declared.to_be_bytes());
+    out.extend_from_slice(b"moov");
+    out
+}
+
+/// An `ftyp` and then 5000 `free` boxes of eight bytes each, the smallest a box can be, with no
+/// `moov` among them.
+fn five_thousand_free_boxes() -> Vec<u8> {
+    let mut out = mp4_box(b"ftyp", b"isom");
+    for _ in 0..5000 {
+        out.extend_from_slice(&mp4_box(b"free", &[]));
+    }
+    out
 }

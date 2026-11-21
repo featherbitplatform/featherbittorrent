@@ -1,10 +1,11 @@
 //! Container sniffing and the two header readers behind [`probe`].
-use crate::capped::CappedLen;
+use crate::capped::{CappedLen, ReadBudget};
 use crate::codec::{self, Codec, TrackKind};
 use crate::{Container, ELEMENT_CAP, MediaError};
 use matroska_demuxer::{DemuxError, MatroskaFile, TrackEntry, TrackType};
 use mp4_atom::{FourCC, Header, Moov, ReadAtom, ReadFrom};
 use std::io::{Read, Seek, SeekFrom};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::result::Result;
 
 /// A track: what kind it is, what codec it holds, and how a player should treat it.
@@ -88,22 +89,47 @@ pub fn probe<R: Read + Seek>(mut reader: R) -> Result<MediaInfo, MediaError> {
     }
 }
 
-/// The Matroska or WebM header, read by `matroska-demuxer`'s own `open`.
+/// A `MatroskaFile` opened over a capped and budgeted reader, with the demuxer's panics turned
+/// back into errors.
 ///
-/// The reader is wrapped in [`CappedLen`], so a lying element size cannot make
-/// `open` read or allocate more than [`ELEMENT_CAP`] bytes from wherever the
-/// caller handed the reader over. `open` reads the EBML header, `Segment`,
-/// `SeekHead`, `Info`, `Tracks`, `Cues`, `Chapters` and `Tags`, and stops at the
-/// first `Cluster` without touching a frame's bytes.
+/// Two things a hostile file can do are not errors in `matroska-demuxer` 0.8.1. A `SeekHead` that
+/// carries two `Seek` entries pointing at a `SeekHead` hits an `expect_err` (`lib.rs:1916`), and a
+/// `SeekPosition` big enough to overflow the position arithmetic panics on the addition
+/// (`lib.rs:1903`, and the same shape at `lib.rs:1499` for cue positions). A torrent's file is
+/// attacker controlled, so every Matroska open in fbtt goes through here and a panic comes back as
+/// `MediaError::Malformed`, which is what the crate already says about a header that does not hold
+/// together.
 ///
-/// One case costs more than a header: a file with no `SeekHead` makes `open`
-/// build its own index by walking element headers from the segment to the end of
-/// the stream, so the walk is as long as the file. Every file ffmpeg or
-/// mkvtoolnix writes carries a `SeekHead`, so this is the shape of a live
-/// recording, and the walk reads headers and seeks over bodies rather than
-/// reading the media data.
+/// The reader is wrapped in [`CappedLen`]: no element may be given more than [`ELEMENT_CAP`]
+/// bytes, and the whole open may not read more than `budget`. The budget is the caller's, because
+/// Task 3 plays through this same wrapper and raises the budget once the header is read
+/// ([`ReadBudget::lift`]), while a probe of an untrusted file keeps it at [`ELEMENT_CAP`].
+///
+/// `open` reads the EBML header, `Segment`, `SeekHead`, `Info`, `Tracks`, `Cues`, `Chapters` and
+/// `Tags`, and stops at the first `Cluster` without touching a frame's bytes. One case costs more
+/// than a header: a file with no `SeekHead` makes `open` build its own index by walking element
+/// headers from the segment to the end of the stream, so the walk is as long as the file. Every
+/// file ffmpeg or mkvtoolnix writes carries a `SeekHead`, so that is the shape of a live
+/// recording, and the walk reads headers and seeks over bodies rather than reading media data.
+pub(crate) fn open_matroska<R: Read + Seek>(
+    reader: R,
+    budget: ReadBudget,
+) -> Result<MatroskaFile<CappedLen<R>>, MediaError> {
+    let wrapped = CappedLen::new(reader, ELEMENT_CAP, budget);
+    // `open` takes the reader with it, so a panic in the middle of the parse drops the reader and
+    // everything it had allocated, which is why unwinding here is safe to ignore.
+    match catch_unwind(AssertUnwindSafe(|| MatroskaFile::open(wrapped))) {
+        Ok(opened) => opened.map_err(matroska_error),
+        Err(_) => Err(MediaError::Malformed("matroska header".to_string())),
+    }
+}
+
+/// The Matroska or WebM header, read by [`open_matroska`] under a budget of one element.
 fn probe_matroska<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
-    let file = MatroskaFile::open(CappedLen::new(reader, ELEMENT_CAP)).map_err(matroska_error)?;
+    // One element's worth is the whole header's budget: the cap alone is per element, so a file
+    // with eight tracks each claiming 200 MiB of `CodecPrivate` would read 1.6 GiB of the same
+    // bytes, and a `SeekHead` that points at itself would walk forever.
+    let file = open_matroska(reader, ReadBudget::new(ELEMENT_CAP))?;
     let container = match file.ebml_header().doc_type() {
         "webm" => Container::WebM,
         _ => Container::Matroska,
@@ -171,15 +197,25 @@ fn ms_from_timecode(duration: f64, scale: u64) -> Option<u64> {
     }
 }
 
+/// The most top level boxes [`probe_mp4`] looks through before it gives up on
+/// finding a `moov`.
+///
+/// Skipping a box is a seek, so the walk is cheap per box, but its length is the
+/// file's choice: 4 GiB of 8 byte `free` boxes is 512 million headers, and a file
+/// with no `moov` anywhere walks every one of them. A track table does not hide
+/// behind 4096 boxes.
+const MAX_MOOV_SEARCH_BOXES: usize = 4096;
+
 /// The MP4 header, walking top level boxes until `moov`.
 ///
-/// `mp4-atom`'s `moov` parser gives the same typed view it gives an MP4 muxer,
-/// so this reads track metadata through the models the writer uses. A `moov`'s
-/// declared size is checked against [`ELEMENT_CAP`] before its bytes are read,
-/// because `mp4-atom` reads a box into a buffer sized by that declaration.
-/// Boxes before it (`ftyp`, `free`, and `mdat` in a file with `moov` last) are
-/// skipped by seeking, so a large media data box costs nothing.
+/// `mp4-atom`'s `moov` parser gives the same typed view it gives an MP4 muxer, so this reads track
+/// metadata through the models the writer uses. The `moov`'s own size goes through
+/// [`sized_moov_header`] before its bytes are read, because `mp4_atom` sizes its buffer from the
+/// declaration. Boxes before it (`ftyp`, `free`, and `mdat` in a file with `moov` last) are skipped
+/// by seeking, so a large media data box costs nothing, and the walk gives up after
+/// [`MAX_MOOV_SEARCH_BOXES`] of them: how many boxes there are is the file's choice, not ours.
 fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
+    let mut skipped = 0_usize;
     let moov = loop {
         let Some(header) = <Option<Header> as ReadFrom>::read_from(reader).map_err(atom_error)?
         else {
@@ -188,15 +224,14 @@ fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
             ));
         };
         if header.kind == FourCC::new(b"moov") {
-            if header
-                .size
-                .is_some_and(|size| capped_size(size) > ELEMENT_CAP)
-            {
-                return Err(MediaError::Malformed(format!(
-                    "moov declares more than {ELEMENT_CAP} bytes"
-                )));
-            }
-            break Moov::read_atom(&header, reader).map_err(atom_error)?;
+            let moov = sized_moov_header(reader, &header)?;
+            break Moov::read_atom(&moov, reader).map_err(atom_error)?;
+        }
+        skipped += 1;
+        if skipped > MAX_MOOV_SEARCH_BOXES {
+            return Err(MediaError::Malformed(format!(
+                "no moov box within {MAX_MOOV_SEARCH_BOXES} top level boxes"
+            )));
         }
         // A box that runs to the end of the file has nothing after it, so a
         // `moov` can only still be found in a box with a declared size.
@@ -229,6 +264,47 @@ fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
 /// A declared box size, widened from `usize` so it can be compared to the cap.
 fn capped_size(size: usize) -> u64 {
     u64::try_from(size).unwrap_or(u64::MAX)
+}
+
+/// A `moov` header whose declared size `mp4_atom` can be trusted to read.
+///
+/// A declared size is checked against [`ELEMENT_CAP`] because `read_body` sizes its buffer from
+/// the declaration. A size of 0 means "runs to the end of the file", which `mp4_atom` reports as
+/// `None`, and `read_body` then copies the stream with `io::copy` and no bound at all (its
+/// `header.rs:126`), so a `moov` that claims to run to the end of a 4 GiB file is read as 4 GiB
+/// of `Vec`. The run to the end is measured here instead, refused when it is longer than a header
+/// may be, and otherwise handed back as the declared size the bounded reader wants.
+///
+/// Task 4 reads a source file's `moov` the same way when it writes fragmented MP4 headers out of
+/// an existing file, which is why this is `pub(crate)`.
+pub(crate) fn sized_moov_header<R: Read + Seek>(
+    reader: &mut R,
+    header: &Header,
+) -> Result<Header, MediaError> {
+    let size = match header.size {
+        Some(size) if capped_size(size) > ELEMENT_CAP => {
+            return Err(MediaError::Malformed(format!(
+                "moov declares more than {ELEMENT_CAP} bytes"
+            )));
+        }
+        Some(size) => Some(size),
+        None => {
+            let here = reader.stream_position()?;
+            let end = reader.seek(SeekFrom::End(0))?;
+            reader.seek(SeekFrom::Start(here))?;
+            let remaining = end.saturating_sub(here);
+            if remaining > ELEMENT_CAP {
+                return Err(MediaError::Malformed(format!(
+                    "moov runs to the end of the file, which is more than {ELEMENT_CAP} bytes"
+                )));
+            }
+            Some(usize::try_from(remaining).unwrap_or(usize::MAX))
+        }
+    };
+    Ok(Header {
+        kind: header.kind,
+        size,
+    })
 }
 
 /// Milliseconds from an `mvhd` duration counted in its own timescale.
@@ -292,14 +368,19 @@ fn mp4_track(track: &mp4_atom::Trak) -> Result<Option<TrackInfo>, MediaError> {
 /// An element declaring more data than the stream holds is what a truncated
 /// file, or a file whose sizes lie, looks like: `Malformed`. So is anything
 /// else the parse can trip over, because the file said it was Matroska and was
-/// not. A document type, or a `DocTypeReadVersion`, fbtt cannot read is
-/// `Unsupported`, and so is an EBML header that is not Matroska at all. A read
-/// failure stays `Io`, so a torrent piece that has not arrived stays distinct
-/// from a file that is broken.
+/// not. So is an `InvalidData` read, which is how a spent [`ReadBudget`]
+/// arrives: the header asked for more bytes than the file is worth, which says
+/// something about the file. A document type, or a `DocTypeReadVersion`, fbtt
+/// cannot read is `Unsupported`, and so is an EBML header that is not Matroska
+/// at all. A read failure stays `Io`, so a torrent piece that has not arrived
+/// stays distinct from a file that is broken.
 fn matroska_error(error: DemuxError) -> MediaError {
     match error {
         DemuxError::IoError(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
             MediaError::Malformed("file ends inside an element".to_string())
+        }
+        DemuxError::IoError(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            MediaError::Malformed(err.to_string())
         }
         DemuxError::IoError(err) => MediaError::Io(err),
         DemuxError::UnsupportedDocType(doc_type) => {
