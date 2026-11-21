@@ -78,11 +78,11 @@ The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless
 - **The desktop app.**
   - A new crate `featherbittorrent-desktop` (Tauri 2) loads the same `web/dist`.
   - For "This computer", it starts the engine in-process, with the same library lock the TUI uses. It also starts `fbtt-server` on `127.0.0.1` with a random per-launch token, and the webview talks HTTP to it. There is one client code path, the browser's; no Tauri-specific API calls; and the TUI's local-library rules (one engine per library, reopen the last used) apply unchanged.
-  - For a remote server, the webview talks to that server directly. That needs the desktop's origin in the server's `cors_origins`, which fbt-api already has. Question 4.
+  - For a remote server, the webview talks to that server directly. The server lists the desktop's origin in `cors_origins`, which fbt-api already has. **[owner, 2026-11-21]**
 - **Auth in a browser.**
   - User name and password, against the existing login routes.
-  - The session token is kept in memory and `sessionStorage`, never `localStorage`. Question 5.
-  - Device keys: a browser can hold a WebCrypto Ed25519 key that cannot be exported, kept in IndexedDB. It becomes an authorized device once approved, from a signed-in session or `featherbittorrent device add`. The challenge-response is the TUI's. Question 6.
+  - The session is an HttpOnly cookie that survives a restart: `Secure` over https, `SameSite=Strict`, and a CSRF token on every state-changing request. No token in script-readable storage. **[owner: cookie, 2026-11-21]**
+  - Browser device keys are not in scope for now. **[owner, 2026-11-21]**
   - Behind the gateway, its `openid-connect` plugin already covers browsers, per the 2026-11-15 decision.
 - **Builds and CI.**
   - Node, pinned, builds `web/` before cargo in CI and in the release workflow.
@@ -101,7 +101,7 @@ The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless
   - The destination tree, limited to the allowed folders.
   - File selection with the selected size, and "Start paused".
 - **Sign in.**
-  - Password and browser device key.
+  - Password. The prototype's "browser device key" button is out of scope for now (question 6).
   - The plain-http warning, the same rule as the TUI's basic-auth warning.
 - **Desktop.**
   - The connection switcher: This computer, saved servers, Add a server.
@@ -118,11 +118,10 @@ The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless
    - file priorities;
    - settings;
    - devices;
-   - browser device keys;
    - browser streaming.
 3. **The desktop app:**
    - the Tauri crate, This computer and remote servers;
-   - the tray and file associations;
+   - the tray, start at login, `.torrent` file associations and the `magnet:` link handler;
    - the release jobs.
 
 ## 8. Anti-goals
@@ -138,11 +137,11 @@ The component structure, state management (plain React, or a small store), the r
 
 ## 10. Questions for the owner
 
-1. **Package names for the two builds.** Should the full build keep the name `featherbittorrent` and the terminal-only build become `featherbittorrent-headless`, or the reverse? (Both ship in every release: answered.)
+1. Answered: the full build is `featherbittorrent`, the terminal-only build is `featherbittorrent-headless`, and both ship in every release. **[owner, 2026-11-21]**
 2. Answered: on by default in a full build, off through `server.web_ui: false` or `FBTT_WEB_UI=0` (section 2).
 3. **Should the local TUI also serve the web UI** for its embedded engine, for example on `127.0.0.1` so a browser on the same machine can watch it? That means the TUI starts a server, which the 2026-11-14 design avoided unless asked for.
-4. **Desktop to a remote server:** should the webview talk to it directly (it needs CORS on the server), or go through a small Rust proxy inside the app (no server change, but a second path)?
-5. **Sessions in the browser:** a token in `sessionStorage` (sign in again per tab or after a restart), or an HttpOnly cookie that survives a restart (it needs CSRF protection)?
-6. **Browser device keys:** do you want them in milestone 2, or is password plus the gateway's OpenID Connect enough for browsers?
-7. **Desktop scope:** tray, start at login, and magnet and `.torrent` file associations. Are all three wanted in the first desktop release?
-8. **Versioning:** does the desktop app ship with the same version number as the binary, in the same release, or on its own schedule?
+4. Answered: the webview talks to a remote server directly, through CORS on the server (`cors_origins`, already in fbt-api). **[owner, 2026-11-21]**
+5. Answered: an HttpOnly session cookie that survives a restart. It is `Secure` over https, `SameSite=Strict`, and paired with a CSRF token on every state-changing request. **[owner, 2026-11-21: "cookie could work"]**
+6. Answered: not now. Browsers sign in with a password, or through the gateway's OpenID Connect. **[owner, 2026-11-21]**
+7. Answered: the first desktop release has all of these: the tray, start at login, `.torrent` file associations, and the `magnet:` link handler. **[owner, 2026-11-21]**
+8. Answered: the desktop app carries featherbittorrent's version and ships in the same release. **[owner, 2026-11-21]**
