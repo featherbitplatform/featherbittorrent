@@ -9,8 +9,10 @@
 # versions pinned in .github/workflows/release.yml).
 # The variant is the build behind the packages: full (default) turns on the web-ui cargo feature and
 # embeds the built web UI, and its package names are featherbittorrent; headless is the build without
-# it, named featherbittorrent-headless. Both install /usr/bin/featherbittorrent and each declares that it
-# conflicts with and replaces the other, so the package managers swap one for the other.
+# it, named featherbittorrent-headless. Both install /usr/bin/featherbittorrent, and each declares that
+# installing it removes the other: the .deb says so with Conflicts and Replaces, and the .rpm says so
+# with Obsoletes (RPM has no "replaces" tag, and a conflict on the obsoleted name would stop the install
+# instead of replacing it), so the package managers swap one for the other.
 # Usage: bash dev/package-linux.sh <version> <x86_64|aarch64> [full|headless]
 #   e.g. bash dev/package-linux.sh 0.1.0 aarch64 full
 # Output: full, target/dist/featherbittorrent-<version>-linux-<arch>.{deb,rpm} and
@@ -231,6 +233,46 @@ while IFS= read -r entry; do
 done <<<"$control_files"
 if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --scripts could not read $dist/$pkg.rpm: $(head -1 <<<"$scripts")"; fi
 [[ -z "${scripts//[[:space:]]/}" ]] || fail "the .rpm carries scriptlets, and no package installs or starts a service: $(head -1 <<<"$scripts")"
+
+# The package metadata is what makes the two builds replace each other on install, so it is checked here
+# rather than trusted: a .deb must be named for its variant and must conflict with and replace the other
+# package, and an .rpm must be named for its variant, must obsolete the other package (RPM has no
+# "replaces" tag, so an obsoletes is what removes the first when the second installs) and must carry no
+# conflicts at all (a conflict on the obsoleted name would stop the install instead of replacing it).
+# The logic is the same the verify job's packaging test runs offline against fixtures
+# (dev/test-packaging.sh's check_deb_control and check_rpm_metadata), so a change to one is a change to
+# both.
+check_deb_control() { # <control text> <variant name> <the other package>
+  local control_text="$1" want="$2" other="$3" pkg conflicts replaces
+  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //')"
+  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //')"
+  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //')"
+  [[ "$pkg" == "$want" ]] || fail "the .deb's control says 'Package: $pkg', expected 'Package: $want'"
+  grep -qwF -- "$other" <<<"$conflicts" || fail "the .deb's control has 'Conflicts: $conflicts', which does not name the other package $other"
+  grep -qwF -- "$other" <<<"$replaces" || fail "the .deb's control has 'Replaces: $replaces', which does not name the other package $other"
+  echo "ok: the .deb is $pkg and conflicts with and replaces $other"
+}
+check_rpm_metadata() { # <rpm name> <rpm obsoletes> <rpm conflicts> <variant name> <the other package>
+  local name="$1" obsoletes="$2" conflicts="$3" want="$4" other="$5"
+  [[ "$name" == "$want" ]] || fail "the .rpm is named '$name', expected '$want'"
+  grep -qwF -- "$other" <<<"$obsoletes" || fail "the .rpm obsoletes '$obsoletes', which does not name the other package $other"
+  [[ -z "${conflicts//[[:space:]]/}" ]] || fail "the .rpm carries 'Conflicts: $conflicts', which would stop installing it over the other package instead of replacing it"
+  echo "ok: the .rpm is $name and obsoletes $other with no conflicts"
+}
+# dpkg-deb reads the control member directly; the ar and tar path is the fallback the build image uses,
+# because it carries no dpkg-deb. The control member was already listed above, so $control holds its name.
+if command -v dpkg-deb >/dev/null; then
+  deb_control="$(dpkg-deb -f "$dist/$pkg.deb" control 2>&1)"
+else
+  deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar -xJO -f - ./control 2>/dev/null)"
+fi
+[[ -n "$deb_control" ]] || fail "could not read the .deb's control member from $dist/$pkg.deb"
+if [[ "$variant" == headless ]]; then other="featherbittorrent"; else other="featherbittorrent-headless"; fi
+check_deb_control "$deb_control" "$prefix" "$other"
+rpm_name="$(rpm -qp --queryformat '%{NAME}' "$dist/$pkg.rpm")" || fail "rpm -qp could not read $dist/$pkg.rpm"
+rpm_obsoletes="$(rpm -qp --obsoletes "$dist/$pkg.rpm" 2>/dev/null)" || rpm_obsoletes=''
+rpm_conflicts="$(rpm -qp --conflicts "$dist/$pkg.rpm" 2>/dev/null)" || rpm_conflicts=''
+check_rpm_metadata "$rpm_name" "$rpm_obsoletes" "$rpm_conflicts" "$prefix" "$other"
 
 # The requirements cargo-generate-rpm derived from the binary, printed for the release log and held to
 # the same allow list dev/check-linux-binary.sh greps: they come from the binary's own DT_NEEDED, so a

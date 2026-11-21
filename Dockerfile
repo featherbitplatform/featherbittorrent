@@ -25,7 +25,10 @@ WORKDIR /app
 # Node 22 is what the front end builds with (web/package.json says >=22). Pinned to a tag so a release
 # does not change because the base image's Node moves: the layer is the build's only entry to the
 # front end, and a release's bytes are the bytes the tag named.
-FROM node:22-bookworm AS web-build
+# 22.23.5 is a current Node 22 release on bookworm, pinned to the exact tag so a release does not
+# change when the :22 tag moves. Only npm is used here, to build web/dist; the binary the image runs
+# is built by the rust stage below, so the Node base's own glibc is not what the release is built on.
+FROM node:22.23.5-bookworm AS web-build
 WORKDIR /app
 
 # The front end's manifest and lockfile first, so npm ci's layer caches a web/ change; the real sources

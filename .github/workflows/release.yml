@@ -422,11 +422,14 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-          # Twelve files per Linux variant and architecture (six per variant: deb, rpm and the archive,
-          # each with its checksum), two for each macOS variant, four for the two Windows zips of each
-          # variant, and the SBOM. A name that changed in a packaging script without changing here means a
-          # download nobody uploaded.
-          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 38 ]
+           # The expected count is the number of lines in the list above, not a remembered number: the two
+           # can never disagree, so a line added or dropped in the heredoc is caught by the per-file check
+           # rather than by a count that was not updated. The list holds 37 files: six per Linux variant
+           # and architecture (deb, rpm and the archive, each with its checksum), two per macOS variant,
+           # four for the two Windows zips of each variant (a zip and its .sha256 each), and the SBOM.
+           expected="$(wc -l < "$RUNNER_TEMP/release-files")"
+           echo "release file list holds $expected files"
+           [ "$expected" -eq 37 ]
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |

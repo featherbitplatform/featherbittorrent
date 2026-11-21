@@ -22,15 +22,17 @@
 
 .EXAMPLE
     $scratch = New-Item -ItemType Directory -Force -Path ([IO.Path]::GetTempPath() + 'fbtt-smoke')
-    ./dev/smoke-cli.ps1 -Binary target\release\featherbittorrent.exe -Version 0.1.0 -Scratch $scratch.FullName
+    ./dev/smoke-cli.ps1 -Binary target\release\featherbittorrent.exe -Version 0.1.0 -Scratch $scratch.FullName -Variant full
 
-    -Version is what bash dev/release-version.sh resolves (on Windows: the version in Cargo.toml). Give every
-    run a fresh -Scratch directory: this refuses one whose config.yaml already exists.
+    -Version is what bash dev/release-version.sh resolves (on Windows: the version in Cargo.toml). -Variant is
+    the build the artifact is, full or headless, and the version check compares the binary's own marker
+    against it. Give every run a fresh -Scratch directory: this refuses one whose config.yaml already exists.
 #>
 param(
     [Parameter(Mandatory)] [string] $Binary,
     [Parameter(Mandatory)] [string] $Version,
-    [Parameter(Mandatory)] [string] $Scratch
+    [Parameter(Mandatory)] [string] $Scratch,
+    [Parameter(Mandatory)] [ValidateSet('full', 'headless')] [string] $Variant
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,22 +73,24 @@ $env:FBTT_CONFIG_DIR = $configDir
 $env:FBTT_DATA_DIR = $dataDir
 if (Test-Path -LiteralPath $configFile) { Write-Failure "$configFile already exists: give the smoke a fresh scratch directory" }
 
-# 1. The version the artifact was built with, spelled the way the release page names it, with the
-# build marker in front of it: `featherbittorrent <v> (full)` or `featherbittorrent-headless <v>
-# (headless)`. The marker is checked exactly, whole string, so a headless package holding the full
-# binary (or the other way around) fails here rather than at install time. stderr is left to the log:
-# what is captured here is what the check compares. Checks 1 to 3 and user list take their stdin from
-# a pipeline that carries nothing, which gives a native command an empty stdin and an immediate EOF
-# (checked in PowerShell 7.4 against /bin/cat: no bytes read, prompt exit). serve --offline gets the
-# same thing from the empty file it redirects, and user set is the one call given input of its own,
-# the two password lines. Nothing here can wait on a terminal this smoke has no business reading.
+# 1. The version the artifact was built with, spelled the way the release page names it, with the build
+# marker in front of it: `featherbittorrent <v> (full)` or `featherbittorrent <v> (headless)`. The binary's
+# command name is featherbittorrent in both builds (the package's binary, which the package manager
+# installs as featherbittorrent.exe whatever the package is called), so what distinguishes a full from a
+# headless artifact is the marker, and -Variant names which of the two this artifact is. The whole string
+# is compared against `featherbittorrent <v> (<variant>)`, so a full artifact holding the headless binary
+# (or the other way around) fails here rather than at install time. stderr is left to the log: what is
+# captured here is what the check compares. Checks 1 to 3 and user list take their stdin from a pipeline
+# that carries nothing, which gives a native command an empty stdin and an immediate EOF (checked in
+# PowerShell 7.4 against /bin/cat: no bytes read, prompt exit). serve --offline gets the same thing from
+# the empty file it redirects, and user set is the one call given input of its own, the two password lines.
+# Nothing here can wait on a terminal this smoke has no business reading.
 $printed = [string]($null | & $Binary --version | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "--version exited $LASTEXITCODE (expected 0)" }
 $printed = $printed.Trim()
-$expectedFull = "featherbittorrent $Version (full)"
-$expectedHeadless = "featherbittorrent $Version (headless)"
-if ($printed -cne $expectedFull -and $printed -cne $expectedHeadless) {
-    Write-Failure "--version printed '$(Get-OneLineExcerpt $printed)', expected '$expectedFull' or '$expectedHeadless'"
+$expected = "featherbittorrent $Version ($Variant)"
+if ($printed -cne $expected) {
+    Write-Failure "--version printed '$(Get-OneLineExcerpt $printed)', expected '$expected'"
 }
 Write-Host "ok: --version names the build: $printed"
 

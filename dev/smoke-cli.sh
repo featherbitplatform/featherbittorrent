@@ -14,29 +14,30 @@
 # keyboard it was never meant to have. Prints one ok line per check, then `cli smoke ok: <version>` and, on the
 # last line, `config: <path>`: the config file this smoke created, which dev/smoke-linux.sh checks survives
 # removing the package. Windows twin: dev/smoke-cli.ps1.
-# Usage: bash dev/smoke-cli.sh <binary> <version> <home> [full|headless]
+# Usage: bash dev/smoke-cli.sh <binary> <version> <home> <full|headless>
 #   <binary>  the binary to smoke: target/release/featherbittorrent, /usr/bin/featherbittorrent, ...
 #   <version> what it has to print, as bash dev/release-version.sh resolves it
 #   <home>    an existing scratch HOME, written to here and removed by the caller. Never the real one.
-#   <variant> the build the artifact was made from, full or headless. When named, check 1 compares the
-#             binary's version marker against it, so a full artifact holding the headless binary (or the
-#             other way around) fails rather than at install time. The default is headless, which is the
-#             build a plain cargo build produces, so an existing caller that does not name a variant
-#             keeps working as it did.
+#   <variant> the build the artifact was made from, full or headless. It is required: check 1 compares
+#             the binary's version marker against it exactly, so a full artifact holding the headless
+#             binary (or the other way around) fails here rather than at install time, and a caller that
+#             forgets the variant is refused with a usage line rather than guessed at.
 set -euo pipefail
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# The usage refusal is exit 2, the same code a missing or invalid argument gets in the packaging
+# scripts: a smoke run that did not get the arguments it needs is a caller bug, not a bad artifact.
+fail() { echo "FAIL: $*" >&2; exit 2; }
 
 # Captured output goes into failure messages, and it can carry newlines: this keeps a failure to the one line
 # it is meant to be, and caps the length so a chatty binary cannot flood a CI log.
 one_line() { local text="${1//$'\n'/ }"; printf '%s' "${text:0:200}"; }
 
 # Arguments first, before any platform or tool question, so a test can exercise the refusals anywhere.
-[[ $# -eq 3 || $# -eq 4 ]] || fail "usage: bash dev/smoke-cli.sh <binary> <version> <home> [full|headless]"
+[[ $# -eq 4 ]] || fail "usage: bash dev/smoke-cli.sh <binary> <version> <home> <full|headless>"
 bin="$1"
 version="$2"
 home="$3"
-variant="${4:-headless}"
+variant="$4"
 case "$variant" in
   full|headless) ;;
   *) fail "invalid variant '$variant' (expected full or headless)" ;;

@@ -98,15 +98,17 @@ fbtt-core = { workspace = true, features = ["test-support"] }
 # `generate-assets` output staged by dev/package-linux.sh; their sources sit under target/release because
 # that is the prefix both tools resolve to the build's own target directory, wherever CARGO_TARGET_DIR
 # sends it, and the pages arrive already gzipped because Debian policy wants them compressed.
-# The two builds ship as two packages that own the same /usr/bin/featherbittorrent, so each declares
-# that it conflicts with and replaces the other: full in the base section, headless in the
-# variants.headless section, which dev/package-linux.sh selects with --variant headless. The base
-# section is the full package; the headless section is a complete set of its own because cargo-deb
-# merges the variant over the base, so the headless section carries the headless name, its conflicts
-# the other way around, and the same assets with the documentation folder renamed to the headless
-# package's name (the binary, the man pages and the completions keep the product's own name, which
-# generate-assets writes from the binary's command name, the one both packages install). The archive
-# installs nothing, so it carries no conflicts of its own.
+# The two builds ship as two packages that own the same /usr/bin/featherbittorrent. The .deb makes
+# each declare that it conflicts with and replaces the other, so installing one removes the first and
+# the other way around: full in the base section, headless in the variants.headless section, which
+# dev/package-linux.sh selects with --variant headless. (The .rpm has no "replaces" tag and uses
+# obsoletes instead; see the generate-rpm section below.) The base section is the full package; the
+# headless section is a complete set of its own because cargo-deb merges the variant over the base, so
+# the headless section carries the headless name, its conflicts and replaces the other way around, and
+# the same assets with the documentation folder renamed to the headless package's name (the binary, the
+# man pages and the completions keep the product's own name, which generate-assets writes from the
+# binary's command name, the one both packages install). The archive installs nothing, so it carries no
+# conflicts of its own.
 [package.metadata.deb]
 name = "featherbittorrent"
 maintainer = "featherbit <featherbit-gw@outlook.com>"
@@ -163,15 +165,18 @@ assets = [
 # directories they sit in: cargo-generate-rpm 0.21.1 cannot emit a `%dir` entry (its `dir = true` asset
 # goes through rpm's `with_file`, which refuses a directory), so `dnf remove` leaves the emptied doc and
 # license directories behind. That is harmless, and dev/smoke-linux.sh prints a note about it.
-# The headless package's name and its conflicts with and replace of the full package live in the
-# variants.headless section, which dev/package-linux.sh selects with --variant headless; the base
-# section is the full package, and it declares the other way around so the two packages cannot be
-# installed side by side (they own the same /usr/bin/featherbittorrent). cargo-generate-rpm reads a
-# conflicts or replaces entry as a TOML table whose keys are the package names, so the other package's
-# name is the key and the empty string is the version that matches any. As with cargo-deb, the
-# headless section is a complete set of its own, carrying the headless name, its conflicts the other
-# way around, and the same assets with the documentation and license folders renamed to the headless
-# package's name.
+# The headless package's name and its obsoletes of the full package live in the variants.headless
+# section, which dev/package-linux.sh selects with --variant headless; the base section is the full
+# package, and it declares the other way around so installing one over the other removes the first.
+# They own the same /usr/bin/featherbittorrent, and RPM has no "replaces" tag: an `obsoletes` entry is
+# what makes dnf remove the other package when it installs this one. cargo-generate-rpm reads an
+# obsoletes entry as a TOML table whose keys are the package names, so the other package's name is the
+# key and the empty string is the version that matches any. As with cargo-deb, the headless section is a
+# complete set of its own, carrying the headless name, its obsoletes the other way around, and the same
+# assets with the documentation and license folders renamed to the headless package's name. The variant
+# wins over the base key by key (cargo-generate-rpm's CompoundMetadataConfig iterates the configs in
+# reverse and takes the first that names the key), so the headless section names its own obsoletes and
+# does not inherit the base section's, which points the other way.
 [package.metadata.generate-rpm]
 name = "featherbittorrent"
 summary = "BitTorrent client for the terminal, with a headless server"
@@ -192,10 +197,7 @@ assets = [
     { source = "../../packaging/systemd/user/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service", mode = "644", doc = true },
 ]
 
-[package.metadata.generate-rpm.conflicts]
-"featherbittorrent-headless" = ""
-
-[package.metadata.generate-rpm.replaces]
+[package.metadata.generate-rpm.obsoletes]
 "featherbittorrent-headless" = ""
 
 [package.metadata.generate-rpm.variants.headless]
@@ -216,8 +218,5 @@ assets = [
     { source = "../../packaging/systemd/user/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent-headless/examples/systemd/user/featherbittorrent.service", mode = "644", doc = true },
 ]
 
-[package.metadata.generate-rpm.variants.headless.conflicts]
-"featherbittorrent" = ""
-
-[package.metadata.generate-rpm.variants.headless.replaces]
+[package.metadata.generate-rpm.variants.headless.obsoletes]
 "featherbittorrent" = ""

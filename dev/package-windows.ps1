@@ -226,11 +226,13 @@ try {
     Write-Host 'ok: register-task.ps1 parses'
 
     # The same smoke every other artifact passes through, on the binary this archive shipped. It is what
-    # checks the version, so a mismatch here means the artifact and the release disagree.
+    # checks the version, so a mismatch here means the artifact and the release disagree. -Variant is the
+    # build this zip holds, and the smoke's version check compares the binary's own marker against it, so a
+    # zip holding the other variant's binary fails here rather than at download time.
     $scratch = Join-Path $work 'smoke-home'
     New-Item -ItemType Directory -Path $scratch -Force | Out-Null
     & (Join-Path $PSScriptRoot 'smoke-cli.ps1') -Binary (Join-Path $extract "$name\featherbittorrent.exe") `
-        -Version $Version -Scratch $scratch
+        -Version $Version -Scratch $scratch -Variant $Variant
     if ($LASTEXITCODE -ne 0) { Write-Failure "dev/smoke-cli.ps1 failed with exit code $LASTEXITCODE" }
 
     Remove-Item -LiteralPath $stage -Recurse -Force

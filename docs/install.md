@@ -10,11 +10,15 @@ never does: no package installs, enables or starts a service, and none of them c
 
 Each release ships two builds of the same binary. The full build, `featherbittorrent`, serves the browser
 web UI beside the API, and the headless build, `featherbittorrent-headless`, carries no front end. On Linux
-both come as packages that install the same `/usr/bin/featherbittorrent`; they declare that they conflict
-with and replace each other, so installing one removes the other, and you pick the build you want by which
-package you install. The archives and the Windows zips are not packages, so both of a system's archives can
-sit on disk at once; use the one you want. The table names the full build's files; the headless build's are
-the same with `-headless` after `featherbittorrent`.
+both come as packages that install the same `/usr/bin/featherbittorrent`, and installing one removes the
+other, so you pick the build you want by which package you install. The two say that in different words,
+because the package managers have different words for it: the `.deb` declares that it conflicts with and
+replaces the other package, so `apt install` of one over the other removes the first; the `.rpm` declares
+that it obsoletes the other package (RPM has no "replaces" tag, and an obsoletes is what makes `dnf
+install` of one over the other remove the first), so the two do not sit on the machine at once. The
+archives and the Windows zips are not packages, so both of a system's archives can sit on disk at once; use
+the one you want. The table names the full build's files; the headless build's are the same with `-headless`
+after `featherbittorrent`.
 
 | System | The full build's file | The headless build's file |
 | --- | --- | --- |
