@@ -10,3 +10,9 @@ target/
 .superpowers/
 docs/
 dev/
+
+# The front end is installed and built inside the image (the Dockerfile's web-build stage): a host's
+# node_modules carries host-platform binaries its `npm run build` cannot run, and a host's web/dist
+# would bake in a page the build inside did not make.
+web/node_modules/
+web/dist/

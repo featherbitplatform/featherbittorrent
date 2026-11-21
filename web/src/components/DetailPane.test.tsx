@@ -691,6 +691,38 @@ describe('the tabs on the keyboard', () => {
     // A key the pattern does not claim stays the page's: the tabs do not swallow it.
     expect(fireEvent.keyDown(tabs[3] as HTMLElement, { key: 'x' })).toBe(true)
   })
+
+  it('arrow_keys_on_close_do_not_switch_tabs', async () => {
+    const { client } = spyClient({})
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    const tabs = ['Files', 'Peers', 'Trackers', 'Pieces'].map((label) =>
+      screen.getByRole('tab', { name: label }),
+    )
+    const close = screen.getByRole('button', { name: 'Close details' })
+
+    // The Close button lives inside the tablist, and arrows on a focused button belong to that
+    // button: no tab moves, no key is taken, and the focus stays where the person put it.
+    close.focus()
+    const taken = fireEvent.keyDown(close, { key: 'ArrowRight' })
+    expect(
+      taken === true &&
+        tabs[0]?.getAttribute('aria-selected') === 'true' &&
+        tabs[1]?.getAttribute('aria-selected') === 'false' &&
+        document.activeElement === close,
+      'arrow keys on the close button switched tabs behind its own key press',
+    ).toBe(true)
+
+    // Home and End are the tablist's too, and hold just the same on the close button.
+    const jumped = fireEvent.keyDown(close, { key: 'End' })
+    expect(
+      jumped === true &&
+        tabs[0]?.getAttribute('aria-selected') === 'true' &&
+        tabs[3]?.getAttribute('aria-selected') === 'false' &&
+        document.activeElement === close,
+      'Home and End on the close button moved the tabs',
+    ).toBe(true)
+  })
 })
 
 describe('what the pane shares with the table', () => {

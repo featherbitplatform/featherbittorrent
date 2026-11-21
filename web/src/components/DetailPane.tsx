@@ -212,7 +212,13 @@ export default function DetailPane({
     key: string
     preventDefault(): void
     currentTarget: HTMLDivElement
+    target: EventTarget
   }): void {
+    // Only the tabs themselves answer the arrows. The Close button sits inside the tablist too, and
+    // arrows on a focused button belong to that button; switching tabs behind its back would make the
+    // arrow keys leave it wherever they found it.
+    const target = event.target
+    if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'tab') return
     const order = TABS.map((item) => item.key)
     const current = order.indexOf(tab)
     let next: Tab | null = null

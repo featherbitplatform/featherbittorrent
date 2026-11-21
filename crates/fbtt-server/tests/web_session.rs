@@ -138,6 +138,17 @@ fn with_alice(scratch: &Path) -> Config {
     base_config(scratch, Some(true), CookieSecure::Auto)
 }
 
+/// The same, with `server.allowed_hosts` filled with `names`.
+fn with_allowed(scratch: &Path, names: &[&str]) -> Config {
+    let mut config = with_alice(scratch);
+    config
+        .server
+        .as_mut()
+        .expect("a server section of our own config")
+        .allowed_hosts = names.iter().map(|name| (*name).to_string()).collect();
+    config
+}
+
 /// The client every request goes through: no redirects followed, no per-request timeout ([`within`] bounds a
 /// test), and no proxy (every URL here is `127.0.0.1`). It also has no cookie store, which is what these
 /// tests need rather than something they configure: reqwest is built here without its `cookies` feature, so
@@ -966,4 +977,277 @@ async fn web_sign_in_refuses_other_origins_and_bodies() {
     );
 
     served.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Reaching the browser half through a host name
+// ---------------------------------------------------------------------------
+
+/// With logins on, a sign-in reached at a host name answers whatever that name is in
+/// `server.allowed_hosts`: an `Origin` that is exactly the request's own `Host` is the page this server
+/// served, and the thing that turns it into a session is the password, which no other page is holding.
+#[tokio::test]
+async fn sign_in_through_a_host_name_is_accepted() {
+    let served = Served::start("web-host-name", with_alice).await;
+    let client = http();
+    let url = served.url("/api/v1/auth/web-session");
+
+    // The public name, at its scheme's default port on both sides: `Host` written without one and
+    // `Origin` written without one, which is exactly what a browser sends over https.
+    let through_name = post_web(
+        &client,
+        &url,
+        credentials(USER, SECRET),
+        &[
+            ("host", "torrent.example.test"),
+            ("origin", "https://torrent.example.test"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        through_name.status(),
+        StatusCode::OK,
+        "a sign-in reached through a public host name was refused for its origin"
+    );
+
+    // The same name with its port spelled on both headers, which is what a browser sends for a
+    // non-default port. Nothing in this server's config named `nas.local`, and nothing has to.
+    let port = served.server.local_addr().port();
+    let local = format!("nas.local:{port}");
+    let through_local = post_web(
+        &client,
+        &url,
+        credentials(USER, SECRET),
+        &[
+            ("host", local.as_str()),
+            ("origin", format!("http://{local}").as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        through_local.status(),
+        StatusCode::OK,
+        "a sign-in reached through a local host name with its port was refused for its origin"
+    );
+
+    served.stop().await;
+}
+
+/// The same-name rule runs the whole session, not just its first call: a change made with the cookie
+/// and its CSRF token reaches its route when it arrives at a host name too. The torrent is one this
+/// library has never had, so what proves the guard let the request through is the route's own `404`.
+#[tokio::test]
+async fn a_cookie_change_through_a_host_name_is_accepted() {
+    let served = Served::start("web-host-name-change", with_alice).await;
+    let client = http();
+    let (cookie, csrf) = sign_in(&served).await;
+    let port = served.server.local_addr().port();
+    let local = format!("nas.local:{port}");
+    let pause = served.url("/api/v1/torrents/0000000000000000000000000000000000000000/pause");
+
+    let response = carrying(&client, "POST", &pause, &cookie)
+        .header(CSRF, &csrf)
+        .header(reqwest::header::HOST, local.as_str())
+        .header(reqwest::header::ORIGIN, format!("http://{local}").as_str())
+        .send()
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a cookie change reached through a host name was refused for its origin instead of reaching its route"
+    );
+    assert_eq!(
+        code, "not_found",
+        "the pause answered a host-named change with {code}, not with its own unknown torrent"
+    );
+
+    served.stop().await;
+}
+
+/// The relaxed rule is only "you are the page this request was addressed as". At a host name, an
+/// origin naming some other site is still refused, before the password at the sign-in and after the
+/// CSRF token at a change.
+#[tokio::test]
+async fn an_origin_that_is_not_the_host_is_still_refused() {
+    let served = Served::start("web-host-name-foreign-origin", with_alice).await;
+    let client = http();
+    let port = served.server.local_addr().port();
+    let local = format!("nas.local:{port}");
+
+    let response = post_web(
+        &client,
+        &served.url("/api/v1/auth/web-session"),
+        credentials(USER, SECRET),
+        &[("host", local.as_str()), ("origin", "http://evil.example")],
+    )
+    .await;
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a sign-in at a host name carrying somebody else's origin was accepted"
+    );
+    let (_, code) = error_of(response).await;
+    assert_eq!(
+        code, "forbidden",
+        "the sign-in refusal did not carry the forbidden code"
+    );
+
+    let (cookie, csrf) = sign_in(&served).await;
+    let pause = served.url("/api/v1/torrents/0000000000000000000000000000000000000000/pause");
+    let response = carrying(&client, "POST", &pause, &cookie)
+        .header(CSRF, &csrf)
+        .header(reqwest::header::HOST, local.as_str())
+        .header(reqwest::header::ORIGIN, "http://evil.example")
+        .send()
+        .await
+        .expect("the server answered");
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a cookie change at a host name carrying somebody else's origin was let through"
+    );
+    let (_, code) = error_of(response).await;
+    assert_eq!(
+        code, "forbidden",
+        "the cookie-change refusal did not carry the forbidden code"
+    );
+
+    served.stop().await;
+}
+
+/// Behind a proxy that rewrites `Host`, which is what the featherbit gateway's `upstream` node does,
+/// the browser's origin is not the host the server sees, and the list rule is what carries it: `403`
+/// while the public name is unlisted, `200` once `server.allowed_hosts` names it.
+#[tokio::test]
+async fn a_rewritten_host_needs_the_listed_name() {
+    let served = Served::start("web-rewritten-host", with_alice).await;
+    let port = served.server.local_addr().port();
+    let address = format!("127.0.0.1:{port}");
+
+    let response = post_web(
+        &http(),
+        &served.url("/api/v1/auth/web-session"),
+        credentials(USER, SECRET),
+        &[
+            ("host", address.as_str()),
+            ("origin", "https://public.example"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a sign-in through a rewritten Host was accepted for an origin server.allowed_hosts does not list"
+    );
+
+    // The same request answers once the gateway's public name is listed: it is the list, and not any
+    // agreement between origin and Host, that carries a rewritten request.
+    let listed = Served::start("web-rewritten-host-listed", |scratch| {
+        with_allowed(scratch, &["public.example"])
+    })
+    .await;
+    let response = post_web(
+        &http(),
+        &listed.url("/api/v1/auth/web-session"),
+        credentials(USER, SECRET),
+        &[
+            ("host", address.as_str()),
+            ("origin", "https://public.example"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a sign-in through a rewritten Host was refused for an origin server.allowed_hosts lists"
+    );
+
+    served.stop().await;
+    listed.stop().await;
+}
+
+/// With logins off the host name is the whole defence, so none of this softens there: an origin that
+/// repeats the Host is refused when the name was not listed, a Host that is answered anyway does not
+/// make an unlisted origin acceptable, and only the list turns either one around.
+#[tokio::test]
+async fn logins_off_keep_the_host_rule() {
+    let served = Served::start("web-logins-off-host", |scratch| {
+        base_config(scratch, Some(false), CookieSecure::Auto)
+    })
+    .await;
+    let client = http();
+    let port = served.server.local_addr().port();
+    let local = format!("nas.local:{port}");
+    let url = served.url("/api/v1/auth/web-session");
+
+    let response = post_web(
+        &client,
+        &url,
+        credentials(USER, SECRET),
+        &[
+            ("host", local.as_str()),
+            ("origin", format!("http://{local}").as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "logins off answered a host name this server was not told to answer"
+    );
+
+    // A Host the address rule answers anyway, and an origin the list does not know: with logins off
+    // the origin still has to earn its place on the list, not merely agree with the Host.
+    let address = format!("127.0.0.1:{port}");
+    let response = post_web(
+        &client,
+        &url,
+        credentials(USER, SECRET),
+        &[
+            ("host", address.as_str()),
+            ("origin", format!("http://{local}").as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "logins off accepted an unlisted origin because the Host guard let the request in"
+    );
+
+    // Listed, the same name and origin answer exactly as the host rule has always answered them.
+    let listed = Served::start("web-logins-off-host-listed", |scratch| {
+        let mut config = base_config(scratch, Some(false), CookieSecure::Auto);
+        config
+            .server
+            .as_mut()
+            .expect("a server section of our own config")
+            .allowed_hosts = vec!["nas.local".to_string()];
+        config
+    })
+    .await;
+    let listed_port = listed.server.local_addr().port();
+    let listed_name = format!("nas.local:{listed_port}");
+    let response = post_web(
+        &http(),
+        &listed.url("/api/v1/auth/web-session"),
+        credentials(USER, SECRET),
+        &[
+            ("host", listed_name.as_str()),
+            ("origin", format!("http://{listed_name}").as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "logins off refused a host name it was told to answer"
+    );
+
+    served.stop().await;
+    listed.stop().await;
 }

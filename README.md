@@ -14,8 +14,8 @@ the server role (`serve`), the remote backend, authentication and streaming, shi
 [0.2.2](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2) fix what came after them.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
-files, each carrying man pages, shell completions, the licenses and the docs. Web UI milestone 1, on this
-branch, puts a browser UI in the full build: a sign-in, the live torrent table, the detail pane, and add,
+files, each carrying man pages, shell completions, the licenses and the docs. Web UI milestone 1
+(unreleased) puts a browser UI in the full build: a sign-in, the live torrent table, the detail pane, and add,
 pause, resume and remove, with the off switch in `server.web_ui` and `FBTT_WEB_UI`
 ([docs/web-ui.md](docs/web-ui.md)). Every release now ships two builds: the full build, `featherbittorrent`,
 which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and

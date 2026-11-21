@@ -301,6 +301,64 @@ fn origin_is_allowed(origin: &str, allowed: &[String]) -> bool {
     host_is_local_or_allowed(authority, allowed)
 }
 
+/// The scheme and authority of an `Origin` value, read exactly the way [`origin_is_allowed`] reads it:
+/// one of the two web schemes, then `host[:port]` with any path, query, fragment or userinfo dropped.
+/// `None` for anything that is not that shape: `null`, another scheme, nothing after the `://`.
+fn origin_authority(origin: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = origin.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let end = match rest.find(['/', '?', '#']) {
+        Some(end) => end,
+        None => rest.len(),
+    };
+    let authority = &rest[..end];
+    let (_, authority) = authority.rsplit_once('@').unwrap_or(("", authority));
+    (!authority.is_empty()).then_some((scheme, authority))
+}
+
+/// [`host_part`]'s name for an authority, with the port spelled on it as a number when there is one:
+/// `Some((name, None))` for a bare name. A port too big for a port is `None` - no client reached this
+/// server that way, so nothing reached it that way can agree with it.
+fn host_part_with_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (name, bracketed) = host_part(authority)?;
+    // [`host_part`] has already said this authority is well formed, so what follows the name (for a
+    // plain name) or the `]` (for a bracketed address) is either empty or `:` and digits.
+    let tail = if bracketed {
+        authority.split_once(']').map_or("", |(_, tail)| tail)
+    } else {
+        &authority[name.len()..]
+    };
+    match tail.strip_prefix(':') {
+        None => Some((name, None)),
+        Some(port) => port.parse::<u16>().ok().map(|port| (name, Some(port))),
+    }
+}
+
+/// Whether an origin names the host the request itself was addressed to. Names are compared without
+/// regard to case, as DNS is; ports are compared once each side's default is spelled in, because an
+/// origin omits its port when it is its scheme's default (80 for `http`, 443 for `https`) and a
+/// browser omits the port from a `Host` under the same rule. That is what keeps two applications on
+/// one host name at two ports apart from each other: a page on one that posts to the other sends its
+/// own origin and the port it reached under `Host`, and a plain name against an explicit port says
+/// somebody is naming a different place than they think they are.
+fn origin_names_requested_host(scheme: &str, origin_authority: &str, host: &str) -> bool {
+    let Some((origin_name, origin_port)) = host_part_with_port(origin_authority) else {
+        return false;
+    };
+    let Some((host_name, host_port)) = host_part_with_port(host) else {
+        return false;
+    };
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    origin_name.eq_ignore_ascii_case(host_name)
+        && origin_port.unwrap_or(default_port) == host_port.unwrap_or(default_port)
+}
+
 /// Why an entry in `server.allowed_hosts` could never be the name a request carries, or `None` when it could
 /// be. What gets compared is the bare name: [`host_part`] takes the port off the request's side and
 /// [`host_is_local_or_allowed`] matches whole names without regard to case, so the entries people type - a
@@ -407,9 +465,9 @@ impl FbttAuth {
     }
 
     /// Whether the `Origin` a browser request carries - when it carries one - names a place this server
-    /// answers: the same rule [`guard_local`] applies with logins off, because the reason to distrust a
-    /// foreign origin is the same whether or not a credential came with it. Absent is ordinary: a command
-    /// line sends none, and so does a same-origin `GET`.
+    /// answers: the rule [`guard_local`] applies with logins off. Absent is ordinary: a command line
+    /// sends none, and so does a same-origin `GET`. [`Self::browser_origin_is_accepted`] is what the
+    /// browser calls made with logins on ask, and it accepts one thing more.
     pub(crate) fn origin_is_accepted(&self, headers: &HeaderMap) -> bool {
         match headers.get(header::ORIGIN) {
             None => true,
@@ -418,6 +476,48 @@ impl FbttAuth {
                 .to_str()
                 .is_ok_and(|origin| origin_is_allowed(origin, &self.hosts)),
         }
+    }
+
+    /// Whether the `Origin` a browser sign-in or cookie change carries comes from this server's own
+    /// page: [`origin_is_accepted`]'s list, plus yes for an origin naming the very host this request
+    /// arrived at.
+    ///
+    /// With logins on, a request standing at this check has already been asked for a credential the
+    /// page cannot forge: the password at the sign-in, this session's own CSRF value on a change. An
+    /// origin equal to the request's own `Host` is therefore the page this server itself served at
+    /// that name, which is the one page worth answering without a list. A DNS-rebinding page can make
+    /// the two agree, but it gets no session from it: the `fbtt_session` cookie belongs to the real
+    /// host name, and signing in needs the password. That is why logins off keep the stricter rule
+    /// ([`guard_local`], where the name is the only credential there is), and why behind a proxy that
+    /// rewrites `Host` (the featherbit gateway does) the public name still has to be in
+    /// `server.allowed_hosts`: there the origin and the host are different names, and the list is
+    /// what carries the sign-in.
+    pub(crate) fn browser_origin_is_accepted(&self, headers: &HeaderMap) -> bool {
+        // An absent `Origin` was answered yes there, so from here down one is present.
+        if self.origin_is_accepted(headers) {
+            return true;
+        }
+        // The only way to one this server did not already answer is a value it cannot read as text,
+        // and an unreadable value is not one it can call its own either.
+        let Some(origin) = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        // `null` is not `scheme://host[:port]`, so a `null` origin matches no host, as it should: its
+        // page is a data: URL or a sandboxed frame, not something this server served.
+        let Some((scheme, authority)) = origin_authority(origin) else {
+            return false;
+        };
+        // A request that names no host at all has no name for an origin to agree with.
+        let Some(host) = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        origin_names_requested_host(scheme, authority, host)
     }
 
     /// The sessions: what a login issues and what every accepted request renews. The login routes
@@ -483,8 +583,10 @@ impl FbttAuth {
             return Err(AuthRejection::Forbidden);
         }
         // A browser that sends an Origin is telling us where it came from; believe it only for a place this
-        // server would answer as a Host (see [`FbttAuth::origin_is_accepted`], which applies the same rule
-        // to the cookie's changes).
+        // server would answer as a Host (see [`FbttAuth::origin_is_accepted`]). The browser calls of a
+        // server with logins on accept one shape more ([`FbttAuth::browser_origin_is_accepted`]); here a
+        // name is the only credential there is, so a name this server was not told to answer stays refused
+        // even when the origin repeats it back.
         if !self.origin_is_accepted(request.headers) {
             let origin = request
                 .headers
@@ -505,9 +607,12 @@ impl FbttAuth {
     /// A cookie this server issued answers a read-only call on its own. A change has to prove two things
     /// the page cannot manage with the cookie alone: that it knows this session's token - only somebody
     /// holding the cookie can compute [`csrf_for`] of it - through the `x-csrf-token` header, and, if a
-    /// browser said where it came from, that it came from a place this server answers. That is the whole
-    /// defence against a page from somewhere else making this person's browser do something on their
-    /// behalf: it can send the cookie, but it can neither read it nor invent the token that goes with it.
+    /// browser said where it came from, that it came from a place this server answers or from this very
+    /// request's own host name ([`FbttAuth::browser_origin_is_accepted`] says why that second shape is
+    /// safe with a session already in play). That is the whole defence against a page from somewhere else
+    /// making this person's browser do something on their behalf: it can send the cookie, but it can
+    /// neither read it nor invent the token that goes with it, and its own name is not this server's
+    /// `Host`.
     fn guard_cookie(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
         let Some(token) = session_cookie(request.headers) else {
             return Err(AuthRejection::Unauthorized);
@@ -530,7 +635,7 @@ impl FbttAuth {
             );
             return Err(AuthRejection::Unauthorized);
         }
-        if !self.origin_is_accepted(request.headers) {
+        if !self.browser_origin_is_accepted(request.headers) {
             tracing::debug!(
                 method = %request.method,
                 path = ?request.matched_path,

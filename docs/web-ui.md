@@ -32,9 +32,16 @@ The cookie's `Secure` flag follows `server.cookie_secure` in `config.yaml`:
 - `always`: the cookie is `Secure` whatever the request says.
 
 A proxy that terminates TLS but does not send `X-Forwarded-Proto` leaves the server believing the request
-came over plain http, and under `auto` the cookie is then issued without `Secure`: a browser that received
-it over https will not send it back, and sign-in loops. Behind such a proxy, set
-`server.cookie_secure: always` so the cookie is always `Secure` and the session survives the round trip.
+came over plain http, and under `auto` the cookie is then issued without `Secure`. That is not a sign-in
+loop, because a browser sends a non-`Secure` cookie over https too; the cost is that the token is then
+free to travel over plain http to this host as well, where anyone who can see that hop can read it.
+Behind such a proxy, set `server.cookie_secure: always` so the cookie carries `Secure` whatever the
+request says and the token travels on https alone.
+
+The session behind the cookie is the server's own, and it outlives nothing the cookie promises: the
+server forgets it after an hour without use (`SESSION_TTL` in `crates/fbtt-server/src/auth/sessions.rs`)
+and on every restart, whatever the cookie's 7-day `Max-Age` says. A page that arrives with a cookie
+whose session has gone simply asks for the password again.
 
 ## Where to serve it
 
@@ -49,14 +56,27 @@ subdomain), not on another application's host name, so the cookie belongs to one
 The web UI signs in at the server, so a gateway that stands in front of it must not put a credential of
 its own in the way. The gateway-only setup in [docs/reverse-proxy.md](reverse-proxy.md) (its setup 3) is
 the one for the browser: `server.auth.enabled` off, the server reachable only through the gateway, and
-`server.allowed_hosts` holding the name the gateway rewrites the request to and the browser-facing domain.
+`server.allowed_hosts` holding the name the gateway rewrites the request to and the browser-facing
+domain.
 
-A gateway that forwards its own `Authorization` header to featherbittorrent must run with featherbittorrent's
-logins off. The server reads any `Authorization` header as its own credential, so a gateway that sends the
-browser's bearer token onward would have the server try to check it as a login and fail; the gateway-only
-setup is the one where the two do not collide. Setups 1 and 2 in the reverse-proxy guide keep the TUI's
-bearer and device-key logins working through the gateway, and the full build's web UI signs in at the
-gateway instead, in the shape that guide describes for the browser half.
+Setup 1 in that guide, a gateway that does TLS and rate limits and asks nothing of its own, serves the
+web UI too: the page, its sign-in and its API calls all pass a gateway that authenticates nobody, and
+the sign-in goes on answering at the server. The gateway rewrites `Host`, so the browser-facing domain
+has to be in `server.allowed_hosts`. A browser that reaches the server at the server's own name, with
+no rewriting proxy between, needs nothing listed: the sign-in and the cookie's changes accept an
+`Origin` naming the very name the request arrived at, and with logins on that is safe because the
+credential for a session is the password, not the name.
+
+Setup 2 does not serve the web UI in this release. Its `/api/*` policy opens only to a gateway API key
+or a bearer token, and the page sends neither, so every call the page makes, its own sign-in included,
+is answered `401` at the gateway. For the browser that means setup 1 or setup 3.
+
+A gateway that forwards its own `Authorization` header to featherbittorrent must run with
+featherbittorrent's logins off. The server reads any `Authorization` header as its own credential, so a
+gateway that sends the browser's bearer token onward would have the server try to check it as a login
+and fail; the gateway-only setup is the one where the two do not collide. Setups 1 and 2 keep the TUI's
+bearer and device-key logins working through the gateway. The web UI never signs in at the gateway:
+where it is served, in setups 1 and 3, it signs in at the server.
 
 ## Streaming in the browser
 

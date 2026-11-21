@@ -77,8 +77,7 @@ RUN mkdir -p \
 COPY crates ./crates
 COPY --from=web-build /app/web/dist ./web/dist
 RUN find crates -name '*.rs' -exec touch {} + \
- && cargo build --locked --release -p featherbittorrent --features web-ui \
- && cargo clean -p featherbittorrent
+ && cargo build --locked --release -p featherbittorrent --features web-ui
 
 FROM debian:12
 RUN apt-get update \

@@ -66,9 +66,11 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 ///
 /// Two gates come before the password is looked at, because both cost nothing and both are about who sent
 /// the request rather than what they sent: the body has to say it is JSON, and an `Origin` that is present
-/// has to be a place this server answers. A sign-in from elsewhere is refused for the same reason a
-/// rebinding attack is refused anywhere else - this server's answers are about the library on this person's
-/// disk, and a page from another site has no business getting one issued a cookie for it.
+/// has to name a place this server answers or the very host this request arrived at
+/// ([`crate::auth::FbttAuth::browser_origin_is_accepted`]). A sign-in from somewhere else is refused for
+/// the same reason a rebinding attack is refused anywhere else - this server's answers are about the
+/// library on this person's disk, and a page from another site has no business getting one issued a cookie
+/// for it.
 pub(super) async fn sign_in(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -93,7 +95,7 @@ pub(super) async fn sign_in(
             "the body must be {JSON_MEDIA_TYPE}"
         )));
     }
-    if !shared.auth.origin_is_accepted(&headers) {
+    if !shared.auth.browser_origin_is_accepted(&headers) {
         tracing::debug!(
             peer = %peer.ip(),
             origin = %clean(&header_text(&headers, &header::ORIGIN)),
