@@ -26,7 +26,7 @@ The two builds come from the owner, 2026-11-21: "For headless I meant only the t
 | **Headless** | The `featherbittorrent` binary exactly as it ships today, TUI and `serve`, with no web UI compiled in. Nothing of the front end is in it. |
 | **Desktop** | A Tauri app with the same front end in a native window. It runs the engine in-process ("This computer"), or connects to a server like the remote TUI does. |
 
-In cargo terms the split is the `web-ui` feature: full builds turn it on, headless builds leave it off. **[builder's call]** Both builds ship in every release, for every platform in the 2026-11-14 table. **[owner, 2026-11-21]** How the packages are named is question 1.
+The headless build contains no front-end assets and changes nothing for existing clients. It does carry the browser-session routes and the `web_ui` setting, so one config file and one API work with both builds. **[builder's call]** In cargo terms the split is the `web-ui` feature: full builds turn it on, headless builds leave it off. **[builder's call]** Both builds ship in every release, for every platform in the 2026-11-14 table. **[owner, 2026-11-21]** How the packages are named is question 1.
 
 **The web UI is on by default in a full build.** A full build's `serve` serves it unless it is turned off. **[owner, 2026-11-21]** Two ways to turn it off, either one enough:
 - the config setting `server.web_ui: false`;
@@ -87,7 +87,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
    It lives in milestone 2, with browser streaming.
 
 4. **Snappy and light, like the TUI.** **[owner: the 2026-11-14 goal applies]**
-   - Live updates come from the SSE stream; nothing polls.
+   - The torrent list refreshes every 1 s and is woken early by the SSE event stream, as the remote TUI does: fbt-api's events carry no transfer rates. It refreshes every 10 s while the page is hidden. That pause is the web UI's own addition.
    - The table renders only its visible rows, so hundreds of torrents scroll smoothly.
    - The embedded bundle stays small: a target of under 300 KB gzipped, excluding fonts. **[builder's call]**
    - The full build's server, on a Pi 2B, grows only by the static files it serves; the headless build is unchanged.
@@ -118,12 +118,12 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
 - **The desktop app.**
   - A new crate `featherbittorrent-desktop` (Tauri 2) loads the same `web/dist`.
   - For "This computer", it starts the engine in-process, with the same library lock the TUI uses. It also starts `fbtt-server` on `127.0.0.1` with a random per-launch token, and the webview talks HTTP to it. There is one client code path, the browser's; no Tauri-specific API calls; and the TUI's local-library rules (one engine per library, reopen the last used) apply unchanged.
-  - For a remote server, the webview talks to that server directly. The server lists the desktop's origin in `cors_origins`, which fbt-api already has. **[owner, 2026-11-21]**
+  - For a remote server, the webview talks to that server directly, cross-origin. The server lists the desktop's origin in `cors_origins`, which fbt-api already has. **[owner, 2026-11-21]** A `SameSite=Strict` cookie cannot cross origins, so against a remote server the desktop app signs in with the existing bearer-token login, the TUI's. The cookie session is for pages the server serves itself. The page's `connect-src` must allow the saved servers' origins in the desktop build only. **[builder's call]**
 - **Auth in a browser.**
   - User name and password, against the existing login routes.
-  - The session is an HttpOnly cookie that survives a restart: `Secure` over https, `SameSite=Strict`, and a CSRF token on every state-changing request. No token in script-readable storage. **[owner: cookie, 2026-11-21]**
+  - The session is an HttpOnly cookie that survives a browser restart, but not a server restart: sessions live in the server's memory. It is `Secure` over https, `SameSite=Strict`, and paired with a CSRF token on every state-changing request. No token in script-readable storage. **[owner: cookie, 2026-11-21]**
   - Browser device keys are not in scope for now. **[owner, 2026-11-21]**
-  - Behind the gateway, its `openid-connect` plugin already covers browsers, per the 2026-11-15 decision.
+  - Behind the gateway, its `openid-connect` plugin covers browsers, per the 2026-11-15 decision. A gateway that forwards its own `Authorization` header upstream must run with featherbittorrent's logins off (the 2026-11-15 "gateway only" setup). With logins on, that header is checked as a featherbittorrent bearer token and never falls back to the cookie. `docs/web-ui.md` says so. **[builder's call]**
 - **Builds and CI.**
   - Node, pinned, builds `web/` before cargo in CI and in the release workflow.
   - New gates: `npm audit` (as fbterm's `website/` has), eslint and typecheck, and vitest for the client code.
@@ -167,7 +167,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
 
 ## 8. Anti-goals
 
-- **A heavy page:** a framework runtime or component library that blows the bundle target, or polling where the SSE stream exists.
+- **A heavy page:** a framework runtime or component library that blows the bundle target, refreshing faster than the remote TUI does, or one poll per component instead of one refresh loop.
 - **A second client code path for the desktop.** It must use the same HTTP client as the browser.
 - **Secrets in browser storage that survives the tab**, or a password on any URL.
 - **A desktop "This computer" that ignores the library lock** and runs beside a TUI or `serve` on the same library.
@@ -182,7 +182,7 @@ The component structure, state management (plain React, or a small store), the r
 2. Answered: on by default in a full build, off through `server.web_ui: false` or `FBTT_WEB_UI=0` (section 2).
 3. Answered: not automatically, but on request at runtime (section 2a). **[owner, 2026-11-21]**
 4. Answered: the webview talks to a remote server directly, through CORS on the server (`cors_origins`, already in fbt-api). **[owner, 2026-11-21]**
-5. Answered: an HttpOnly session cookie that survives a restart. It is `Secure` over https, `SameSite=Strict`, and paired with a CSRF token on every state-changing request. **[owner, 2026-11-21: "cookie could work"]**
+5. Answered: an HttpOnly session cookie that survives a browser restart (not a server restart: sessions are in memory). It is `Secure` over https, `SameSite=Strict`, and paired with a CSRF token on every state-changing request. **[owner, 2026-11-21: "cookie could work"]**
 6. Answered: not now. Browsers sign in with a password, or through the gateway's OpenID Connect. **[owner, 2026-11-21]**
 7. Answered: the first desktop release has all of these: the tray, start at login, `.torrent` file associations, and the `magnet:` link handler. **[owner, 2026-11-21]**
 8. Answered: the desktop app carries featherbittorrent's version and ships in the same release. **[owner, 2026-11-21]**
