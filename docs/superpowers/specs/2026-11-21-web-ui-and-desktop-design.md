@@ -52,6 +52,33 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
 - **Going back.** Going back to the TUI stops the server and closes the port. The engine and the torrents keep running throughout, because the server only serves the engine the TUI already runs. One library, one engine.
 - **Leaving the message screen.** Quitting from it is the same as quitting the TUI: the torrents stop and resume on the next start, as today.
 
+## 2b. Finding torrents from inside the app (parked, undecided)
+
+Owner, 2026-11-21: "Another feature for the Tauri app could be adding you favorite torrent sites for searching torrents. You could open a tab to one of your saved torrent sites, search through them and intercept torrents and magnet links". **[owner]**
+
+**Why.** Today the owner opens a browser, goes to a torrent site they keep as a bookmark, searches, and opens magnet links. The point is having it all in one window: finding, adding and downloading, with no switch to a browser. **[owner: "That's the draw"]** The owner named pop-ups and fake download buttons as the pain on those sites. **[owner]**
+
+**Status: parked. The owner will decide later.** **[owner, 2026-11-21: "lets leave the matter for later to decide"]** If it is built, it comes after the basic desktop app (milestone 3), as its own release. It is not a priority: the media player matters more for the first desktop release. **[owner]**
+
+There are two directions, and nothing has been chosen between them.
+
+1. **Site tabs in the desktop app.**
+   - The owner chose tabs like a browser (Torrents first, then one tab per saved site) over a sidebar.
+   - Magnet links and real torrent files are caught into the Add torrent dialog. Pop-ups are refused, and any download that is not a torrent is refused.
+   - Ads are hidden with an existing engine and existing lists, never filters we maintain. **[owner]**
+   - The open question that stopped this direction: request-level ad blocking needs `unsafe` calls into each system web view (WKWebView, WebView2, WebKitGTK). The repo forbids `unsafe` everywhere. The choice is between a narrow exception crate and weak script-only ad hiding.
+   - It also needs site tabs strictly isolated from the app: no IPC, token, session or loopback access.
+2. **Search inside the app, no browser at all.** The owner's alternative, after hearing about the `unsafe` question: search plugins, as qBittorrent's unofficial search plugins work. **[owner]**
+   - Results are a list in our own UI, which removes pop-ups, fake buttons and ads entirely.
+   - If search runs in the engine or server, it would serve the TUI, the web UI and the desktop alike. **[builder's guess]**
+   - Three ways to get the plugins, still open:
+     - **qBittorrent's Python plugins as they are.** A large existing set, but it needs Python, and the plugins are third-party code running with full access.
+     - **A Torznab client for Jackett or Prowlarr.** These are maintained by others, so we keep no site definitions and run no foreign code. The catch: the user runs one of those services. This is the builder's recommendation.
+     - **Our own sandboxed plugin format.** The safest way to run plugins, but we would maintain them, which the owner does not want.
+   - The open question: whether the owner would run Jackett or Prowlarr. **[owner: "I'm not sure"]**
+
+Direction 2 reverses the non-goal "search across indexing sites" (section 4). Choosing it is a deliberate change.
+
 ## 3. Goals
 
 1. **Feature parity with the TUI.** **[builder's call]** The web UI has every TUI screen:
@@ -99,7 +126,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
 
 ## 4. Non-goals
 
-- Search across indexing sites, and one UI on several servers at once. These stay "later" exactly as in the TUI design. **[owner, 2026-11-14]**
+- Search across indexing sites, and one UI on several servers at once. These stay "later" exactly as in the TUI design. **[owner, 2026-11-14]** Section 2b records an idea, parked, that may revisit this.
 - Transcoding for the browser. Remuxing is in scope (goal 3); re-encoding is not. **[builder's call]**
 - Read-only users or per-user permissions: every signed-in client may do everything. **[builder's call, as in the TUI design]**
 
@@ -164,6 +191,7 @@ Owner, 2026-11-21: "Not automatic, but you could have it serving if the user cho
    - the Tauri crate, This computer and remote servers;
    - the tray, start at login, `.torrent` file associations and the `magnet:` link handler;
    - the release jobs.
+4. **Finding torrents from inside the app (section 2b). Parked, undecided.** In any case it comes after milestone 3 and is not a priority. **[owner, 2026-11-21]**
 
 ## 8. Anti-goals
 
