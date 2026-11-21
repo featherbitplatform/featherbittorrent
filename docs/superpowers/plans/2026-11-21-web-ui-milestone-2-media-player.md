@@ -20,7 +20,6 @@ It starts while the torrent is still downloading. The server remuxes and never t
 
 **Tech stack:**
 - **Rust:** `matroska-demuxer` 0.8.1 (Zlib OR MIT OR Apache-2.0, `#![forbid(unsafe_code)]`) and `mp4-atom` 0.17.1 (MIT OR Apache-2.0). Both are new workspace dependencies.
-  - `tokio-util` 0.7 is already in `Cargo.lock` through fbt-api. It joins the workspace table, for `SyncIoBridge`.
 - **Web:** React 19, TypeScript, vitest. No new npm dependency.
 
 **Spec:** `docs/superpowers/specs/2026-11-21-web-ui-and-desktop-design.md`, section 3, goals 2 and 3, and section 7, milestone 2.
@@ -130,14 +129,14 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 - Create: `crates/fbtt-media/{Cargo.toml,src/lib.rs,src/capped.rs,src/codec.rs,src/probe.rs}`
 - Create: `dev/make-media-fixtures.sh`
 - Create: `crates/fbtt-media/tests/fixtures/` and `crates/fbtt-media/tests/probe.rs`
-- Modify: the root `Cargo.toml`, with the workspace member and `matroska-demuxer = "0.8.1"`, `mp4-atom = "0.17.1"` and `tokio-util = { version = "0.7", default-features = false, features = ["io-util"] }` in `[workspace.dependencies]`
+- Modify: the root `Cargo.toml`, with the workspace member and `matroska-demuxer = "0.8.1"` and `mp4-atom = "0.17.1"` in `[workspace.dependencies]`
 
 **Interfaces:**
 - Produces, in `fbtt_media`:
   - `pub const TIME_OFFSET_MS: u64 = 1000;`
-  - `pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;`
+  - `pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;`, `pub const SUBTITLE_FILE_CAP: u64 = 4 * 1024 * 1024;`, `pub const CUE_WINDOW_MAX_MS: u64 = 600_000;`, `pub const MAX_FRAGMENT_MS: u64 = 5000;` and `pub const MAX_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;`
   - `pub enum MediaError { Unsupported(String), Malformed(String), Io(std::io::Error) }`, with `Display` and `From<io::Error>`. An `io::ErrorKind::TimedOut` stays `Io`.
-  - `pub enum Container { Matroska, Mp4 }`
+  - `pub enum Container { Matroska, WebM, Mp4 }`. `WebM` is a Matroska file whose EBML DocType is `webm`. It is demuxed the same way, and the probe says `"webm"`.
   - `pub enum TrackKind { Video, Audio, Subtitle }`
   - `pub enum Codec`, with these variants:
     - video: `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`;
@@ -198,7 +197,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - `opus`, `flac` and `fLaC` (both, in that order), `mp4a.6B`, `ac-3` and `ec-3`.
     - Non-remuxable codecs get an empty `mime_codecs`.
   - Language: `language_bcp47()`, else `language()`. `und` becomes `None`.
-  - The crate stays free of `fbt`. Task 6 passes every track name, language and cue text through `fbt::display_safe(s, fbt::MAX_DISPLAY_CHARS)` before sending it.
+  - The crate stays free of `fbt`. Task 6 passes every track name and language through `fbt::display_safe(s, fbt::MAX_DISPLAY_CHARS)`, and cue text through it one line at a time: `display_safe` turns `\n` into a space, so the lines are split on `\n`, each is sanitised, empty lines are dropped, and the rest are joined with `\n` again.
 - [ ] **Step 5: Run them.** Run: `cargo test -p fbtt-media --test probe`. Expected: PASS.
 - [ ] **Step 6: Run the gate and commit.** Commit: `feat(media): the fbtt-media crate, fixtures, and probing Matroska and MP4`.
 
@@ -220,7 +219,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - `fn finish(&mut self) -> Result<Option<Vec<u8>>, MediaError>` flushes the last one.
   - `pub fn sample_entry(track: &TrackInfo, private: Option<&[u8]>, first_frame: Option<&[u8]>, audio: Option<(u32 /*rate*/, u16 /*channels*/)>, video: Option<(u16, u16)>) -> Result<mp4_atom::Codec, MediaError>`
 - **Fragmenting:**
-  - A video fragment runs from one keyframe up to the next keyframe, not including it.
+  - A video fragment runs from one keyframe up to the next keyframe, not including it. It also closes when it reaches `MAX_FRAGMENT_MS = 5000` of samples or `MAX_FRAGMENT_BYTES = 16 MiB`, whichever comes first. This keeps memory bounded when keyframes are rare or unknown.
   - An audio fragment closes once it holds at least 1000 ms.
   - Every fragment's first sample carries sync-sample flags. A video sample that is not a keyframe carries `sample_is_non_sync_sample`.
 - **Decode times, when the samples have none (Matroska).** The algorithm, per video fragment `p[0..n]` in decode order:
@@ -228,7 +227,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
   sorted = sort(p)
   delay  = max(0, max_i(sorted[i] - p[i]))
   dts[i] = sorted[i] - delay
-  dts[i] = max(dts[i], last_dts + 1)          // last_dts from the previous fragment, or -inf
+  dts[i] = max(dts[i], last_dts + 1)          // last_dts from the previous fragment, or -inf; may make cts negative, which trun v1 allows
   cts[i] = p[i] - dts[i]                       // trun version 1, signed
   duration[i] = dts[i+1] - dts[i]; the last one = next fragment's first dts - dts[n-1]
                 (the writer holds one fragment back until the next keyframe arrives),
@@ -241,7 +240,9 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
   - `dts_synthesis_with_b_frames`: decode order with PTS `[0, 300, 100, 200, 400, 700, 500, 600]` (two fragments, keyframes at 0 and 400). Decoding the output gives:
     - every `dts + cts == pts + offset`;
     - `dts` strictly increasing across both fragments;
-    - every `cts >= 0`.
+    - every `cts >= 0` (this input never needs the clamp).
+  - `dts_clamp_at_a_shrinking_delay`: fragment one with PTS `[0, 300, 100, 200]`, then fragment two with no reordering `[400, 500]`. `dts` stays strictly increasing, `dts + cts == pts + offset` holds, and the `trun` is version 1.
+  - `fragments_close_without_keyframes`: 300 video samples, all non-key after the first, at 40 ms each, give several fragments, none longer than 5000 ms.
   - `fragment_tfdt_continuity`: for each fragment after the first, `tfdt == previous tfdt + sum(previous durations)`.
   - `audio_fragments_hold_a_second`: 100 AAC samples of 21 ms each give fragments with a sum of durations of at least 1000 ms, except the last.
   - `aac_esds_round_trips`: the AudioSpecificConfig `12 10` gives an `mp4a` whose esds decodes back with object type 0x40 and the same two bytes.
@@ -265,7 +266,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 - Test: `crates/fbtt-media/tests/remux.rs`
 
 **Interfaces:**
-- Consumes: `Sample`, `TrackConfig`, `init_segment` and `FragmentWriter` (Task 2), `CappedLen` (Task 1).
+- Consumes: `Sample`, `TrackConfig`, `sample_entry`, `init_segment` and `FragmentWriter` (Task 2), and `CappedLen`, `TrackInfo`, `Codec` and the Matroska probing helpers (Task 1).
 - Produces:
   - `pub fn open_track<R: Read + Seek>(reader: R, track: u32, start_ms: u64) -> Result<FragmentStream, MediaError>`
   - `pub struct FragmentStream`:
@@ -278,7 +279,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 - **Behaviour:**
   - The source wraps the reader in `CappedLen::new(_, ELEMENT_CAP)`, opens `MatroskaFile`, and calls `seek(start_ms * 1_000_000 / timestamp_scale)` when `start_ms > 0`.
   - It skips frames of other tracks.
-  - For video it drops frames until the first one with `is_keyframe == Some(true)`. If the file uses BlockGroups (`is_keyframe == None`), the first frame after the seek counts as the keyframe.
+  - For video it drops frames until the first one with `is_keyframe == Some(true)`. If the file uses BlockGroups (`is_keyframe == None`, which `matroska-demuxer` reports because it does not expose `ReferenceBlock`), the first frame after the seek counts as the keyframe, and every later `None` frame counts as non-sync. Fragments then close by the caps in Task 2. Playback after a seek may show a few broken frames until the next real keyframe. This is accepted and recorded in the report.
   - Timestamps convert from Matroska units (`timestamp * timestamp_scale` ns) to the track timescale with `u128` arithmetic. Video uses 90 000, and audio uses the sampling frequency rounded.
   - **Content encodings:**
     - header stripping (`ContentCompAlgo` 3): prepend the stored bytes to every frame;
@@ -315,7 +316,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 - Test: add to `tests/remux.rs`
 
 **Interfaces:**
-- Consumes: `TrackSource` and `Sample` (Task 3).
+- Consumes: `Sample` and `sample_entry` (Task 2), and `TrackSource` (Task 3).
 - **Behaviour:**
   - Walk the top-level box headers with `mp4_atom::Header`, seeking past `mdat` without reading it. Decode `moov` wherever it is.
   - Build each track's sample list from `stts`, `ctts`, `stsc`, `stsz`, `stco`/`co64` and `stss`.
@@ -355,7 +356,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - `S_TEXT/ASS` block text is the ninth comma field onward: ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text.
     - The end is `timestamp + duration`. With no duration, the end is the next cue's start, or start + 5000.
   - MP4 `tx3g`: a sample is a 2-byte big-endian length, then UTF-8 text.
-  - `to_ms - from_ms > 600_000` gives `Unsupported`.
+  - `to_ms - from_ms > CUE_WINDOW_MAX_MS`, or `to_ms <= from_ms`, gives `Unsupported`.
 
 - [ ] **Step 1: Write the failing tests.**
   - `srt_file`: 3 cues with the fixture's exact times, the two-line cue joined with `\n`.
@@ -375,14 +376,15 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 **Files:**
 - Create: `crates/fbtt-server/src/routes/media.rs` and `crates/fbtt-server/src/media_io.rs`
 - Modify: `crates/fbtt-server/src/routes/mod.rs` (`mod media;`, the routes inside `router()` next to the fs routes, and a `media_permits: Arc<Semaphore>` in `Shared`)
-- Modify: `crates/fbtt-server/Cargo.toml` (`fbtt-media`, `tokio-util`, and tokio `io-util`)
+- Modify: `crates/fbtt-server/Cargo.toml` (`fbtt-media`, and tokio's `io-util` feature)
 - Test: `crates/fbtt-server/tests/media.rs`
 
 **Interfaces:**
-- Consumes: `fbtt_media::{probe, open_track, file_cues, embedded_cues, subtitle_format, TIME_OFFSET_MS}`, and `shared.session().torrent(..)` then `handle.open_file(index)`, as in `routes/stream.rs:81`.
+- Consumes: `fbtt_media::{probe, open_track, file_cues, embedded_cues, subtitle_format, TIME_OFFSET_MS}`, `shared.session().torrent(..)` as in `routes/stream.rs:81`, then fbt-lib's `TorrentHandle::open_file(index)` (`crates/fbt-session/src/torrent/mod.rs:434` at v0.11.1).
 - Produces, in `media_io.rs`:
-  - `pub(crate) struct BlockingReader`. It wraps `tokio_util::io::SyncIoBridge<fbt::FileReader>`, and every `read` and `seek` is bounded by `READ_TIMEOUT = Duration::from_secs(60)`.
-  - Build it on the runtime handle with `tokio::time::timeout` inside `Handle::block_on`, from the blocking thread. A timeout is `io::ErrorKind::TimedOut`.
+  - `pub(crate) struct BlockingReader { reader: fbt::FileReader, handle: tokio::runtime::Handle, timeout: Duration }`, implementing `std::io::Read` and `std::io::Seek` directly.
+  - Each `read` is `handle.block_on(tokio::time::timeout(timeout, reader.read(buf)))` (`AsyncReadExt`), and each `seek` is the same with `reader.seek(pos)` (`AsyncSeekExt`). A timeout becomes `io::ErrorKind::TimedOut`.
+  - There is no `SyncIoBridge`, because it offers no timeout.
   - It is used only inside `tokio::task::spawn_blocking`.
 - **Routes.** Paths use the 40-hex lowercase id, the same parsing as `routes/stream.rs`, and `{file}` is the file index. All are GET. Errors use `RouteError` with these codes:
   - `GET /api/v1/media/{id}/{file}` returns 200 with JSON:
@@ -394,12 +396,12 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     ```
     - `text` is `codec.text_subtitle()`.
     - `external_subtitles` lists every file in the same torrent with a subtitle extension, sorted with the files that share the video's base name first.
-    - Errors: `unsupported_media` 415, `not_found` 404 (unknown torrent, file index, or pad file), `no_metadata` 409, `read_timeout` 504.
+    - Errors: `unsupported_media` 415, `not_found` 404 (unknown torrent, file index, or pad file), `no_metadata` 409, `read_timeout` 504, and `too_many_readers` 503 with `Retry-After: 1` for `SessionError::TooManyReaders` (16 readers per torrent).
   - `GET /api/v1/media/{id}/{file}/tracks/{track}/stream?start_ms=N` returns 200 with `Content-Type` from `FragmentStream::mime()`, the header `X-Fbtt-Start-Ms: <start_ms()>`, and `Cache-Control: no-store`.
     - The body is the init segment, then fragments, sent through a `tokio::sync::mpsc` channel of capacity 4 from the blocking job.
-    - The job ends when the receiver is gone, or when a `send` waits more than `IDLE_SEND = 10 min`.
+    - The job ends when the receiver is gone, or when a `send` waits more than `IDLE_SEND = Duration::from_secs(600)`. `READ_TIMEOUT`, `IDLE_SEND` and `MEDIA_PERMITS = 8` are `const`s in `routes/media.rs`.
     - Errors raised before the first byte map to the codes above. An error after the first byte ends the body.
-  - `GET /api/v1/media/{id}/{file}/tracks/{track}/cues?from_ms=A&to_ms=B` returns 200 with `{"cues":[{"start_ms":..,"end_ms":..,"text":".."}]}`.
+  - `GET /api/v1/media/{id}/{file}/tracks/{track}/cues?from_ms=A&to_ms=B` checks the window first: `to_ms <= from_ms` or a window over `CUE_WINDOW_MAX_MS` gives 400 `invalid_request`. It returns 200 with `{"cues":[{"start_ms":..,"end_ms":..,"text":".."}]}`.
   - `GET /api/v1/media/{id}/{file}/subtitles/{sub}` returns 200 with the same cue JSON for subtitle file `{sub}` of the same torrent. `{sub}` must have a subtitle extension (else 415) and be at most `SUBTITLE_FILE_CAP` (else 413 `too_large`).
   - Every handler takes one permit from `media_permits` (8) with `try_acquire_owned`. When none is free it answers 503 `too_many_media_streams` with `Retry-After: 1`. The stream route moves its permit into the blocking job.
 
@@ -412,13 +414,14 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - the body decodes with `mp4_atom` to `ftyp`, `moov`, then at least one `moof`.
   - `stream_route_audio_and_seek`: track 3 with `start_ms=2000` gives `audio/mp4; codecs="opus"`.
   - `cues_and_subtitle_file_routes`: cues for track 4 match `expected.json`, and the subtitle route for `movie.srt` gives 3 cues. `notes.txt` gives 415.
+  - `cue_text_keeps_its_lines`: the two-line cue of `movie.srt` arrives with exactly one `\n` between its lines, and a cue holding `\u{1b}[31m` arrives without the escape character.
   - `media_routes_refuse_a_stream_token`: with logins on, a stream token issued for file 0 used as `?token=` on the probe route gives 401. A cookie session works with GET.
   - `permits_are_released_when_the_client_goes_away`:
     - start 8 streams;
     - a ninth gives 503;
     - drop the 8 responses;
     - within 5 s a new stream gives 200.
-  - `read_timeout_ends_the_stream`: with the read timeout taken from a `media_read_timeout: Duration` on `Shared` (default `READ_TIMEOUT`, set through a `pub fn` on whatever the tests use to start a server, with no config key), add a torrent whose data is absent (add the `.torrent` with no files on disk and no peers). The probe answers 504 `read_timeout` within 3 s when the timeout is 1 s.
+  - `read_timeout_ends_the_stream`: with the read timeout taken from an `AtomicU64` of milliseconds in `Shared` (default `READ_TIMEOUT`), set through `pub fn set_media_read_timeout(&self, timeout: Duration)` on `fbtt_server::Server` (no config key), add a torrent whose data is absent (add the `.torrent` with no files on disk and no peers). The probe answers 504 `read_timeout` within 3 s when the timeout is 1 s.
 - [ ] **Step 2: Run them.** Run: `cargo test -p fbtt-server --all-features --test media`. Expected: FAIL.
 - [ ] **Step 3: Implement the routes, `BlockingReader` and the permits.**
 - [ ] **Step 4: Run them.** Expected: PASS.
@@ -428,17 +431,17 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 
 **Files:**
 - Create: `web/src/player/{time,tracks,buffering,positions,cues}.ts` and their `*.test.ts`
-- Modify: `web/src/api/client.ts` adds hand-typed `MediaProbe`, `MediaTrack` and `Cue` types and `probe(id, file)`, `cues(id, file, track, fromMs, toMs)` and `subtitleFile(id, file, sub)`
+- Modify: `web/src/api/client.ts` adds hand-typed `MediaProbe`, `MediaTrack` and `Cue` types , plus `probe(id, file)`, `cues(id, file, track, fromMs, toMs)`, `subtitleFile(id, file, sub)`, `streamToken(id, file): Promise<string>` (`POST /api/v1/stream-tokens` with `{torrent, file}` and the CSRF header; it returns the answer's `path`, which carries `?token=` when logins are on), and `mediaStreamUrl(id, file, track, startMs): string` (`/api/v1/media/<id>/<file>/tracks/<track>/stream?start_ms=<n>`)
 
 **Interfaces:**
 - Produces:
   - `time.ts`: `toMedia(sourceMs: number, offsetMs: number): number` (seconds) and `toSource(mediaSeconds: number, offsetMs: number): number` (ms).
-  - `tracks.ts`: `chooseTracks(probe: MediaProbe, supported: (mime: string) => boolean, preferredAudio?: number): TrackChoice`, where:
+  - `tracks.ts`: `chooseTracks(probe: MediaProbe, supported: (mime: string) => boolean, canPlay: (mime: string) => boolean, preferredAudio?: number): TrackChoice`, where:
     ```ts
     type TrackChoice =
       | { kind: 'remux'; video: MediaTrack; videoMime: string; audio: MediaTrack | null; audioMime: string | null;
           audioOptions: { track: MediaTrack; playable: boolean }[] }
-      | { kind: 'native' }            // WebM VP8/VP9 the browser plays directly
+      | { kind: 'native' }            // container "webm", VP8/VP9 video, and canPlay('video/webm') true
       | { kind: 'unplayable'; codec: string }
     ```
     - The mime is `video/mp4; codecs="<c>"` and `audio/mp4; codecs="<c>"`, using the first of `mime_codecs` that `supported` accepts.
@@ -480,16 +483,18 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
   - `engine.ts`: `createEngine(video: HTMLVideoElement, target: {id: string; file: number}, choice: Extract<TrackChoice, {kind:'remux'}>, offsetMs: number, deps?: EngineDeps): Engine`, where:
     ```ts
     interface Engine { seek(sourceMs: number): void; setAudio(track: MediaTrack): void; state(): 'loading'|'waiting'|'playing'|'error'; destroy(): void; onState(cb: (s: string) => void): void }
-    interface EngineDeps { fetch: typeof fetch; MediaSource: typeof MediaSource }   // defaults: window.fetch and window.ManagedMediaSource ?? window.MediaSource
+    interface EngineDeps { fetch: typeof fetch; MediaSource: typeof MediaSource; managed: boolean }   // defaults: window.fetch, then window.ManagedMediaSource (managed: true) if present, else window.MediaSource
     ```
   - **Behaviour:**
-    - **Start-up.** Create the source and add the video `SourceBuffer` (then the audio one, when there is one). Fetch the video stream at the start time, read `X-Fbtt-Start-Ms`, then fetch the audio at that same time. Set `video.currentTime = toMedia(start)`.
+    - **Attaching.** With `MediaSource`, set `video.src = URL.createObjectURL(source)`. With `ManagedMediaSource`, set `video.disableRemotePlayback = true` and `video.srcObject = source`; there is no object URL.
+    - **Start-up.** On `sourceopen`, set `source.duration = toMedia(probe.duration_ms)` when the duration is known, so seeking into unbuffered time is not clamped. Add the video `SourceBuffer` (then the audio one, when there is one). Fetch the video stream at the start time, read `X-Fbtt-Start-Ms`, then fetch the audio at that same time. Set `video.currentTime = toMedia(start)`.
     - **Appending.** Each body is read with `getReader()`. Chunks are appended in order, one at a time, waiting for `updateend`. Reading pauses while `shouldRead` is false and resumes on `timeupdate`.
     - **Full buffer.** On `QuotaExceededError`, remove `evictRanges(...)` and retry once.
     - **Seeking.** On `seeking` to a time outside the buffered ranges: abort both fetches (`AbortController`), `abort()` both buffers, and start again at `toSource(video.currentTime)`.
     - **Changing audio.** `setAudio` aborts only the audio fetch, removes the audio buffer from `currentTime` to the end, and fetches the new track at `toSource(currentTime)`.
     - **Waiting.** A body that ends before the end of the file, a 504, or a network error moves to `waiting`. The engine retries from the end of the buffered range after 1, 2, 4 and then every 5 s.
-    - **Stopping.** `destroy()` aborts everything and revokes the object URL.
+    - **End.** When every active buffer's end is within 0.5 s of `toMedia(duration_ms)` and its body has ended, call `source.endOfStream()`, so `ended` fires.
+    - **Stopping.** `destroy()` aborts everything, and revokes the object URL when one was made.
   - `Player.tsx`: `Player({ id, file, name, onClose })`. It renders in the existing modal pattern (`modal.ts`):
     - the video;
     - a seek bar in source time, from the probe's `duration_ms`;
@@ -497,8 +502,12 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - `Audio` and `Subtitles` menus, where image tracks are listed disabled with `Image subtitles cannot be shown here.`;
     - fullscreen and close;
     - `Waiting for data...` while waiting;
-    - for `unplayable`: `This browser cannot play <codec> video.` plus a `Download` link to the fbt-api stream path for the file, with the `download` attribute;
-    - for `native`: a plain `<video src>` on the stream path.
+    - for `unplayable`: `This browser cannot play <codec> video.` plus a `Download` button. On click it calls `streamToken` (a token must be used within 60 s, so it is fetched at click time) and follows the returned path through a temporary `<a download>`;
+    - for `native`: a plain `<video src>` set to a `streamToken` path fetched when the player opens.
+  - **Look and access:**
+    - The player uses the Graphite tokens already in `web/src/theme.css` (`../design-system-v2/` is the reference): ink surfaces, violet only for the progress fill and focus rings, and Geist Mono for times.
+    - Every control is a real `<button>` with an `aria-label`. The menus are keyboard-navigable. The seek bar is an `<input type="range">`.
+    - The controls wrap at phone width.
   - **Keyboard:** `Space` and `k` play or pause. `ArrowLeft` and `ArrowRight` move 5 s. `ArrowUp` and `ArrowDown` change the volume by 0.1. `f` is fullscreen, `m` mutes, `a` takes the next playable audio, `c` the next subtitle (including Off), and `Escape` closes.
   - **Subtitles:**
     - an embedded text track is fetched by `nextWindow` on `timeupdate`;
@@ -514,7 +523,9 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - from the fixture's probe shape, the Audio menu has `eng` and `ita`;
     - Subtitles has `Off`, `eng` and `ita`, plus the external file;
     - a PGS track appears disabled.
-  - `unplayable shows the message and Download`, with the download link's `href` equal to the stream path.
+  - `unplayable shows the message and Download`: clicking Download makes one `POST /api/v1/stream-tokens` and follows the returned path.
+  - `managed media source attaches by srcObject`: with `managed: true`, `video.srcObject` is the source, `disableRemotePlayback` is true, and no object URL is made. With `managed: false`, `video.src` is a `blob:` URL.
+  - `duration and end of stream`: after `sourceopen`, `duration` equals `toMedia(4000)`. When both fake bodies end at the duration, `endOfStream` is called once.
   - `start header moves the playhead`: the fake answers `X-Fbtt-Start-Ms: 2000`, and `video.currentTime` becomes `3` (offset 1000).
   - `a stream that ends early shows Waiting for data and retries`: the first body ends after the init segment, and the second fetch starts at the buffered end.
   - `keyboard`: Space toggles `paused`, `a` switches the audio and causes one new audio fetch with the other track id, and Escape calls `onClose`.
