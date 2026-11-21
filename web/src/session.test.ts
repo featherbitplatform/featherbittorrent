@@ -1,6 +1,8 @@
 /**
  * The session store, against a fake fetch: which states the endpoint's answers move it through, and
- * what the sign-in screen is shown when an answer is a refusal. No DOM, no server, no internet.
+ * what the sign-in screen is shown when an answer is a refusal - and, just as much, which answers
+ * are *not* a refusal, so a server that said nothing does not end up blamed on a password nobody
+ * typed. No DOM, no server, no internet.
  *
  * @module session.test
  */
@@ -66,4 +68,23 @@ it('sign_in_failure_shows_the_server_message', async () => {
   expect(shown(store).error, 'the sign-in screen did not pass on the server\'s own message').toBe(
     'the request came from an origin this server does not answer',
   )
+})
+
+it('an_unreachable_server_is_not_a_sign_in_failure', async () => {
+  // Two ways the status question gets no readable answer: the fetch never completed, and the server
+  // answered its own failure. Neither means anybody failed to sign in - nobody tried - so the store
+  // says "unreachable" and the page offers to ask again instead of asking for a password.
+  const store = createSessionStore(async () => {
+    throw new TypeError('fetch failed')
+  })
+  await store.refresh()
+  expect(store.get(), 'a server that did not answer became a sign-in failure').toEqual({
+    phase: 'unreachable',
+  })
+
+  const answering = createSessionStore(async () => json(500, 'upstream exploded'))
+  await answering.refresh()
+  expect(answering.get(), 'a server that answered its own failure became a sign-in failure').toEqual({
+    phase: 'unreachable',
+  })
 })

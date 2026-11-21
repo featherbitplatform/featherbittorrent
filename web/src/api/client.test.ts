@@ -3,10 +3,18 @@
  * no cheap test for (a session that ends mid-use, a token on a change and no token on a read), and
  * none of them needs a process, a port, or the internet.
  *
+ * The 401 tests pair the client with a real session store over the same fake, because the rule under
+ * test is whose session a 401 is about: the client reports the generation its request was sent under
+ * and the store decides whether that session is still current. A hand-written callback counting
+ * notices could show "once" while proving nothing about a second session, so these tests read the
+ * store's own states, and count its transitions where "once" is the claim.
+ *
  * @module api/client.test
  */
 import { expect, it } from 'vitest'
 import { ApiError, createClient } from './client'
+import { createSessionStore } from '../session'
+import type { SessionStore, SignedOutState } from '../session'
 
 interface Seen {
   url: string
@@ -17,7 +25,9 @@ interface Seen {
 }
 
 /** A fetch that records what was asked and answers with whatever `answer` says. */
-function record(answer: (call: Seen) => Response): { seen: Seen[]; fetchFn: typeof fetch } {
+function record(
+  answer: (call: Seen) => Response | Promise<Response>,
+): { seen: Seen[]; fetchFn: typeof fetch } {
   const seen: Seen[] = []
   const fetchFn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const call: Seen = {
@@ -38,14 +48,39 @@ function json(status: number, body: string): Response {
 }
 
 const ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
+const SESSION_URL = '/api/v1/auth/web-session'
 const UNAUTHORIZED = '{"error":{"code":"unauthorized","message":"the credentials are not valid"}}'
+const SESSION_ENDED_COPY = 'Your session ended. Sign in again.'
+
+/** A promise the test holds the end of, so an answer can arrive exactly when the test says. */
+function held(): { promise: Promise<void>; release: () => void } {
+  let release = (): void => {}
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
+/** The message the sign-in screen is holding, or a thrown line saying this is not the sign-in screen. */
+function signedOut(store: SessionStore): SignedOutState {
+  const state = store.get()
+  if (state.phase !== 'signedOut') {
+    throw new Error(`the page is in state ${state.phase}, not on the sign-in screen`)
+  }
+  return state
+}
 
 it('sends_the_csrf_token_on_changes_only', async () => {
   const { seen, fetchFn } = record(() => json(200, '[]'))
   let notices = 0
-  const client = createClient(fetchFn, () => 'csrf-value', () => {
-    notices += 1
-  })
+  const client = createClient(
+    fetchFn,
+    () => 'csrf-value',
+    () => 0,
+    () => {
+      notices += 1
+    },
+  )
 
   await client.torrents()
   await client.pause(ID)
@@ -59,41 +94,144 @@ it('sends_the_csrf_token_on_changes_only', async () => {
 
   // A change with no session to prove sends no header at all, not an empty one.
   const headless = record(() => json(200, '[]'))
-  await createClient(headless.fetchFn, () => null, () => {}).pause(ID)
+  await createClient(headless.fetchFn, () => null, () => 0, () => {}).pause(ID)
   expect(headless.seen[0].headers.has('x-csrf-token'), 'a change sent an empty token where there is none').toBe(false)
 })
 
 it('a_401_signs_out_once_and_does_not_retry', async () => {
-  const { seen, fetchFn } = record(() => json(401, UNAUTHORIZED))
-  let notices = 0
-  const client = createClient(fetchFn, () => 'csrf-value', () => {
-    notices += 1
+  // Store and client over one fake: the load says signed in, every torrent call after it says 401.
+  // The count that matters is the store's transitions, because "once" is about how many times the
+  // page is moved, not about how many refusals arrive.
+  const { seen, fetchFn } = record((call) =>
+    call.url === SESSION_URL ? json(200, '{"auth": true, "subject": "alice", "csrf": "csrf-value"}') : json(401, UNAUTHORIZED),
+  )
+  const store = createSessionStore(fetchFn)
+  await store.refresh()
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession)
+
+  let moves = 0
+  store.subscribe(() => {
+    moves += 1
   })
 
-  await expect(client.torrents(), 'a call that got 401 did not throw an ApiError').rejects.toBeInstanceOf(ApiError)
-  await expect(client.torrents(), 'the second 401 was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+  const settled = await Promise.allSettled([client.torrents(), client.torrents()])
+  for (const outcome of settled) {
+    expect(outcome.status === 'rejected' && outcome.reason instanceof ApiError, 'a call that got 401 did not throw an ApiError').toBe(true)
+  }
+  expect(seen, 'a 401 made the client call the server more than once per call').toHaveLength(3)
+  expect(store.get().phase, 'a 401 did not sign the page out').toBe('signedOut')
+  expect(signedOut(store).notice, 'the page did not say why it signed itself out').toBe(SESSION_ENDED_COPY)
+  expect(moves, 'two 401s for one session moved the page more than once').toBe(1)
 
-  expect(notices, 'a 401 did not sign the page out').toBe(1)
-  expect(seen, 'a 401 made the client call the server more than once per call').toHaveLength(2)
+  // And a later 401 finds the page already signed out: it is refused, but it does not move the page
+  // again or rewrite the words it is already showing.
+  await expect(client.torrents(), 'a 401 after the sign-out was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+  expect(moves, 'a 401 after the page was already signed out moved it again').toBe(1)
+  expect(signedOut(store).notice, 'a second 401 changed the notice the page was showing').toBe(SESSION_ENDED_COPY)
+})
 
-  // An answer that arrived signed in re-arms the report: the next ended session is a second ended
-  // session, and the page has to be moved again.
-  const phases = [401, 200, 401]
-  let phase = 0
-  const later = record(() => {
-    const status = phases[phase] ?? 401
-    phase += 1
-    return status === 200 ? json(200, '[]') : json(401, UNAUTHORIZED)
+it('a_stale_401_does_not_end_a_new_session', async () => {
+  // A call is in flight under session one; the person signs out and signs in again (session three);
+  // the old call's 401 lands last. Slow answers outrun people, and an answer about a session that is
+  // already over must not end the one the page is in now.
+  const { promise, release } = held()
+  const { fetchFn } = record((call) => {
+    if (call.url === SESSION_URL) {
+      if (call.method === 'GET') return json(200, '{"auth": true, "subject": "alice", "csrf": "csrf-one"}')
+      if (call.method === 'POST') return json(200, '{"subject": "alice", "csrf": "csrf-two"}')
+      return json(200, '{}')
+    }
+    return promise.then(() => json(401, UNAUTHORIZED))
   })
-  let noticesAgain = 0
-  const client2 = createClient(later.fetchFn, () => 'csrf-value', () => {
-    noticesAgain += 1
+  const store = createSessionStore(fetchFn)
+  await store.refresh()
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession)
+
+  const slow = client.torrents()
+  await store.signOut()
+  expect(await store.signIn('alice', 'hunter2'), 'the second sign-in did not take').toBe(true)
+  const fresh = store.get()
+  expect(fresh.phase === 'signedIn' && fresh.csrf === 'csrf-two', 'the new session did not start as it should').toBe(true)
+
+  release()
+  await expect(slow, 'the stale 401 was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+  expect(store.get(), 'a stale 401 ended the new session').toBe(fresh)
+})
+
+it('a_401_right_after_signing_in_again_still_signs_out', async () => {
+  // Session one ends by a 401; the person signs in again; the very next call is refused. A flag that
+  // remembers reporting once would keep the page sitting signed in while every call fails, because a
+  // new session is not the old one's second refusal.
+  const { fetchFn } = record((call) => {
+    if (call.url === SESSION_URL) {
+      if (call.method === 'GET') return json(200, '{"auth": true, "subject": "alice", "csrf": "csrf-one"}')
+      if (call.method === 'POST') return json(200, '{"subject": "alice", "csrf": "csrf-two"}')
+      return json(200, '{}')
+    }
+    return json(401, UNAUTHORIZED)
   })
-  await expect(client2.torrents(), 'the next ended session was not reported at all').rejects.toBeInstanceOf(ApiError)
-  expect(noticesAgain, 'a session that ended twice in a row signed the page out once').toBe(1)
-  await expect(client2.torrents(), 'a call that arrived signed in did not succeed').resolves.toEqual([])
-  await expect(client2.torrents(), 'the session that ended a second time was not refused').rejects.toBeInstanceOf(ApiError)
-  expect(noticesAgain, 'a session that ended again after working did not sign the page out again').toBe(2)
+  const store = createSessionStore(fetchFn)
+  await store.refresh()
+  expect(store.get().phase, 'the first session did not start signed in').toBe('signedIn')
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession)
+
+  await expect(client.torrents(), 'the first 401 was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+  expect(signedOut(store).notice, 'the 401 did not end the first session with a reason').toBe(SESSION_ENDED_COPY)
+
+  expect(await store.signIn('alice', 'hunter2'), 'signing in again did not take').toBe(true)
+  await expect(client.torrents(), 'the 401 after signing in again was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+
+  const after = store.get()
+  expect(after.phase === 'signedOut' && after.notice === SESSION_ENDED_COPY, 'the first 401 after signing in again did not sign the page out').toBe(true)
+})
+
+it('a_late_401_leaves_the_failed_sign_in_alone', async () => {
+  // Nobody was signed in when this call went out, and the answer arrives after the person has tried
+  // a password and failed. The refusal stands as a failure of its own, but it has no business
+  // rewriting the sign-in screen with a session that never started here.
+  const { promise, release } = held()
+  const { fetchFn } = record((call) =>
+    call.url === SESSION_URL ? json(401, UNAUTHORIZED) : promise.then(() => json(401, UNAUTHORIZED)),
+  )
+  const store = createSessionStore(fetchFn)
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession)
+
+  const late = client.torrents()
+  await store.refresh()
+  expect(await store.signIn('alice', 'nope'), 'a wrong password was treated as signed in').toBe(false)
+
+  release()
+  await expect(late, 'the late 401 was not a failure the caller could see').rejects.toBeInstanceOf(ApiError)
+  expect(signedOut(store).error, 'a late 401 rewrote the reason the last sign-in failed').toBe('Wrong user name or password.')
+  expect(signedOut(store).notice, 'a late 401 gave the sign-in screen a session that never started').toBeNull()
+})
+
+it('a_failed_sign_out_keeps_the_session', async () => {
+  // The person pressed Sign out and the server said 500. The cookie and the session it belongs to
+  // survived that - only the request to end them failed - so the page stays signed in, says the sign
+  // out did not work, and keeps proving the next change with the same token.
+  const { seen, fetchFn } = record((call) => {
+    if (call.url === SESSION_URL) {
+      if (call.method === 'DELETE') return json(500, '{"error":{"code":"internal_error","message":"something broke"}}')
+      return json(200, '{"auth": true, "subject": "alice", "csrf": "csrf-keep"}')
+    }
+    return new Response(null, { status: 204 })
+  })
+  const store = createSessionStore(fetchFn)
+  await store.refresh()
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession)
+
+  await store.signOut()
+  const state = store.get()
+  expect(
+    state.phase === 'signedIn' && state.subject === 'alice' && state.csrf === 'csrf-keep' && state.error === 'Could not sign out. Try again.',
+    'a failed sign-out logged the person out anyway',
+  ).toBe(true)
+
+  await client.pause(ID)
+  const change = seen[seen.length - 1]
+  if (!change) throw new Error('no call was made')
+  expect(change.headers.get('x-csrf-token'), 'the change after a failed sign-out did not carry the session token').toBe('csrf-keep')
 })
 
 it('encodes_path_segments_and_query_values', async () => {
@@ -106,7 +244,7 @@ it('encodes_path_segments_and_query_values', async () => {
     if (call.url.includes('/pieces') || call.url === '/api/v1/session') return json(200, '{}')
     return json(200, '[]')
   })
-  const client = createClient(fetchFn, () => 'csrf-value', () => {})
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {})
   const last = (): Seen => {
     const call = seen[seen.length - 1]
     if (!call) throw new Error('no call was made')

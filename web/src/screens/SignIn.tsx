@@ -10,7 +10,11 @@
  * box answering `localhost` is nobody else's wire.
  *
  * The two messages from the session store are its strings, shown as they are; this screen decides
- * nothing about why a sign-in failed.
+ * nothing about why a sign-in failed. They render inside one live region that stays mounted whether
+ * or not there is anything to say - a strip that appears together with the region around it is how
+ * an announcement gets missed - and the region turns itself assertive for the failure message, which
+ * is about the attempt the person just made, over anything else being read. The card carries its own
+ * margins rather than sharing a column gap, so the empty region costs the layout nothing.
  *
  * @module screens/SignIn
  */
@@ -58,9 +62,11 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
 
   const insecure = travelsInPlainHttp()
 
+  const hasMessage = state.notice !== null || state.error !== null || insecure
+
   return (
-    <main className="flex min-h-dvh flex-col items-center justify-center gap-7 px-4 py-12">
-      <div className="flex flex-col items-center gap-3">
+    <main className="flex min-h-dvh flex-col items-center justify-center px-4 py-12">
+      <div className="mb-7 flex flex-col items-center gap-3">
         <img
           className="h-16 w-auto object-contain drop-shadow-[0_0_18px] drop-shadow-violet-400/45"
           src="/favicon.png"
@@ -73,7 +79,7 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
       </div>
 
       <form
-        className="flex w-full max-w-[380px] flex-col gap-3.5 rounded-overlay border border-rule bg-surface p-6"
+        className={`flex w-full max-w-[380px] flex-col gap-3.5 rounded-overlay border border-rule bg-surface p-6${hasMessage ? ' mb-7' : ''}`}
         onSubmit={submit}
       >
         <TextField
@@ -99,13 +105,15 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
         </Button>
       </form>
 
-      {(state.notice !== null || state.error !== null || insecure) && (
-        <div className="flex w-full max-w-[380px] flex-col gap-2.5">
-          {state.notice !== null && <Banner>{state.notice}</Banner>}
-          {state.error !== null && <Banner tone="danger">{state.error}</Banner>}
-          {insecure && <Banner>{PLAIN_HTTP_WARNING}</Banner>}
-        </div>
-      )}
+      <div
+        role="status"
+        aria-live={state.error !== null ? 'assertive' : 'polite'}
+        className="flex w-full max-w-[380px] flex-col gap-2.5"
+      >
+        {state.notice !== null && <Banner>{state.notice}</Banner>}
+        {state.error !== null && <Banner tone="danger">{state.error}</Banner>}
+        {insecure && <Banner>{PLAIN_HTTP_WARNING}</Banner>}
+      </div>
     </main>
   )
 }

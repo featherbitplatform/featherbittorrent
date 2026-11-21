@@ -15,11 +15,15 @@
  * `encodeURIComponent`, because a torrent id and a save path are inputs with their own ideas about
  * slashes and spaces.
  *
- * A `401` is the interesting failure. It means the cookie stopped meaning anything, so the client
- * hands it to `onUnauthorized` once and throws, and it does not retry: a call that was refused will
- * still be refused by the same cookie, and calling again would be how a lost session turns into a
- * request loop. "Once" is per lost session, not per client: the report flag is reset by any answer
- * that came in signed, so a session that ends again later is reported again.
+ * A `401` is the interesting failure. It means the cookie stopped meaning anything *for the call
+ * that got it*, so the client hands it to `onUnauthorized` and throws, and it does not retry: a call
+ * that was refused will still be refused by the same cookie, and calling again would be how a lost
+ * session turns into a request loop. The client does not decide what to do about the `401` on its
+ * own and does not keep any session flag of its own: it reports the *generation* of the session the
+ * request was sent under, captured at send time beside the CSRF value, and the session store decides
+ * whether that session is still the current one. A slow request under an old session that answers
+ * `401` after the person signed in again is history, and the store drops it; a `401` on the first
+ * call under a brand new session is not, and no once-ever flag would know the difference.
  *
  * @module api/client
  */
@@ -103,19 +107,17 @@ const TORRENTS = '/api/v1/torrents'
 type AddTorrentRequest = components['schemas']['AddTorrentRequest']
 
 /**
- * The client over an injected `fetch`, a way to ask "what token should a change carry right now",
- * and the one action to take when a call finds the session gone. The tests hand it a fake and read
- * the requests back; the page hands it the browser's own.
+ * The client over an injected `fetch`, a way to ask "what token should a change carry right now", a
+ * way to ask "which session is the page in right now", and the one action to take when a call finds
+ * the session gone, told with the generation that call was sent under. The tests hand it a fake and
+ * read the requests back; the page hands it the browser's own and the session store's own answers.
  */
 export function createClient(
   fetchFn: typeof fetch,
   getCsrf: () => string | null,
-  onUnauthorized: () => void,
+  getGeneration: () => number,
+  onUnauthorized: (generation: number) => void,
 ): Api {
-  // Whether the current loss of the session has been reported yet. Any answer that arrived signed
-  // clears it, so the next one gets reported too.
-  let reported = false
-
   async function request(
     url: string,
     method: 'GET' | 'POST' | 'DELETE',
@@ -128,15 +130,15 @@ export function createClient(
       const token = getCsrf()
       if (token !== null) headers.set('x-csrf-token', token)
     }
+    // Captured *before* the request goes out, not when the answer lands: an answer about a `401`
+    // must name the session the call left home under, because by the time a slow one arrives the
+    // person may already be signed in again.
+    const generation = getGeneration()
     const response = await fetchFn(url, { method, headers, body, credentials: 'same-origin' })
     if (!response.ok) {
-      if (response.status === 401 && !reported) {
-        reported = true
-        onUnauthorized()
-      }
+      if (response.status === 401) onUnauthorized(generation)
       throw await errorFrom(response)
     }
-    reported = false
     return response
   }
 
@@ -218,4 +220,9 @@ export function createClient(
  * both the token and the one thing to do when a call finds the session gone. Tasks 6 and on import
  * this instance rather than building their own, so one cookie and one CSRF value are the whole story.
  */
-export const api = createClient(fetch, () => session.csrf(), () => session.endSession())
+export const api = createClient(
+  fetch,
+  () => session.csrf(),
+  session.generation,
+  session.endSession,
+)

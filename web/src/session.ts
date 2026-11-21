@@ -10,17 +10,30 @@
  * somewhere else. A page that loses the CSRF value loses nothing a reload cannot get back, because
  * `GET /api/v1/auth/web-session` hands it out again from the cookie that is already trusted.
  *
- * Three states come from that one endpoint, and a fourth is this module's own:
+ * Four states come from that one endpoint and one is this module's own:
  * `loading` while the first answer is on its way, `open` when logins are off and nobody has to sign
- * in, `signedIn` with the subject and the CSRF value, and `signedOut` when the cookie answers
- * nothing. The `401` that means signed-out is not an error, and the first one of those on page load
- * is not a lost session either: it is the ordinary starting point. The "session ended" notice exists
+ * in, `signedIn` with the subject and the CSRF value, `signedOut` when the cookie answers nothing,
+ * and `unreachable` when the question itself got no answer to read - the fetch did not complete or
+ * the server answered with a failure. `unreachable` is deliberately not `signedOut` with an error:
+ * nobody tried to sign in, and a screen that asks for a password when the server is simply not
+ * answering tells the person the wrong story.
+ *
+ * The `401` that means signed-out is not an error, and the first one of those on page load is not a
+ * lost session either: it is the ordinary starting point. The "session ended" notice exists
  * separately, because only the API client can discover a session that was working and stopped; that
  * is why `endSession` is its own door rather than a flag the `GET` could set.
  *
- * The states and the actions are a plain store (get / subscribe / refresh / signIn / signOut), so
- * the rules are testable without a DOM, and `useSession` is the React reading of that store rather
- * than a second implementation of it.
+ * `endSession` takes the *generation* of the session the finding call was made under, and the store
+ * keeps that number. It moves every time a session starts or ends: a successful sign-in, a load
+ * that answers signed in, a sign-out that took, and the ending itself. That ties the notice to a
+ * session instead of to whichever `401` happens to arrive last. A request sent under an old session
+ * can answer `401` after the person has signed in again - slow ones always outrun a person - and an
+ * answer about a session that is already over must not end the new one. A flag on the client cannot
+ * say that: only this store knows which session is current.
+ *
+ * The states and the actions are a plain store (get / subscribe / refresh / signIn / signOut /
+ * generation / endSession), so the rules are testable without a DOM, and `useSession` is the React
+ * reading of that store rather than a second implementation of it.
  *
  * @module session
  */
@@ -45,6 +58,9 @@ const RATE_LIMITED = 'Too many attempts. Try again in a minute.'
 /** What the screen says when the answer was neither of those and had no message of its own to show. */
 const SIGN_IN_FAILED = 'Could not sign in. Try again.'
 
+/** The answer when the sign-out request failed but the session it was meant to end did not: the cookie and the token are still good, so the page stays signed in and says what did not work. */
+const SIGN_OUT_FAILED = 'Could not sign out. Try again.'
+
 /** The screen a person signs in on, and the two messages it might have to carry. */
 export type SignedOutState = {
   phase: 'signedOut'
@@ -58,8 +74,20 @@ export type SignedOutState = {
 export type SessionState =
   | { phase: 'loading' }
   | { phase: 'open' }
+  /**
+   * The status question got no readable answer: the fetch threw, or the server answered a failure.
+   * Nobody is signed out and nobody failed to sign in - the server simply did not say - so the page
+   * offers "Try again" rather than a password.
+   */
+  | { phase: 'unreachable' }
   | SignedOutState
-  | { phase: 'signedIn'; subject: string; csrf: string }
+  | {
+      phase: 'signedIn'
+      subject: string
+      csrf: string
+      /** Why the last sign-out attempt did not take, or null. The session is live; only the request to end it failed. */
+      error: string | null
+    }
 
 /** What a caller can ask of the session, and do to it. */
 export interface SessionStore {
@@ -67,16 +95,31 @@ export interface SessionStore {
   get(): SessionState
   /** Follow every later change. Returns the way to stop. */
   subscribe(listener: () => void): () => void
-  /** Ask the server what this cookie is: `open`, `signedIn`, or `signedOut`. */
+  /** Ask the server what this cookie is: `open`, `signedIn`, `signedOut`, or `unreachable`. */
   refresh(): Promise<void>
   /** Try the password. True took, false shows why it did not. */
   signIn(user: string, password: string): Promise<boolean>
-  /** End this browser's session. A `401` here means it was already gone, which is signed out too. */
+  /**
+   * End this browser's session, and stay signed in unless the server says it ended: a `401` means
+   * it was already gone (which is signed out too), but any other failure left the session alive,
+   * and only this request to end it failed.
+   */
   signOut(): Promise<void>
   /** The value every change must carry, or null when there is no session to prove. */
   csrf(): string | null
-  /** Move to signed-out with the "session ended" notice, from whoever found out. */
-  endSession(): void
+  /**
+   * Which session is current. It moves every time one starts or ends, so a caller can say "the call
+   * that got this `401` was made under session number N" and the store can tell whether that
+   * session is still the one the page is running.
+   */
+  generation(): number
+  /**
+   * End the session a finding call was sent under. Does nothing when that generation is not the
+   * current one (the answer came about a session that is already over) or when the page is already
+   * signed out (there is nothing left to end, and a late `401` has no business rewriting the
+   * sign-in screen's last message).
+   */
+  endSession(ended: number): void
 }
 
 /**
@@ -86,6 +129,9 @@ export interface SessionStore {
 export function createSessionStore(fetchFn: typeof fetch): SessionStore {
   let state: SessionState = { phase: 'loading' }
   let token: string | null = null
+  // Which session the page is in the middle of. Every start and every end of a session moves it,
+  // which is how an answer about a session already over is recognized as stale.
+  let generation = 0
   const listeners = new Set<() => void>()
   // The first status question is on its way while React mounts the tree twice in development; two
   // callers share one answer rather than asking the server twice about one cookie.
@@ -100,6 +146,13 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
   function signedOut(error: string | null, notice: string | null = null): void {
     token = null
     set({ phase: 'signedOut', notice, error })
+  }
+
+  /** A session this store just learned is live: a new generation, with nothing carried over from the last one. */
+  function signedIn(subject: string, csrf: string): void {
+    token = csrf
+    generation += 1
+    set({ phase: 'signedIn', subject, csrf, error: null })
   }
 
   /** The server's own words, when the answer carries any; the page's, when it does not. */
@@ -119,7 +172,7 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
     try {
       response = await fetchFn(ENDPOINT, { method: 'GET', credentials: 'same-origin' })
     } catch {
-      signedOut(SIGN_IN_FAILED)
+      set({ phase: 'unreachable' })
       return
     }
     // The ordinary "nobody is signed in" answer: signed out, no error, and no notice about a
@@ -128,8 +181,10 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
       signedOut(null)
       return
     }
+    // Anything else that is not an answer at all - a 5xx, a proxy error page, a 403 from a guard -
+    // says the server did not answer this question, not that anybody failed to sign in.
     if (!response.ok) {
-      signedOut(await message(response))
+      set({ phase: 'unreachable' })
       return
     }
     const body = (await response.json()) as { auth?: boolean; subject?: unknown; csrf?: unknown }
@@ -139,8 +194,7 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
       return
     }
     if (body.auth === true && typeof body.subject === 'string' && typeof body.csrf === 'string') {
-      token = body.csrf
-      set({ phase: 'signedIn', subject: body.subject, csrf: body.csrf })
+      signedIn(body.subject, body.csrf)
       return
     }
     signedOut(SIGN_IN_FAILED)
@@ -163,8 +217,7 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
     if (response.ok) {
       const body = (await response.json()) as { subject?: unknown; csrf?: unknown }
       if (typeof body.subject === 'string' && typeof body.csrf === 'string') {
-        token = body.csrf
-        set({ phase: 'signedIn', subject: body.subject, csrf: body.csrf })
+        signedIn(body.subject, body.csrf)
         return true
       }
       token = null
@@ -184,9 +237,19 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
     return false
   }
 
+  function signOutFailed(): void {
+    const was = state
+    if (was.phase === 'signedIn') {
+      // The server kept the session and the cookie kept working; only this browser's request to end
+      // them failed. Staying signed in is the truth, and it keeps the next change sendable.
+      set({ ...was, error: SIGN_OUT_FAILED })
+      return
+    }
+    signedOut(SIGN_OUT_FAILED)
+  }
+
   async function signOut(): Promise<void> {
     const given = token
-    token = null
     let response: Response
     try {
       response = await fetchFn(ENDPOINT, {
@@ -195,18 +258,19 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
         credentials: 'same-origin',
       })
     } catch {
-      // Nothing arrived and nothing can be asked of it again: the browser is on its own with the
-      // cookie, and the server expires that session on its own schedule.
-      set({ phase: 'signedOut', notice: null, error: null })
+      signOutFailed()
       return
     }
     // A `401` here is not a failure: it says the session was already gone, which is exactly what
-    // signing out was asked to bring about.
+    // signing out was asked to bring about. Only a session that the server agrees is over ends a
+    // generation and clears the token.
     if (response.ok || response.status === 401) {
+      generation += 1
+      token = null
       set({ phase: 'signedOut', notice: null, error: null })
       return
     }
-    set({ phase: 'signedOut', notice: null, error: await message(response) })
+    signOutFailed()
   }
 
   return {
@@ -226,18 +290,26 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
     signIn,
     signOut,
     csrf: () => token,
-    endSession: () => signedOut(null, SESSION_ENDED),
+    generation: () => generation,
+    endSession: (ended) => {
+      // Not the session this page is in anymore, or nothing left to end: either way this `401` is
+      // history talking, and history does not move the page or rewrite its messages.
+      if (ended !== generation || state.phase === 'signedOut') return
+      generation += 1
+      signedOut(null, SESSION_ENDED)
+    },
   }
 }
 
 /** The store this page runs on: one browser, one cookie, one set of answers about it. */
 export const session = createSessionStore(fetch)
 
-/** The state the page renders, plus the two things a person can do about it. */
+/** The state the page renders, plus the things a person can do about it. */
 export function useSession(): {
   state: SessionState
   signIn: (user: string, password: string) => Promise<boolean>
   signOut: () => Promise<void>
+  refresh: () => Promise<void>
 } {
   const state = useSyncExternalStore(session.subscribe, session.get)
   // The server answers before anything about this cookie is known, so nothing is drawn as decided
@@ -245,5 +317,10 @@ export function useSession(): {
   useEffect(() => {
     void session.refresh()
   }, [])
-  return { state, signIn: session.signIn, signOut: session.signOut }
+  return {
+    state,
+    signIn: session.signIn,
+    signOut: session.signOut,
+    refresh: () => session.refresh(),
+  }
 }
