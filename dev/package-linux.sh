@@ -178,7 +178,7 @@ stage="$dist/stage-linux-$arch"
 # string, so a headless package built from the wrong tree is refused here rather than published.
 build_features=()
 if [[ "$variant" == full ]]; then build_features=(--features web-ui); fi
-cargo build --locked --release -p featherbittorrent "${build_features[@]}"
+cargo build --locked --release -p featherbittorrent ${build_features[@]+"${build_features[@]}"}
 bin="$target/release/featherbittorrent"
 if ! printed="$("$bin" --version)"; then fail "$bin --version failed to run"; fi
 # The binary's command name is featherbittorrent in both builds (it is the package's binary, which the
@@ -217,9 +217,9 @@ if [[ "$variant" == headless ]]; then
   rpm_variant_args=(--variant headless)
 fi
 cargo deb -p featherbittorrent --no-build --no-strip --deb-version "$deb_version" \
-  "${deb_variant_args[@]}" --output "$dist/$pkg.deb"
+  ${deb_variant_args[@]+"${deb_variant_args[@]}"} --output "$dist/$pkg.deb"
 cargo generate-rpm -p crates/featherbittorrent --target-dir "$target" \
-  --set-metadata "version = \"$rpm_version\"" "${rpm_variant_args[@]}" --output "$dist/$pkg.rpm"
+  --set-metadata "version = \"$rpm_version\"" ${rpm_variant_args[@]+"${rpm_variant_args[@]}"} --output "$dist/$pkg.rpm"
 
 # Tarball: the binary at the top of one folder (the 0.1.0 layout), with the licenses, the docs and the
 # examples that are documentation only. The flags make the archive reproducible for a given build.
