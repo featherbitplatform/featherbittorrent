@@ -235,9 +235,40 @@ describe('the keyboard', () => {
 
     const rowA = container.querySelector('[data-row="t0"]') as HTMLElement
     expect(rowA.getAttribute('tabindex') === '0', 'a row cannot be focused').toBe(true)
+    // One ring around the whole row, as inset shadow bands on the row's own cells: Chrome draws
+    // an `outline` (or a `border`) on a `tr` around every cell of it, which is the violet bar
+    // between the columns this replaces. The `tr` carries `group` and `outline-none` - the latter
+    // keeps Chrome's own per-cell default focus draw off - and every cell carries the ring, which
+    // switches on with `group-focus-visible`: the row's own keyboard focus, not a click.
     expect(
-      rowA.className.includes('focus-visible:outline-accent-light'),
-      'the focused row has no accent-coloured focus ring',
+      rowA.className.includes('group') &&
+        rowA.className.includes('outline-none') &&
+        !rowA.className.includes('outline-accent-light'),
+      'the row still draws its focus indicator per cell with an outline',
+    ).toBe(true)
+    const ringCells = Array.from(rowA.querySelectorAll('td'))
+    expect(
+      ringCells.length === 6 &&
+        ringCells.every((td) =>
+          td.className.includes(
+            'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light)',
+          ),
+        ),
+      'the row focus ring does not band top and bottom across every cell',
+    ).toBe(true)
+    expect(
+      (ringCells[0]?.className ?? '').includes('inset_2px_0_0_var(--color-accent-light)') &&
+        ringCells
+          .slice(1)
+          .every((td) => !td.className.includes('inset_2px_0_0_var(--color-accent-light)')),
+      'the row focus ring has no closed left edge',
+    ).toBe(true)
+    expect(
+      (ringCells[5]?.className ?? '').includes('inset_-2px_0_0_var(--color-accent-light)') &&
+        ringCells
+          .slice(0, 5)
+          .every((td) => !td.className.includes('inset_-2px_0_0_var(--color-accent-light)')),
+      'the row focus ring has no closed right edge',
     ).toBe(true)
 
     rowA.focus()
@@ -272,6 +303,39 @@ describe('the keyboard', () => {
     expect(
       container.querySelector('[data-row="t1"][aria-selected="true"]') !== null,
       'Space on a row did not select it',
+    ).toBe(true)
+  })
+
+  it('the_selected_row_marks_its_edge_once', () => {
+    const { container } = render(
+      <TorrentTable rows={rowsOf(3)} selectedId="t1" viewportHeight={900} />,
+    )
+    // The chosen row's accent edge is the prototype's bar at the row's left: one bar, on the
+    // first cell only. Painted on every cell it is a violet vertical bar between the columns,
+    // the thing this replaces. The composite token is how the bar and the plain rule tell each
+    // other apart: every cell keeps the row rule, only the chosen row's first cell adds the edge.
+    const bar =
+      'shadow-[inset_0_-1px_0_var(--color-ink-750),inset_2px_0_0_var(--color-accent-light)]'
+    for (const id of ['t0', 't1', 't2']) {
+      const cells = Array.from(container.querySelectorAll(`tbody tr[data-row="${id}"] td`))
+      const bars = cells.filter((td) => td.className.includes(bar)).length
+      const wants = id === 't1' ? 1 : 0
+      expect(
+        bars === wants,
+        `row ${id} drew the selected accent edge ${bars} times instead of ${wants}`,
+      ).toBe(true)
+    }
+    // The chosen row keeps its background, and every row keeps the rule between rows.
+    const chosen = container.querySelector('tbody tr[data-row="t1"]') as HTMLElement
+    expect(chosen.className.includes('bg-accent-soft'), 'the selected row lost its background').toBe(
+      true,
+    )
+    expect(
+      container
+        .querySelectorAll('tbody tr[data-row="t1"] td')
+        .item(3)
+        ?.className.includes('shadow-[inset_0_-1px_0_var(--color-ink-750)') === true,
+      'the selected row lost the rule between its other cells',
     ).toBe(true)
   })
 })

@@ -11,9 +11,11 @@
  *
  * The height is the scroll box's own `clientHeight`, watched with a `ResizeObserver` (`resize`
  * where one is missing), and `viewportHeight` overrides it because jsdom lays nothing out. With
- * nothing measured at all - jsdom, or a box that has not resized yet - the window assumes the
- * `max-h-56` the pane's boxes carry, so it draws the rows that box would have shown rather than
- * none.
+ * nothing measured at all - jsdom, or a box that has not resized yet - the window assumes eight
+ * rows, 224 px, the height a pane list has under a laptop-height pane, so it draws the rows a box
+ * that size would have shown rather than none. The boxes themselves are `min-h-0 flex-1` inside
+ * the pane's own fixed share of the screen, so in a browser this fallback is only ever what an
+ * unmeasured box pretends it is.
  *
  * @module components/detail/window
  */
@@ -29,7 +31,7 @@ export const DETAIL_ROW_RULE = 'shadow-[inset_0_-1px_0_var(--color-ink-750)]'
 /** Rows kept drawn above and below the window, so a scroll does not have to wait for them. */
 const OVERSCAN = 6
 
-/** The rows a `max-h-56` box shows: 224 px. The height the window assumes when nothing can be measured. */
+/** The rows the window assumes when nothing can be measured: 224 px, the height a pane list has under a laptop-height pane. */
 const FALLBACK_ROWS = 8
 
 export interface RowWindow {

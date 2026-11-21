@@ -29,7 +29,7 @@ export default function Peers({ peers, viewportHeight }: PeersProps) {
   )
 
   return (
-    <div ref={boxRef} onScroll={onScroll} className="max-h-56 overflow-auto">
+    <div ref={boxRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
       <table className="w-full min-w-[560px] border-separate border-spacing-0">
         <caption className="sr-only">Peers of the selected torrent</caption>
         <thead>

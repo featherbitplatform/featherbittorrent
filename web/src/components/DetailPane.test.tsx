@@ -2,8 +2,9 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import DetailPane from './DetailPane'
+import Torrents from '../screens/Torrents'
 import { ApiError } from '../api/client'
-import type { Api, FileInfo, PeerInfo, PiecesInfo, TrackerInfo } from '../api/client'
+import type { Api, FileInfo, PeerInfo, PiecesInfo, TorrentInfo, TrackerInfo } from '../api/client'
 
 afterEach(cleanup)
 
@@ -86,6 +87,47 @@ const pane = (container: HTMLElement): HTMLElement | null =>
 
 const rowText = (container: HTMLElement, index: number): string =>
   (container.querySelector(`tbody tr[data-row="${index}"]`)?.textContent ?? '')
+
+/** One torrent, the way `Torrents` receives it: the pane-height test drives the real screen, not the pane alone. */
+function torrentInfo(id: string, over: Partial<TorrentInfo> = {}): TorrentInfo {
+  return {
+    id,
+    name: `torrent ${id}`,
+    progress: 0.4,
+    download_rate: 1_000,
+    upload_rate: 0,
+    num_peers: 2,
+    num_seeds: 1,
+    state: 'downloading',
+    active_time: 0,
+    auto_managed: true,
+    has_metadata: true,
+    is_seed: false,
+    layers_missing: 0,
+    need_save_resume: false,
+    num_web_seeds: 0,
+    queue_position: 0,
+    save_path: '/downloads',
+    seeding_time: 0,
+    total_downloaded: 0,
+    total_uploaded: 0,
+    total_wanted: 100,
+    total_wasted: 0,
+    wanted_done: 40,
+    ...over,
+  }
+}
+
+const SCREEN_SESSION = {
+  version: '0.13.5',
+  download_limit: 0,
+  upload_limit: 0,
+  download_rate: 1_000_000,
+  upload_rate: 250_000,
+  listen_addrs: ['0.0.0.0:51497'],
+  torrents: 1,
+  dht_nodes: 120,
+}
 
 describe('what the pane reads', () => {
   it('loads_the_selected_tab_only', async () => {
@@ -194,6 +236,90 @@ describe('what the pane reads', () => {
     expect(
       text.includes('b-file.bin') && !text.includes('a-file.bin'),
       'the pane showed data for the wrong torrent',
+    ).toBe(true)
+  })
+
+  it('missing_metadata_is_a_wait_not_an_error', async () => {
+    // A magnet whose metadata has not arrived answers `409 no_metadata`. The first read says that;
+    // the next one already knows the file list.
+    let asked = 0
+    const { client } = spyClient({
+      files: async () => {
+        asked += 1
+        if (asked === 1)
+          throw new ApiError(409, 'no_metadata', "the torrent's metadata is not known yet")
+        return [file(0, { path: 'now-known.bin' })]
+      },
+    })
+    const { container, rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+
+    const waiting = screen.getByText("Waiting for the torrent's metadata.")
+    expect(
+      waiting.className.includes('text-muted') && !waiting.className.includes('text-error'),
+      'the metadata wait was drawn in the error colour',
+    ).toBe(true)
+    const text = (pane(container) as HTMLElement).textContent ?? ''
+    expect(
+      text.includes("Waiting for the torrent's metadata.") &&
+        !text.includes("the torrent's metadata is not known yet"),
+      'the pane quoted the server instead of saying what it waits for',
+    ).toBe(true)
+
+    // A wait keeps asking: the next tick reads again, and the tab fills itself in with no trace
+    // of the wait left behind.
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    const after = (pane(container) as HTMLElement).textContent ?? ''
+    expect(
+      after.includes('now-known.bin') && !after.includes('metadata'),
+      'the pane stopped asking once a read answered 409',
+    ).toBe(true)
+    expect(asked === 2, 'the metadata wait did not keep polling').toBe(true)
+  })
+
+  it('a_slow_answer_still_paints', async () => {
+    // Pieces for a big torrent on a slow link: the answer takes longer than two ticks.
+    let resolvePieces: (pieces: PiecesInfo) => void = () => {}
+    const slow = new Promise<PiecesInfo>((resolve) => {
+      resolvePieces = resolve
+    })
+    const { client, calls } = spyClient({ pieces: () => slow })
+    const { container, rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    // The mount read (Files) already landed; now the slow tab is asked for.
+    fireEvent.click(screen.getByRole('tab', { name: 'Pieces' }))
+    await flush()
+
+    // Two ticks pass while the read is still in flight: a tick is the same question, not a new
+    // one, so it starts nothing - and it supersedes nothing either.
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    rerender(<DetailPane id="a" client={client} tick={2} />)
+    await flush()
+    expect(
+      calls.join(',') === 'files:a,pieces:a',
+      'a tick while a read was in flight started a second one',
+    ).toBe(true)
+
+    // The slow answer lands. It is the answer for the torrent and tab still on screen, so it
+    // paints - the pane did not discard it just because two ticks went by meanwhile.
+    await act(async () => {
+      resolvePieces(PIECES_10)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    const text = (pane(container) as HTMLElement).textContent ?? ''
+    expect(
+      text.includes('2 of 8 pieces') && !text.includes('Loading'),
+      'the slow answer never painted',
+    ).toBe(true)
+
+    // And only after it landed does the next tick ask again: the pane refreshes, it stampedes.
+    rerender(<DetailPane id="a" client={client} tick={3} />)
+    await flush()
+    expect(
+      calls.join(',') === 'files:a,pieces:a,pieces:a',
+      'the pane stopped refreshing after the slow answer painted',
     ).toBe(true)
   })
 
@@ -373,16 +499,21 @@ describe('the pieces tab', () => {
   // jsdom has no 2D canvas context; hand the canvas one that records what it is told to draw.
   const realGetContext = HTMLCanvasElement.prototype.getContext
   const drawn: Array<{ x: number; y: number; style: string }> = []
+  const scaled: Array<{ x: number; y: number }> = []
   const context = {
     fillStyle: '',
     fillRect(x: number, y: number) {
       drawn.push({ x, y, style: this.fillStyle })
+    },
+    scale(x: number, y: number) {
+      scaled.push({ x, y })
     },
   }
   HTMLCanvasElement.prototype.getContext = vi.fn(() => context) as unknown as typeof realGetContext
 
   it('many_pieces_draw_on_one_canvas', async () => {
     drawn.length = 0
+    scaled.length = 0
     // 5,000 pieces; 'c0' bytes have their top two bits set, so 1,250 of them are had.
     const pieces: PiecesInfo = { num_pieces: 5_000, have: 'c0'.repeat(625) }
     const { client } = spyClient({ pieces: async () => pieces })
@@ -410,6 +541,18 @@ describe('the pieces tab', () => {
       canvases[0]?.getAttribute('aria-label') === label &&
         (pane(container) as HTMLElement).textContent?.includes(label),
       'the piece canvas had no exact count as its accessible name and its text',
+    ).toBe(true)
+    // Device pixels, not CSS pixels: the backing store is the CSS size times the display ratio,
+    // and one `ctx.scale` maps drawing back into CSS coordinates. Here the ratio is 1 (jsdom),
+    // so the mapping is called exactly once at 1:1 - a canvas that skipped the ratio entirely
+    // would never call it at all.
+    expect(
+      scaled.length === 1 &&
+        scaled[0]?.x === 1 &&
+        scaled[0]?.y === 1 &&
+        canvases[0]?.width === 80 * 12 &&
+        canvases[0]?.height === 63 * 12,
+      'the canvas backing store was not the CSS size mapped through the display ratio',
     ).toBe(true)
   })
 
@@ -457,5 +600,136 @@ describe('the pieces tab', () => {
 
   afterEach(() => {
     HTMLCanvasElement.prototype.getContext = realGetContext
+  })
+})
+
+describe('the tabs on the keyboard', () => {
+  it('tabs_follow_the_arrow_keys', async () => {
+    const { client } = spyClient({})
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    const tabs = ['Files', 'Peers', 'Trackers', 'Pieces'].map((label) =>
+      screen.getByRole('tab', { name: label }),
+    )
+
+    // Roving tabindex: exactly the chosen tab is in the Tab order, so `Tab` walks the strip the
+    // way it walks the TUI's tabs line - one stop, the one that answers to the arrows.
+    expect(
+      tabs.map((button) => button.getAttribute('tabindex')).join(',') === '0,-1,-1,-1',
+      'every tab sat in the Tab order at once',
+    ).toBe(true)
+
+    // One panel, one id: switching tabs swaps what the panel shows, it never swaps which element
+    // the tabs control. Every tab points at the same panel, and the panel names the chosen tab.
+    const panel = document.getElementById('detail-panel')
+    expect(panel !== null, 'the pane has no panel with the id every tab points at').toBe(true)
+    expect(
+      tabs.every((button) => button.getAttribute('aria-controls') === 'detail-panel'),
+      'a tab does not control the panel the others control',
+    ).toBe(true)
+    expect(
+      panel?.getAttribute('aria-labelledby') === 'detail-tab-files',
+      'the panel did not name the tab it belongs to',
+    ).toBe(true)
+
+    // ArrowRight moves the focus and the choice together, in the same key press.
+    tabs[0]?.focus()
+    const took = fireEvent.keyDown(tabs[0] as HTMLElement, { key: 'ArrowRight' })
+    expect(took === false, 'ArrowRight scrolled the page instead of taking the key').toBe(true)
+    expect(
+      tabs[1]?.getAttribute('aria-selected') === 'true' && document.activeElement === tabs[1],
+      'ArrowRight did not move the focus and the choice together',
+    ).toBe(true)
+    expect(
+      tabs.map((button) => button.getAttribute('tabindex')).join(',') === '-1,0,-1,-1',
+      'the tab that took the choice did not take its place in the Tab order',
+    ).toBe(true)
+    expect(
+      document.getElementById('detail-panel')?.getAttribute('aria-labelledby') ===
+        'detail-tab-peers',
+      'the panel kept naming the tab that is no longer chosen',
+    ).toBe(true)
+    await flush()
+
+    fireEvent.keyDown(tabs[1] as HTMLElement, { key: 'ArrowRight' })
+    await flush()
+    fireEvent.keyDown(tabs[2] as HTMLElement, { key: 'ArrowRight' })
+    await flush()
+    expect(
+      document.activeElement === tabs[3] && tabs[3]?.getAttribute('aria-selected') === 'true',
+      'ArrowRight did not walk to the last tab',
+    ).toBe(true)
+
+    // Wrapping at both ends, the way the arrows wrap in the TUI.
+    fireEvent.keyDown(tabs[3] as HTMLElement, { key: 'ArrowRight' })
+    await flush()
+    expect(
+      document.activeElement === tabs[0] && tabs[0]?.getAttribute('aria-selected') === 'true',
+      'ArrowRight at the last tab did not wrap to the first',
+    ).toBe(true)
+    fireEvent.keyDown(tabs[0] as HTMLElement, { key: 'ArrowLeft' })
+    await flush()
+    expect(
+      document.activeElement === tabs[3] && tabs[3]?.getAttribute('aria-selected') === 'true',
+      'ArrowLeft at the first tab did not wrap to the last',
+    ).toBe(true)
+
+    // Home and End jump to the ends.
+    fireEvent.keyDown(tabs[3] as HTMLElement, { key: 'Home' })
+    await flush()
+    expect(
+      document.activeElement === tabs[0] && tabs[0]?.getAttribute('aria-selected') === 'true',
+      'Home did not move to the first tab',
+    ).toBe(true)
+    fireEvent.keyDown(tabs[0] as HTMLElement, { key: 'End' })
+    await flush()
+    expect(
+      document.activeElement === tabs[3] && tabs[3]?.getAttribute('aria-selected') === 'true',
+      'End did not move to the last tab',
+    ).toBe(true)
+
+    // A key the pattern does not claim stays the page's: the tabs do not swallow it.
+    expect(fireEvent.keyDown(tabs[3] as HTMLElement, { key: 'x' })).toBe(true)
+  })
+})
+
+describe('what the pane shares with the table', () => {
+  it('the_pane_has_its_own_height', async () => {
+    // The real screen: the pane only has its share of the column if the column gives it one,
+    // and the table box only shrinks if the box is the one making room.
+    const { client: detail } = spyClient({})
+    const client = {
+      ...detail,
+      torrents: async () => [torrentInfo('a')],
+      session: async () => SCREEN_SESSION,
+    } as unknown as Api
+    const { container } = render(
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+    )
+    await flush()
+    expect(pane(container) === null, 'the pane was drawn when nothing was selected').toBe(true)
+
+    fireEvent.click(container.querySelector('tbody tr[data-row="a"]') as HTMLElement)
+    await flush()
+    const section = pane(container) as HTMLElement
+    expect(section !== null, 'clicking a row did not open the pane').toBe(true)
+
+    // The pane takes a fixed share of the screen: 40 % of the column, never less than 220 px so
+    // it is a pane and not a tab strip, never more than 60 % so the table keeps its rows.
+    for (const token of ['h-[40%]', 'min-h-[220px]', 'max-h-[60%]']) {
+      expect(
+        section.className.includes(token),
+        `the pane has no share of the screen (${token} missing)`,
+      ).toBe(true)
+    }
+    // The table gives up the room from its own side: its scroll box keeps `flex-1` and `min-h-0`
+    // above the pane, so it shrinks and scrolls instead of growing and squeezing the pane out.
+    const box = container.querySelector('table')?.parentElement as HTMLElement
+    for (const token of ['flex-1', 'min-h-0', 'overflow-auto']) {
+      expect(
+        box.className.includes(token),
+        `the table box does not shrink to make room for the pane (${token} missing)`,
+      ).toBe(true)
+    }
   })
 })

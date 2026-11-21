@@ -37,9 +37,13 @@
  * Rows are keyboard citizens, not click-only targets: each is focusable, Enter and Space pick it,
  * Arrow Up and Down move the selection through the current order, and the drawn window follows
  * the chosen row until the reader scrolls away - the pin releases at the first real scroll. The
- * sort starts where the server left it; one click orders a column, the next reverses it, the third
- * hands it back to server order, and the toolbar says which of those the rows are in. Sorting and
- * filtering both read the same display-safe names the rows show.
+ * focus indicator draws ONE ring around the whole row, as inset shadow bands on the row's own
+ * cells: Chrome renders an `outline` (or a `border`) on a `tr` around every cell of the row, which
+ * is why the ring is bands on cells and why the selected row's accent edge rides the first cell
+ * alone - either one drawn per-cell is a violet bar between the columns. The sort starts where the
+ * server left it; one click orders a column, the next reverses it, the third hands it back to
+ * server order, and the toolbar says which of those the rows are in. Sorting and filtering both
+ * read the same display-safe names the rows show.
  *
  * @module components/TorrentTable
  */
@@ -64,9 +68,16 @@ const OVERSCAN = 6
 
 /** The rule between rows, drawn inside the row's own 40px so rows are exactly `ROW_HEIGHT` tall. */
 const ROW_RULE = 'shadow-[inset_0_-1px_0_var(--color-ink-750)]'
-/** The same rule plus the chosen row's left edge, which the prototype drew as an inset border. */
-const ROW_RULE_SELECTED =
+/** The chosen row's accent edge - the bar the prototype drew at the row's left - on the first cell only. The same inset on every cell is the violet bar between the columns: a `tr` holds cells side by side, so anything painted per-cell repeats once per column. */
+const ROW_EDGE_SELECTED =
   'shadow-[inset_0_-1px_0_var(--color-ink-750),inset_2px_0_0_var(--color-accent-light)]'
+/** The focus ring: ONE ring around the whole row, drawn as inset shadow bands on the row's own cells - the top and bottom band on every cell, the left band on the first, the right band on the last - while the row (`tr.group`) has keyboard focus. A `border` or an `outline` on a `tr` cannot do this job in Chrome: both render around every cell of the row, which is exactly the per-cell violet bar this replaces. The ring replaces the row rule for the moment it is up - the accent band sits where the rule sat - which is what keeps one box-shadow declaration in charge per cell instead of two competing ones. */
+const RING_BAND =
+  'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light)]'
+const RING_EDGE_LEFT =
+  'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light),inset_2px_0_0_var(--color-accent-light)]'
+const RING_EDGE_RIGHT =
+  'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light),inset_-2px_0_0_var(--color-accent-light)]'
 
 type SortColumn = 'name' | 'progress' | 'down' | 'up' | 'peers' | 'state'
 
@@ -79,6 +90,14 @@ const COLUMNS: { key: SortColumn; label: string; className: string }[] = [
   { key: 'peers', label: 'Peers', className: 'px-3 text-right' },
   { key: 'state', label: 'State', className: 'px-5 text-left' },
 ]
+
+/** One cell's shadows: the row rule (the chosen row's accent edge, first cell only), plus the cell's share of the row's focus ring. */
+function cellRules(index: number, selected: boolean): string {
+  const base = index === 0 && selected ? ROW_EDGE_SELECTED : ROW_RULE
+  const ring =
+    index === 0 ? RING_EDGE_LEFT : index === COLUMNS.length - 1 ? RING_EDGE_RIGHT : RING_BAND
+  return `${base} ${ring}`
+}
 
 /** The one-word state labels, the terminal's (`state_label` in `fbtt-tui/src/view/mod.rs`). */
 const STATE_LABEL: Record<RowState, string> = {
@@ -381,7 +400,7 @@ export default function TorrentTable({
               const fraction = fractionOf(row)
               const filled = filledPercent(fraction)
               const selected = row.id === selectedId
-              const rule = selected ? ROW_RULE_SELECTED : ROW_RULE
+              const ruleFor = (index: number): string => cellRules(index, selected)
               return (
                 <tr
                   key={row.id}
@@ -399,20 +418,23 @@ export default function TorrentTable({
                     }
                   }}
                   className={
-                    'outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent-light ' +
+                    // `group`: the ring's bands live on the cells but switch on with the row's own
+                    // `:focus-visible`. `outline-none` keeps Chrome's own per-cell default focus
+                    // draw-off; the bands below are the ring.
+                    'group outline-none ' +
                     (onPick !== undefined ? 'cursor-pointer hover:bg-ink-700 ' : '') +
                     (selected ? 'bg-accent-soft' : '')
                   }
                   style={{ height: ROW_HEIGHT }}
                 >
                   <td
-                    className={`box-border h-10 leading-5 max-w-[420px] truncate px-5 py-2.5 text-body ${rule}`}
+                    className={`box-border h-10 leading-5 max-w-[420px] truncate px-5 py-2.5 text-body ${ruleFor(0)}`}
                     title={name}
                   >
                     {name}
                   </td>
                   <td
-                    className={`box-border h-10 leading-5 overflow-hidden px-3 py-2.5 ${rule}`}
+                    className={`box-border h-10 leading-5 overflow-hidden px-3 py-2.5 ${ruleFor(1)}`}
                   >
                     <div className="flex items-center gap-2.5">
                       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink-700">
@@ -427,22 +449,22 @@ export default function TorrentTable({
                     </div>
                   </td>
                   <td
-                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${ruleFor(2)}`}
                   >
                     {formatRate(row.download_rate)}
                   </td>
                   <td
-                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${ruleFor(3)}`}
                   >
                     {formatRate(row.upload_rate)}
                   </td>
                   <td
-                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}
+                    className={`box-border h-10 leading-5 truncate px-3 py-2.5 text-right font-mono text-xs text-body ${ruleFor(4)}`}
                   >
                     {row.num_seeds} / {row.num_peers}
                   </td>
                   <td
-                    className={`box-border h-10 leading-5 max-w-[190px] truncate px-5 py-2.5 ${rule}`}
+                    className={`box-border h-10 leading-5 max-w-[190px] truncate px-5 py-2.5 ${ruleFor(5)}`}
                     title={stateText(row)}
                   >
                     {/* Block-level flex, deliberately not inline-flex: an inline box whose first child is the empty dot synthesises a baseline that enlarges the cell's line box past 20 px, and the row follows the tallest cell. */}
