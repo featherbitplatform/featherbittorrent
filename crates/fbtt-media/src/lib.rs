@@ -3,7 +3,8 @@
 //! It is pure, synchronous Rust over `Read + Seek`: no tokio, no network, no engine. A caller hands
 //! it any reader it likes - a file, a piece of a torrent behind a timeout, a `Cursor` over bytes in a
 //! test - and this crate probes it ([`probe`()]), turns one of its tracks into fragmented MP4
-//! (`fmp4`, from Task 2), and reads text subtitles into cues (`subtitle`, from Task 5). It copies
+//! ([`init_segment`], [`FragmentWriter`]), and reads text subtitles into cues (`subtitle`, from
+//! Task 5). It copies
 //! bytes: nothing here decodes or transcodes, which is what the plan's "no transcoding, no native
 //! libraries" rule asks of it.
 //!
@@ -15,11 +16,15 @@
 
 pub mod capped;
 pub mod codec;
+pub mod fmp4;
 pub mod probe;
+pub mod source;
 
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
-pub use codec::{Codec, TrackKind};
+pub use codec::{Codec, TrackKind, sample_entry};
+pub use fmp4::{FragmentWriter, init_segment};
 pub use probe::{MediaInfo, TrackInfo, probe};
+pub use source::{Sample, TrackConfig};
 
 /// Which container a file is.
 ///
@@ -77,6 +82,13 @@ pub const MAX_FRAGMENT_MS: u64 = 5000;
 
 /// The most bytes a fragment holds, however big the samples are.
 pub const MAX_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most samples a video fragment may hold, however few keyframes the file has.
+///
+/// A fragment is one `moof` and one `mdat`, so its sample table is one flat array: a file with no
+/// keyframes at all would otherwise grow a fragment's table for as long as its longest
+/// non-keyframe run, and the cap is what bounds that array.
+pub const MAX_FRAGMENT_SAMPLES: usize = 10_000;
 
 /// Why a file could not be used.
 #[derive(Debug, thiserror::Error)]

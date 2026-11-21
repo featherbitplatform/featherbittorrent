@@ -402,7 +402,7 @@ fn matroska_error(error: DemuxError) -> MediaError {
 ///
 /// A file that starts with an `ftyp` or `moov` box and then fails to parse is
 /// not a valid MP4, so everything but a read failure is `Malformed`.
-fn atom_error(error: mp4_atom::Error) -> MediaError {
+pub(crate) fn atom_error(error: mp4_atom::Error) -> MediaError {
     match error {
         mp4_atom::Error::Io(err) => MediaError::Io(err),
         other => MediaError::Malformed(other.to_string()),
