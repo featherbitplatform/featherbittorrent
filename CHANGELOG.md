@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-21
+
+### Fixed
+
+- The featherbit mark no longer shows the first letters of the text header through it when it appears after startup: the cells under a mark that has just appeared are rewritten blank before the image is drawn over them, so there is no old text left for the transparent image to let through. The help screen's mark now sits on the help box's own colour instead of a darker rectangle in the middle of the box. ([#17](https://github.com/featherbitplatform/featherbittorrent/pull/17))
+- On Windows, a session listening on port 0 keeps its UDP socket (DHT, uTP, UDP trackers) on its TCP listen port. Separately, on every platform, a DHT node whose bootstrap ended with fewer than 8 routing-table entries now keeps retrying until its table holds 8. Both come with fbt-lib `v0.11.1`. ([#18](https://github.com/featherbitplatform/featherbittorrent/pull/18))
+
 ## [0.2.2] - 2026-11-20
 
 ### Fixed

@@ -1270,7 +1270,9 @@ fn cell_size_changed(current: (u16, u16), estimated: (u16, u16)) -> bool {
 ///    large mark that is newly chosen or resized in this frame (the help just opened, or a smaller
 ///    size picked), which was not known before the draw; the terminal draws the placeholders it
 ///    just received as soon as the pixels arrive, in the same flush. The image protocols write
-///    their image here, and the cells a removed placement covered are repainted.
+///    their image here, over the cells they marked skipped, and the cells ratatui did not write -
+///    a removed placement's, and the new placement's own - are written out of the frame's buffer
+///    first.
 ///
 /// `last_placements` is replaced with this frame's. An error is the terminal failing, worded for
 /// the person.
@@ -1314,18 +1316,19 @@ where
     Ok(())
 }
 
-/// The logo's bytes after a frame is drawn: the cells a removed placement used to cover, repainted
-/// from the frame's own buffer, and what [`Placer::after_draw`] answered with. Every frame that
-/// leaves a mark behind, and every frame that takes one down - the frame the `Saving...` screen
-/// draws is one of those - goes through this, so the screen never has the ghost of a mark its last
-/// frame did not draw.
+/// The logo's bytes after a frame is drawn: the frame's own cells for every cell ratatui did not write
+/// (the ones a removed placement used to cover, and the ones a new placement's image is about to go
+/// over), and what [`Placer::after_draw`] answered with. Every frame that leaves a mark behind, and
+/// every frame that takes one down (the frame the `Saving...` screen draws is one of those) goes
+/// through this, so the screen never has the ghost of a mark its last frame did not draw, and a mark
+/// that just appeared never shows the text the frame before left under it.
 ///
 /// The bytes are the image the image protocols write over the skipped cells, and for kitty the
 /// pixels of a large mark this frame newly chose (see [`draw_frame`]). What kitty needs before the
 /// frame is transmitted before it, by [`Placer::before_draw`].
 ///
-/// `repaint_cells` are the cells a removed placement used to cover, copied out of the frame's
-/// buffer by the caller, which is where the decision of which cells are owed a repaint lives - the
+/// `repaint_cells` are the cells ratatui did not write, copied out of the frame's buffer by the
+/// caller, which is where the decision of which cells are owed a repaint lives - the
 /// frame's buffer is borrowed from the terminal, so the cells are read out before the terminal is
 /// written to. The buffer is never cloned for the frame as a whole: only the cells that are owed a
 /// repaint are copied, and a frame with nothing to repaint copies nothing.
@@ -1336,9 +1339,10 @@ fn write_logo_bytes<B>(
 ) where
     B: ratatui::backend::Backend + std::io::Write,
 {
-    // The image protocols write the image over the skipped cells, and the cells a removed placement
-    // used to cover are repainted from the buffer the frame just drew - before the image, so a cell
-    // that is text again shows the text and not the ghost of an image.
+    // The image protocols write the image over the skipped cells, and the cells ratatui did not write
+    // (a removed placement's, and a new placement's own) are written from the buffer the frame just
+    // drew before the image, so a cell that is text again shows the text, and a mark that just
+    // appeared covers the text under it instead of letting it show through.
     if !repaint_cells.is_empty() {
         let backend = terminal.backend_mut();
         let _ = backend.draw(
@@ -1354,7 +1358,7 @@ fn write_logo_bytes<B>(
     let _ = std::io::Write::flush(terminal.backend_mut());
 }
 
-/// The cells a removed placement used to cover, copied out of the frame's buffer: the answer to
+/// The cells ratatui did not write, copied out of the frame's buffer: the answer to
 /// "which cells are owed a repaint" comes from [`Placer::after_draw`], and the cells themselves are
 /// read out of the buffer before the terminal is written to, because the buffer is borrowed from it.
 /// A frame with nothing to repaint copies nothing.
