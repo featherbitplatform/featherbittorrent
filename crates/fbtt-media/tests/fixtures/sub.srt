@@ -1,0 +1,12 @@
+1
+00:00:00,500 --> 00:00:02,000
+First subtitle line
+spanning two lines
+
+2
+00:00:02,500 --> 00:00:03,000
+Second subtitle line
+
+3
+00:00:03,200 --> 00:00:03,900
+Third subtitle line

@@ -1,0 +1,327 @@
+//! Container sniffing and the two header readers behind [`probe`].
+use crate::capped::CappedLen;
+use crate::codec::{self, Codec, TrackKind};
+use crate::{Container, ELEMENT_CAP, MediaError};
+use matroska_demuxer::{DemuxError, MatroskaFile, TrackEntry, TrackType};
+use mp4_atom::{FourCC, Header, Moov, ReadAtom, ReadFrom};
+use std::io::{Read, Seek, SeekFrom};
+use std::result::Result;
+
+/// A track: what kind it is, what codec it holds, and how a player should treat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// The container's own track number: `TrackNumber` in Matroska, `track_ID` in MP4.
+    pub id: u32,
+    /// Video, audio or subtitle.
+    pub kind: TrackKind,
+    /// Which codec the samples are.
+    pub codec: Codec,
+    /// The RFC 6381 and ISO 14496-15 codec strings for this track: what an HLS
+    /// manifest's `CODECS` attribute names, and what the fMP4 sample entry is
+    /// called. Empty for a codec fbtt does not remux, which is the same set
+    /// [`Codec::remuxable`] reports.
+    pub mime_codecs: Vec<String>,
+    /// The track's BCP 47 or three letter language.
+    ///
+    /// A container's "undetermined" marker (`und`, which both containers use as
+    /// their default) is left out, so a language is present only when the file
+    /// actually states one.
+    pub language: Option<String>,
+    /// The container's track title, if it carries one.
+    pub name: Option<String>,
+    /// Whether a player should pick this track when the viewer expresses no preference.
+    pub default: bool,
+    /// Whether this track should play even for a viewer who did not ask for subtitles.
+    pub forced: bool,
+}
+
+/// What [`probe`] found: the container, how long it is, and what is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaInfo {
+    /// Matroska, WebM or MP4.
+    pub container: Container,
+    /// Duration in milliseconds, when the container states one.
+    pub duration_ms: Option<u64>,
+    /// The tracks, in container order.
+    pub tracks: Vec<TrackInfo>,
+}
+
+/// Reads a container's header and reports its tracks.
+///
+/// The container is sniffed from the first eight bytes: the EBML magic
+/// `1A 45 DF A3` is Matroska or WebM, and an `ftyp` or `moov` box header at
+/// offset 4 is MP4.
+///
+/// `reader` may be any seekable source: a `BufReader<File>` in a test, a
+/// `BufReader<Upload>` behind a torrent reader in the API. The container is read
+/// from the start of the stream, so the reader may sit anywhere when it is handed
+/// over. On return it sits wherever the header parse ended, which is media data
+/// for Matroska and the byte after `moov` for MP4; a caller that still holds it
+/// (a `&mut` reader, or one sharing a file position) has to seek before using it
+/// again.
+///
+/// Only the header is read: the elements `matroska-demuxer` needs for its own
+/// `open`, and for MP4 the boxes up to and including `moov`.
+///
+/// A file that is not Matroska, WebM or MP4, one too short to hold a container
+/// header, and an MP4 that never reaches a `moov` are [`MediaError::Unsupported`]:
+/// in each case there is no header to have got wrong. A file that starts like one
+/// of the three and whose header does not parse is [`MediaError::Malformed`].
+pub fn probe<R: Read + Seek>(mut reader: R) -> Result<MediaInfo, MediaError> {
+    let mut magic = [0u8; 8];
+    match reader.read_exact(&mut magic) {
+        Ok(()) if magic[..4] == [0x1a, 0x45, 0xdf, 0xa3] => {
+            reader.rewind()?;
+            probe_matroska(&mut reader)
+        }
+        Ok(()) if magic[4..] == *b"ftyp" || magic[4..] == *b"moov" => {
+            reader.rewind()?;
+            probe_mp4(&mut reader)
+        }
+        Ok(()) => Err(MediaError::Unsupported(format!(
+            "not a Matroska, WebM or MP4 file: starts with {magic:02X?}"
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Err(
+            MediaError::Unsupported("too short to hold a container header".to_string()),
+        ),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The Matroska or WebM header, read by `matroska-demuxer`'s own `open`.
+///
+/// The reader is wrapped in [`CappedLen`], so a lying element size cannot make
+/// `open` read or allocate more than [`ELEMENT_CAP`] bytes from wherever the
+/// caller handed the reader over. `open` reads the EBML header, `Segment`,
+/// `SeekHead`, `Info`, `Tracks`, `Cues`, `Chapters` and `Tags`, and stops at the
+/// first `Cluster` without touching a frame's bytes.
+///
+/// One case costs more than a header: a file with no `SeekHead` makes `open`
+/// build its own index by walking element headers from the segment to the end of
+/// the stream, so the walk is as long as the file. Every file ffmpeg or
+/// mkvtoolnix writes carries a `SeekHead`, so this is the shape of a live
+/// recording, and the walk reads headers and seeks over bodies rather than
+/// reading the media data.
+fn probe_matroska<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
+    let file = MatroskaFile::open(CappedLen::new(reader, ELEMENT_CAP)).map_err(matroska_error)?;
+    let container = match file.ebml_header().doc_type() {
+        "webm" => Container::WebM,
+        _ => Container::Matroska,
+    };
+    let info = file.info();
+    let scale = info.timestamp_scale().get();
+    Ok(MediaInfo {
+        container,
+        duration_ms: info
+            .duration()
+            .and_then(|duration| ms_from_timecode(duration, scale)),
+        tracks: matroska_tracks(&file)?,
+    })
+}
+
+/// The media tracks of a Matroska file, in container order.
+fn matroska_tracks<R: Read + Seek>(file: &MatroskaFile<R>) -> Result<Vec<TrackInfo>, MediaError> {
+    let mut tracks = Vec::new();
+    for track in file.tracks() {
+        let Some(kind) = matroska_kind(track) else {
+            continue;
+        };
+        let number = track.track_number().get();
+        let id = u32::try_from(number)
+            .map_err(|_| MediaError::Malformed(format!("TrackNumber {number} is over a u32")))?;
+        let (codec, mime_codecs) = codec::matroska_codec(track.codec_id(), track.codec_private());
+        let language = track
+            .language_bcp47()
+            .or_else(|| track.language())
+            .filter(|language| *language != "und")
+            .map(str::to_string);
+        tracks.push(TrackInfo {
+            id,
+            kind,
+            codec,
+            mime_codecs,
+            language,
+            name: track.name().map(str::to_string),
+            default: track.flag_default(),
+            forced: track.flag_forced(),
+        });
+    }
+    Ok(tracks)
+}
+
+/// What kind of media a Matroska track holds, or `None` for the track types
+/// that hold none: complex, logo, button, control and metadata tracks.
+fn matroska_kind(track: &TrackEntry) -> Option<TrackKind> {
+    match track.track_type() {
+        TrackType::Video => Some(TrackKind::Video),
+        TrackType::Audio => Some(TrackKind::Audio),
+        TrackType::Subtitle => Some(TrackKind::Subtitle),
+        _ => None,
+    }
+}
+
+/// Milliseconds from a Matroska `Duration`, which counts the segment's
+/// `TimestampScale` (one millisecond, the default, in everything ffmpeg writes).
+fn ms_from_timecode(duration: f64, scale: u64) -> Option<u64> {
+    let ms = duration * (scale as f64 / 1_000_000.0);
+    if ms.is_finite() && ms >= 0.0 {
+        Some(ms.round() as u64)
+    } else {
+        None
+    }
+}
+
+/// The MP4 header, walking top level boxes until `moov`.
+///
+/// `mp4-atom`'s `moov` parser gives the same typed view it gives an MP4 muxer,
+/// so this reads track metadata through the models the writer uses. A `moov`'s
+/// declared size is checked against [`ELEMENT_CAP`] before its bytes are read,
+/// because `mp4-atom` reads a box into a buffer sized by that declaration.
+/// Boxes before it (`ftyp`, `free`, and `mdat` in a file with `moov` last) are
+/// skipped by seeking, so a large media data box costs nothing.
+fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
+    let moov = loop {
+        let Some(header) = <Option<Header> as ReadFrom>::read_from(reader).map_err(atom_error)?
+        else {
+            return Err(MediaError::Unsupported(
+                "MP4 file has no moov box".to_string(),
+            ));
+        };
+        if header.kind == FourCC::new(b"moov") {
+            if header
+                .size
+                .is_some_and(|size| capped_size(size) > ELEMENT_CAP)
+            {
+                return Err(MediaError::Malformed(format!(
+                    "moov declares more than {ELEMENT_CAP} bytes"
+                )));
+            }
+            break Moov::read_atom(&header, reader).map_err(atom_error)?;
+        }
+        // A box that runs to the end of the file has nothing after it, so a
+        // `moov` can only still be found in a box with a declared size.
+        let Some(body) = header.size else {
+            return Err(MediaError::Unsupported(
+                "MP4 file has no moov box".to_string(),
+            ));
+        };
+        let body = i64::try_from(body).map_err(|_| {
+            MediaError::Malformed("a box declares more than 2^63 bytes".to_string())
+        })?;
+        // `Header::size` excludes the header, so this lands on the next box.
+        reader.seek(SeekFrom::Current(body))?;
+    };
+
+    let mvhd = &moov.mvhd;
+    let mut tracks = Vec::new();
+    for track in &moov.trak {
+        if let Some(info) = mp4_track(track)? {
+            tracks.push(info);
+        }
+    }
+    Ok(MediaInfo {
+        container: Container::Mp4,
+        duration_ms: ms_from_timescale(mvhd.timescale, mvhd.duration),
+        tracks,
+    })
+}
+
+/// A declared box size, widened from `usize` so it can be compared to the cap.
+fn capped_size(size: usize) -> u64 {
+    u64::try_from(size).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds from an `mvhd` duration counted in its own timescale.
+fn ms_from_timescale(timescale: u32, duration: u64) -> Option<u64> {
+    if timescale == 0 {
+        return None;
+    }
+    u64::try_from(u128::from(duration) * 1000 / u128::from(timescale)).ok()
+}
+
+/// An MP4 track, or `None` for a track whose handler carries no media.
+fn mp4_track(track: &mp4_atom::Trak) -> Result<Option<TrackInfo>, MediaError> {
+    let handler = track.mdia.hdlr.handler;
+    let kind = if handler == FourCC::new(b"vide") {
+        TrackKind::Video
+    } else if handler == FourCC::new(b"soun") {
+        TrackKind::Audio
+    } else if [
+        FourCC::new(b"sbtl"),
+        FourCC::new(b"subt"),
+        FourCC::new(b"text"),
+    ]
+    .contains(&handler)
+    {
+        TrackKind::Subtitle
+    } else {
+        // Timecode, metadata, closed caption and helper tracks are not tracks a
+        // player offers a viewer.
+        return Ok(None);
+    };
+    let Some(entry) = track.mdia.minf.stbl.stsd.codecs.first() else {
+        return Ok(None);
+    };
+    let (codec, mime_codecs) = codec::mp4_codec(entry);
+    let language = &track.mdia.mdhd.language;
+    Ok(Some(TrackInfo {
+        id: track.tkhd.track_id,
+        kind,
+        codec,
+        mime_codecs,
+        language: (language != "und" && !language.is_empty()).then(|| language.clone()),
+        // ISO BMFF has no track title box that `mp4-atom` models, so an MP4
+        // track is named by its codec, language and track number alone.
+        name: None,
+        // ISO BMFF has no forced flag either: an MP4 subtitle track is forced
+        // by a `cla3` handler or an edit list, neither of which is our files.
+        forced: false,
+        // There is no default track flag in ISO BMFF. The `tkhd` enabled flag is
+        // what a muxer leaves set on the track it means a player to pick and
+        // clears on the alternatives it offers for selection, which is what
+        // ffmpeg writes and what its reader reports as the default disposition.
+        // `in_movie` says only that the track belongs to the presentation, so
+        // every track ffmpeg muxes has it, and reading it would call every track
+        // the default.
+        default: track.tkhd.enabled,
+    }))
+}
+
+/// `matroska-demuxer`'s errors, as `MediaError`s.
+///
+/// An element declaring more data than the stream holds is what a truncated
+/// file, or a file whose sizes lie, looks like: `Malformed`. So is anything
+/// else the parse can trip over, because the file said it was Matroska and was
+/// not. A document type, or a `DocTypeReadVersion`, fbtt cannot read is
+/// `Unsupported`, and so is an EBML header that is not Matroska at all. A read
+/// failure stays `Io`, so a torrent piece that has not arrived stays distinct
+/// from a file that is broken.
+fn matroska_error(error: DemuxError) -> MediaError {
+    match error {
+        DemuxError::IoError(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            MediaError::Malformed("file ends inside an element".to_string())
+        }
+        DemuxError::IoError(err) => MediaError::Io(err),
+        DemuxError::UnsupportedDocType(doc_type) => {
+            MediaError::Unsupported(format!("{doc_type} is not matroska or webm"))
+        }
+        DemuxError::UnsupportedDocTypeReadVersion(version) => {
+            MediaError::Unsupported(format!("DocTypeReadVersion {version} is too new"))
+        }
+        DemuxError::InvalidEbmlHeader(reason) => {
+            MediaError::Unsupported(format!("not a Matroska file: {reason}"))
+        }
+        other => MediaError::Malformed(other.to_string()),
+    }
+}
+
+/// `mp4-atom`'s errors, as `MediaError`s.
+///
+/// A file that starts with an `ftyp` or `moov` box and then fails to parse is
+/// not a valid MP4, so everything but a read failure is `Malformed`.
+fn atom_error(error: mp4_atom::Error) -> MediaError {
+    match error {
+        mp4_atom::Error::Io(err) => MediaError::Io(err),
+        other => MediaError::Malformed(other.to_string()),
+    }
+}

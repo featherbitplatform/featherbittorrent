@@ -179,3 +179,10 @@ crossterm_winapi = "0.9.1"
 rust-embed = { version = "8.14", default-features = false }
 mime_guess = "2.0"
 subtle = "2.6"
+# The media player (plan 2026-11-21-web-ui-milestone-2-media-player): `matroska-demuxer` reads Matroska
+# and WebM (Zlib OR MIT OR Apache-2.0, and `#![forbid(unsafe_code)]` like every crate here), `mp4-atom`
+# is the box codec `fbtt-media` reads MP4 with and writes its fragmented MP4 with (MIT OR Apache-2.0).
+# Neither decodes nor transcodes anything: both are container codecs, which is what "no native
+# libraries" (plan Global Constraints) asks for.
+matroska-demuxer = "0.8.1"
+mp4-atom = "0.17.1"
