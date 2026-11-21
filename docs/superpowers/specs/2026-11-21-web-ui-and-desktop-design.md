@@ -1,6 +1,6 @@
 # featherbittorrent: web UI and desktop app (draft)
 
-Status: **draft for the owner's review**, written 2026-11-21 overnight from one sentence of the owner's. Nothing here is built yet. The section 10 questions need answers before a plan is written.
+Status: **all owner questions answered (2026-11-21)**. Ready for the owner's final read, then the milestone 1 plan. Nothing here is built yet.
 
 Tags, as in `2026-11-14-featherbittorrent-design.md`:
 - **[owner]**: the owner said it.
@@ -33,6 +33,24 @@ In cargo terms the split is the `web-ui` feature: full builds turn it on, headle
 - the environment variable `FBTT_WEB_UI=0`. This one wins over the file, like `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR` do.
 
 The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless build accepts the setting and ignores it, with one log line, so one config file works with either build.
+
+## 2a. The local TUI can serve the web UI on request
+
+Owner, 2026-11-21: "Not automatic, but you could have it serving if the user chooses it after the app has opened. In that case the TUI app stops updating the screen displaying a message it's serving UI on a specific host port and then you open the browser. The user can go back to TUI." **[owner]**
+
+**What the owner decided.**
+- The local TUI never opens a port by itself.
+- The user asks for the web UI from the running TUI. The TUI then stops drawing its normal screen and shows one message: the web UI is being served at a given host and port, so open a browser there.
+- From that message the user can go back to the TUI.
+
+**The rest is the builder's call:**
+- **Builds.** Only the full build has the action. The headless build has no key for it and no hint in the footer.
+- **The key.** A single key in the TUI footer, for example `w` for web UI, listed in `?`. It works only with the local engine. On a remote connection the server already serves its own web UI, so the key is hidden there.
+- **The address.** It binds `127.0.0.1` on a free port by default, so it is reachable only from this machine. Opening it to the LAN would be an explicit setting, never the default.
+  - The message shows the full URL, including a one-time sign-in token, so another user on the same machine cannot use the port.
+  - With a session cookie, the token is exchanged for that cookie on the first request.
+- **Going back.** Going back to the TUI stops the server and closes the port. The engine and the torrents keep running throughout, because the server only serves the engine the TUI already runs. One library, one engine.
+- **Leaving the message screen.** Quitting from it is the same as quitting the TUI: the torrents stop and resume on the next start, as today.
 
 ## 3. Goals
 
@@ -115,6 +133,7 @@ The names `server.web_ui` and `FBTT_WEB_UI` are the builder's call. The headless
    - Add, pause, resume and delete, and sign-in with a password.
    - CI builds and tests both builds. The release ships the full build beside the headless one.
 2. **The rest of parity:**
+   - the local TUI's "serve the web UI" action (section 2a);
    - file priorities;
    - settings;
    - devices;
@@ -139,7 +158,7 @@ The component structure, state management (plain React, or a small store), the r
 
 1. Answered: the full build is `featherbittorrent`, the terminal-only build is `featherbittorrent-headless`, and both ship in every release. **[owner, 2026-11-21]**
 2. Answered: on by default in a full build, off through `server.web_ui: false` or `FBTT_WEB_UI=0` (section 2).
-3. **Should the local TUI also serve the web UI** for its embedded engine, for example on `127.0.0.1` so a browser on the same machine can watch it? That means the TUI starts a server, which the 2026-11-14 design avoided unless asked for.
+3. Answered: not automatically, but on request at runtime (section 2a). **[owner, 2026-11-21]**
 4. Answered: the webview talks to a remote server directly, through CORS on the server (`cors_origins`, already in fbt-api). **[owner, 2026-11-21]**
 5. Answered: an HttpOnly session cookie that survives a restart. It is `Secure` over https, `SameSite=Strict`, and paired with a CSRF token on every state-changing request. **[owner, 2026-11-21: "cookie could work"]**
 6. Answered: not now. Browsers sign in with a password, or through the gateway's OpenID Connect. **[owner, 2026-11-21]**
