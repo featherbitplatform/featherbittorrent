@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The release-safe CLI smoke, shared by every packaging smoke (dev/smoke-linux.sh, dev/package-macos.sh):
-# one binary, one scratch home, and nothing that reaches outside the machine. Checks in order, each failure a
-# clear line on stderr and exit 1: --version is exactly `featherbittorrent <version> (full)` or
-# `featherbittorrent <version> (headless)`; the last argument names which of the two the artifact is, and
-# when it is named the check compares the binary's own marker against it, so a full artifact holding the
-# headless binary (or the other way around) fails here; --help names serve,
+# one binary, one scratch home, and nothing that reaches outside the machine. Checks in order, each
+# artifact failure a clear line on stderr and exit 1; usage errors (wrong argument count, unknown variant)
+# exit 2. --version is exactly `featherbittorrent <version> (full)` or `featherbittorrent <version>
+# (headless)`; the last argument names which of the two the artifact is, and the check compares the
+# binary's own marker against it, so a full artifact holding the headless binary (or the other way around)
+# fails here; --help names serve,
 # user and device; serve --help shows none of the debug-only flags; serve --offline is refused with exit 2,
 # which is what proves the artifact is a release build; then user set with a piped password and user list
 # write and read back an argon2id login in the platform's own config directory, which holds the hash and not
@@ -24,28 +25,29 @@
 #             forgets the variant is refused with a usage line rather than guessed at.
 set -euo pipefail
 
-# The usage refusal is exit 2, the same code a missing or invalid argument gets in the packaging
-# scripts: a smoke run that did not get the arguments it needs is a caller bug, not a bad artifact.
-fail() { echo "FAIL: $*" >&2; exit 2; }
+# Exit codes: 2 for a usage error (wrong argument count, unknown variant), 1 for a failed artifact check.
+# A caller bug is not the same as a bad artifact, and the callers' gates rely on the distinction.
+fail() { echo "FAIL: $*" >&2; exit 1; }
+usage_fail() { echo "FAIL: $*" >&2; exit 2; }
 
 # Captured output goes into failure messages, and it can carry newlines: this keeps a failure to the one line
 # it is meant to be, and caps the length so a chatty binary cannot flood a CI log.
 one_line() { local text="${1//$'\n'/ }"; printf '%s' "${text:0:200}"; }
 
 # Arguments first, before any platform or tool question, so a test can exercise the refusals anywhere.
-[[ $# -eq 4 ]] || fail "usage: bash dev/smoke-cli.sh <binary> <version> <home> <full|headless>"
+[[ $# -eq 4 ]] || usage_fail "usage: bash dev/smoke-cli.sh <binary> <version> <home> <full|headless>"
 bin="$1"
 version="$2"
 home="$3"
 variant="$4"
 case "$variant" in
   full|headless) ;;
-  *) fail "invalid variant '$variant' (expected full or headless)" ;;
+  *) usage_fail "invalid variant '$variant' (expected full or headless)" ;;
 esac
-[[ -n "$bin" && -n "$version" && -n "$home" ]] || fail "an argument is empty (binary '$bin', version '$version', home '$home')"
-[[ -f "$bin" && -x "$bin" ]] || fail "no executable binary at $bin"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || fail "'$version' is not a version"
-[[ -d "$home" ]] || fail "no scratch home directory at $home"
+[[ -n "$bin" && -n "$version" && -n "$home" ]] || usage_fail "an argument is empty (binary '$bin', version '$version', home '$home')"
+[[ -f "$bin" && -x "$bin" ]] || usage_fail "no executable binary at $bin"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || usage_fail "'$version' is not a version"
+[[ -d "$home" ]] || usage_fail "no scratch home directory at $home"
 
 # HOME is read by the binary rather than by this script, so it has to be absolute: a relative scratch home
 # would become whatever directory the smoke happened to start in.

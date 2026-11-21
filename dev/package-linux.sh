@@ -20,8 +20,9 @@
 #         headless, the same with -headless after featherbittorrent.
 # Test hooks that need no build and ask nothing about the platform (dev/test-packaging.sh runs them on
 # any OS): --print-versions <version> prints the deb version then the rpm version; --check-rpm-reqs
-# reads requirement lines on stdin and refuses any the declared dependencies do not cover. Both refuse
-# with one line like everything else here.
+# reads requirement lines on stdin and refuses any the declared dependencies do not cover;
+# --check-deb-control <variant> <file> and --check-rpm-metadata <variant> <name> <obsoletes-file>
+# <conflicts-file> run the metadata checks on fixture text. All refuse with one line, exit 2.
 set -euo pipefail
 
 fail() { echo "package-linux.sh: $*" >&2; exit 2; }
@@ -50,6 +51,23 @@ check_rpm_reqs() { # rpm requirement lines on stdin; refuses any the declared de
       || fail "the .rpm requires '$req', which the declared dependencies do not cover: add it to [package.metadata.deb] depends and to dev/check-linux-binary.sh's allow list together"
   done
 }
+check_deb_control() { # <control text> <variant name> <the other package>
+  local control_text="$1" want="$2" other="$3" pkg conflicts replaces
+  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //')"
+  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //')"
+  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //')"
+  [[ "$pkg" == "$want" ]] || fail "the .deb's control says 'Package: $pkg', expected 'Package: $want'"
+  grep -qwF -- "$other" <<<"$conflicts" || fail "the .deb's control has 'Conflicts: $conflicts', which does not name the other package $other"
+  grep -qwF -- "$other" <<<"$replaces" || fail "the .deb's control has 'Replaces: $replaces', which does not name the other package $other"
+  echo "ok: the .deb is $pkg and conflicts with and replaces $other"
+}
+check_rpm_metadata() { # <rpm name> <rpm obsoletes> <rpm conflicts> <variant name> <the other package>
+  local name="$1" obsoletes="$2" conflicts="$3" want="$4" other="$5"
+  [[ "$name" == "$want" ]] || fail "the .rpm is named '$name', expected '$want'"
+  grep -qwF -- "$other" <<<"$obsoletes" || fail "the .rpm obsoletes '$obsoletes', which does not name the other package $other"
+  [[ -z "${conflicts//[[:space:]]/}" ]] || fail "the .rpm carries 'Conflicts: $conflicts', which would stop installing it over the other package instead of replacing it"
+  echo "ok: the .rpm is $name and obsoletes $other with no conflicts"
+}
 
 # The hooks dispatch here, ahead of every platform and tool question. --print-versions checks the
 # version exactly as package mode does, so a bad one is refused the same way.
@@ -63,6 +81,29 @@ if [[ "${1:-}" == "--check-rpm-reqs" ]]; then
   [[ $# -eq 1 ]] || fail "usage: bash dev/package-linux.sh --check-rpm-reqs (requirement lines on stdin)"
   check_rpm_reqs
   echo 'package-linux.sh ok: every rpm requirement is covered by the declared dependencies'
+  exit 0
+fi
+if [[ "${1:-}" == "--check-deb-control" ]]; then
+  # <variant> <control-text-file>; runs check_deb_control on the file's contents
+  [[ $# -eq 3 ]] || fail "usage: bash dev/package-linux.sh --check-deb-control <full|headless> <control-text-file>"
+  case "$2" in full|headless) ;; *) fail "invalid variant '$2' (expected full or headless)" ;; esac
+  [[ -r "$3" ]] || fail "could not read $3"
+  if [[ "$2" == headless ]]; then hook_want="featherbittorrent-headless"; hook_other="featherbittorrent";
+  else hook_want="featherbittorrent"; hook_other="featherbittorrent-headless"; fi
+  check_deb_control "$(cat "$3")" "$hook_want" "$hook_other"
+  echo "package-linux.sh ok: the .deb control for $2 is correct"
+  exit 0
+fi
+if [[ "${1:-}" == "--check-rpm-metadata" ]]; then
+  # <variant> <name> <obsoletes-file> <conflicts-file>; runs check_rpm_metadata
+  [[ $# -eq 5 ]] || fail "usage: bash dev/package-linux.sh --check-rpm-metadata <full|headless> <name> <obsoletes-file> <conflicts-file>"
+  case "$2" in full|headless) ;; *) fail "invalid variant '$2' (expected full or headless)" ;; esac
+  [[ -r "$4" ]] || fail "could not read $4"
+  [[ -r "$5" ]] || fail "could not read $5"
+  if [[ "$2" == headless ]]; then hook_want="featherbittorrent-headless"; hook_other="featherbittorrent";
+  else hook_want="featherbittorrent"; hook_other="featherbittorrent-headless"; fi
+  check_rpm_metadata "$3" "$(cat "$4")" "$(cat "$5")" "$hook_want" "$hook_other"
+  echo "package-linux.sh ok: the .rpm metadata for $2 is correct"
   exit 0
 fi
 
@@ -242,27 +283,11 @@ if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --
 # The logic is the same the verify job's packaging test runs offline against fixtures
 # (dev/test-packaging.sh's check_deb_control and check_rpm_metadata), so a change to one is a change to
 # both.
-check_deb_control() { # <control text> <variant name> <the other package>
-  local control_text="$1" want="$2" other="$3" pkg conflicts replaces
-  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //')"
-  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //')"
-  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //')"
-  [[ "$pkg" == "$want" ]] || fail "the .deb's control says 'Package: $pkg', expected 'Package: $want'"
-  grep -qwF -- "$other" <<<"$conflicts" || fail "the .deb's control has 'Conflicts: $conflicts', which does not name the other package $other"
-  grep -qwF -- "$other" <<<"$replaces" || fail "the .deb's control has 'Replaces: $replaces', which does not name the other package $other"
-  echo "ok: the .deb is $pkg and conflicts with and replaces $other"
-}
-check_rpm_metadata() { # <rpm name> <rpm obsoletes> <rpm conflicts> <variant name> <the other package>
-  local name="$1" obsoletes="$2" conflicts="$3" want="$4" other="$5"
-  [[ "$name" == "$want" ]] || fail "the .rpm is named '$name', expected '$want'"
-  grep -qwF -- "$other" <<<"$obsoletes" || fail "the .rpm obsoletes '$obsoletes', which does not name the other package $other"
-  [[ -z "${conflicts//[[:space:]]/}" ]] || fail "the .rpm carries 'Conflicts: $conflicts', which would stop installing it over the other package instead of replacing it"
-  echo "ok: the .rpm is $name and obsoletes $other with no conflicts"
-}
-# dpkg-deb reads the control member directly; the ar and tar path is the fallback the build image uses,
-# because it carries no dpkg-deb. The control member was already listed above, so $control holds its name.
+# dpkg-deb with no field prints the whole control file (Package:, Conflicts:, Replaces:, ...); the
+# ar and tar path is the fallback the build image uses, because it carries no dpkg-deb. The control
+# member was already listed above, so $control holds its name.
 if command -v dpkg-deb >/dev/null; then
-  deb_control="$(dpkg-deb -f "$dist/$pkg.deb" control 2>&1)"
+  deb_control="$(dpkg-deb -f "$dist/$pkg.deb" 2>&1)"
 else
   deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar -xJO -f - ./control 2>/dev/null)"
 fi

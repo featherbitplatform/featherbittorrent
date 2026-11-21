@@ -422,14 +422,16 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-           # The expected count is the number of lines in the list above, not a remembered number: the two
-           # can never disagree, so a line added or dropped in the heredoc is caught by the per-file check
-           # rather than by a count that was not updated. The list holds 37 files: six per Linux variant
-           # and architecture (deb, rpm and the archive, each with its checksum), two per macOS variant,
-           # four for the two Windows zips of each variant (a zip and its .sha256 each), and the SBOM.
-           expected="$(wc -l < "$RUNNER_TEMP/release-files")"
-           echo "release file list holds $expected files"
-           [ "$expected" -eq 37 ]
+           # The expected count comes from the build matrix, not from a remembered number: 2 Linux
+           # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
+           # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
+           # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM.
+           # The heredoc above must list exactly that many lines; a line added or dropped in either
+           # place is caught here.
+           expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 ))
+           listed="$(wc -l < "$RUNNER_TEMP/release-files")"
+           echo "release file list holds $listed files, expected $expected"
+           [ "$listed" -eq "$expected" ]
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |
