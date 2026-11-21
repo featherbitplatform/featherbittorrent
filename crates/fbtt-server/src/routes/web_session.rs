@@ -139,25 +139,30 @@ pub(super) async fn sign_in(
 /// one signed in.
 ///
 /// A cookie that is not here, or not this server's, gets the `401` every other route gives for that. With
-/// logins off there is nothing to be signed in to, and the answer says so rather than pretending the
-/// address is somebody.
+/// logins off there is nothing to be signed in to and the answer says so whatever cookie arrives: the password
+/// path does not consult `auth_on`, so a cookie can exist on such a server at all, and the guard lets every
+/// request through with or without it.
 pub(super) async fn status(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let answer = match session_cookie(&headers).and_then(|token| {
+    if !shared.auth.auth_on() {
+        return no_store(Json(json!({ "auth": false })).into_response());
+    }
+    let Some((token, subject)) = session_cookie(&headers).and_then(|token| {
         shared
             .auth
             .sessions()
             .check(token)
             .map(|subject| (token, subject))
-    }) {
-        Some((token, subject)) => json!({
+    }) else {
+        return no_store(RouteError::unauthorized().into_response());
+    };
+    no_store(
+        Json(json!({
             "auth": true,
             "subject": subject,
             "csrf": csrf_for(token),
-        }),
-        None if !shared.auth.auth_on() => json!({ "auth": false }),
-        None => return no_store(RouteError::unauthorized().into_response()),
-    };
-    no_store(Json(answer).into_response())
+        }))
+        .into_response(),
+    )
 }
 
 /// `DELETE /api/v1/auth/web-session`: end this browser's session and take its cookie away.

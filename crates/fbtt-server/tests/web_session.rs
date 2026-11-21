@@ -707,9 +707,10 @@ async fn the_secure_flag() {
 // The other two answers this route gives
 // ---------------------------------------------------------------------------
 
-/// With logins off there is nothing to sign in to, and the page has to be told that rather than be sent to a
-/// sign-in that would only fail. No `subject`, no CSRF value, and the `no-store` the answer needs because it
-/// is about whoever asked.
+/// With logins off there is nothing to sign in to, and the page has to be told that whatever it sends: the
+/// sign-in route checks the password and not whether logins are required, so a cookie can exist on a server
+/// like this one, and reading it back must not make the page believe somebody is here. No `subject`, no CSRF
+/// value, and the `no-store` the answer needs because it is about whoever asked.
 #[tokio::test]
 async fn web_session_says_when_logins_are_off() {
     let served = Served::start("web-logins-off", |scratch| {
@@ -759,6 +760,21 @@ async fn web_session_says_when_logins_are_off() {
     assert_eq!(
         set_cookie_of(&logged_out),
         "fbtt_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+    );
+
+    // A cookie does not change that answer either. The sign-in route checks the password and not whether logins
+    // are required, so a browser really can sign in on a server like this one; what it is told when it asks is
+    // still that nobody has to be signed in, with no name and no session's value to fill a page in with.
+    let (cookie, _csrf) = sign_in(&served).await;
+    let signed_in = body(get_with_cookie(&client, &url, &cookie).await).await;
+    assert_eq!(
+        signed_in["auth"].as_bool(),
+        Some(false),
+        "a cookie was read as a session on a server with nothing to sign in to",
+    );
+    assert!(
+        signed_in["subject"].is_null() && signed_in["csrf"].is_null(),
+        "with logins off there is still no name and no session's value to give: {signed_in}",
     );
 
     served.stop().await;
