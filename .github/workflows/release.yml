@@ -19,6 +19,8 @@ on:
       - dev/fixtures/**
       - packaging/**
       - crates/featherbittorrent/Cargo.toml
+      - web/**
+      - Dockerfile
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -90,12 +92,16 @@ jobs:
   # dev/check-linux-binary.sh refuses a binary that asks for a newer symbol than that floor. The rustup
   # toolchain installs into the job. gcc, make and pkgconf are what ring's C build needs; rpm, cpio and
   # findutils are what cargo-generate-rpm and the .rpm checks shell out to, and binutils provides the ar
-  # the .deb is read with.
+  # the .deb is read with. The variant axis is the two builds every release ships: full turns on the
+  # web-ui cargo feature and embeds the built web UI, headless is the build without it. The full variant
+  # builds the front end first, because build.rs reads web/dist and refuses to compile the server crate
+  # without the built page in it.
   linux:
-    name: linux-${{ matrix.arch }}
+    name: linux-${{ matrix.variant }}-${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
+        variant: [full, headless]
         include:
           - arch: x86_64
             runner: ubuntu-24.04
@@ -121,40 +127,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-${{ matrix.arch }}
+          key: linux-${{ matrix.variant }}-${{ matrix.arch }}
+      # The full build embeds web/dist; the headless build does not, and the npm setup below would be
+      # wasted work for it, so it runs only when the variant is full. The node action is pinned to the
+      # same node-version as ci.yml, and the cache key follows web/package-lock.json, so a front end
+      # change rebuilds the front end in every job that needs one.
+      - if: matrix.variant == 'full'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: matrix.variant == 'full'
+        name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
       # Pinned, and installed from the tool's own lockfile, so a release does not change because a
       # dependency of the packaging tool gained a version. The same pins ../terminal releases with.
       - name: Install packaging tools
         run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
       # Builds, packages as .deb, .rpm and .tar.gz, holds the binary to the glibc floor and the NEEDED
       # allow list, and proves that no package carries a maintainer script or a file a service manager
-      # would pick up. It prints the paths it wrote, and each one beside its own .sha256.
+      # would pick up. It prints the paths it wrote, and each one beside its own .sha256. The variant is
+      # the last argument, which is what dev/test-packaging.sh exercises against the unknown-variant
+      # refusal (exit 2).
       - name: Package
-        run: bash dev/package-linux.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
+        run: bash dev/package-linux.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}" "${{ matrix.variant }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: featherbittorrent-linux-${{ matrix.arch }}
+          # The artifact name must be distinct per variant, and the headless variant's name carries
+          # -headless after featherbittorrent, which is what the headless archive's own name spells out.
+          name: featherbittorrent-${{ matrix.variant }}-linux-${{ matrix.arch }}
           if-no-files-found: error
           path: |
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb.sha256
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm.sha256
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb.sha256
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm.sha256
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
 
   # Every Linux artifact is installed, run and removed in a clean container of the system it claims to
   # serve, before anything is published: debian:12 and debian:13 stand in for Raspberry Pi OS 12 and 13
   # (same userland; Raspberry Pi publishes no container image), ubuntu:22.04 is the oldest .deb glibc,
   # fedora:41 and rockylinux:9 are the .rpm systems, and ubuntu:22.04 again puts the .tar.gz through the
   # same CLI smoke. fail-fast is off so one sick image cannot hide the state of the others, and the runner
-  # follows the architecture so each package runs natively: a container image is not emulated here.
+  # follows the architecture so each package runs natively: a container image is not emulated here. The
+  # variant axis is what the artifact was built from: the smoke looks for the variant's package name and
+  # the variant's archive name, and the CLI smoke checks that the binary's own version string names that
+  # variant, so an artifact holding the other variant's binary fails here rather than at install time.
   linux-smoke:
-    name: linux smoke ${{ matrix.arch }} ${{ matrix.target.format }} ${{ matrix.target.image }}
+    name: linux smoke ${{ matrix.variant }} ${{ matrix.arch }} ${{ matrix.target.format }} ${{ matrix.target.image }}
     needs: linux
     strategy:
       fail-fast: false
       matrix:
+        variant: [full, headless]
         arch: [x86_64, aarch64]
         target:
           - { image: "debian:12", format: deb }
@@ -179,21 +206,29 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
-          name: featherbittorrent-linux-${{ matrix.arch }}
+          name: featherbittorrent-${{ matrix.variant }}-linux-${{ matrix.arch }}
           path: dist
       # Checksum, minimal install, where the files landed, nothing installed or enabled a service, the CLI
-      # smoke, then removal with the user's config left behind. One line per check on stdout.
+      # smoke, then removal with the user's config left behind. One line per check on stdout. The variant
+      # is the last argument, and the smoke's own version check is the exact one: the binary's version
+      # string has to name the build this smoke is running against.
       - name: Install, run and remove
-        run: bash dev/smoke-linux.sh "${{ matrix.target.format }}" dist "${{ needs.linux.outputs.version }}"
+        run: bash dev/smoke-linux.sh "${{ matrix.target.format }}" dist "${{ needs.linux.outputs.version }}" "${{ matrix.variant }}"
 
   # One universal archive from both Apple-silicon and Intel builds. dev/package-macos.sh joins the slices
   # with lipo, checks which architectures are really in the result and whether its signature verifies,
   # generates the man pages and completions from the joined binary, ships the docs and the launchd example
   # as files only, and finishes with dev/smoke-cli.sh against a fresh extraction. The runner is Apple
   # silicon, so that smoke runs the arm64 slice; the x86_64 slice is checked by lipo -archs in the script
-  # and by the Intel machine that downloads it.
+  # and by the Intel machine that downloads it. The variant axis is what the archive holds: full turns on
+  # the web-ui feature (and builds the front end first, because build.rs reads web/dist), headless is the
+  # build without it.
   macos:
-    name: macos-universal
+    name: macos-${{ matrix.variant }}-universal
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, headless]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -206,28 +241,44 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-universal
-      # The script is its own smoke, so there is nothing left to check between it and the upload.
+          key: macos-${{ matrix.variant }}-universal
+      # The front end, in full builds only: headless embeds nothing, so the npm setup would be wasted.
+      - if: matrix.variant == 'full'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: matrix.variant == 'full'
+        name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
+      # The script is its own smoke, so there is nothing left to check between it and the upload. The
+      # variant is the second argument, which is what the script's own argument checks exercise.
       - name: Package and smoke
-        run: bash dev/package-macos.sh "${{ steps.version.outputs.version }}"
+        run: bash dev/package-macos.sh "${{ steps.version.outputs.version }}" "${{ matrix.variant }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: featherbittorrent-macos-universal
+          # The artifact name is distinct per variant, and the headless archive's own name carries
+          # -headless after featherbittorrent, which is what the upload's file list spells out.
+          name: featherbittorrent-${{ matrix.variant }}-macos-universal
           if-no-files-found: error
           path: |
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz.sha256
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz.sha256
 
   # The Windows archives build for the runner's own arch on native runners of each arch. -Target is named
   # on the cargo command line (see dev/package-windows.ps1), which is why this step installs that target:
   # under an x64 pwsh emulated on the ARM runner, the architecture the machine reports is not something a
   # build default can be trusted to turn into the right binary. The script zips, hashes and then smokes its
-  # own archive through dev/smoke-cli.ps1, so nothing else here runs the exe.
+  # own archive through dev/smoke-cli.ps1, so nothing else here runs the exe. The variant axis is what the
+  # zip holds: full turns on the web-ui feature (and builds the front end first, because build.rs reads
+  # web/dist), headless is the build without it.
   windows:
-    name: windows-${{ matrix.arch }}
+    name: windows-${{ matrix.variant }}-${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
+        variant: [full, headless]
         include:
           - arch: x86_64
             runner: windows-latest
@@ -248,25 +299,38 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-${{ matrix.arch }}
+          key: windows-${{ matrix.variant }}-${{ matrix.arch }}
+      # The front end, in full builds only: headless embeds nothing, so the npm setup would be wasted.
+      - if: matrix.variant == 'full'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: matrix.variant == 'full'
+        name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
       - name: Package and smoke the zip
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TARGET: ${{ matrix.target }}
-        run: ./dev/package-windows.ps1 -Version $env:VERSION -Target $env:TARGET
+          VARIANT: ${{ matrix.variant }}
+        run: ./dev/package-windows.ps1 -Version $env:VERSION -Target $env:TARGET -Variant $env:VARIANT
       - uses: actions/upload-artifact@v4
         with:
-          name: featherbittorrent-windows-${{ matrix.arch }}
+          # The artifact name is distinct per variant, and the headless zip's own folder name carries
+          # -headless after featherbittorrent, which is what the upload's file list spells out.
+          name: featherbittorrent-${{ matrix.variant }}-windows-${{ matrix.arch }}
           if-no-files-found: error
           path: |
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
-            target/dist/featherbittorrent-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip.sha256
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.zip.sha256
 
   # One release with every system's packages and archives plus the SBOM, published only when every job
   # passed: any failing build or smoke test skips this one, so nothing untested is published. Only a tag
   # push publishes; a pull request or manual run builds and checks, never releases. The release is made as
-  # a draft, gets all 19 files, and only then is published, so a failed upload never leaves a half-published
+  # a draft, gets all 38 files, and only then is published, so a failed upload never leaves a half-published
   # release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
@@ -284,11 +348,15 @@ jobs:
       NOTES: >-
         `.deb` for Debian, Ubuntu and Raspberry Pi OS 64-bit (12 or newer), `.rpm` for Fedora and the RHEL 9
         family, and `.tar.gz` for any other Linux with glibc 2.34 or newer, each built for x86_64 and for
-        aarch64; macOS gets one universal `.tar.gz`, Windows a `.zip` for x86_64 and one for arm64. A
-        `.sha256` sits beside every file, so `sha256sum -c` checks what was downloaded. No package installs,
-        enables or starts a service; `docs/autostart.md` shows how to run `serve` under systemd, launchd or
-        Windows Task Scheduler. `featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json` is this
-        release's CycloneDX SBOM.
+        aarch64; macOS gets one universal `.tar.gz` per variant, Windows a `.zip` for x86_64 and one for
+        arm64. Every variant ships in two builds: the full build, `featherbittorrent`, carries the web UI
+        and is the one to install for a server that serves the browser; the headless build,
+        `featherbittorrent-headless`, carries no front end and is the one to install for a server that the
+        TUI alone drives. A `.sha256` sits beside every file, so `sha256sum -c` checks what was downloaded.
+        No package installs, enables or starts a service; `docs/autostart.md` shows how to run `serve`
+        under systemd, launchd or Windows Task Scheduler, and `docs/web-ui.md` covers the full build's
+        browser sign-in and the off switch. `featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json`
+        is this release's CycloneDX SBOM.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -315,18 +383,36 @@ jobs:
           dist/featherbittorrent-$VERSION-linux-x86_64.rpm.sha256
           dist/featherbittorrent-$VERSION-x86_64-unknown-linux-gnu.tar.gz
           dist/featherbittorrent-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256
+          dist/featherbittorrent-headless-$VERSION-linux-x86_64.deb
+          dist/featherbittorrent-headless-$VERSION-linux-x86_64.deb.sha256
+          dist/featherbittorrent-headless-$VERSION-linux-x86_64.rpm
+          dist/featherbittorrent-headless-$VERSION-linux-x86_64.rpm.sha256
+          dist/featherbittorrent-headless-$VERSION-x86_64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-headless-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256
           dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz
           dist/featherbittorrent-$VERSION-universal-apple-darwin.tar.gz.sha256
+          dist/featherbittorrent-headless-$VERSION-universal-apple-darwin.tar.gz
+          dist/featherbittorrent-headless-$VERSION-universal-apple-darwin.tar.gz.sha256
           dist/featherbittorrent-$VERSION-x86_64-pc-windows-msvc.zip
           dist/featherbittorrent-$VERSION-x86_64-pc-windows-msvc.zip.sha256
+          dist/featherbittorrent-headless-$VERSION-x86_64-pc-windows-msvc.zip
+          dist/featherbittorrent-headless-$VERSION-x86_64-pc-windows-msvc.zip.sha256
           dist/featherbittorrent-$VERSION-linux-aarch64.deb
           dist/featherbittorrent-$VERSION-linux-aarch64.deb.sha256
           dist/featherbittorrent-$VERSION-linux-aarch64.rpm
           dist/featherbittorrent-$VERSION-linux-aarch64.rpm.sha256
           dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz
           dist/featherbittorrent-$VERSION-aarch64-unknown-linux-gnu.tar.gz.sha256
+          dist/featherbittorrent-headless-$VERSION-linux-aarch64.deb
+          dist/featherbittorrent-headless-$VERSION-linux-aarch64.deb.sha256
+          dist/featherbittorrent-headless-$VERSION-linux-aarch64.rpm
+          dist/featherbittorrent-headless-$VERSION-linux-aarch64.rpm.sha256
+          dist/featherbittorrent-headless-$VERSION-aarch64-unknown-linux-gnu.tar.gz
+          dist/featherbittorrent-headless-$VERSION-aarch64-unknown-linux-gnu.tar.gz.sha256
           dist/featherbittorrent-$VERSION-aarch64-pc-windows-msvc.zip
           dist/featherbittorrent-$VERSION-aarch64-pc-windows-msvc.zip.sha256
+          dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip
+          dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip.sha256
           dist/featherbittorrent-$VERSION.cdx.json
           EOF
           missing=0
@@ -336,10 +422,30 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-          # Six files per Linux architecture (deb, rpm and the archive, each with its checksum), two for
-          # macOS, four for the two Windows zips, and the SBOM. A name that changed in a packaging script
-          # without changing here means a download nobody uploaded.
-          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 19 ]
+          # The expected count comes from the build matrix, not from a remembered number: 2 Linux
+          # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
+          # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
+          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM.
+          # The heredoc above must list exactly that many lines, and dist/ must hold exactly that
+          # many files; a line added or dropped in either place is caught here.
+          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 ))
+          listed="$(wc -l < "$RUNNER_TEMP/release-files")"
+          echo "release file list holds $listed files, expected $expected"
+          [ "$listed" -eq "$expected" ]
+          present="$(find dist -maxdepth 1 -type f | wc -l)"
+          echo "dist/ holds $present files, expected $expected"
+          [ "$present" -eq "$expected" ]
+          # Any file in dist/ that is not in the heredoc is a stray: name it and fail, so a script
+          # that writes a new artifact without updating the list is caught here rather than at the
+          # upload step.
+          strays=0
+          while read -r f; do
+            if ! grep -qxF "$f" "$RUNNER_TEMP/release-files"; then
+              echo "::error::in dist/ but not in the release list: $f"
+              strays=1
+            fi
+          done < <(cd dist && find . -maxdepth 1 -type f | sed "s|^\./|dist/|" | sort)
+          [ "$strays" -eq 0 ] || exit 1
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |

@@ -30,12 +30,18 @@
 .EXAMPLE
     ./dev/package-windows.ps1 0.1.0 aarch64-pc-windows-msvc
 
-    The same thing positionally: the two parameters bind in declaration order. The workflow passes them by
+    The same thing positionally: the parameters bind in declaration order. The workflow passes them by
     name.
+
+.DESCRIPTION
+    -Variant picks the build the zip holds: full (the default) turns on the web-ui cargo feature and
+    embeds the built web UI, and headless is the build without it. The zip's one top-level folder carries
+    -headless for the headless build, full the plain name; both hold the same files.
 #>
 param(
     [Parameter(Mandatory)] [string] $Version,
-    [Parameter(Mandatory)] [string] $Target
+    [Parameter(Mandatory)] [string] $Target,
+    [string] $Variant = 'full'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +102,9 @@ $ArchitectureOfTarget = @{
 if (-not $ArchitectureOfTarget.ContainsKey($Target)) {
     Write-Failure "-Target must be x86_64-pc-windows-msvc or aarch64-pc-windows-msvc (got '$Target')"
 }
+if ($Variant -cne 'full' -and $Variant -cne 'headless') {
+    Write-Failure "-Variant must be full or headless (got '$Variant')"
+}
 
 if (-not $IsWindows) { Write-Failure 'package-windows.ps1 runs on Windows only' }
 $architecture = $env:PROCESSOR_ARCHITECTURE
@@ -108,7 +117,9 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $root
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
 $dist = Join-Path $root 'target\dist'
-$name = "featherbittorrent-$Version-$Target"
+# full is the release name and the default; headless carries -headless in the folder and zip names.
+if ($Variant -ceq 'headless') { $prefix = 'featherbittorrent-headless' } else { $prefix = 'featherbittorrent' }
+$name = "$prefix-$Version-$Target"
 $zip = Join-Path $dist "${name}.zip"
 $hashPath = "${zip}.sha256"
 # The build below names -Target, so its output lands under the triple's own directory.
@@ -123,7 +134,11 @@ try {
     # emulated on an ARM runner PROCESSOR_ARCHITECTURE reports AMD64, so the check above cannot tell which
     # architecture a toolchain would build for; naming it puts the exe in target\<target>\release, where a
     # build of the wrong architecture lands in a directory this script never reads.
-    $buildArgs = @('build', '--locked', '--release', '-p', 'featherbittorrent', '--target', $Target)
+    # The feature decides which build the zip holds; the variant must match what the exe's smoke prints,
+    # whole string, so a zip built from the wrong tree is refused at the end rather than published.
+    $buildArgs = @('build', '--locked', '--release', '-p', 'featherbittorrent')
+    if ($Variant -ceq 'full') { $buildArgs += @('--features', 'web-ui') }
+    $buildArgs += @('--target', $Target)
     Invoke-Native cargo $buildArgs 'cargo build'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { Write-Failure "cargo did not write $exe" }
 
@@ -211,11 +226,13 @@ try {
     Write-Host 'ok: register-task.ps1 parses'
 
     # The same smoke every other artifact passes through, on the binary this archive shipped. It is what
-    # checks the version, so a mismatch here means the artifact and the release disagree.
+    # checks the version, so a mismatch here means the artifact and the release disagree. -Variant is the
+    # build this zip holds, and the smoke's version check compares the binary's own marker against it, so a
+    # zip holding the other variant's binary fails here rather than at download time.
     $scratch = Join-Path $work 'smoke-home'
     New-Item -ItemType Directory -Path $scratch -Force | Out-Null
     & (Join-Path $PSScriptRoot 'smoke-cli.ps1') -Binary (Join-Path $extract "$name\featherbittorrent.exe") `
-        -Version $Version -Scratch $scratch
+        -Version $Version -Scratch $scratch -Variant $Variant
     if ($LASTEXITCODE -ne 0) { Write-Failure "dev/smoke-cli.ps1 failed with exit code $LASTEXITCODE" }
 
     Remove-Item -LiteralPath $stage -Recurse -Force

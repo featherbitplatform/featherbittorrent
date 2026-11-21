@@ -48,12 +48,11 @@ library. `server.auth.enabled` stays on.
 
 - **Browsers** sign in at the gateway: `openid-connect` with `bearer_only: false`, the interactive
   Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people). This half is
-  wired for the web UI featherbittorrent has not got yet, and it is worth being plain about what that means
-  today: there is no browser client to serve. A browser pointed at `/api` gets nothing out of it - without a
-  credential either door recognises it stops with a `401` at the gateway, and a browser that does get through
-  (a bearer token the gateway accepts, say) still meets featherbittorrent's own sign-in on the other side,
-  which a browser session is not an answer to: `401` again, this time from the server. What setup 2 serves
-  today is the TUI.
+  the web UI's door in the full build: the browser completes the gateway's flow and then reaches
+  featherbittorrent's page, which signs in at the server as its own session (see
+  [docs/web-ui.md](web-ui.md)). A browser pointed at `/api` alone gets nothing out of the API without a
+  credential either door recognises; the page is the client that turns the gateway's sign-in into a
+  session the server keeps.
 - **The TUI** carries an API key the gateway reads before it looks at anything else, and then signs in to
   featherbittorrent as it always has. One `multi-auth` node accepts either credential on one route: its
   `key-auth` sub-plugin is tried first, and a request with no key there has only failed one attempt, so
@@ -184,6 +183,13 @@ A warning that belongs here, not in a footnote: with logins off the server alway
 address as the host name, and no gateway sits in front of an address someone types straight into the
 browser at the server's port. If the bind is reachable beyond loopback, firewall that port to the
 gateway (and any machines you mean to share it with), or turn logins back on.
+
+This is also the setup the full build's web UI wants behind a gateway: the page signs in at the server,
+and the server must not have a login of its own to stand in the way. A gateway that forwards its own
+`Authorization` header onward needs featherbittorrent's logins off for exactly this reason: the server
+reads any `Authorization` header as its own credential, so a bearer token the gateway sent would be
+checked as a login and fail. The web UI's own sign-in and the off switch are in
+[docs/web-ui.md](web-ui.md).
 
 ## Streaming to a player
 
