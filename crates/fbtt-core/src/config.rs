@@ -865,6 +865,21 @@ mod tests {
         }
     }
 
+    /// The value `key` names in `text`, when a line of it names that key: the line, trimmed of its
+    /// indentation, has to start `key:`. This asks about the YAML's own keys, which a plain
+    /// `contains` on the whole file cannot: the same words turn up inside values, and the scratch
+    /// test directory named after a key reaches a saved config as part of the `download_dir` value
+    /// on any host with no Downloads folder for the default to name instead. `None` is what "no
+    /// line names this key" looks like.
+    fn yaml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        text.lines().find_map(|line| {
+            line.trim_start()
+                .strip_prefix(key)
+                .and_then(|named| named.strip_prefix(':'))
+                .map(|value| value.trim())
+        })
+    }
+
     /// What a first run saves is what the next run reads back.
     #[test]
     fn defaults_round_trip() {
@@ -1434,12 +1449,16 @@ mod tests {
         // file the save wrote.
         chosen.save(&path).expect("save the chosen config");
         let written = fs::read_to_string(&path).expect("read the save back");
-        assert!(
-            written.contains("web_ui: false"),
+        // Asked as YAML keys, not as words anywhere in the file: this file also names the scratch
+        // folder it was saved from, and that folder is named after this test.
+        assert_eq!(
+            yaml_value(&written, "web_ui"),
+            Some("false"),
             "the switch is written back as the config has it: {written}"
         );
-        assert!(
-            written.contains("cookie_secure: always"),
+        assert_eq!(
+            yaml_value(&written, "cookie_secure"),
+            Some("always"),
             "the cookie rule is spelled in lowercase: {written}"
         );
         let ConfigLoad::Loaded(again) = Config::load(&paths).expect("read the save back") else {
@@ -1458,12 +1477,14 @@ mod tests {
             .save(&path)
             .expect("save a config that chose neither key");
         let written = fs::read_to_string(&path).expect("read the silent save back");
-        assert!(
-            !written.contains("web_ui"),
+        assert_eq!(
+            yaml_value(&written, "web_ui"),
+            None,
             "no switch line for a config that never chose one: {written}"
         );
-        assert!(
-            !written.contains("cookie_secure"),
+        assert_eq!(
+            yaml_value(&written, "cookie_secure"),
+            None,
             "no cookie line for the rule nobody changed: {written}"
         );
     }
@@ -1491,8 +1512,12 @@ mod tests {
         config.save(&path).expect("save a settings-only config");
 
         let written = fs::read_to_string(&path).expect("read the file back");
-        assert!(
-            !written.contains("server"),
+        // A `server:` line, not the word anywhere in the file: this scratch folder is named after
+        // a server that is absent, and on a host without a Downloads folder the file carries that
+        // name in its `download_dir` value.
+        assert_eq!(
+            yaml_value(&written, "server"),
+            None,
             "no server section appears in a config that never chose one: {written}"
         );
         let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("read it back") else {

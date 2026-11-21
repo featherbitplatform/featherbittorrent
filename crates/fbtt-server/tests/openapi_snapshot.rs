@@ -4,7 +4,8 @@
 //! stale the moment the routes move. What is checked here is that it has not: a server is started, the
 //! document is fetched from `GET /api/v1/openapi.json` - the one route fbt-api answers without a credential,
 //! which is what a browser that has not signed in yet fetches - and the response, pretty-printed with a
-//! trailing newline, is compared with the file byte for byte. A difference in formatting counts as a
+//! trailing newline, is compared with the file byte for byte, after the one thing a checkout can change
+//! without anybody editing the file (a `\r\n` where the file holds `\n`; see the comparison below). A difference in formatting counts as a
 //! difference in content for the same reason a difference in content does: the generated types are made from
 //! the file, so the file has to say exactly what the server says.
 //!
@@ -91,6 +92,23 @@ fn http() -> reqwest::Client {
         .expect("an http client")
 }
 
+/// The file's bytes with a checkout's line-ending translation undone: every `\r\n` pair becomes
+/// `\n`, and a `\r` that is not part of a pair is left alone. Used on the file's side of the
+/// comparison only, for checkouts made before the root `.gitattributes` pinned this file to LF;
+/// see [`the_web_ui_has_the_current_api_document`].
+fn with_lf_endings(bytes: &[u8]) -> Vec<u8> {
+    let mut folded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+            index += 1;
+        }
+        folded.push(bytes[index]);
+        index += 1;
+    }
+    folded
+}
+
 /// The document as this server serves it, pretty-printed with a trailing newline: the exact bytes the file
 /// holds, so a reformat and a change of content fail the same way.
 ///
@@ -150,10 +168,16 @@ async fn the_web_ui_has_the_current_api_document() {
         std::fs::write(&file, served.as_bytes()).expect("write the document");
     } else {
         // Read as bytes, not as text: the comparison is byte-exact, and the file is bytes the server
-        // wrote, so anything the two disagree about - a CR left by an editor, a re-encoding, one space of
-        // indentation - has to fail here rather than be smoothed over on the way in.
+        // wrote, so anything the two disagree about - a lone CR, a re-encoding, one space of
+        // indentation - has to fail here rather than be smoothed over on the way in. The one thing
+        // that is folded is `\r\n` into `\n`, and on the file's side only: a checkout made before the
+        // root `.gitattributes` pinned this file to LF holds the CRLF line endings Git checks text
+        // files out with on Windows, and that checkout is older than the fix, so the test has to
+        // tolerate exactly those endings and nothing else. With the attribute in place every fresh
+        // checkout carries the LF the file is committed with, and the fold changes nothing.
         let on_disk = std::fs::read(&file)
             .unwrap_or_else(|e| panic!("{DOC_PATH} could not be read: {e}. {OUT_OF_DATE}"));
+        let on_disk = with_lf_endings(&on_disk);
         let served = served.as_bytes();
         // Both sides are hundreds of kilobytes, so the failure says where they part company instead of
         // printing two documents at the person.

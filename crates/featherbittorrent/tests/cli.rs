@@ -75,8 +75,12 @@ fn settings_saved_library_offers_no_server_when_locked() {
     saved.limits.download_kib = 512;
     saved.save(&config_path).expect("save a settings config");
     let written = fs::read_to_string(&config_path).expect("read the file back");
+    // The question is whether the file names a `server:` key, not whether the word `server`
+    // appears anywhere in it: the other lines carry paths, and a path may say `server`.
     assert!(
-        !written.contains("server"),
+        !written
+            .lines()
+            .any(|line| line.trim_start().starts_with("server:")),
         "a settings save wrote no server section: {written}"
     );
 

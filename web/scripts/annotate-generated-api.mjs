@@ -10,6 +10,7 @@
 // looks like here.
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +21,10 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const project = join(here, '..');
 const target = join(project, 'src/api/schema.ts');
+
+// This file is an ES module, so the CommonJS resolver exists only through `createRequire`. It is
+// how the typecheck below finds the compiler to run, package-relative, rather than by PATH.
+const require = createRequire(import.meta.url);
 
 const header = readFileSync(target, 'utf8');
 const banner = header.split('\n').slice(0, 4).join('\n');
@@ -44,16 +49,18 @@ const withoutMarker = header.includes(MARKER)
   : header;
 
 function typecheck() {
-  // The project is named by the config file inside it and found by the working directory, so the only
-  // things on the command line are `npx` and `tsc` and their flags. That matters because Node hands a
-  // shell its arguments unquoted - it turns quoting off for `cmd.exe` - and an absolute folder path
-  // would be one more thing for a shell to split on a space. The shell is asked for only where it is
-  // needed: `npx` is an executable on Unix and a `.cmd` shim on Windows, and Windows will not start a
-  // `.cmd` without one.
-  const run = spawnSync('npx', ['tsc', '-p', '.', '--pretty', 'false'], {
+  // The compiler runs from its own package, started by the very node process running this script,
+  // rather than through `npx`: `npx` is an executable on Unix and a `.cmd` shim on Windows, and
+  // starting a `.cmd` needs a shell - the thing this script must not ask for. The CLI script's path
+  // is the one the `typescript` package declares in its `bin` entry (`bin/tsc`), found through
+  // Node's own package resolution rather than by name on PATH. With no shell there is nothing to
+  // split arguments on, so naming that absolute path is safe, and the project keeps being named
+  // the same way it always was: by the config file inside it, found from the working directory,
+  // with `-p .` and `--pretty false` as unchanged as the diagnostics read out of the pipes.
+  const tsc = require.resolve('typescript/bin/tsc');
+  const run = spawnSync(process.execPath, [tsc, '-p', '.', '--pretty', 'false'], {
     cwd: project,
     encoding: 'utf8',
-    shell: process.platform === 'win32',
   });
   const diagnostics = `${run.stdout ?? ''}${run.stderr ?? ''}`;
   return {
