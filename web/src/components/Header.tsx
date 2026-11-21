@@ -41,7 +41,7 @@ export interface HeaderProps {
   onSignOut(): void
 }
 
-/** The pill's words while a retry pause is running: it counts down once per second and, when the pause is spent, says the retry is happening rather than showing a frozen number. A fresh `key` for each new pause restarts the count from the number the loop just reported. */
+/** The pill's words while a retry pause is running: it counts down once per second and, when the pause is spent, says the retry is happening rather than showing a frozen number. The header keys it on the loop's failure count rather than on the pause, because the top of the ladder repeats: two 30-second pauses in a row are two failures, and the second one starts its count over instead of inheriting the first one's spent zero. */
 function PauseCountdown({ retryIn }: { retryIn: number }) {
   const [secondsLeft, setSecondsLeft] = useState(retryIn)
   useEffect(() => {
@@ -84,7 +84,7 @@ export default function Header({
       <div className="flex items-center gap-2 rounded-control border border-rule bg-surface px-2.5 py-1">
         <span aria-hidden="true" className={`h-2 w-2 rounded-full ${lost ? 'bg-error' : 'bg-connection'}`} />
         <span className={`text-[13px] font-medium ${lost ? 'text-error' : 'text-strong'}`}>
-          {lost ? <PauseCountdown key={link.retryIn} retryIn={link.retryIn} /> : 'Connected'}
+          {lost ? <PauseCountdown key={link.attempt} retryIn={link.retryIn} /> : 'Connected'}
         </span>
       </div>
 

@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { cleanup, render } from '@testing-library/react'
-import { afterEach, expect, it } from 'vitest'
+import { act, cleanup, render } from '@testing-library/react'
+import { afterEach, expect, it, vi } from 'vitest'
 import Header from './Header'
+import type { HeaderProps } from './Header'
 
 afterEach(cleanup)
 
@@ -11,18 +12,19 @@ const ENGINE_VERSION = '0.11.1'
 const headerText = (container: HTMLElement): string =>
   container.querySelector('header')?.textContent ?? ''
 
+const headerProps = (over: Partial<HeaderProps>): HeaderProps => ({
+  engineVersion: ENGINE_VERSION,
+  link: { phase: 'live' },
+  totalDown: 1_234,
+  totalUp: 5_678,
+  dhtNodes: 123,
+  signedIn: true,
+  onSignOut: () => {},
+  ...over,
+})
+
 function renderHeader(dhtNodes: number | null) {
-  return render(
-    <Header
-      engineVersion={ENGINE_VERSION}
-      link={{ phase: 'live' }}
-      totalDown={1_234}
-      totalUp={5_678}
-      dhtNodes={dhtNodes}
-      signedIn
-      onSignOut={() => {}}
-    />,
-  )
+  return render(<Header {...headerProps({ dhtNodes })} />)
 }
 
 it('the_header_version_is_the_apps_own', () => {
@@ -66,4 +68,39 @@ it('the_header_version_is_the_apps_own', () => {
     headerText(nullDht).includes('DHT 0'),
     'no DHT count when the server gives null',
   ).toBe(true)
+})
+
+it('the_countdown_restarts_on_equal_pauses', () => {
+  // The ladder ends 30, 30, 30: two consecutive failures can carry the same pause. What must
+  // restart the count is the failure - the loop's per-round count, which `live.ts` puts on every
+  // lost report as `attempt` - not the pause's number, or the second 30 s pause keeps the first
+  // one's spent zero and the pill sticks at "Reconnecting..." for the whole wait.
+  vi.useFakeTimers()
+  try {
+    const { container, rerender } = render(
+      <Header {...headerProps({ link: { phase: 'lost', retryIn: 30, attempt: 1 } })} />,
+    )
+    expect(
+      headerText(container).includes('Reconnecting in 30 s'),
+      'the first 30 s failure did not start its countdown at 30 s',
+    ).toBe(true)
+
+    act(() => {
+      vi.advanceTimersByTime(30_000)
+    })
+    expect(
+      headerText(container).includes('Reconnecting...'),
+      'the first pause did not end in the retry message',
+    ).toBe(true)
+
+    // The next failure, same pause and a new count: the pill starts over, not from the zero the
+    // first pause left behind.
+    rerender(<Header {...headerProps({ link: { phase: 'lost', retryIn: 30, attempt: 2 } })} />)
+    expect(
+      headerText(container).includes('Reconnecting in 30 s'),
+      "the second 30 s pause kept the first pause's spent count instead of restarting the countdown",
+    ).toBe(true)
+  } finally {
+    vi.useRealTimers()
+  }
 })

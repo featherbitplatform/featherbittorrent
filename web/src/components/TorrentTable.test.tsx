@@ -201,6 +201,30 @@ describe('the windowed table', () => {
       nameCell.className.includes('truncate') && numberCell.className.includes('truncate'),
       'a cell was left free to wrap and change the row height',
     ).toBe(true)
+
+    // The state cell's dot-and-word span is a block-level 20 px flex box. An inline box whose
+    // first child is the empty dot - the dot is aria-hidden and holds no text - synthesises a
+    // baseline that enlarges the cell's line box past 20 px, and the row follows the tallest
+    // cell: that is how 40 quietly becomes 40.5 in a browser that lays tables out for real.
+    const stateSpan = stateCell.firstElementChild as HTMLElement
+    expect(
+      stateSpan.className.includes('flex') &&
+        stateSpan.className.includes('h-5') &&
+        !stateSpan.className.includes('inline-flex'),
+      'the state cell is drawn with an inline box that can synthesise a taller line box than the row',
+    ).toBe(true)
+
+    // No cell's content box hangs off an inline element the way the dot span once did: the
+    // progress bar's flex is a block-level div, and the header buttons live in the header, not
+    // in a row this table's arithmetic multiplies.
+    for (const cell of [nameCell, stateCell, numberCell]) {
+      for (const child of Array.from(cell.children)) {
+        expect(
+          !child.className.includes('inline-flex') && !child.className.includes('inline-block'),
+          `a cell hangs its content off an inline box (${child.className})`,
+        ).toBe(true)
+      }
+    }
   })
 })
 

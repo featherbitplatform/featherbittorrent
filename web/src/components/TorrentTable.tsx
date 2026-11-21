@@ -28,8 +28,11 @@
  * an inset shadow so it costs no height, and every cell `box-border` with the row height as its own
  * height and `leading-5` so one line of text is exactly 20 px. Padding 10, text 20, padding 10 is
  * then exactly 40: nothing a cell holds can exceed its declared 40, and a row is as tall as its
- * tallest cell, whole pixels at any zoom. Every cell `truncate` with the full text in a `title`
- * keeps it to that one line - a 255-character error is dots, not a wrapped paragraph.
+ * tallest cell, whole pixels at any zoom. The state cell's dot-and-word span is a block-level 20px
+ * flex box for that reason - an inline box with an empty first child synthesises a baseline taller
+ * than the text line, and that is how 40 quietly becomes 40.5. Every cell `truncate` with the full
+ * text in a `title` keeps it to that one line - a 255-character error is dots, not a wrapped
+ * paragraph.
  *
  * Rows are keyboard citizens, not click-only targets: each is focusable, Enter and Space pick it,
  * Arrow Up and Down move the selection through the current order, and the drawn window follows
@@ -252,13 +255,17 @@ export default function TorrentTable({
 
   // The document's side of the two-way street, in one effect that only writes to the DOM: make
   // the box's real position agree with where the drawn window is, and hand the focus to the
-  // selected row. State never moves here - it moves through this file's event handlers.
+  // selected row - with `preventScroll`, because the box's position is this component's business:
+  // the browser's own "scroll it into view" nudge would fight the explicit `scrollTop` above and
+  // the sticky header over it. State never moves here - it moves through this file's event handlers.
   useEffect(() => {
     const box = boxRef.current
     if (box !== null && box.scrollTop !== effectiveScroll) box.scrollTop = effectiveScroll
     if (selectedId === null) return
     const row = box?.querySelector<HTMLElement>(`[data-row="${CSS.escape(selectedId)}"]`)
-    if (row !== null && row !== undefined && row !== document.activeElement) row.focus()
+    if (row !== null && row !== undefined && row !== document.activeElement) {
+      row.focus({ preventScroll: true })
+    }
   }, [selectedId, effectiveScroll])
 
   function pick(id: string): void {
@@ -438,7 +445,8 @@ export default function TorrentTable({
                     className={`box-border h-10 leading-5 max-w-[190px] truncate px-5 py-2.5 ${rule}`}
                     title={stateText(row)}
                   >
-                    <span className={`inline-flex items-center gap-2 ${STATE_TEXT[row.rowState]}`}>
+                    {/* Block-level flex, deliberately not inline-flex: an inline box whose first child is the empty dot synthesises a baseline that enlarges the cell's line box past 20 px, and the row follows the tallest cell. */}
+                    <span className={`flex h-5 items-center gap-2 ${STATE_TEXT[row.rowState]}`}>
                       <span
                         aria-hidden="true"
                         className={`h-1.75 w-1.75 flex-none rounded-full ${BAR_BG[row.rowState]}`}

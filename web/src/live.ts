@@ -115,8 +115,8 @@ export function createLiveAnnouncer(store: SessionStore, regions: LiveRegions): 
 // The refresh loop
 // ---------------------------------------------------------------------------
 
-/** How the link to the server stands, as the header draws it: a retry pause of N seconds when it is lost. */
-export type LinkState = { phase: 'live' } | { phase: 'lost'; retryIn: number }
+/** How the link to the server stands, as the header draws it: a retry pause of N seconds when it is lost, and how many failed rounds in a row that notice follows - the header counts the pause down, and two consecutive rungs of the same length (the ladder ends 30, 30, 30) are still two failures with two counts of their own. */
+export type LinkState = { phase: 'live' } | { phase: 'lost'; retryIn: number; attempt: number }
 
 /** What one torrent is doing, spelled the terminal's way (`crates/fbtt-tui/src/view/mod.rs`'s `state_label`), after the mapping both TUI backends share. */
 export type RowState =
@@ -307,6 +307,10 @@ export function startLive(
   let rung = 0
   // Whether the link is lost right now: while it is, the backoff timer owns the next read and wakes do not apply.
   let linkLost = false
+  // Failed rounds reported in a row; a good read starts it over. The header keys its countdown on
+  // this number rather than on the pause, because the top of the ladder repeats and a repeated
+  // pause must still start its count again.
+  let attempt = 0
   // Two schedules this loop cannot cancel (`opts` has no clearTimeout), so each scheduled call
   // carries the generation it was scheduled under and a stale call is a no-op.
   let refreshGeneration = 0
@@ -354,6 +358,7 @@ export function startLive(
     if (ok) {
       rung = 0
       linkLost = false
+      attempt = 0
       onLink({ phase: 'live' })
       delay = permit ? 0 : opts.visibility() === 'hidden' ? SLOW_REFRESH_MS : REFRESH_MS
     } else {
@@ -362,7 +367,8 @@ export function startLive(
       linkLost = true
       const pause = rungAt(rung)
       rung = Math.min(rung + 1, BACKOFF_SECONDS.length - 1)
-      onLink({ phase: 'lost', retryIn: pause })
+      attempt += 1
+      onLink({ phase: 'lost', retryIn: pause, attempt })
       delay = pause * 1000
     }
     permit = false

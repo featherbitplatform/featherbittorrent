@@ -344,6 +344,8 @@ it('a_lost_server_keeps_the_rows_and_backs_off', async () => {
   expect(rowsSeen.length, 'the first read did not deliver its rows').toBe(1)
 
   // Failures walk the TUI's ladder: 1, 2, 4, 8, 16, 30, and 30 again rather than doubling on forever.
+  // Each report counts itself, too - the ladder's top repeats, and the header's countdown needs to
+  // know a 30 s pause is a second pause, not the first one's number shown twice.
   const ladder = [1, 2, 4, 8, 16, 30, 30]
   for (let attempt = 0; attempt < ladder.length; attempt += 1) {
     await w.advance(attempt === 0 ? 1_000 : ladder[attempt - 1] * 1_000)
@@ -353,6 +355,10 @@ it('a_lost_server_keeps_the_rows_and_backs_off', async () => {
     expect(
       last.phase === 'lost' && last.retryIn === ladder[attempt],
       `failure ${attempt + 1} should retry in ${ladder[attempt]} s on the 1, 2, 4, 8, 16, 30, 30 ladder`,
+    ).toBe(true)
+    expect(
+      last.phase === 'lost' && last.attempt === attempt + 1,
+      `failure ${attempt + 1} did not count itself as failure ${attempt + 1} for the countdown to key on`,
     ).toBe(true)
   }
 
@@ -383,7 +389,7 @@ it('a_lost_server_keeps_the_rows_and_backs_off', async () => {
   await w.settle()
   const after = links[links.length - 1]
   expect(
-    after.phase === 'lost' && after.retryIn === 1,
+    after.phase === 'lost' && after.retryIn === 1 && after.attempt === 1,
     'the retry ladder did not start over from one second after a good round',
   ).toBe(true)
 
