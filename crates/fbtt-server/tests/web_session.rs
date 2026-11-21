@@ -577,6 +577,47 @@ async fn sign_out_ends_the_cookie_session() {
     served.stop().await;
 }
 
+/// A browser cannot be made to sign out by a page it never visited: dropping its cookie is a change like any
+/// other, so the `DELETE` needs the session's own CSRF token, and being refused for want of one must not spend
+/// the session it was refused for.
+#[tokio::test]
+async fn sign_out_needs_the_csrf_token() {
+    let served = Served::start("web-sign-out-csrf", with_alice).await;
+    let client = http();
+    let (cookie, csrf) = sign_in(&served).await;
+    let url = served.url("/api/v1/auth/web-session");
+    let torrents = served.url("/api/v1/torrents");
+
+    let (status, code) = error_of(delete_with_cookie(&client, &url, &cookie, None).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a sign-out without its CSRF token was let through",
+    );
+    assert_eq!(code, "unauthorized");
+
+    // Refused before the route ran, so the session is still here: still readable, and still able to sign out
+    // the way it was meant to.
+    assert_eq!(
+        get_with_cookie(&client, &torrents, &cookie).await.status(),
+        StatusCode::OK,
+        "the refused sign-out took the session with it",
+    );
+    let signed_out = delete_with_cookie(&client, &url, &cookie, Some(&csrf)).await;
+    assert_eq!(
+        signed_out.status(),
+        StatusCode::NO_CONTENT,
+        "a session refused once will not sign out",
+    );
+    assert_eq!(
+        set_cookie_of(&signed_out),
+        "fbtt_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        "signing out takes the browser's copy away",
+    );
+
+    served.stop().await;
+}
+
 /// Sign-out ends the session the caller authenticated with, not whichever credential the route happens to look
 /// at first. A `DELETE` carrying a bearer header is a bearer call all the way through: the guard answers it
 /// from the header and never asks the cookie to prove itself, so a route that then revoked the cookie's session
