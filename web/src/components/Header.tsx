@@ -3,18 +3,21 @@
  *
  * The shape is the Torrents prototype's header strip: the mark and the word with the library's
  * version in mono beside them, a bordered pill that says whether the link is up (the connection
- * cyan, or the error red with the pause the refresh loop is waiting out), the total rates summed
- * over every row with the arrows muted and the numbers strong the way the terminal states them,
- * the DHT size where the server gives one, and the actions at the end. The Add torrent button is
- * the violet fill the plan names for the primary action, and it answers nothing yet: it is present
- * so the header is the header the finished screen will have. Sign out appears only when there is
- * a session to end, because on a server with logins off there is nobody signed in.
+ * cyan) or counts down the pause the refresh loop is waiting out in error red - and once the pause
+ * is spent, says `Reconnecting...` while the retry itself runs, so the pill is never a number
+ * frozen mid-second, the total rates summed over every row with the arrows muted and the numbers
+ * strong the way the terminal states them, the DHT size where the server gives one, and the
+ * actions at the end. The Add torrent button is the violet fill the plan names for the primary
+ * action, and it answers nothing yet: it is present so the header is the header the finished
+ * screen will have. Sign out appears only when there is a session to end, because on a server with
+ * logins off there is nobody signed in.
  *
  * Nothing here is remote text except the version, and that came from this server's own `/session`
  * route; the pill's words are this file's, built around a number.
  *
  * @module components/Header
  */
+import { useEffect, useState } from 'react'
 import { LogOut, Plus } from 'lucide-react'
 import { formatRate } from '../format'
 import type { LinkState } from '../live'
@@ -33,6 +36,21 @@ export interface HeaderProps {
   /** Whether there is a session to end. */
   signedIn: boolean
   onSignOut(): void
+}
+
+/** The pill's words while a retry pause is running: it counts down once per second and, when the pause is spent, says the retry is happening rather than showing a frozen number. A fresh `key` for each new pause restarts the count from the number the loop just reported. */
+function PauseCountdown({ retryIn }: { retryIn: number }) {
+  const [secondsLeft, setSecondsLeft] = useState(retryIn)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSecondsLeft((left) => (left > 0 ? left - 1 : 0))
+    }, 1_000)
+    return () => {
+      clearInterval(timer)
+    }
+  }, [])
+  if (secondsLeft <= 0) return <>Reconnecting...</>
+  return <>Reconnecting in {secondsLeft} s</>
 }
 
 export default function Header({
@@ -58,7 +76,7 @@ export default function Header({
       <div className="flex items-center gap-2 rounded-control border border-rule bg-surface px-2.5 py-1">
         <span aria-hidden="true" className={`h-2 w-2 rounded-full ${lost ? 'bg-error' : 'bg-connection'}`} />
         <span className={`text-[13px] font-medium ${lost ? 'text-error' : 'text-strong'}`}>
-          {lost ? `Reconnecting in ${link.retryIn} s` : 'Connected'}
+          {lost ? <PauseCountdown key={link.retryIn} retryIn={link.retryIn} /> : 'Connected'}
         </span>
       </div>
 

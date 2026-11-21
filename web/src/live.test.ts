@@ -144,12 +144,20 @@ function world() {
   let seq = 0
   const timers: { at: number; seq: number; fn: () => void }[] = []
   const streams: { stream: FakeStream; at: number }[] = []
+  const visibilityListeners: (() => void)[] = []
   const injected: LiveOptions = {
     now: () => nowMs,
     setTimeout: (fn: () => void, ms: number) => {
       timers.push({ at: nowMs + ms, seq: seq++, fn })
     },
     visibility: () => (hidden ? 'hidden' : 'visible'),
+    onVisibilityChange: (listener: () => void) => {
+      visibilityListeners.push(listener)
+      return () => {
+        const at = visibilityListeners.indexOf(listener)
+        if (at !== -1) visibilityListeners.splice(at, 1)
+      }
+    },
     eventSource: () => {
       const stream = new FakeStream()
       streams.push({ stream, at: nowMs })
@@ -184,7 +192,13 @@ function world() {
       hidden = true
     },
     show: () => {
+      // The browser only says "it changed"; the injector is what calls the listener, and only
+      // on the hidden-to-visible edge, the way `document` fires `visibilitychange`.
+      const wasHidden = hidden
       hidden = false
+      if (wasHidden) {
+        for (const listener of [...visibilityListeners]) listener()
+      }
     },
   }
 }
@@ -268,12 +282,51 @@ it('slows_to_ten_seconds_while_hidden', async () => {
   await w.advance(1)
   expect(answers.length, 'the hidden page did not read at ten seconds').toBe(3)
 
-  // Showing the page does not wait for the slow round to come round again: the next read is a second off.
+  // The page coming back into view wakes the loop at once: the read in flight finishes, the wake
+  // buys one extra read straight after it, and the second cadence follows from there.
   w.show()
   answers[2].resolve([])
   await w.settle()
   await w.advance(1_000)
   expect(answers.length, 'the visible page stayed on the slow cadence').toBe(4)
+
+  live.stop()
+})
+
+it('becoming_visible_refreshes_now', async () => {
+  const w = world()
+  const { answers, client } = roundRobinClient()
+  const live = startLive(client, () => {}, () => {}, w.injected)
+  await w.settle()
+  answers[0].resolve([])
+  await w.settle()
+
+  // Hide the page while a read is in flight: the cadence slows to ten seconds, and two seconds
+  // into the wait there is nothing new yet.
+  await w.advance(1_000)
+  w.hide()
+  answers[1].resolve([])
+  await w.settle()
+  await w.advance(2_000)
+  expect(answers.length, 'the hidden page read early').toBe(2)
+
+  // Coming back does not wait for the slow round: the listener wakes the loop, superseding the
+  // pending ten-second timer with a read right now.
+  w.show()
+  await w.advance(0)
+  expect(answers.length, 'becoming visible waited for the slow timer').toBe(3)
+
+  // And a wake that lands while a read is already in flight is coalesced exactly like an event:
+  // one extra read after the round in flight, not one per wake.
+  answers[2].resolve([])
+  await w.settle()
+  await w.advance(1_000) // the next second's read goes out and is still in flight
+  w.hide()
+  w.show()
+  answers[3].resolve([])
+  await w.settle()
+  await w.advance(0)
+  expect(answers.length, 'becoming visible while reading bought more than one extra read').toBe(5)
 
   live.stop()
 })
@@ -303,12 +356,23 @@ it('a_lost_server_keeps_the_rows_and_backs_off', async () => {
     ).toBe(true)
   }
 
+  // While a pause is running the backoff owns the next read: neither a stream event nor the page
+  // coming back into view cuts in front of the ladder.
+  const beforeWake = answers.length
+  w.streams[w.streams.length - 1].stream.emit('state_changed')
+  w.hide()
+  w.show()
+  await w.settle()
+  await w.advance(ladder[6] * 1_000 - 1)
+  expect(answers.length, 'a wake cut in front of the backoff pause').toBe(beforeWake)
+  await w.advance(1)
+  expect(answers.length, 'the backoff pause ended without a read going out').toBe(beforeWake + 1)
+
   // Through all of it the screen still shows the last good table: a failed round says nothing to onRows.
   expect(rowsSeen.length, 'a failed refresh dropped the rows the page already had').toBe(1)
   expect(rowsSeen[0][0].name, 'the rows that stayed are not the rows that arrived').toBe('Sintel (2010) 4K')
 
   // A good round is the ladder's reset: live at once, and the next failure starts from one second again.
-  await w.advance(30_000)
   answers[8].resolve([torrent({ id: 'keep-me', name: 'Sintel (2010) 4K' }), torrent({ id: 'new' })])
   await w.settle()
   expect(links[links.length - 1].phase, 'a good round did not bring the link back').toBe('live')
@@ -359,6 +423,10 @@ it('a_closed_event_stream_is_reopened_with_backoff', async () => {
   await w.advance(1_000)
   opens += 1
   expect(w.streams.length, 'a stream that opened again did not reset its reopen ladder').toBe(opens)
+  expect(
+    w.streams[w.streams.length - 1].at - w.streams[w.streams.length - 2].at,
+    'a stream that opened again did not start its reopen ladder over from one second',
+  ).toBe(1_000)
 
   live.stop()
   const lastStream = w.streams[w.streams.length - 1].stream

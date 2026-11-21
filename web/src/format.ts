@@ -41,24 +41,28 @@ const IS_MARK = /\p{M}/u
  * value reaches whole, so 999 KiB never reads as 0.9 MiB and a value that rounds up to a full
  * 1024.0 of its unit is one of the next unit instead.
  *
+ * Input is guarded the way the table needs it guarded: fractional bytes do not exist, so they are
+ * floored; a negative count, NaN, or an infinity is `0 B` rather than odd text.
+ *
  * Sizes beyond 2^53 lose exact tenths in plain JS numbers; the API answers integers that fit in a
  * number in practice, and every string stays a well-formed reading of whatever number came in.
  */
 export function formatBytes(bytes: number): string {
+  const amount = Number.isFinite(bytes) ? Math.max(0, Math.floor(bytes)) : 0
   let unit = 0
   let divisor = 1
-  while (unit + 1 < UNITS.length && bytes >= divisor * UNIT_STEP) {
+  while (unit + 1 < UNITS.length && amount >= divisor * UNIT_STEP) {
     unit += 1
     divisor *= UNIT_STEP
   }
 
   // The value in tenths of that unit, rounded half up: the divisor is a power of two, so half of
   // it is a whole number and this is the same arithmetic as the Rust original's integer math.
-  let tenths = Math.floor((bytes * 10 + Math.floor(divisor / 2)) / divisor)
+  let tenths = Math.floor((amount * 10 + Math.floor(divisor / 2)) / divisor)
   if (unit + 1 < UNITS.length && tenths >= ROUNDED_UP) {
     unit += 1
     divisor *= UNIT_STEP
-    tenths = Math.floor((bytes * 10 + Math.floor(divisor / 2)) / divisor)
+    tenths = Math.floor((amount * 10 + Math.floor(divisor / 2)) / divisor)
   }
 
   const whole = Math.floor(tenths / 10)

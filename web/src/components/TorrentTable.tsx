@@ -11,15 +11,25 @@
  *
  * Twenty rows render twenty rows; two thousand render a window of them. The box scrolls, the rows
  * below and above the window are replaced by two spacer rows sized to keep the scrollbar honest,
- * and the window moves with the scroll position. This is deliberately not a library: windowing a
- * `tbody` is one division and two spacer rows, and a library would cost more than the 2,000-row
- * table earns back. `viewportHeight` overrides the measured height for the same reason jsdom is a
- * poor place to measure anything: it has no layout.
+ * and the window moves with the scroll position minus the sticky header's height. This is
+ * deliberately not a library: windowing a `tbody` is one division and two spacer rows, and a
+ * library would cost more than the 2,000-row table earns back. `viewportHeight` overrides the
+ * measured height for the same reason jsdom is a poor place to measure anything: it has no layout.
+ * In a real browser the box's size is watched with a `ResizeObserver` (the `resize` event is the
+ * fallback where one is missing), so a banner appearing, the sidebar wrapping, or the phone
+ * turning sideways all move the window before the next read rather than after the next reload.
  *
- * The toolbar filter narrows by name, case-insensitively, over the displayed name. The headers
- * sort: one click orders the column, the next reverses it, and the toolbar says which column is in
- * charge the way the prototype does. Sorting uses the same display-safe names the rows show, so
- * what a filter finds and what a header orders are readings of the same thing.
+ * Every row is exactly `ROW_HEIGHT` tall, because the spacer arithmetic only tells the truth if
+ * it can multiply a constant: `border-separate` with zero spacing so a border never adds to a
+ * row, the rule drawn as an inset shadow so it costs no height, and every cell `truncate` with
+ * the full text in a `title` - a 255-character error is one line of dots, not a wrapped paragraph.
+ *
+ * Rows are keyboard citizens, not click-only targets: each is focusable, Enter and Space pick it,
+ * Arrow Up and Down move the selection through the current order, and the drawn window follows
+ * the chosen row until the reader scrolls away - the pin releases at the first real scroll. The
+ * sort starts where the server left it; one click orders a column, the next reverses it, the third
+ * hands it back to server order, and the toolbar says which of those the rows are in. Sorting and
+ * filtering both read the same display-safe names the rows show.
  *
  * @module components/TorrentTable
  */
@@ -41,6 +51,12 @@ export interface TorrentTableProps {
 const ROW_HEIGHT = 40
 /** Rows kept drawn above and below the window, so a scroll does not have to wait for them. */
 const OVERSCAN = 6
+
+/** The rule between rows, drawn inside the row's own 40px so rows are exactly `ROW_HEIGHT` tall. */
+const ROW_RULE = 'shadow-[inset_0_-1px_0_var(--color-ink-750)]'
+/** The same rule plus the chosen row's left edge, which the prototype drew as an inset border. */
+const ROW_RULE_SELECTED =
+  'shadow-[inset_0_-1px_0_var(--color-ink-750),inset_2px_0_0_var(--color-accent-light)]'
 
 type SortColumn = 'name' | 'progress' | 'down' | 'up' | 'peers' | 'state'
 
@@ -98,6 +114,13 @@ function displayName(row: TorrentRow): string {
   return displaySafe(row.name) || displaySafe(row.id)
 }
 
+/** The state column's whole text, dots and all: what the cell shows when nothing is truncated, and what its `title` always holds. */
+function stateText(row: TorrentRow): string {
+  return row.rowState === 'error' && row.error !== null && row.error !== undefined
+    ? `error: ${displaySafe(row.error)}`
+    : STATE_LABEL[row.rowState]
+}
+
 /** The value a column sorts on, so the header's order and the rows' contents agree. */
 function sortValue(row: TorrentRow, column: SortColumn): number | string {
   switch (column) {
@@ -134,10 +157,7 @@ export default function TorrentTable({
 }: TorrentTableProps) {
   const filterId = useId()
   const [query, setQuery] = useState('')
-  const [sort, setSort] = useState<{ column: SortColumn; reverse: boolean }>({
-    column: 'progress',
-    reverse: false,
-  })
+  const [sort, setSort] = useState<{ column: SortColumn; reverse: boolean } | null>(null)
 
   const shown = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -145,23 +165,44 @@ export default function TorrentTable({
       needle === ''
         ? [...rows]
         : rows.filter((row) => displayName(row).toLowerCase().includes(needle))
-    const factor = sort.reverse ? -1 : 1
-    kept.sort((a, b) => factor * compareRows(a, b, sort.column))
+    if (sort !== null) {
+      const factor = sort.reverse ? -1 : 1
+      kept.sort((a, b) => factor * compareRows(a, b, sort.column))
+    }
     return kept
   }, [rows, query, sort])
 
   // The window. The height is measured from the scroll box in a real browser; `viewportHeight`
   // overrides it (jsdom measures nothing, and the virtualisation test names the height itself).
+  // The measurement is watched with a ResizeObserver so banners, wrapping, and rotation all
+  // change it: the window must follow the box the reader is looking at, not the box that existed
+  // when the screen first mounted. `resize` is the fallback where no observer exists (jsdom).
   const boxRef = useRef<HTMLDivElement>(null)
+  const headerRef = useRef<HTMLTableSectionElement>(null)
   const [measured, setMeasured] = useState(0)
+  const [headerHeight, setHeaderHeight] = useState(0)
   const [scrollY, setScrollY] = useState(0)
+  // The row the view is pinned to: set by whichever event selects a row (the first selection this
+  // screen was handed included) and released by any real scroll, which reports where the box
+  // actually is. The pin is what lets an arrow that lands off screen move the window in the same
+  // render that makes the selection.
+  const [pinToRow, setPinToRow] = useState<string | null>(selectedId)
   useEffect(() => {
     const box = boxRef.current
     if (box === null) return
     const measure = () => {
       setMeasured(box.clientHeight)
+      setHeaderHeight(headerRef.current?.offsetHeight ?? 0)
     }
     measure()
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(measure)
+      observer.observe(box)
+      if (headerRef.current !== null) observer.observe(headerRef.current)
+      return () => {
+        observer.disconnect()
+      }
+    }
     window.addEventListener('resize', measure)
     return () => {
       window.removeEventListener('resize', measure)
@@ -171,13 +212,68 @@ export default function TorrentTable({
   const height = viewportHeight ?? measured
   const total = shown.length
   const windowSize = Math.ceil(height / ROW_HEIGHT) + 2 * OVERSCAN
-  const start = Math.max(0, Math.min(Math.floor(scrollY / ROW_HEIGHT) - OVERSCAN, total - windowSize))
+
+  // Where the box is looking: its real `scrollTop`, unless a selection this very moment pinned the
+  // view to a row outside it - then the nearest scroll position that keeps that row on screen
+  // under the sticky header. A browser's own scroll event replaces the pin with the real number
+  // the instant the box actually moves.
+  let effectiveScroll = scrollY
+  if (pinToRow !== null) {
+    const pinned = shown.findIndex((row) => row.id === pinToRow)
+    if (pinned !== -1) {
+      const top = pinned * ROW_HEIGHT
+      const lowest = Math.max(0, top + ROW_HEIGHT - height)
+      const highest = Math.max(0, top - headerHeight)
+      effectiveScroll = lowest <= highest ? Math.min(highest, Math.max(lowest, scrollY)) : lowest
+    }
+  }
+
+  // The sticky header covers the first `headerHeight` pixels of whatever the box is scrolled to,
+  // so the rows begin one header below it, not at it.
+  const start = Math.max(
+    0,
+    Math.min(
+      Math.floor(Math.max(0, effectiveScroll - headerHeight) / ROW_HEIGHT) - OVERSCAN,
+      total - windowSize,
+    ),
+  )
   const end = Math.min(total, start + windowSize)
   const visible = shown.slice(start, end)
   const padTop = start * ROW_HEIGHT
   const padBottom = (total - end) * ROW_HEIGHT
 
-  const sortedLabel = COLUMNS.find((column) => column.key === sort.column)?.label.toLowerCase()
+  // The document's side of the two-way street, in one effect that only writes to the DOM: make
+  // the box's real position agree with where the drawn window is, and hand the focus to the
+  // selected row. State never moves here - it moves through this file's event handlers.
+  useEffect(() => {
+    const box = boxRef.current
+    if (box !== null && box.scrollTop !== effectiveScroll) box.scrollTop = effectiveScroll
+    if (selectedId === null) return
+    const row = box?.querySelector<HTMLElement>(`[data-row="${CSS.escape(selectedId)}"]`)
+    if (row !== null && row !== undefined && row !== document.activeElement) row.focus()
+  }, [selectedId, effectiveScroll])
+
+  function pick(id: string): void {
+    if (onPick === undefined) return
+    // The row the reader chose is the row the view keeps on screen, until they scroll away.
+    setPinToRow(id)
+    onPick(id)
+  }
+
+  function moveSelection(delta: number): void {
+    if (onPick === undefined || shown.length === 0) return
+    const current = shown.findIndex((row) => row.id === selectedId)
+    const next =
+      current === -1
+        ? delta > 0
+          ? 0
+          : shown.length - 1
+        : Math.min(shown.length - 1, Math.max(0, current + delta))
+    pick(shown[next].id)
+  }
+
+  const sortedLabel =
+    sort === null ? null : COLUMNS.find((column) => column.key === sort.column)?.label.toLowerCase()
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -196,48 +292,59 @@ export default function TorrentTable({
           className="box-border h-9 min-w-0 basis-60 max-w-90 rounded-control border border-rule bg-sunken px-3 text-[13px] text-strong outline-none focus-visible:border-accent-light focus-visible:ring-2 focus-visible:ring-accent-soft"
         />
         <span className="text-[13px] text-muted">
-          Sorted by <span className="text-body">{sortedLabel}</span>
-          {sort.reverse && ' (reverse)'}
+          {sort === null ? (
+            'In server order'
+          ) : (
+            <>
+              Sorted by <span className="text-body">{sortedLabel}</span>
+              {sort.reverse ? ' (reverse)' : ''}
+            </>
+          )}
         </span>
       </div>
 
       <div
         ref={boxRef}
         onScroll={(event) => {
+          // A scroll is the box telling us where it really is: that truth replaces any pin, and
+          // the pin lets go the moment it has done its job.
           setScrollY(event.currentTarget.scrollTop)
+          setPinToRow(null)
         }}
         className="min-h-0 flex-1 overflow-auto"
       >
-        <table className="w-full min-w-[760px] border-collapse text-[13px]">
+        <table className="w-full min-w-[760px] border-separate border-spacing-0 text-[13px]">
           <caption className="sr-only">Torrents</caption>
-          <thead>
+          <thead ref={headerRef}>
             <tr className="text-[12px] text-muted">
               {COLUMNS.map((column) => (
                 <th
                   key={column.key}
                   scope="col"
                   aria-sort={
-                    sort.column === column.key
+                    sort !== null && sort.column === column.key
                       ? sort.reverse
                         ? 'descending'
                         : 'ascending'
                       : 'none'
                   }
-                  className={`sticky top-0 z-10 border-b border-rule bg-canvas py-2.5 font-medium ${column.className}`}
+                  className={`sticky top-0 z-10 whitespace-nowrap border-b border-rule bg-canvas py-2.5 font-medium ${column.className}`}
                 >
                   <button
                     type="button"
                     onClick={() => {
                       setSort((current) =>
-                        current.column === column.key
-                          ? { column: column.key, reverse: !current.reverse }
+                        current !== null && current.column === column.key
+                          ? current.reverse
+                            ? null
+                            : { column: column.key, reverse: true }
                           : { column: column.key, reverse: false },
                       )
                     }}
                     className="inline-flex cursor-pointer items-center gap-1 hover:text-body"
                   >
                     {column.label}
-                    {sort.column === column.key &&
+                    {sort !== null && sort.column === column.key &&
                       (sort.reverse ? (
                         <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
                       ) : (
@@ -258,24 +365,35 @@ export default function TorrentTable({
               const name = displayName(row)
               const fraction = fractionOf(row)
               const filled = filledPercent(fraction)
+              const selected = row.id === selectedId
+              const rule = selected ? ROW_RULE_SELECTED : ROW_RULE
               return (
                 <tr
                   key={row.id}
                   data-row={row.id}
-                  onClick={onPick === undefined ? undefined : () => onPick(row.id)}
+                  tabIndex={0}
+                  aria-selected={selected ? true : undefined}
+                  onClick={onPick === undefined ? undefined : () => pick(row.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      pick(row.id)
+                    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                      event.preventDefault()
+                      moveSelection(event.key === 'ArrowDown' ? 1 : -1)
+                    }
+                  }}
                   className={
-                    'border-t border-ink-750 ' +
+                    'outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent-light ' +
                     (onPick !== undefined ? 'cursor-pointer hover:bg-ink-700 ' : '') +
-                    (row.id === selectedId
-                      ? 'bg-accent-soft shadow-[inset_2px_0_0_var(--color-accent-light)]'
-                      : '')
+                    (selected ? 'bg-accent-soft' : '')
                   }
                   style={{ height: ROW_HEIGHT }}
                 >
-                  <td className="max-w-[420px] truncate px-5 py-2.5 text-body" title={name}>
+                  <td className={`max-w-[420px] truncate px-5 py-2.5 text-body ${rule}`} title={name}>
                     {name}
                   </td>
-                  <td className="px-3 py-2.5">
+                  <td className={`overflow-hidden px-3 py-2.5 ${rule}`}>
                     <div className="flex items-center gap-2.5">
                       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink-700">
                         <div
@@ -288,24 +406,22 @@ export default function TorrentTable({
                       </span>
                     </div>
                   </td>
-                  <td className="px-3 py-2.5 text-right font-mono text-xs text-body">
+                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
                     {formatRate(row.download_rate)}
                   </td>
-                  <td className="px-3 py-2.5 text-right font-mono text-xs text-body">
+                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
                     {formatRate(row.upload_rate)}
                   </td>
-                  <td className="px-3 py-2.5 text-right font-mono text-xs text-body">
+                  <td className={`truncate px-3 py-2.5 text-right font-mono text-xs text-body ${rule}`}>
                     {row.num_seeds} / {row.num_peers}
                   </td>
-                  <td className="px-5 py-2.5">
+                  <td className={`max-w-[190px] truncate px-5 py-2.5 ${rule}`} title={stateText(row)}>
                     <span className={`inline-flex items-center gap-2 ${STATE_TEXT[row.rowState]}`}>
                       <span
                         aria-hidden="true"
                         className={`h-1.75 w-1.75 flex-none rounded-full ${BAR_BG[row.rowState]}`}
                       />
-                      {row.rowState === 'error' && row.error !== null && row.error !== undefined
-                        ? `error: ${displaySafe(row.error)}`
-                        : STATE_LABEL[row.rowState]}
+                      {stateText(row)}
                     </span>
                   </td>
                 </tr>

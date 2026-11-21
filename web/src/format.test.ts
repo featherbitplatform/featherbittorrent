@@ -54,6 +54,21 @@ it('format_units', () => {
     expect(formatBytes(bytes), `${bytes} bytes should read as ${want}`).toBe(want)
   }
 
+  // Input a confused engine can hand over: fractional bytes do not exist and are floored, and a
+  // negative, NaN, or infinite count reads as nothing rather than as odd text.
+  const guarded: [number, string][] = [
+    [1.4, '1 B'],
+    [1_023.9, '1023 B'],
+    [-255, '0 B'],
+    [Number.NaN, '0 B'],
+    [Number.POSITIVE_INFINITY, '0 B'],
+    [Number.NEGATIVE_INFINITY, '0 B'],
+  ]
+  for (const [bytes, want] of guarded) {
+    expect(formatBytes(bytes), `${bytes} bytes should read as ${want}`).toBe(want)
+  }
+  expect(formatRate(Number.NaN), 'a NaN rate should read as 0 B/s').toBe('0 B/s')
+
   // The percent: whole, clamped, and NaN-proof, as the TUI states it.
   const percents: [number, string][] = [
     [0.62, '62%'],

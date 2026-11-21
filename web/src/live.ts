@@ -186,6 +186,8 @@ export interface LiveOptions {
   setTimeout(fn: () => void, ms: number): void
   /** Whether the page is visible: hidden is the ten-second cadence. */
   visibility(): 'visible' | 'hidden'
+  /** Start watching whether the page is shown; the listener is called each time it *becomes* visible, and what this returns is called on `stop`. */
+  onVisibilityChange(listener: () => void): () => void
   /** Open the event stream, or say this environment has none (then the seconds do the work alone). */
   eventSource(): WakeStream | null
 }
@@ -271,9 +273,14 @@ export function deriveRows(
 }
 
 /**
- * Start the refresh loop: read the table at once, then every second, early on a stream event
- * (coalesced to one extra read per read in flight, the terminal's rule), every ten seconds while
- * hidden, and on a doubling pause after a failure - 1, 2, 4, 8, 16, then 30 seconds.
+ * Start the refresh loop: read the table at once, then every second, early on a stream event or
+ * on the page becoming visible again (each coalesced to one extra read per read in flight, the
+ * terminal's rule), every ten seconds while hidden, and on a doubling pause after a failure - 1,
+ * 2, 4, 8, 16, then 30 seconds.
+ *
+ * A lost link is on its own schedule: while the loop is waiting out a backoff pause, wakes do not
+ * apply - neither stream events nor the page coming back - because cutting in front of the ladder
+ * is how a down server gets stampeded. The backoff timer decides when the next read goes out.
  *
  * `onRows` comes only from a good read, so a server that stops answering keeps the last table on
  * the screen, which is what the header's "Reconnecting in N s" is for; `onLink` says how the link
@@ -298,6 +305,8 @@ export function startLive(
   let inFlight = false
   // Which rung of the ladder the next failure waits out; a good read takes it back to the bottom.
   let rung = 0
+  // Whether the link is lost right now: while it is, the backoff timer owns the next read and wakes do not apply.
+  let linkLost = false
   // Two schedules this loop cannot cancel (`opts` has no clearTimeout), so each scheduled call
   // carries the generation it was scheduled under and a stale call is a no-op.
   let refreshGeneration = 0
@@ -313,7 +322,9 @@ export function startLive(
   }
 
   function wake(): void {
-    if (stopped) return
+    // While the link is lost the backoff timer owns the next read: events and a page turning
+    // visible come back to the queue rather than cutting in front of the ladder.
+    if (stopped || linkLost) return
     if (inFlight) {
       // Coalesced: one extra read after the one in flight, however many events arrived meanwhile.
       permit = true
@@ -342,9 +353,13 @@ export function startLive(
     let delay: number
     if (ok) {
       rung = 0
+      linkLost = false
       onLink({ phase: 'live' })
       delay = permit ? 0 : opts.visibility() === 'hidden' ? SLOW_REFRESH_MS : REFRESH_MS
     } else {
+      // The ladder owns the next read from here: wake() will not answer the stream or the page
+      // until a round succeeds and reports the link live again.
+      linkLost = true
       const pause = rungAt(rung)
       rung = Math.min(rung + 1, BACKOFF_SECONDS.length - 1)
       onLink({ phase: 'lost', retryIn: pause })
@@ -379,12 +394,20 @@ export function startLive(
     })
   }
 
+  // Coming back to the page must not wait out the slow cadence: becoming visible wakes the loop
+  // exactly the way a stream event does - extra read after the one in flight, and not at all
+  // while the link is lost and the backoff owns the next read.
+  const stopWatchingVisibility = opts.onVisibilityChange(() => {
+    if (!stopped) wake()
+  })
+
   openStream()
   void tick()
 
   return {
     stop: () => {
       stopped = true
+      stopWatchingVisibility()
       stream?.close()
       stream = null
       // Scheduled calls outlive `stop` (nothing cancels them); they check `stopped` and do nothing.

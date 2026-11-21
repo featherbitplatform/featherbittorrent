@@ -2,16 +2,20 @@
  * The Torrents screen: the workspace a signed-in person (or a server with logins off) lands on.
  *
  * The layout is the Torrents prototype at full width: the header strip, a sidebar of state filters
- * on the left, and the table with its toolbar beside it. Below 768 px the flex row wraps and the
- * sidebar becomes a scrolling row above the table; that is one wrapper `flex-wrap` and the
- * `max-md:` classes in `StateFilters`, not a media query in JS. The table scrolls sideways in its
- * own box at every width, the way the prototype draws it.
+ * on the left, and the table with its toolbar beside it. The screen is exactly one viewport tall
+ * (`h-dvh`), every flex ancestor of the table box carries `min-h-0`, and the box itself is the one
+ * thing that scrolls: left an ancestor unbounded and the box would grow to its content instead of
+ * scrolling, which is how a windowed table ends up showing fourteen rows and a mile of spacer.
+ * Below 768 px the column layout stacks the filters above the table; that is the `md:` classes in
+ * `StateFilters`, not a media query in JS. The table scrolls sideways in its box at every width,
+ * the way the prototype draws it.
  *
  * The data comes from `startLive`: one second while the page is up, ten while it is hidden, early
- * on the event stream, and on a doubling pause when the server stops answering. A lost server is
- * the header pill's news, not the table's: the last rows stay while the loop backs off. The
- * version and the DHT count ride the session row, re-read every half minute and on mount; they are
- * header decoration, and they do not earn a place in the once-a-second round.
+ * on the event stream or when the page comes back into view, and on a doubling pause when the
+ * server stops answering - and while it backs off, nothing cuts in front of the pause. A lost
+ * server is the header pill's news, not the table's: the last rows stay while the loop backs off.
+ * The version and the DHT count ride the session row, re-read every half minute and on mount; they
+ * are header decoration, and they do not earn a place in the once-a-second round.
  *
  * The header's Add torrent button answers nothing yet: the dialog comes with the actions task. The
  * selected row is remembered here because the detail pane that will use it mounts beside this
@@ -66,6 +70,17 @@ export default function Torrents({
         setTimeout(fn, ms)
       },
       visibility: () => (document.visibilityState === 'hidden' ? 'hidden' : 'visible'),
+      // Coming back to a tab should not cost the ten-second wait: the loop reads the moment the
+      // page shows itself again.
+      onVisibilityChange: (listener: () => void) => {
+        const handler = () => {
+          if (document.visibilityState === 'visible') listener()
+        }
+        document.addEventListener('visibilitychange', handler)
+        return () => {
+          document.removeEventListener('visibilitychange', handler)
+        }
+      },
       // The cookie authenticates the stream; it is same-origin, so there is nothing to add to it.
       // An environment without EventSource (a test jsdom) simply gets no stream.
       eventSource: () => (typeof EventSource === 'function' ? new EventSource(EVENTS_URL) : null),
@@ -105,7 +120,7 @@ export default function Torrents({
   }, [rows])
 
   return (
-    <div className="flex min-h-dvh flex-col">
+    <div className="flex h-dvh min-h-0 flex-col overflow-hidden">
       <Header
         version={sessionInfo?.version ?? null}
         link={link}
@@ -116,11 +131,11 @@ export default function Torrents({
         onSignOut={onSignOut}
       />
       {signOutError !== null && (
-        <div className="px-5 pt-3">
+        <div className="shrink-0 px-5 pt-3">
           <Banner tone="danger">{signOutError}</Banner>
         </div>
       )}
-      <div className="flex min-h-0 flex-1 flex-wrap">
+      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <StateFilters counts={counts} active={filter} onChange={setFilter} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <TorrentTable rows={shown} selectedId={selectedId} onPick={setSelectedId} />
