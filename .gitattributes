@@ -1,0 +1,7 @@
+# The API document and the types generated from it are compared byte for byte with the bytes
+# the server serves (crates/fbtt-server/tests/openapi_snapshot.rs), and every tool that writes
+# them writes LF. Pin them here so a Windows checkout, where Git converts text files to CRLF in
+# the working tree by default, does not hand that comparison a file whose line endings differ
+# from the bytes it is checked against.
+web/src/api/openapi.json text eol=lf
+web/src/api/schema.ts text eol=lf

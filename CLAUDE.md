@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.11.1`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface, the local backend over `fbt::Session`, the remote backend and its login methods), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering), `fbtt-server` (the HTTP server: fbt-api's routes plus this product's auth, device and fs routes, the Host guard when auth is off) and `featherbittorrent` (the binary that wires terminal, runtime, backends, the wizard and the `user`/`device` admin commands together). The screen side of a backend comes apart through `Client::split`: the command sender and the two receivers become fields the runtime owns, because a method on the client borrows the whole client and one `select!` branch cannot hold that borrow while another sends on it.
 
-Status: milestone 1, the local client, is complete (branch `feature/m1-local-client`). Milestone 2, the server role (`serve`), the remote backend, logins (users and passwords, Ed25519 device keys, gateway private key and gateway password), the folder picker, the devices screen, the wizard and hand-off, `docs/server.md` and `docs/reverse-proxy.md` with a runnable gateway-Authelia example under `docs/examples/gateway-oidc/`, a root `Dockerfile` and the release workflow, is complete and carried the first release (`v0.1.0`). Every release bumps the workspace version on its own `release/X.Y.Z` branch. Milestone 4, packages and autostart docs, shipped in `v0.2.0`: the hidden `generate-assets` subcommand (man pages and shell completions written from the same `Command` as `--help`), `.deb` and `.rpm` for x86_64 and aarch64 plus Linux, macOS and Windows archives that carry the same files, the service examples under `packaging/`, the smoke scripts that check every artifact in a clean container or runner before anything is published, `docs/install.md` and `docs/autostart.md`; no package installs or enables a service, and removal keeps the user's config. Milestone 3, also in `v0.2.0`: streaming to mpv or VLC with `s` (a local path or a loopback stream, server stream tokens from `POST /api/v1/stream-tokens`, the loopback gateway relay), the `player:` settings, and the featherbit mark drawn as an image in the header and on the help screen (`logo: auto | off`, kitty graphics, iTerm2 inline images, sixel) with the terminal probe; `docs/streaming.md` describes it. Release `0.2.0` carried milestones 3 and 4, `0.2.1` is a fix release (fbt-lib `v0.11.0` and the milestone 3 leftovers), and `0.2.2` makes the image logo work: the probe runs in raw mode and on Windows, and the mark keeps its alpha, so the workspace version is `0.2.2`.
+Status: milestone 1, the local client, is complete (branch `feature/m1-local-client`). Milestone 2, the server role (`serve`), the remote backend, logins (users and passwords, Ed25519 device keys, gateway private key and gateway password), the folder picker, the devices screen, the wizard and hand-off, `docs/server.md` and `docs/reverse-proxy.md` with a runnable gateway-Authelia example under `docs/examples/gateway-oidc/`, a root `Dockerfile` and the release workflow, is complete and carried the first release (`v0.1.0`). Every release bumps the workspace version on its own `release/X.Y.Z` branch. Milestone 4, packages and autostart docs, shipped in `v0.2.0`: the hidden `generate-assets` subcommand (man pages and shell completions written from the same `Command` as `--help`), `.deb` and `.rpm` for x86_64 and aarch64 plus Linux, macOS and Windows archives that carry the same files, the service examples under `packaging/`, the smoke scripts that check every artifact in a clean container or runner before anything is published, `docs/install.md` and `docs/autostart.md`; no package installs or enables a service, and removal keeps the user's config. Milestone 3, also in `v0.2.0`: streaming to mpv or VLC with `s` (a local path or a loopback stream, server stream tokens from `POST /api/v1/stream-tokens`, the loopback gateway relay), the `player:` settings, and the featherbit mark drawn as an image in the header and on the help screen (`logo: auto | off`, kitty graphics, iTerm2 inline images, sixel) with the terminal probe; `docs/streaming.md` describes it. Web UI milestone 1 is complete and unreleased: a React app in `web/` built with Vite, embedded into `fbtt-server` behind the `web-ui` cargo feature (on `featherbittorrent` as `web-ui = ["fbtt-server/web-ui"]`), served on the API's own origin. Browser sign-in is a cookie session (`fbtt_session`, `SameSite=Strict`, a CSRF token `X-CSRF-Token` on every change); the live torrent table, the detail pane, and add, pause, resume and remove are in it, with `server.web_ui: false` and `FBTT_WEB_UI` as the off switch. Every release ships two builds: the full build (`--features web-ui`, which serves the web UI and needs `web/dist` built first) and the headless build (no feature, no front end, today's binary), and the two are named `featherbittorrent` and `featherbittorrent-headless` in the release artifacts and remove the other on install in the Linux packages (the `.deb` says so with `Conflicts` and `Replaces`, the `.rpm` with `Obsoletes`); `featherbittorrent --version` prints `(full)` or `(headless)` to say which. `docs/web-ui.md` covers the web UI, its sign-in, the off switch and where to serve it. Release `0.2.0` carried milestones 3 and 4, `0.2.1` is a fix release (fbt-lib `v0.11.0` and the milestone 3 leftovers), and `0.2.2` makes the image logo work: the probe runs in raw mode and on Windows, and the mark keeps its alpha, so the workspace version is `0.2.2`.
 
 Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. The current plan is `docs/superpowers/plans/2026-11-19-milestone-3-streaming-and-logo.md`, and its Global Constraints are the rules below.
 
@@ -40,6 +40,20 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 Run `source "$HOME/.cargo/env"` first if cargo is not on PATH.
 
 ```
+# The web UI (the full build's front end, in web/). Node 22. The full build embeds web/dist, so the
+# full build below needs `npm --prefix web ci && npm --prefix web run build` run first: its build.rs
+# refuses to compile the server crate without the built page in it.
+npm --prefix web ci
+npm --prefix web run build
+npm --prefix web test
+
+# The two builds. Headless is a plain build and is today's binary; full turns on the web-ui feature,
+# which embeds web/dist and serves the web UI. Both print which they are: `--version` ends with
+# (headless) or (full). The smoke checks the version exactly, so a full build smoked as headless (or
+# the other way around) fails rather than shipping.
+cargo build -p featherbittorrent                          # headless
+cargo build -p featherbittorrent --features web-ui        # full
+
 # The client: no subcommand runs the local TUI (it needs a real terminal; a second
 # instance on a locked library prints one line and exits 3 without touching the tty)
 cargo run -p featherbittorrent
@@ -91,9 +105,13 @@ bash dev/test-service-examples.sh
 
 # The release-safe CLI smoke: --version, --help, serve --help, serve --offline refused with exit 2 (that
 # is what proves the artifact is a release build), then user set and user list against a scratch HOME.
-# Build the binary first; Windows twin: ./dev/smoke-cli.ps1 -Binary <exe> -Version <v> -Scratch <dir>
+# Build the binary first; the last argument names the build the binary is, and it is required, so a full
+# build smoked as headless (or the other way around) fails:
+#   bash dev/smoke-cli.sh target/release/featherbittorrent "$(bash dev/release-version.sh)" "$(mktemp -d)" headless
+#   bash dev/smoke-cli.sh target/release/featherbittorrent "$(bash dev/release-version.sh)" "$(mktemp -d)" full
+# Windows twin: ./dev/smoke-cli.ps1 -Binary <exe> -Version <v> -Scratch <dir> -Variant <full|headless>
 cargo build --release -p featherbittorrent
-bash dev/smoke-cli.sh target/release/featherbittorrent "$(bash dev/release-version.sh)" "$(mktemp -d)"
+bash dev/smoke-cli.sh target/release/featherbittorrent "$(bash dev/release-version.sh)" "$(mktemp -d)" headless
 
 # The Linux packages (.deb, .rpm and .tar.gz, each beside its own .sha256), built on the glibc 2.34 floor.
 # On Apple silicon this makes the aarch64 (Raspberry Pi) artifacts; the separate target dir keeps them

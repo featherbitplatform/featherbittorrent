@@ -12,8 +12,12 @@
 # examples/, never under /Library/LaunchAgents, and plutil -lint reads it back out of the finished archive.
 # The last step is dev/smoke-cli.sh against a fresh extraction: what gets checked is the artifact a person
 # downloads, not the build directory it came from. Nothing here contacts the network beyond cargo build.
-# Usage: bash dev/package-macos.sh <version>   e.g. bash dev/package-macos.sh 0.1.0
-# Output: target/dist/featherbittorrent-<version>-universal-apple-darwin.tar.gz and its .sha256, holding
+# The variant is the build behind the archive: full (default) turns on the web-ui cargo feature and
+# embeds the built web UI, and headless is the build without it. The two differ only in the archive's
+# name, which carries -headless for the headless build; both hold the same files.
+# Usage: bash dev/package-macos.sh <version> [full|headless]   e.g. bash dev/package-macos.sh 0.1.0 full
+# Output: full, target/dist/featherbittorrent-<version>-universal-apple-darwin.tar.gz and its .sha256;
+#         headless, the same with -headless after featherbittorrent. The archive holds
 #         featherbittorrent, LICENSE, NOTICE, README.md, man/, completions/, docs/autostart.md,
 #         docs/server.md, docs/install.md (once that task writes it) and
 #         examples/launchd/io.featherbit.featherbittorrent.plist.
@@ -22,11 +26,16 @@ set -euo pipefail
 fail() { echo "package-macos.sh: $*" >&2; exit 1; }
 
 # Arguments first, before any platform or tool question, so the refusals can be tested on any OS.
-[[ $# -eq 1 ]] || fail "usage: bash dev/package-macos.sh <version>"
+[[ $# -eq 1 || $# -eq 2 ]] || fail "usage: bash dev/package-macos.sh <version> [full|headless]"
 version="$1"
+variant="${2:-full}"
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   fail "invalid version '$version' (expected X.Y.Z or X.Y.Z-pre)"
 fi
+case "$variant" in
+  full|headless) ;;
+  *) fail "invalid variant '$variant' (expected full or headless)" ;;
+esac
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "package-macos.sh runs on macOS only"
 for tool in cargo lipo codesign plutil shasum gzip; do
@@ -37,18 +46,24 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 target="${CARGO_TARGET_DIR:-$root/target}"
 dist="$root/target/dist"
-targz="featherbittorrent-${version}-universal-apple-darwin"
+# full is the release name and the default; headless carries -headless in the archive name.
+if [[ "$variant" == headless ]]; then prefix="featherbittorrent-headless"; else prefix="featherbittorrent"; fi
+targz="${prefix}-${version}-universal-apple-darwin"
 stage="$dist/stage-macos-universal"
 top="$stage/$targz"
 assets="$stage/assets"
 bin="$top/featherbittorrent"
 plist="io.featherbit.featherbittorrent.plist"
 
+# The feature decides which build the archive holds; the variant must match what the binary prints,
+# whole string, so an archive built from the wrong tree is refused here rather than published.
+build_features=()
+if [[ "$variant" == full ]]; then build_features=(--features web-ui); fi
 # Both Apple architectures, the same lockfile and release profile as every other artifact. The runner is
 # Apple silicon, so the smoke below runs the arm64 slice of what it builds; the x86_64 slice is checked by
 # lipo -archs here and by the machine that downloads it.
 for triple in aarch64-apple-darwin x86_64-apple-darwin; do
-  cargo build --locked --release -p featherbittorrent --target "$triple"
+  cargo build --locked --release -p featherbittorrent ${build_features[@]+"${build_features[@]}"} --target "$triple"
 done
 
 rm -rf "$stage" "$dist/$targz.tar.gz" "$dist/$targz.tar.gz.sha256"
@@ -148,9 +163,11 @@ plutil -lint "$extract/$targz/examples/launchd/$plist" >/dev/null \
   || fail "plutil -lint refused examples/launchd/$plist as archived"
 echo "ok: plutil -lint accepts examples/launchd/$plist"
 
-# The same smoke every other artifact passes through, on the binary this archive shipped. It is what checks
-# the version, so a mismatch here means the artifact and the release disagree, not that cargo built wrong.
-bash dev/smoke-cli.sh "$extract/$targz/featherbittorrent" "$version" "$home"
+# The same smoke every other artifact passes through, on the binary this archive shipped. It is what
+# checks the version, so a mismatch here means the artifact and the release disagree, not that cargo
+# built wrong. The variant is the last argument, and the smoke's own check compares the binary's marker
+# against it, so an archive holding the other variant's binary fails here rather than at download time.
+bash dev/smoke-cli.sh "$extract/$targz/featherbittorrent" "$version" "$home" "$variant"
 
 echo "$dist/$targz.tar.gz"
 cat "$dist/$targz.tar.gz.sha256"

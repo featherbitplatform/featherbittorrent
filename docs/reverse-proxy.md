@@ -47,13 +47,13 @@ whether this is somebody it knows, and only then does the server decide whether 
 library. `server.auth.enabled` stays on.
 
 - **Browsers** sign in at the gateway: `openid-connect` with `bearer_only: false`, the interactive
-  Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people). This half is
-  wired for the web UI featherbittorrent has not got yet, and it is worth being plain about what that means
-  today: there is no browser client to serve. A browser pointed at `/api` gets nothing out of it - without a
-  credential either door recognises it stops with a `401` at the gateway, and a browser that does get through
-  (a bearer token the gateway accepts, say) still meets featherbittorrent's own sign-in on the other side,
-  which a browser session is not an answer to: `401` again, this time from the server. What setup 2 serves
-  today is the TUI.
+  Authorization Code flow with PKCE (or `basic-auth`, or whatever else you run for people). One thing
+  to know about the full build's web UI, though: setup 2 does not serve it in this release, and not
+  because the gateway's login stands in the way of the page. Its `/api/*` policy opens to an API key
+  or a bearer token, and the page sends neither one, so every call the page makes - its own
+  sign-in at the server included - is answered `401` at the gateway before the server sees it. The
+  browser's door is setup 1 (a gateway that asks nothing of its own) or setup 3 (gateway login only);
+  [docs/web-ui.md](web-ui.md) works through both.
 - **The TUI** carries an API key the gateway reads before it looks at anything else, and then signs in to
   featherbittorrent as it always has. One `multi-auth` node accepts either credential on one route: its
   `key-auth` sub-plugin is tried first, and a request with no key there has only failed one attempt, so
@@ -163,8 +163,14 @@ value - a file somebody can `cat` says that a gateway stands in front of this se
 opens it. Leave the header row empty and no such header is sent at all, which is right for every server
 you reach directly.
 
-With logins on there is no host-name guessing at all: every request has to carry a token, so
-`server.allowed_hosts` is irrelevant in this setup.
+With logins on, everything that gets past this policy carries a credential somebody checks, so
+`server.allowed_hosts` changes nothing here for the TUI. What it still decides, wherever a proxy
+rewrites `Host`, is the web UI's origin check: a browser reached at the server's own name needs
+nothing listed, because its `Origin` is then the name the request arrives at and the sign-in and the
+cookie's changes accept that, but this gateway rewrites `Host` to the upstream target, so a page on
+`torrent.example.test` needs that name listed for the server to accept its sign-in. Setup 2 never
+gets that far, because the policy above turns the page's calls away at the gateway first, but
+setups 1 and 3 do, and each needs `torrent.example.test` listed for exactly this reason.
 
 ### 3. Gateway only: featherbittorrent auth off
 
@@ -184,6 +190,13 @@ A warning that belongs here, not in a footnote: with logins off the server alway
 address as the host name, and no gateway sits in front of an address someone types straight into the
 browser at the server's port. If the bind is reachable beyond loopback, firewall that port to the
 gateway (and any machines you mean to share it with), or turn logins back on.
+
+This is also the setup the full build's web UI wants behind a gateway: the page signs in at the server,
+and the server must not have a login of its own to stand in the way. A gateway that forwards its own
+`Authorization` header onward needs featherbittorrent's logins off for exactly this reason: the server
+reads any `Authorization` header as its own credential, so a bearer token the gateway sent would be
+checked as a login and fail. The web UI's own sign-in and the off switch are in
+[docs/web-ui.md](web-ui.md).
 
 ## Streaming to a player
 

@@ -1,0 +1,4689 @@
+{
+  "components": {
+    "schemas": {
+      "AddPeerRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/torrents/{id}/peers`.",
+        "properties": {
+          "addr": {
+            "description": "The peer's address, `ip:port` (`[ip]:port` for IPv6).",
+            "example": "192.0.2.1:6881",
+            "type": "string"
+          }
+        },
+        "required": [
+          "addr"
+        ],
+        "type": "object"
+      },
+      "AddTorrentRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/torrents` as JSON: add a magnet link.",
+        "properties": {
+          "auto_managed": {
+            "description": "Under the session's queue (default true).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "magnet": {
+            "description": "The `magnet:` URI.",
+            "type": "string"
+          },
+          "paused": {
+            "description": "Start paused (default false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "save_path": {
+            "description": "The directory the files go below; inside an allowed root when\nroots are configured.",
+            "type": "string"
+          },
+          "sequential": {
+            "description": "Download pieces in order (default false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "magnet",
+          "save_path"
+        ],
+        "type": "object"
+      },
+      "AutoManagedRequest": {
+        "additionalProperties": false,
+        "description": "`PUT /api/v1/torrents/{id}/auto-managed`.",
+        "properties": {
+          "auto_managed": {
+            "description": "Put the torrent under the session's queue, or take it out.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "auto_managed"
+        ],
+        "type": "object"
+      },
+      "CreateTorrentRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/create-torrent`.",
+        "properties": {
+          "comment": {
+            "description": "A free-form comment.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "The file or directory to hash; subject to `allowed_roots`.",
+            "type": "string"
+          },
+          "piece_length": {
+            "description": "The piece length in bytes: a power of two of at least 16 KiB\n(default: automatic).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "private": {
+            "description": "The BEP 27 private flag.",
+            "type": "boolean"
+          },
+          "trackers": {
+            "description": "Announce tiers. Tiers (an empty one counts as one URL), their URLs\nand the web seeds together are at most 256.",
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "version": {
+            "$ref": "#/components/schemas/CreateVersion",
+            "description": "Which versions to write (default hybrid)."
+          },
+          "web_seeds": {
+            "description": "BEP 19 web seed URLs.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "CreateVersion": {
+        "description": "A metainfo version to create.",
+        "enum": [
+          "v1",
+          "v2",
+          "hybrid"
+        ],
+        "type": "string"
+      },
+      "ErrorBody": {
+        "description": "The body of every error response.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail",
+            "description": "What went wrong."
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "description": "What went wrong.",
+        "properties": {
+          "code": {
+            "description": "Machine-readable code: `invalid_request`, `invalid_id`,\n`invalid_priorities`, `invalid_path` (400); `unauthorized` (401);\n`path_not_allowed`, `forbidden` (403); `not_found` (404);\n`request_timeout` (408); `no_metadata`, `duplicate_torrent`, `busy`,\n`already_exists` (409);\n`body_too_large` (413); `range_not_satisfiable` (416);\n`too_many_requests` (429); `internal` (500); `unsupported` (501);\n`too_many_streams`, `shutting_down`, `dht_disabled`, `busy` (503).",
+            "example": "not_found",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable message.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "EventDto": {
+        "description": "One session event, as the `data:` of a server-sent event whose\n`event:` field equals `type`. Torrent ids are the 40-hex wire hash.",
+        "oneOf": [
+          {
+            "description": "A torrent was added.",
+            "properties": {
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "torrent_added"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A torrent was removed.",
+            "properties": {
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "torrent_removed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A torrent changed state.",
+            "properties": {
+              "checking_progress": {
+                "description": "Fraction of the file check done, when `state` is\n`checking_files`.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "state": {
+                "description": "The new state, as in `TorrentInfo.state`.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "state_changed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "state",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A piece passed its hash check.",
+            "properties": {
+              "piece": {
+                "description": "Piece index.",
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "piece_finished"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "piece",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A downloaded piece failed its hash check.",
+            "properties": {
+              "piece": {
+                "description": "Piece index.",
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "hash_failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "piece",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A magnet torrent received its metadata.",
+            "properties": {
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "metadata_received"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every wanted piece was downloaded, verified and written.",
+            "properties": {
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "torrent_finished"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An auto-managed seed reached its ratio or time limit and was paused.",
+            "properties": {
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "seed_limit_reached"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A tracker answered an announce.",
+            "properties": {
+              "info_hash": {
+                "description": "The hash announced, lowercase hex (20 bytes).",
+                "type": "string"
+              },
+              "peers": {
+                "description": "Peers in the reply.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tracker_reply"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "description": "Tracker URL.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "info_hash",
+              "url",
+              "peers",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An announce failed.",
+            "properties": {
+              "message": {
+                "description": "What went wrong.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tracker_error"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "description": "Tracker URL.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "url",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A tracker answered a scrape.",
+            "properties": {
+              "complete": {
+                "description": "Seeds.",
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "downloaded": {
+                "description": "Completed downloads the tracker has seen.",
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "incomplete": {
+                "description": "Leechers.",
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "scrape_reply"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "description": "Tracker URL.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "url",
+              "complete",
+              "incomplete",
+              "downloaded",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A scrape failed.",
+            "properties": {
+              "message": {
+                "description": "What went wrong.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "scrape_failed"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "description": "Tracker URL.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "url",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A web seed request failed.",
+            "properties": {
+              "message": {
+                "description": "What went wrong.",
+                "type": "string"
+              },
+              "retired": {
+                "description": "The seed is never asked again.",
+                "type": "boolean"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "web_seed_error"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "description": "The web seed's URL.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "url",
+              "message",
+              "retired",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A batch of peer addresses arrived.",
+            "properties": {
+              "count": {
+                "description": "Dialable addresses in the batch.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "source": {
+                "description": "Where they came from, as in `PeerInfo.source`.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "peers_found"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "source",
+              "count",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The DHT node filled its routing table for the first time.",
+            "properties": {
+              "nodes": {
+                "description": "Nodes in the routing tables.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "dht_bootstrapped"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "nodes",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A peer completed the handshake.",
+            "properties": {
+              "addr": {
+                "description": "Remote address.",
+                "type": "string"
+              },
+              "encrypted": {
+                "description": "The connection is RC4-encrypted (MSE).",
+                "type": "boolean"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "transport": {
+                "description": "`tcp`, `utp` or `unknown`.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "peer_connected"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "addr",
+              "transport",
+              "encrypted",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A peer connection ended.",
+            "properties": {
+              "addr": {
+                "description": "Remote address.",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Details: the error text, or for `blocked` the block reason.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "description": "Why: `self_connection`, `info_hash_mismatch`,\n`handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,\n`io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,\n`upload_only`, `blocked` or `unknown`.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "peer_disconnected"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "addr",
+              "reason",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A peer was refused.",
+            "properties": {
+              "addr": {
+                "description": "The peer's address.",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`ip_filter`, `banned`, `per_ip_limit` or `unknown`.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id; null for an incoming connection refused\nbefore its handshake.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "peer_blocked"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "addr",
+              "reason",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Reading or writing torrent data failed.",
+            "properties": {
+              "message": {
+                "description": "The error.",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file involved, when known.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "file_error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A storage move finished.",
+            "properties": {
+              "path": {
+                "description": "The new save path.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "storage_moved"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "path",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A storage move failed.",
+            "properties": {
+              "message": {
+                "description": "The error.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "storage_move_failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A file rename finished.",
+            "properties": {
+              "index": {
+                "description": "The file's index.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "description": "Its new path, relative to the save path, `/`-separated.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "file_renamed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "index",
+              "path",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A file rename failed.",
+            "properties": {
+              "index": {
+                "description": "The file's index.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message": {
+                "description": "The error.",
+                "type": "string"
+              },
+              "torrent": {
+                "description": "The torrent's id.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "file_rename_failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "torrent",
+              "index",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The router mapped a listen port.",
+            "properties": {
+              "external": {
+                "description": "The public address and port.",
+                "type": "string"
+              },
+              "method": {
+                "description": "`upnp`, `nat_pmp`, `pcp` or `unknown`.",
+                "type": "string"
+              },
+              "protocol": {
+                "description": "`tcp`, `udp` or `unknown`.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "port_mapped"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "protocol",
+              "method",
+              "external",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Mapping a listen port failed.",
+            "properties": {
+              "message": {
+                "description": "Why.",
+                "type": "string"
+              },
+              "method": {
+                "description": "`upnp`, `nat_pmp`, `pcp` or `unknown`.",
+                "type": "string"
+              },
+              "protocol": {
+                "description": "`tcp`, `udp` or `unknown`.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "port_mapping_failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "protocol",
+              "method",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A source learned our external address.",
+            "properties": {
+              "ip": {
+                "description": "The address.",
+                "type": "string"
+              },
+              "source": {
+                "description": "`port_mapping`, `dht`, `peers` or `unknown`.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "external_ip_changed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "ip",
+              "source",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proxy failed in a way that affects the whole session.",
+            "properties": {
+              "message": {
+                "description": "What happened.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "proxy_error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The subscriber fell behind and `missed` events were dropped.",
+            "properties": {
+              "missed": {
+                "description": "Number of events dropped.",
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "lagged"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "missed",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An event this API version does not know.",
+            "properties": {
+              "debug": {
+                "description": "The event's Rust `Debug` form.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "other"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "debug",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "FileInfo": {
+        "description": "One file of a torrent.",
+        "properties": {
+          "downloaded": {
+            "description": "Bytes of the file inside verified pieces.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "index": {
+            "description": "Its index in the file list (pad files included).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "len": {
+            "description": "Its length in bytes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pad": {
+            "description": "A BEP 47 pad file, never written to disk.",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Its path relative to the save path.",
+            "type": "string"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/FilePriority",
+            "description": "Its download priority."
+          }
+        },
+        "required": [
+          "index",
+          "path",
+          "len",
+          "pad",
+          "priority",
+          "downloaded"
+        ],
+        "type": "object"
+      },
+      "FilePrioritiesRequest": {
+        "additionalProperties": false,
+        "description": "`PUT /api/v1/torrents/{id}/file-priorities`.",
+        "properties": {
+          "priorities": {
+            "description": "One priority per file, pad files included, in file order; at most\n4 194 304.",
+            "items": {
+              "$ref": "#/components/schemas/PriorityDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "priorities"
+        ],
+        "type": "object"
+      },
+      "FilePriority": {
+        "description": "A file's download priority as reported (response side). Requests use\ntheir own type with the four real values.",
+        "enum": [
+          "skip",
+          "low",
+          "normal",
+          "high",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "IpFilterAction": {
+        "description": "What an IP filter rule does to its range.",
+        "enum": [
+          "block",
+          "allow"
+        ],
+        "type": "string"
+      },
+      "IpFilterDto": {
+        "additionalProperties": false,
+        "description": "The session's IP filter (`GET`/`PUT /api/v1/session/ip-filter`). `PUT`\nreplaces the filter; rules apply in order and the last one covering an\naddress decides. `GET` returns the disjoint ranges the filter holds.",
+        "properties": {
+          "rules": {
+            "description": "The rules.",
+            "items": {
+              "$ref": "#/components/schemas/IpFilterRule"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules"
+        ],
+        "type": "object"
+      },
+      "IpFilterRule": {
+        "additionalProperties": false,
+        "description": "One IP filter rule: an inclusive range of one address family.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/IpFilterAction",
+            "description": "Block or allow the range."
+          },
+          "first": {
+            "description": "The first address of the range.",
+            "example": "10.0.0.0",
+            "type": "string"
+          },
+          "last": {
+            "description": "The last address of the range (not below `first`, same family).",
+            "example": "10.0.0.255",
+            "type": "string"
+          }
+        },
+        "required": [
+          "first",
+          "last",
+          "action"
+        ],
+        "type": "object"
+      },
+      "LimitsRequest": {
+        "additionalProperties": false,
+        "description": "`PUT /api/v1/torrents/{id}/limits`.",
+        "properties": {
+          "download": {
+            "description": "Download limit in bytes per second; null (or 0) is unlimited.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "upload": {
+            "description": "Upload limit in bytes per second; null (or 0) is unlimited.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "MagnetInfo": {
+        "description": "A magnet link.",
+        "properties": {
+          "magnet": {
+            "description": "The `magnet:` URI.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "magnet"
+        ],
+        "type": "object"
+      },
+      "MoveModeDto": {
+        "description": "What a move does with files already at the target.",
+        "enum": [
+          "fail_if_exists",
+          "replace_existing",
+          "keep_existing"
+        ],
+        "type": "string"
+      },
+      "MoveRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/torrents/{id}/move`.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/MoveModeDto",
+            "description": "What to do with files already there (default `fail_if_exists`)."
+          },
+          "path": {
+            "description": "The new save path; inside an allowed root when roots are\nconfigured.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "PeerInfo": {
+        "description": "One connected peer.",
+        "properties": {
+          "addr": {
+            "description": "Its address.",
+            "type": "string"
+          },
+          "am_choking": {
+            "description": "We choke it.",
+            "type": "boolean"
+          },
+          "am_interested": {
+            "description": "We are interested in its pieces.",
+            "type": "boolean"
+          },
+          "client": {
+            "description": "Its client name, when known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "download_rate": {
+            "description": "Payload bytes per second from it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "encrypted": {
+            "description": "The connection is encrypted (MSE).",
+            "type": "boolean"
+          },
+          "incoming": {
+            "description": "The peer connected to us.",
+            "type": "boolean"
+          },
+          "peer_choking": {
+            "description": "It chokes us.",
+            "type": "boolean"
+          },
+          "peer_interested": {
+            "description": "It is interested in our pieces.",
+            "type": "boolean"
+          },
+          "progress": {
+            "description": "The share of the pieces it has, from 0 to 1.",
+            "format": "double",
+            "type": "number"
+          },
+          "source": {
+            "description": "Where we learnt of it: `tracker`, `dht`, `pex`, `magnet`, `lsd`,\n`incoming`, `manual`, `resume` or `holepunch`.",
+            "type": "string"
+          },
+          "total_downloaded": {
+            "description": "Payload bytes received from it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_uploaded": {
+            "description": "Payload bytes sent to it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "transport": {
+            "description": "`tcp`, `utp` or `unknown`.",
+            "type": "string"
+          },
+          "upload_rate": {
+            "description": "Payload bytes per second to it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "addr",
+          "transport",
+          "encrypted",
+          "incoming",
+          "download_rate",
+          "upload_rate",
+          "total_downloaded",
+          "total_uploaded",
+          "peer_choking",
+          "peer_interested",
+          "am_choking",
+          "am_interested",
+          "progress",
+          "source"
+        ],
+        "type": "object"
+      },
+      "PiecesInfo": {
+        "description": "Which pieces a torrent has.",
+        "properties": {
+          "have": {
+            "description": "The bitfield as lowercase hex, piece 0 in the top bit of the\nfirst byte (BEP 3 order); spare bits of the last byte are zero.",
+            "type": "string"
+          },
+          "num_pieces": {
+            "description": "The number of pieces.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "num_pieces",
+          "have"
+        ],
+        "type": "object"
+      },
+      "PriorityDto": {
+        "description": "A file's download priority as a request sets it.",
+        "enum": [
+          "skip",
+          "low",
+          "normal",
+          "high"
+        ],
+        "type": "string"
+      },
+      "QueuePositionRequest": {
+        "additionalProperties": false,
+        "description": "`PUT /api/v1/torrents/{id}/queue-position`.",
+        "properties": {
+          "position": {
+            "description": "The new place in the queue, from 0; past the end is the bottom.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "type": "object"
+      },
+      "QueueSettingsDto": {
+        "additionalProperties": false,
+        "description": "The session's queue limits (`GET`/`PUT /api/v1/session/queue`). `PUT`\nreplaces them all: a limit left out or null is unlimited.",
+        "properties": {
+          "active_downloads": {
+            "description": "Auto-managed downloading torrents running at once; null is\nunlimited.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "active_limit": {
+            "description": "Auto-managed torrents running at once, downloading or seeding; null\nis unlimited.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "active_seeds": {
+            "description": "Auto-managed seeding torrents running at once; null is unlimited.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dont_count_slow_torrents": {
+            "description": "A slow torrent does not count against the download and seed limits.",
+            "type": "boolean"
+          },
+          "inactive_down_rate": {
+            "description": "Download rate below which a torrent may be slow, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inactive_up_rate": {
+            "description": "Upload rate below which a torrent may be slow, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "interval": {
+            "description": "Seconds between scheduler passes (greater than zero).",
+            "format": "double",
+            "type": "number"
+          },
+          "startup_grace": {
+            "description": "Seconds a torrent runs before it may count as slow.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "dont_count_slow_torrents",
+          "inactive_down_rate",
+          "inactive_up_rate",
+          "startup_grace",
+          "interval"
+        ],
+        "type": "object"
+      },
+      "RenameFileRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/torrents/{id}/rename-file`.",
+        "properties": {
+          "index": {
+            "description": "The file's index (pad files included).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Its new path relative to the save path, `/`-separated.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "path"
+        ],
+        "type": "object"
+      },
+      "SessionInfo": {
+        "description": "The session at a glance.",
+        "properties": {
+          "dht_nodes": {
+            "description": "Nodes in the DHT routing tables; null with the DHT off.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "download_limit": {
+            "description": "Session-wide download limit, bytes per second; 0 is unlimited.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "download_rate": {
+            "description": "Payload download rate over every torrent, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "external_ip": {
+            "description": "Our external IP address, when known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listen_addrs": {
+            "description": "The peer listener's bound addresses.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "torrents": {
+            "description": "Torrents in the session.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_limit": {
+            "description": "Session-wide upload limit, bytes per second; 0 is unlimited.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_rate": {
+            "description": "Payload upload rate over every torrent, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "The library version.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "listen_addrs",
+          "download_rate",
+          "upload_rate",
+          "torrents",
+          "download_limit",
+          "upload_limit"
+        ],
+        "type": "object"
+      },
+      "TorrentInfo": {
+        "description": "One torrent: its status and identity.",
+        "properties": {
+          "active_time": {
+            "description": "Seconds spent announced and open to peers.",
+            "format": "double",
+            "type": "number"
+          },
+          "auto_managed": {
+            "description": "Under the queue's control.",
+            "type": "boolean"
+          },
+          "checking_progress": {
+            "description": "Fraction of the file check done, while `state` is\n`checking_files`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "download_rate": {
+            "description": "Download rate, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "description": "The error that stopped the torrent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_metadata": {
+            "description": "The metadata is known.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The id used in paths: the 40-hex wire hash (v1, or the truncated\nv2 hash of a v2-only torrent).",
+            "type": "string"
+          },
+          "info_hash_v1": {
+            "description": "The v1 info hash, lowercase hex; null for a v2-only torrent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "info_hash_v2": {
+            "description": "The v2 info hash, lowercase hex; null for a v1-only torrent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_seed": {
+            "description": "Every piece is verified, skipped files included.",
+            "type": "boolean"
+          },
+          "layers_missing": {
+            "description": "BEP 52 piece layers the metadata does not hold yet: one per file of\nmore than one piece whose layer is still missing (0 for a v1 torrent,\nand once every layer arrived or was built). A v2-only torrent downloads\nwhat it can verify meanwhile and fetches the rest beside the download.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The torrent's name (a magnet's `dn` before the metadata).",
+            "type": "string"
+          },
+          "need_save_resume": {
+            "description": "Resume data would change if saved now.",
+            "type": "boolean"
+          },
+          "num_peers": {
+            "description": "Connected peers.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "num_seeds": {
+            "description": "Connected peers that have every piece.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "num_web_seeds": {
+            "description": "Web seeds in use.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "progress": {
+            "description": "Fraction of the wanted bytes done, from 0 to 1.",
+            "format": "double",
+            "type": "number"
+          },
+          "queue_position": {
+            "description": "Its place in the queue, from 0.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resume_trusted": {
+            "description": "For a torrent added from resume data: whether its pieces were\ntrusted without a check; null otherwise.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "save_path": {
+            "description": "The directory its files are below.",
+            "type": "string"
+          },
+          "seeding_time": {
+            "description": "Seconds spent running as a seed.",
+            "format": "double",
+            "type": "number"
+          },
+          "state": {
+            "description": "`downloading_metadata`, `queued_for_checking`, `checking_files`,\n`downloading`, `seeding`, `paused`, `queued` or `error`.",
+            "example": "seeding",
+            "type": "string"
+          },
+          "total_downloaded": {
+            "description": "Payload bytes received.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_uploaded": {
+            "description": "Payload bytes sent.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_wanted": {
+            "description": "Bytes of wanted pieces.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_wasted": {
+            "description": "Payload bytes discarded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_rate": {
+            "description": "Upload rate, bytes per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "`v1`, `v2` or `hybrid`; null until the metadata is known (or for a\nversion this API does not know).",
+            "example": "hybrid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wanted_done": {
+            "description": "Bytes of wanted pieces verified and written.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "has_metadata",
+          "layers_missing",
+          "state",
+          "progress",
+          "total_wanted",
+          "wanted_done",
+          "total_downloaded",
+          "total_uploaded",
+          "total_wasted",
+          "download_rate",
+          "upload_rate",
+          "num_peers",
+          "num_seeds",
+          "num_web_seeds",
+          "save_path",
+          "queue_position",
+          "auto_managed",
+          "active_time",
+          "seeding_time",
+          "need_save_resume",
+          "is_seed"
+        ],
+        "type": "object"
+      },
+      "TrackerInfo": {
+        "description": "One tracker of a torrent under one announced hash.",
+        "properties": {
+          "info_hash": {
+            "description": "The hash announced to it, lowercase hex (20 bytes).",
+            "type": "string"
+          },
+          "last_error": {
+            "description": "The last announce's error.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_reply": {
+            "description": "When it last answered, as integer Unix seconds (like every\ntimestamp in this API).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "leechers": {
+            "description": "Leechers in its last reply.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "next_announce": {
+            "description": "Seconds until the next announce to it.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "peers_returned": {
+            "description": "Peers its last reply carried.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "seeders": {
+            "description": "Seeders in its last reply.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tier": {
+            "description": "Its tier (BEP 12), from 0.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "url": {
+            "description": "The announce URL.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "tier",
+          "info_hash"
+        ],
+        "type": "object"
+      },
+      "WebSeedRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/torrents/{id}/web-seeds`.",
+        "properties": {
+          "url": {
+            "description": "An `http://` or `https://` URL (BEP 19).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "HTTP/JSON control of an fbt BitTorrent session: torrents, session settings, server-sent events and byte-range file streaming.\n\nEvery route needs `Authorization: Bearer <token>`, except this document. The streaming and event routes also take `?token=<token>`. Errors are `{\"error\": {\"code\": \"<snake_case>\", \"message\": \"<text>\"}}`.",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
+    },
+    "title": "fbt API",
+    "version": "0.11.1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/create-torrent": {
+      "post": {
+        "description": "Runs on the blocking pool, two at a time; a third request gets\n`503 busy`. Hashing reads every byte, so a large source takes a while.",
+        "operationId": "create_torrent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTorrentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-bittorrent": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The bencoded `.torrent`."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed body, empty source or bad piece length (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The source is outside `allowed_roots` (`path_not_allowed`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The source does not exist (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "A file changed while it was hashed (`busy`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Reading the source failed (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Two creations already run (`busy`), or the session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Hashes the file or directory at `path` and returns the `.torrent`.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [
+          {
+            "description": "Comma-separated categories to receive: `status`, `piece`,\n`tracker`, `peer`, `dht`, `storage`, `nat` (default all).\n`lagged` comes whatever the categories.",
+            "example": "status,tracker",
+            "in": "query",
+            "name": "categories",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventDto"
+                }
+              }
+            },
+            "description": "Server-sent events: `event:` is the type, `data:` the JSON event. A comment every 15 s keeps the stream alive."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown category (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Too many open event streams (`too_many_streams`)."
+          }
+        },
+        "summary": "The session's events as `text/event-stream`. Browsers' `EventSource`\ncannot send headers, so this route also takes `?token=`.",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi_json",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The OpenAPI document."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The document could not be serialised (`internal`)."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "The OpenAPI 3.1 document of this API. Needs no token.",
+        "tags": [
+          "meta"
+        ]
+      }
+    },
+    "/api/v1/session": {
+      "get": {
+        "operationId": "get_session",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            },
+            "description": "The session."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "The session at a glance: version, listen addresses, external IP, DHT\nsize, total rates, limits and the number of torrents.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/session/banned-peers": {
+      "get": {
+        "operationId": "banned_peers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Banned peer addresses."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "The peers banned for the rest of the session, oldest first. An address\nwith port 0 bans the whole IP.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/session/ip-filter": {
+      "get": {
+        "operationId": "get_ip_filter",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpFilterDto"
+                }
+              }
+            },
+            "description": "The filter's rules."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The filter could not be read (`internal`)."
+          }
+        },
+        "summary": "The IP filter, as disjoint ranges.",
+        "tags": [
+          "session"
+        ]
+      },
+      "put": {
+        "operationId": "set_ip_filter",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IpFilterDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The filter applies."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed body, a bad rule or more than 65 536 rules (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "Replaces the IP filter; peers it blocks are disconnected.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/session/limits": {
+      "put": {
+        "operationId": "set_limits",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The limits apply."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed body (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "Sets the session-wide rate limits.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/session/queue": {
+      "get": {
+        "operationId": "get_queue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueSettingsDto"
+                }
+              }
+            },
+            "description": "The queue settings."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "The queue's limits.",
+        "tags": [
+          "session"
+        ]
+      },
+      "put": {
+        "operationId": "set_queue",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueueSettingsDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The settings apply."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed body or a zero interval (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "Replaces the queue's limits and runs a scheduler pass.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/session/state": {
+      "get": {
+        "operationId": "session_state",
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The bencoded session state."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The session state (torrent list in queue order, with resume data), to\nrestore with `SessionState::from_bytes`.",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/v1/torrents": {
+      "get": {
+        "operationId": "list_torrents",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TorrentInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The torrents."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          }
+        },
+        "summary": "Every torrent, in queue order.",
+        "tags": [
+          "torrents"
+        ]
+      },
+      "post": {
+        "operationId": "add_torrent",
+        "parameters": [
+          {
+            "description": "The directory the files go below (only with an\n`application/x-bittorrent` body).",
+            "in": "query",
+            "name": "save_path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Start paused (default false).",
+            "in": "query",
+            "name": "paused",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Under the session's queue (default true).",
+            "in": "query",
+            "name": "auto_managed",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Download pieces in order (default false).",
+            "in": "query",
+            "name": "sequential",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddTorrentRequest"
+              }
+            },
+            "application/x-bittorrent": {
+              "schema": {
+                "items": {
+                  "format": "int32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "A magnet as JSON, or the raw `.torrent` bytes (then the query string carries the options).",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TorrentInfo"
+                }
+              }
+            },
+            "description": "The torrent was added."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed body, magnet, `.torrent` or query (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Save path outside the allowed roots (`path_not_allowed`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Already in the session (`duplicate_torrent`)."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Body over the limit (`body_too_large`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Adds a torrent: a magnet link as JSON, or a `.torrent` file as an\n`application/x-bittorrent` body with the options in the query string.\nFile priorities are set afterwards with `PUT .../file-priorities`.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/resume": {
+      "post": {
+        "operationId": "add_resume",
+        "parameters": [
+          {
+            "description": "Replaces the save path stored in the resume data.",
+            "in": "query",
+            "name": "save_path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "items": {
+                  "format": "int32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "description": "The resume data.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TorrentInfo"
+                }
+              }
+            },
+            "description": "The torrent was added."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed resume data or query (`invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Save path outside the allowed roots (`path_not_allowed`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Already in the session (`duplicate_torrent`)."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Body over the limit (`body_too_large`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Adds a torrent from its resume data (`GET .../resume-data`). The save\npath stored in it, or `?save_path=` when given, must be inside an\nallowed root when roots are configured.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}": {
+      "delete": {
+        "operationId": "remove_torrent",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Delete the torrent's files too (default false).",
+            "in": "query",
+            "name": "delete_files",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The torrent was removed."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or query (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Removes a torrent, deleting its files with `?delete_files=true`.",
+        "tags": [
+          "torrents"
+        ]
+      },
+      "get": {
+        "operationId": "get_torrent",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TorrentInfo"
+                }
+              }
+            },
+            "description": "The torrent."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          }
+        },
+        "summary": "One torrent's status.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/auto-managed": {
+      "put": {
+        "operationId": "set_auto_managed",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutoManagedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The queue applied the change."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Puts the torrent under the session's queue or takes it out.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/file-priorities": {
+      "put": {
+        "operationId": "set_file_priorities",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FilePrioritiesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The priorities apply."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body, or more than 4 194 304 priorities (`invalid_id`, `invalid_request`), or not one priority per file (`invalid_priorities`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No metadata yet (`no_metadata`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Sets one priority per file (pad files included).",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/files": {
+      "get": {
+        "operationId": "get_files",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FileInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The files."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No metadata yet (`no_metadata`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The torrent's files with priority and progress.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/files/{index}/stream": {
+      "get": {
+        "operationId": "stream_file",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The file's index in the torrent.",
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "One range in `bytes` (`a-b`, `a-` or `-n`); anything else gets the whole file.",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Never matches: the whole file is sent.",
+            "in": "header",
+            "name": "If-Range",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The token, for clients that cannot send `Authorization`.",
+            "in": "query",
+            "name": "token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "The whole file."
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "The range asked for, with `Content-Range`."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or index (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent or file (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No metadata yet (`no_metadata`)."
+          },
+          "416": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The range starts past the end (`range_not_satisfiable`), with `Content-Range: bytes */<len>`."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Too many open streams (`too_many_streams`), with `Retry-After: 1`, or the session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "One file of a torrent, whole or one byte range, read while the torrent\ndownloads. Browser media elements cannot send headers, so this route\nalso takes `?token=`.",
+        "tags": [
+          "torrents"
+        ]
+      },
+      "head": {
+        "operationId": "stream_file_head",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The file's index in the torrent.",
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "As for `GET`.",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "As for `GET`.",
+            "in": "header",
+            "name": "If-Range",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The token, for clients that cannot send `Authorization`.",
+            "in": "query",
+            "name": "token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The whole file's headers."
+          },
+          "206": {
+            "description": "The range's headers, with `Content-Range`."
+          },
+          "400": {
+            "description": "Malformed id or index (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "description": "Unknown torrent or file (`not_found`)."
+          },
+          "409": {
+            "description": "No metadata yet (`no_metadata`)."
+          },
+          "416": {
+            "description": "The range starts past the end, with `Content-Range: bytes */<len>`."
+          }
+        },
+        "summary": "The headers `GET` would send, with no body.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/limits": {
+      "put": {
+        "operationId": "set_limits",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The limits apply."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Sets the torrent's own rate limits.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/magnet": {
+      "get": {
+        "operationId": "get_magnet",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MagnetInfo"
+                }
+              }
+            },
+            "description": "The magnet link."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          }
+        },
+        "summary": "A magnet link for the torrent; before its metadata is known, one built\nfrom the info hashes alone.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/move": {
+      "post": {
+        "operationId": "move_storage",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The files were moved."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Target outside the allowed roots (`path_not_allowed`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "A target file exists (`already_exists`) or too many waiting commands (`busy`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Moves the torrent's files to a new save path.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/pause": {
+      "post": {
+        "operationId": "pause",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Pauses a torrent: disconnects its peers and stops announcing.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/peers": {
+      "get": {
+        "operationId": "get_peers",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PeerInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The peers."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The torrent's connected peers.",
+        "tags": [
+          "torrents"
+        ]
+      },
+      "post": {
+        "operationId": "add_peer",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddPeerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The connection was asked for."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id, body or address (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Connects to a peer.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/pieces": {
+      "get": {
+        "operationId": "get_pieces",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiecesInfo"
+                }
+              }
+            },
+            "description": "The pieces."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The pieces the torrent has, as a hex bitfield.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/queue-position": {
+      "put": {
+        "operationId": "set_queue_position",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueuePositionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The torrent is at its new place."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Moves the torrent in the session's queue.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/reannounce": {
+      "post": {
+        "operationId": "reannounce",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The announce was asked for."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Announces to the trackers now.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/recheck": {
+      "post": {
+        "operationId": "recheck",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The check started."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No metadata yet (`no_metadata`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Checks the torrent's data again.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/rename-file": {
+      "post": {
+        "operationId": "rename_file",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The file was renamed."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or body (`invalid_id`, `invalid_request`), or a path that is not plain and relative or collides (`invalid_path`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent or file (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No metadata yet (`no_metadata`), the torrent is checking (`busy`) or the target exists (`already_exists`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Renames one file, relative to the save path.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/resume": {
+      "post": {
+        "operationId": "resume",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Resumed."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Resumes a paused torrent (an auto-managed one may stay queued); also\nclears a storage error.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/resume-data": {
+      "get": {
+        "operationId": "get_resume_data",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The resume data."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The torrent's resume data (bencoded), for `POST /api/v1/torrents/resume`.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/scrape": {
+      "post": {
+        "operationId": "scrape",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The scrape was asked for."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Scrapes the torrent's trackers; the counts arrive as events.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/trackers": {
+      "get": {
+        "operationId": "get_trackers",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TrackerInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The trackers."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id (`invalid_id`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "The torrent's trackers with their last announce state.",
+        "tags": [
+          "torrents"
+        ]
+      }
+    },
+    "/api/v1/torrents/{id}/web-seeds": {
+      "delete": {
+        "operationId": "remove_web_seed",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The web seed to remove.",
+            "in": "query",
+            "name": "url",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The web seed is gone."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id or query (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Removes a web seed; nothing if it is not there.",
+        "tags": [
+          "torrents"
+        ]
+      },
+      "post": {
+        "operationId": "add_web_seed",
+        "parameters": [
+          {
+            "description": "40-hex wire hash or 64-hex v2 hash.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebSeedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The web seed was added."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed id, body or URL (`invalid_id`, `invalid_request`)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No valid token (`unauthorized`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unknown torrent (`not_found`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The torrent has 16 web seeds (`busy`)."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An internal failure, such as a storage error (`internal`)."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The session is shutting down (`shutting_down`)."
+          }
+        },
+        "summary": "Adds a web seed (BEP 19).",
+        "tags": [
+          "torrents"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "description": "The session: status and settings.",
+      "name": "session"
+    },
+    {
+      "description": "Torrents: add, remove and control them; list, status, files, peers, trackers, pieces.",
+      "name": "torrents"
+    },
+    {
+      "description": "Server-sent session events.",
+      "name": "events"
+    },
+    {
+      "description": "This document.",
+      "name": "meta"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "types": ["vite/client"],
+
+    /* Bundler mode: Vite resolves the imports, so tsc only typechecks. */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+
+    /* Strict, and it applies to every file tsc actually reads. The generated API types are the one
+       file that is not read: `src/api/schema.ts` carries `@ts-nocheck`, put there by
+       `scripts/annotate-generated-api.mjs` while the OpenAPI document declares one operationId on more
+       than one operation and the generator emits that member twice. */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo"
+  },
+  "include": ["src", "vite.config.ts"]
+}

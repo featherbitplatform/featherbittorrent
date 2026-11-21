@@ -18,6 +18,12 @@ workspace = true
 # library away from where its config points needs it in a release build too. The `server` test target below
 # requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
 test-support = []
+# The browser UI: this build serves the built `web/dist` on the API's own origin. The release
+# executable carries the bytes; a debug build reads the folder from disk on each request, which is
+# what makes editing the front end without recompiling work and what makes a debug run whose
+# `web/dist` went away answer `500` where the shipped binary could not (`src/web.rs`'s module doc
+# says the same at more length). The headless build pays for neither.
+web-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 # The password hashes.
@@ -25,6 +31,14 @@ argon2.workspace = true
 # The routes: `Router`, the body and query extractors, and the `http` types an `AuthRequest` carries.
 # fbt-api turns the serving half on for the tree; these are the parts our own code names.
 axum = { workspace = true, features = ["json", "query"] }
+# The built front end. Only with `web-ui`: the headless build carries no assets, and `build.rs` skips
+# the change-tracking line for it, so a missing `web/dist` is not even an error there. Its features
+# are decided at the workspace entry (`rust-embed` in the root `Cargo.toml`), where `default-features
+# = false` lives with the reason for it.
+rust-embed = { workspace = true, optional = true }
+# What type an asset is served as, from its extension. Vite hashes the names but keeps the
+# extensions, and the hash is exactly why the extension is the only thing left to ask.
+mime_guess = { workspace = true, optional = true }
 # Session tokens and challenge nonces, spelled in base64.
 base64.workspace = true
 # `fbt::display_safe`, because a folder name or a config device name is remote text by the time a
@@ -38,6 +52,8 @@ getrandom.workspace = true
 sha2.workspace = true
 # Device keys: the OpenSSH public key line and `sshsig`.
 ssh-key.workspace = true
+# The browser session's CSRF token is compared in constant time.
+subtle.workspace = true
 # The request and response bodies of our own routes.
 serde.workspace = true
 # `StreamExt::next`, for the stream-token route reading its body chunk by chunk under its own caps.

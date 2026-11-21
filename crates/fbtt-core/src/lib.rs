@@ -34,8 +34,8 @@ pub use client::{
     TrackerRow,
 };
 pub use config::{
-    AuthConfig, Config, ConfigError, ConfigLoad, DeviceEntry, LogoSetting, PlayerConfig,
-    ServerConfig, UserEntry,
+    AuthConfig, Config, ConfigError, ConfigLoad, CookieSecure, DeviceEntry, LogoSetting,
+    PlayerConfig, ServerConfig, UserEntry, web_ui_env_override,
 };
 pub use engine::Engine;
 pub use local::LocalBackend;
