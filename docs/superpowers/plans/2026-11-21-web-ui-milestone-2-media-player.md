@@ -179,6 +179,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - `av1-ac3-eac3.mkv`: `av01.0.`, plus `ac-3` and `ec-3`.
     - `h264-mp3.mkv`: `mp4a.6B`.
   - `probe_mp4_faststart_and_moov_last`: both MP4 fixtures list their tracks. The mov_text track is `MovText`, and `text_subtitle()` is true.
+  - `probe_webm_is_webm`: `vp9-opus.webm` gives `Container::WebM`, with `Vp9` and `Opus` tracks.
   - `probe_refuses_unknown_bytes`: 1 KiB of zeros gives `Unsupported`.
   - `probe_truncated_mkv_is_an_error`: the first 300 bytes of an mkv give `Malformed` or `Io(UnexpectedEof)`, and no panic.
   - `capped_len_bounds_huge_elements`: hand-build an EBML header plus a Segment whose first child is a binary element declaring 2 GiB, inside a `Read + Seek` that pretends to be 3 GiB long and returns zeros lazily. `probe` returns an error at once, without allocating the 2 GiB: the declared size exceeds the room `CappedLen` reports, so the demuxer refuses before it allocates.
@@ -221,7 +222,8 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
 - **Fragmenting:**
   - A video fragment runs from one keyframe up to the next keyframe, not including it. It also closes when it reaches `MAX_FRAGMENT_MS = 5000` of samples or `MAX_FRAGMENT_BYTES = 16 MiB`, whichever comes first. This keeps memory bounded when keyframes are rare or unknown.
   - An audio fragment closes once it holds at least 1000 ms.
-  - Every fragment's first sample carries sync-sample flags. A video sample that is not a keyframe carries `sample_is_non_sync_sample`.
+  - A video sample carries sync-sample flags only when it is a keyframe (or the first sample after a seek), and `sample_is_non_sync_sample` otherwise. That holds for a fragment's first sample too: a fragment closed by a cap starts mid-GOP, so its first sample keeps its real non-sync flag. Audio samples are all sync.
+  - A cap cut inside a B-frame group can give the next fragment a PTS below the previous fragment's. The `dts` clamp below absorbs that, and `cts` goes negative there, which `trun` version 1 allows.
 - **Decode times, when the samples have none (Matroska).** The algorithm, per video fragment `p[0..n]` in decode order:
   ```
   sorted = sort(p)
@@ -241,7 +243,7 @@ docs/web-ui.md, CHANGELOG.md        the player section, Added entry
     - every `dts + cts == pts + offset`;
     - `dts` strictly increasing across both fragments;
     - every `cts >= 0` (this input never needs the clamp).
-  - `dts_clamp_at_a_shrinking_delay`: fragment one with PTS `[0, 300, 100, 200]`, then fragment two with no reordering `[400, 500]`. `dts` stays strictly increasing, `dts + cts == pts + offset` holds, and the `trun` is version 1.
+  - `dts_clamp_at_a_growing_delay`: fragment one with PTS `[0, 100]` (no reordering), then fragment two `[200, 500, 300, 400]`. Fragment two's raw first `dts` is 100, which the clamp raises to 101. `dts` stays strictly increasing, `dts + cts == pts + offset` holds, and the `trun` is version 1.
   - `fragments_close_without_keyframes`: 300 video samples, all non-key after the first, at 40 ms each, give several fragments, none longer than 5000 ms.
   - `fragment_tfdt_continuity`: for each fragment after the first, `tfdt == previous tfdt + sum(previous durations)`.
   - `audio_fragments_hold_a_second`: 100 AAC samples of 21 ms each give fragments with a sum of durations of at least 1000 ms, except the last.
