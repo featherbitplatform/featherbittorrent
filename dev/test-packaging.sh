@@ -207,21 +207,23 @@ Replaces: featherbittorrent
 FIXTURE
 bash "$package_sh" --check-deb-control headless "$fixture_dir/headless-deb-control" >/dev/null \
   || fail 'the headless .deb fixture was refused by --check-deb-control'
-# A .deb with no Replaces line is refused.
+# A .deb with no Replaces line is refused: exit 2, message names Replaces.
 cat > "$fixture_dir/noreplaces-deb-control" <<'FIXTURE'
 Package: featherbittorrent
 Conflicts: featherbittorrent-headless
 FIXTURE
 status=0; out="$(bash "$package_sh" --check-deb-control full "$fixture_dir/noreplaces-deb-control" 2>&1)" || status=$?
-[[ $status -ne 0 ]] || fail '--check-deb-control accepted a .deb with no Replaces line'
-# A .deb whose Conflicts names the wrong package is refused.
+[[ $status -eq 2 ]] || fail "--check-deb-control (no Replaces) exited $status, expected 2: $out"
+grep -qF 'Replaces' <<<"$out" || fail "the no-Replaces refusal did not name the field: $out"
+# A .deb whose Conflicts names the wrong package is refused: exit 2, message names Conflicts.
 cat > "$fixture_dir/wrongconflicts-deb-control" <<'FIXTURE'
 Package: featherbittorrent
 Conflicts: something-else
 Replaces: featherbittorrent-headless
 FIXTURE
 status=0; out="$(bash "$package_sh" --check-deb-control full "$fixture_dir/wrongconflicts-deb-control" 2>&1)" || status=$?
-[[ $status -ne 0 ]] || fail '--check-deb-control accepted a .deb whose Conflicts names the wrong package'
+[[ $status -eq 2 ]] || fail "--check-deb-control (wrong Conflicts) exited $status, expected 2: $out"
+grep -qF 'Conflicts' <<<"$out" || fail "the wrong-Conflicts refusal did not name the field: $out"
 
 # RPM metadata fixtures.
 # A full .rpm: named featherbittorrent, obsoletes featherbittorrent-headless, no conflicts.
@@ -234,15 +236,17 @@ printf 'featherbittorrent\n' > "$fixture_dir/headless-rpm-obsoletes"
 printf '' > "$fixture_dir/headless-rpm-conflicts"
 bash "$package_sh" --check-rpm-metadata headless featherbittorrent-headless "$fixture_dir/headless-rpm-obsoletes" "$fixture_dir/headless-rpm-conflicts" >/dev/null \
   || fail 'the headless .rpm fixture was refused by --check-rpm-metadata'
-# An .rpm that carries a conflict is refused.
+# An .rpm that carries a conflict is refused: exit 2, message names Conflicts.
 printf 'featherbittorrent-headless\n' > "$fixture_dir/conflict-rpm-obsoletes"
 printf 'featherbittorrent-headless\n' > "$fixture_dir/conflict-rpm-conflicts"
 status=0; out="$(bash "$package_sh" --check-rpm-metadata full featherbittorrent "$fixture_dir/conflict-rpm-obsoletes" "$fixture_dir/conflict-rpm-conflicts" 2>&1)" || status=$?
-[[ $status -ne 0 ]] || fail '--check-rpm-metadata accepted an .rpm that carries a conflict'
-# An .rpm that does not obsolete the other package is refused.
+[[ $status -eq 2 ]] || fail "--check-rpm-metadata (conflict) exited $status, expected 2: $out"
+grep -qF 'Conflicts' <<<"$out" || fail "the conflict refusal did not name the field: $out"
+# An .rpm that does not obsolete the other package is refused: exit 2, message names obsoletes.
 printf '' > "$fixture_dir/empty-rpm-obsoletes"
 status=0; out="$(bash "$package_sh" --check-rpm-metadata full featherbittorrent "$fixture_dir/empty-rpm-obsoletes" "$fixture_dir/full-rpm-conflicts" 2>&1)" || status=$?
-[[ $status -ne 0 ]] || fail '--check-rpm-metadata accepted an .rpm that obsoletes nothing'
+[[ $status -eq 2 ]] || fail "--check-rpm-metadata (no obsoletes) exited $status, expected 2: $out"
+grep -qiF 'obsoletes' <<<"$out" || fail "the no-obsoletes refusal did not name the field: $out"
 echo 'ok: the .deb and .rpm metadata checks accept the right packages and refuse the wrong ones'
 
 # 8. The service examples the packages ship as documentation: no package installs, enables or starts a

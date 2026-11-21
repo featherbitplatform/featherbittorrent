@@ -422,16 +422,30 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-           # The expected count comes from the build matrix, not from a remembered number: 2 Linux
-           # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
-           # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
-           # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM.
-           # The heredoc above must list exactly that many lines; a line added or dropped in either
-           # place is caught here.
-           expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 ))
-           listed="$(wc -l < "$RUNNER_TEMP/release-files")"
-           echo "release file list holds $listed files, expected $expected"
-           [ "$listed" -eq "$expected" ]
+          # The expected count comes from the build matrix, not from a remembered number: 2 Linux
+          # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
+          # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
+          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM.
+          # The heredoc above must list exactly that many lines, and dist/ must hold exactly that
+          # many files; a line added or dropped in either place is caught here.
+          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 ))
+          listed="$(wc -l < "$RUNNER_TEMP/release-files")"
+          echo "release file list holds $listed files, expected $expected"
+          [ "$listed" -eq "$expected" ]
+          present="$(find dist -maxdepth 1 -type f | wc -l)"
+          echo "dist/ holds $present files, expected $expected"
+          [ "$present" -eq "$expected" ]
+          # Any file in dist/ that is not in the heredoc is a stray: name it and fail, so a script
+          # that writes a new artifact without updating the list is caught here rather than at the
+          # upload step.
+          strays=0
+          while read -r f; do
+            if ! grep -qxF "$f" "$RUNNER_TEMP/release-files"; then
+              echo "::error::in dist/ but not in the release list: $f"
+              strays=1
+            fi
+          done < <(cd dist && find . -maxdepth 1 -type f | sed "s|^\./|dist/|" | sort)
+          [ "$strays" -eq 0 ] || exit 1
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |

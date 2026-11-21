@@ -53,9 +53,9 @@ check_rpm_reqs() { # rpm requirement lines on stdin; refuses any the declared de
 }
 check_deb_control() { # <control text> <variant name> <the other package>
   local control_text="$1" want="$2" other="$3" pkg conflicts replaces
-  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //')"
-  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //')"
-  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //')"
+  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //' || true)"
+  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //' || true)"
+  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //' || true)"
   [[ "$pkg" == "$want" ]] || fail "the .deb's control says 'Package: $pkg', expected 'Package: $want'"
   grep -qwF -- "$other" <<<"$conflicts" || fail "the .deb's control has 'Conflicts: $conflicts', which does not name the other package $other"
   grep -qwF -- "$other" <<<"$replaces" || fail "the .deb's control has 'Replaces: $replaces', which does not name the other package $other"
@@ -285,13 +285,23 @@ if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --
 # both.
 # dpkg-deb with no field prints the whole control file (Package:, Conflicts:, Replaces:, ...); the
 # ar and tar path is the fallback the build image uses, because it carries no dpkg-deb. The control
-# member was already listed above, so $control holds its name.
+# member was already listed above, so $control holds its name (control.tar.gz, .xz or .zst). GNU tar
+# reading from stdin does not auto-detect the compression, so the flag follows the extension.
 if command -v dpkg-deb >/dev/null; then
-  deb_control="$(dpkg-deb -f "$dist/$pkg.deb" 2>&1)"
+  if ! deb_control="$(dpkg-deb -f "$dist/$pkg.deb" 2>/dev/null)"; then
+    fail "could not read the .deb's control member from $dist/$pkg.deb (dpkg-deb failed)"
+  fi
 else
-  deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar -xJO -f - ./control 2>/dev/null)"
+  case "$control" in
+    *.gz)  tar_flag=-xOzf ;;
+    *.xz)  tar_flag=-xOJf ;;
+    *.zst) tar_flag=-xOaF ;;
+    *)     tar_flag=-xOf ;;
+  esac
+  deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar $tar_flag - ./control 2>/dev/null)" \
+    || deb_control="$(ar p "$dist/$pkg.deb" "$control" 2>/dev/null | tar $tar_flag - control 2>/dev/null)"
+  [[ -n "$deb_control" ]] || fail "could not read the .deb's control member from $dist/$pkg.deb"
 fi
-[[ -n "$deb_control" ]] || fail "could not read the .deb's control member from $dist/$pkg.deb"
 if [[ "$variant" == headless ]]; then other="featherbittorrent"; else other="featherbittorrent-headless"; fi
 check_deb_control "$deb_control" "$prefix" "$other"
 rpm_name="$(rpm -qp --queryformat '%{NAME}' "$dist/$pkg.rpm")" || fail "rpm -qp could not read $dist/$pkg.rpm"
