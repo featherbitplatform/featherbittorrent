@@ -671,16 +671,22 @@ fn audio_box(audio: Option<(u32, u16)>, codec: &str) -> Result<atom::Audio, Medi
 /// The `Audio` box's fixed fields, with the sample size given: 16 for everything
 /// that carries encoded bits per sample, and FLAC's real bit depth for FLAC.
 ///
-/// A rate over `u16::MAX` is `Malformed`: no real audio track runs that fast, and
-/// the box cannot write one.
+/// A rate over `u16::MAX` - 88.2, 96 or 192 kHz, all valid and common - is
+/// written as 0, which is what FFmpeg's movenc does too: the fixed-point field
+/// cannot say the rate, but `dfLa`'s STREAMINFO or the AudioSpecificConfig
+/// beside the box can, and a decoder reads the rate from there. Zero channels
+/// stays `Malformed`: there is no stream to describe.
 fn audio_box_rate(rate: u32, channels: u16, sample_size: u16) -> Result<atom::Audio, MediaError> {
     if channels == 0 {
         return Err(MediaError::Malformed(
             "an audio track with no channels has no Audio box".to_string(),
         ));
     }
-    let whole = u16::try_from(rate)
-        .map_err(|_| MediaError::Malformed(format!("sample rate {rate} is above a u16")))?;
+    let whole = if rate > u32::from(u16::MAX) {
+        0
+    } else {
+        rate as u16
+    };
     Ok(atom::Audio {
         data_reference_index: 1,
         channel_count: channels,
@@ -708,6 +714,11 @@ fn dops_from_opus_head(head: &[u8]) -> Result<atom::Dops, MediaError> {
         )));
     }
     let channels = head[9];
+    if channels == 0 {
+        return Err(MediaError::Malformed(
+            "an OpusHead with no channels decodes nothing".to_string(),
+        ));
+    }
     let pre_skip = u16::from_le_bytes([head[10], head[11]]);
     let input_sample_rate = u32::from_le_bytes([head[12], head[13], head[14], head[15]]);
     let output_gain = i16::from_le_bytes([head[16], head[17]]);
@@ -992,9 +1003,8 @@ const AC3_FRAME_WORDS: [[u16; 3]; 38] = [
 ///
 /// A bitstream id of 6 through 8 is DolbyNet and 9 or 10 is RealAudio: ISOBMFF's
 /// `ac-3` registers the Dolby families up to 8, matching what FFmpeg refuses to
-/// write. Bitstream ids under 8 also halve the sample rate once per step below 8
-/// (the `max(bsid, 8) - 8` shift FFmpeg applies), so the `Audio` box says 24 kHz
-/// where the rate code alone would say 48.
+/// write, so every header that reaches here has an id that leaves the rate code
+/// to stand on its own: no sample-rate shifting applies.
 fn ac3_syncframe(
     frame: &[u8],
     bsid: u8,
@@ -1041,8 +1051,10 @@ fn ac3_syncframe(
         )));
     }
 
-    let shift = u32::from(bsid.max(8) - 8);
-    let sample_rate = AC3_RATES[fscod as usize] >> shift;
+    // Every AC-3 that gets this far has a bitstream id at or below 8 (the
+    // dispatcher refuses the rest), which is exactly the case where FFmpeg's
+    // `max(bsid, 8) - 8` rate shift is zero: the rate code stands alone.
+    let sample_rate = AC3_RATES[fscod as usize];
     let channels = AC3_CHANNELS[acmod] + u16::from(lfeon);
     Ok(DolbySync {
         sample_rate,
@@ -1082,9 +1094,23 @@ fn eac3_syncframe(
     bsid: u8,
     bit: &impl Fn(u32, u32) -> u32,
 ) -> Result<DolbySync, MediaError> {
-    if bit(16, 2) == 3 {
+    // The two-bit stream type right after the syncword: 0 is an independent
+    // substream (complete in itself, everything `dec3` describes can be read
+    // from it), 2 is the enhanced-compatibility substream of an AC-3 core,
+    // whose fields this parser reads the same way. 1 is dependent: it borrows
+    // its parameters from the frame before it, so reading a dependent frame as
+    // if it were independent would attribute the wrong rate, channels and size
+    // to the track. 3 is reserved.
+    let frame_type = bit(16, 2);
+    if frame_type == 3 {
         return Err(MediaError::Malformed(
             "E-AC-3 frame type 3 is reserved".to_string(),
+        ));
+    }
+    if frame_type == 1 {
+        return Err(MediaError::Malformed(
+            "a dependent E-AC-3 substream borrows its parameters from the frame before it"
+                .to_string(),
         ));
     }
     let words = bit(21, 11) as u64;
@@ -1616,6 +1642,106 @@ mod tests {
         assert!(
             matches!(result, Err(MediaError::Malformed(_))),
             "a truncated frame is a file that lied: {result:?}"
+        );
+    }
+
+    /// A STREAMINFO at 96 kHz is a real FLAC track, and refusing it because the
+    /// `Audio` box's fixed-point field tops out at 65535 would throw the track
+    /// away over a box field. The rate rides in `dfLa`, where it fits; the box
+    /// says 0, the same thing FFmpeg's movenc writes.
+    #[test]
+    fn flac_96k_is_accepted() {
+        // RFC 9639's STREAMINFO payload: block sizes, frame sizes, then one
+        // 64-bit word with rate (20), channels minus one (3), bits minus one
+        // (5) and sample count (36), then the MD5.
+        let word: u64 = (96_000_u64 << 44) | (1_u64 << 41) | (23_u64 << 36) | 2_120_000;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"fLaC");
+        header.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // last block, STREAMINFO, 34 bytes
+        header.extend_from_slice(&4096_u16.to_be_bytes());
+        header.extend_from_slice(&4096_u16.to_be_bytes());
+        header.extend_from_slice(&[0x00, 0x04, 0x00]); // min frame
+        header.extend_from_slice(&[0x00, 0x08, 0x00]); // max frame
+        header.extend_from_slice(&word.to_be_bytes());
+        header.extend_from_slice(&[0_u8; 16]); // MD5
+
+        let entry = sample_entry(
+            &track(TrackKind::Audio, Codec::Flac),
+            Some(&header),
+            None,
+            None,
+            None,
+        )
+        .expect("96 kHz FLAC is a real track");
+        let entry = match entry {
+            atom::Codec::Flac(entry) => entry,
+            other => panic!("FLAC writes a flac entry, got {other:?}"),
+        };
+        assert_eq!(
+            entry.audio.sample_rate.integer(),
+            0,
+            "the Audio box cannot say 96000, so it says 0 like FFmpeg"
+        );
+        assert_eq!(entry.audio.channel_count, 2);
+        assert_eq!(entry.audio.sample_size, 24);
+        match &entry.dfla.blocks[0] {
+            atom::FlacMetadataBlock::StreamInfo { sample_rate, .. } => {
+                assert_eq!(*sample_rate, 96_000, "the rate rides in dfLa");
+            }
+            other => panic!("the block parsed is the STREAMINFO handed in, got {other:?}"),
+        }
+    }
+
+    /// An E-AC-3 dependent substream (stream type 1) borrows its parameters
+    /// from the frame before it: read as if it were independent, its bits would
+    /// be attributed the wrong rate, channels and size.
+    #[test]
+    fn dependent_eac3_substream_is_malformed() {
+        // The fixture's E-AC-3 syncframe with the two bits after the syncword
+        // set to 1 (dependent) instead of 0: frame size 384, rate code 48 kHz,
+        // bitstream id 16, otherwise the fixture's own layout.
+        let mut frame = vec![0x0b, 0x77, 0x40, 0xBF, 0x32, 0x87, 0xC0, 0x00];
+        frame.resize(384, 0);
+        // With the guard absent this frame would parse cleanly as mono at
+        // 48 kHz - the track claim below matches that, so the only thing that
+        // can refuse it is the stream type itself.
+        let result = sample_entry(
+            &track(TrackKind::Audio, Codec::Eac3),
+            None,
+            Some(&frame),
+            Some((48_000, 1)),
+            None,
+        );
+        assert!(
+            matches!(result, Err(MediaError::Malformed(_))),
+            "a dependent substream alone says nothing about the track: {result:?}"
+        );
+    }
+
+    /// An `OpusHead` with zero channels decodes nothing; `dOps` cannot describe
+    /// it and an `Opus` track with no channels is a file that lied.
+    #[test]
+    fn opus_zero_channels_is_malformed() {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(0); // channels: nothing at all
+        head.extend_from_slice(&312_u16.to_le_bytes());
+        head.extend_from_slice(&48_000_u32.to_le_bytes());
+        head.extend_from_slice(&0_i16.to_le_bytes());
+        head.push(0); // channel mapping family
+        assert_eq!(head.len(), 19);
+
+        let result = sample_entry(
+            &track(TrackKind::Audio, Codec::Opus),
+            Some(&head),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Err(MediaError::Malformed(_))),
+            "zero channels is not a track: {result:?}"
         );
     }
 

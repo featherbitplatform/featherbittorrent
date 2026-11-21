@@ -294,8 +294,7 @@ impl Open {
 /// The monotone clamp inside [`synthesize`] makes this at least 1 for every
 /// fragment the writer seals mid-stream; the `max(1, ·)` is what `finish` needs
 /// it for, where a last fragment borrows a duration instead of meeting a
-/// successor, and for the one case where an explicit duration outran the
-/// synthesized timeline a sample forward.
+/// successor. A gap wider than a `u32` is `Malformed`: no field could hold it.
 fn clamp_gap(next_first_dts: i64, last_dts: i64) -> Result<u32, MediaError> {
     let gap = next_first_dts
         .checked_sub(last_dts)
@@ -314,7 +313,8 @@ struct SealedState {
 
 /// Synthesize decode times and durations for one fragment's samples.
 ///
-/// The plan's algorithm, per fragment of samples `p` in decode order:
+/// The plan's algorithm, per fragment of samples `p` in decode order, when the
+/// source did not hand decode times over:
 ///
 /// ```text
 /// sorted = sort(p)
@@ -327,13 +327,22 @@ struct SealedState {
 /// duration[i < n-1] = dts[i+1] - dts[i]
 /// ```
 ///
-/// Audio uses `dts = pts` (no reordering exists to compensate for), which is the
-/// same formula with `delay = 0`, and the same `last_dts` clamp, so a track that
-/// resets its clock mid-stream cannot walk backwards.
+/// Audio takes `dts = pts`, stated or plain: audio has no reordering to
+/// compensate for, so its decode order is the order it was pushed in, and the
+/// same `last_dts` clamp applies so a track that resets its clock mid-stream
+/// cannot walk backwards. When every sample of a fragment carries `dts`, those
+/// given values are the base instead - clamped and checked exactly the same way.
+/// A fragment that mixes given and unstated decode times is
+/// [`MediaError::Malformed`]: half a stated timeline and half a synthesized one
+/// is no timeline.
 ///
 /// The last sample's duration is not here: it is the distance to the next
 /// fragment's first decode time, which [`FragmentWriter`] fills in at flush time
-/// (or, at end of stream, from the previous duration).
+/// (or, at end of stream, borrows a duration from - with the last sample's own
+/// stated duration in place of the borrow, when it states one). Nor are the
+/// other samples' stated durations: `trun` durations are what the samples add
+/// up to, and a stated duration that differed from the gap would shift every
+/// presentation time after it, compounding across fragments.
 ///
 /// Timestamps outside what `i64` can subtract without wrapping are
 /// [`MediaError::Malformed`], as are durations that do not fit a `u32` field.
@@ -342,31 +351,48 @@ fn synthesize(
     is_audio: bool,
     last_dts: &mut Option<i64>,
 ) -> Result<SealedState, MediaError> {
-    let pts: Vec<i64> = samples.iter().map(|sample| sample.pts).collect();
-    let n = pts.len();
+    let given = samples.iter().all(|sample| sample.dts.is_some());
+    if !given && samples.iter().any(|sample| sample.dts.is_some()) {
+        return Err(MediaError::Malformed(
+            "a fragment mixing given and unstated decode times is half a timeline".to_string(),
+        ));
+    }
 
-    // The delay: the largest distance a decode-order sample trails the sorted
-    // PTS it pairs with. Bounded by the fragment's own PTS span, so the only
-    // way its subtraction wraps is if the fragment itself spans near the whole
-    // `i64` range, which no container means to say.
-    let mut sorted = pts.clone();
-    sorted.sort_unstable();
-    let mut delay: i64 = 0;
-    if !is_audio {
+    // The base decode times, before the seam clamp. The synthesized delay is
+    // the largest distance a decode-order sample trails the sorted PTS it
+    // pairs with - bounded by the fragment's own PTS span, so the only way its
+    // subtraction wraps is if the fragment itself spans near the whole `i64`
+    // range, which no container means to say. Audio's base is its PTS, because
+    // audio does not reorder; a source that stated decode times says them.
+    let mut base: Vec<i64> = Vec::with_capacity(samples.len());
+    if given {
+        base.extend(samples.iter().map(|sample| sample.dts.unwrap()));
+    } else if is_audio {
+        base.extend(samples.iter().map(|sample| sample.pts));
+    } else {
+        let pts: Vec<i64> = samples.iter().map(|sample| sample.pts).collect();
+        let mut sorted = pts.clone();
+        sorted.sort_unstable();
+        let mut delay: i64 = 0;
         for (position, &sample_pts) in pts.iter().enumerate() {
             let lag = sorted[position]
                 .checked_sub(sample_pts)
                 .ok_or_else(|| malformed_overflow("a PTS span beyond i64"))?;
             delay = delay.max(lag);
         }
+        for &sorted_pts in &sorted {
+            base.push(
+                sorted_pts
+                    .checked_sub(delay)
+                    .ok_or_else(|| malformed_overflow("a PTS span beyond i64"))?,
+            );
+        }
     }
 
-    let mut dts = Vec::with_capacity(n);
+    let mut dts = Vec::with_capacity(base.len());
     let mut previous: Option<i64> = *last_dts;
-    for &sorted_pts in &sorted {
-        let mut sample_dts = sorted_pts
-            .checked_sub(delay)
-            .ok_or_else(|| malformed_overflow("a PTS span beyond i64"))?;
+    for base_dts in base {
+        let mut sample_dts = base_dts;
         if let Some(previous_dts) = previous {
             let floor = previous_dts
                 .checked_add(1)
@@ -378,21 +404,20 @@ fn synthesize(
     }
     *last_dts = previous;
 
-    // Durations for all but the last: from the next sample's decode time, or
-    // the container's own when it states one. A stated duration is written as
-    // given; it is Task 3's job (and the plan's "the container's claims are
-    // checked" rule) to hand over ones that match the timeline they ride on.
-    let mut durations = Vec::with_capacity(n.saturating_sub(1));
-    for position in 0..n.saturating_sub(1) {
+    // Durations for all but the last: from the decode timeline and nothing
+    // else. What a container stated is not believed here, because the timeline
+    // the samples add up to is what a player will play; only at end of stream,
+    // in `finish`, does a sample's own stated duration get used, in place of
+    // the duration that call would otherwise borrow.
+    let count = dts.len();
+    let mut durations = Vec::with_capacity(count.saturating_sub(1));
+    for position in 0..count.saturating_sub(1) {
         let derived = dts[position + 1]
             .checked_sub(dts[position])
             .ok_or_else(|| malformed_overflow("a decode-time gap beyond i64"))?;
-        let duration = match samples[position].duration {
-            Some(stated) => stated,
-            None => u32::try_from(derived).map_err(|_| {
-                MediaError::Malformed(format!("a duration of {derived} ticks is over a u32"))
-            })?,
-        };
+        let duration = u32::try_from(derived).map_err(|_| {
+            MediaError::Malformed(format!("a duration of {derived} ticks is over a u32"))
+        })?;
         durations.push(duration);
     }
 
@@ -426,8 +451,9 @@ fn malformed_overflow(what: &str) -> MediaError {
 /// `moof`'s length point the samples at the `mdat` right after it.
 /// The last duration is passed in, not derived here, because only the caller
 /// knows which rule applies: mid-stream it is the distance to the next
-/// fragment's first decode time, and at end of stream `finish` borrows the
-/// previous duration instead. A sealed fragment is encoded exactly once, so it
+/// fragment's first decode time, and at end of stream `finish` borrows a
+/// duration, or takes the last sample's own stated one when it states one.
+/// A sealed fragment is encoded exactly once, so it
 /// comes by value and its sample bytes are moved straight into the `mdat`.
 fn encode_fragment(
     writer: &mut FragmentWriter,
@@ -445,12 +471,11 @@ fn encode_fragment(
     writer.prev_duration = Some(last_duration);
 
     let offset = writer.offset()?;
-    // tfdt is the sum of every duration the writer has written, which for whole
-    // fragments equals this fragment's first decode time - the telescoping
-    // `clamp_gap` guarantees - and for a stream with explicit durations that
-    // diverged is what actually keeps the seam exact.
-    let tfdt_base = writer.running_tfdt.unwrap_or(first_dts);
-    let tfdt_value = tfdt_base
+    // tfdt is this fragment's first decode time, shifted out of the negatives.
+    // Every duration written is a difference of decode times, so the durations
+    // before this fragment telescope onto exactly this number - the invariant
+    // `fragment_tfdt_continuity` checks - and nothing needs accumulating.
+    let tfdt_value = first_dts
         .checked_add(offset)
         .and_then(|v| u64::try_from(v).ok())
         .ok_or_else(|| {
@@ -520,17 +545,6 @@ fn encode_fragment(
         fragment_bytes.extend_from_slice(&sample.data);
     }
 
-    // Roll the timeline forward for the next fragment: tfdt is the sum of
-    // everything before it, which is the invariant `fragment_tfdt_continuity`
-    // checks, true by construction here.
-    writer.running_tfdt = Some(
-        durations
-            .iter()
-            .try_fold(tfdt_base, |acc, duration| {
-                acc.checked_add(i64::from(*duration))
-            })
-            .ok_or_else(|| malformed_overflow("the fragment timeline overflowed i64"))?,
-    );
     Ok(fragment_bytes)
 }
 
@@ -599,7 +613,11 @@ fn encode_moof(
 /// Samples that contradict the track it started on - PTS jumping more than ten
 /// seconds back from the last fragment's first decode time, timestamps that wrap
 /// `i64`, durations that overflow `u32` - are [`MediaError::Malformed`]: they
-/// claim a timeline the fragments cannot tell.
+/// claim a timeline the fragments cannot tell. So is a fragment whose first
+/// decode time falls below minus [`TIME_OFFSET_MS`]: the writer shifts decode
+/// times by that much to keep them non-negative on the wire, and past that line
+/// it could not state the time it would write. After any error the writer
+/// stays failed: every later `push` or `finish` reports the first failure.
 #[derive(Debug)]
 pub struct FragmentWriter {
     timescale: u32,
@@ -612,11 +630,17 @@ pub struct FragmentWriter {
     /// First decode time of the last sealed fragment, ten seconds of which is
     /// the room a capped fragment may jump back into.
     last_sealed_first_dts: Option<i64>,
-    /// tfdt the next fragment must state: the sum of every duration written.
-    running_tfdt: Option<i64>,
     /// The last duration the writer settled on, which is what a final fragment
-    /// with no fragment after it uses for its own last sample.
+    /// with no fragment after it uses for its own last sample, unless that
+    /// sample states its own.
     prev_duration: Option<u32>,
+    /// The message of the first error this writer hit. After one its state is
+    /// half-moved - a failed seal has eaten the open and held fragments and
+    /// moved `last_dts` - and no later call can be trusted to make a coherent
+    /// fragment, so every later `push` or `finish` reports `Malformed` with
+    /// this message instead. (`MediaError` itself is not `Clone`: the message
+    /// is kept, which is all the verdict needs.)
+    failed: Option<String>,
     held: Option<Sealed>,
     open: Open,
 }
@@ -637,8 +661,8 @@ impl FragmentWriter {
             sequence: 0,
             last_dts: None,
             last_sealed_first_dts: None,
-            running_tfdt: None,
             prev_duration: None,
+            failed: None,
             held: None,
             open: Open::default(),
         }
@@ -666,6 +690,32 @@ impl FragmentWriter {
     /// [`MAX_FRAGMENT_MS`], [`MAX_FRAGMENT_BYTES`] or [`MAX_FRAGMENT_SAMPLES`]
     /// caps, and the sample then starts the next fragment.
     pub fn push(&mut self, sample: Sample) -> Result<Option<Vec<u8>>, MediaError> {
+        self.poisoned()?;
+        let result = self.push_inner(sample);
+        self.poison(&result);
+        result
+    }
+
+    /// Once a call has failed the writer is done with: a failed seal has eaten
+    /// the open and held fragments and moved `last_dts`, so every later call
+    /// repeats the first failure rather than inventing a fragment from the
+    /// wreckage.
+    fn poisoned(&self) -> Result<(), MediaError> {
+        match &self.failed {
+            Some(reason) => Err(MediaError::Malformed(format!(
+                "the writer already failed and will not invent a fragment: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, result: &Result<Option<Vec<u8>>, MediaError>) {
+        if let Err(error) = result {
+            self.failed.get_or_insert_with(|| error.to_string());
+        }
+    }
+
+    fn push_inner(&mut self, sample: Sample) -> Result<Option<Vec<u8>>, MediaError> {
         self.offset()?;
         self.check_sample(&sample)?;
 
@@ -687,23 +737,35 @@ impl FragmentWriter {
 
     /// Seals whatever is left and flushes whatever was held back, in one Vec:
     /// the held fragment with its last duration now known from the final one,
-    /// and the final fragment with its last sample lasting as long as the
-    /// sample before it did (or 1 tick, for a final fragment that was one
-    /// sample long and has no history to borrow).
+    /// and the final fragment with its last sample lasting as long as it
+    /// states, or as long as the sample before it did, or 1 tick with nothing
+    /// to borrow.
     ///
     /// `Ok(None)` when no sample is outstanding. A player cannot be told a
     /// fragment ended before its last sample ended, so the last duration at the
     /// end of the stream is the best guess the timeline allows.
     pub fn finish(&mut self) -> Result<Option<Vec<u8>>, MediaError> {
+        self.poisoned()?;
+        let result = self.finish_inner();
+        self.poison(&result);
+        result
+    }
+
+    fn finish_inner(&mut self) -> Result<Option<Vec<u8>>, MediaError> {
         self.offset()?;
         if self.open.is_empty() {
             // The held fragment cannot learn its last duration with no fragment
             // after it; nothing pushes after `finish` in the intended flow, so
-            // end it with the previous duration, the fallback the plan names.
+            // end it with its last sample's stated duration if it states one,
+            // and otherwise the previous duration, the fallback the plan names.
             return match self.held.take() {
                 None => Ok(None),
                 Some(sealed) => {
-                    let last_duration = self.prev_duration.unwrap_or(1);
+                    let last_duration =
+                        match sealed.samples.last().and_then(|sample| sample.duration) {
+                            Some(stated) if stated > 0 => stated,
+                            _ => self.prev_duration.unwrap_or(1),
+                        };
                     Ok(Some(encode_fragment(self, sealed, last_duration)?))
                 }
             };
@@ -716,15 +778,22 @@ impl FragmentWriter {
             first_dts,
         } = synthesize(&open.samples, self.is_audio, &mut self.last_dts)?;
         let last_dts = *dts.last().expect("samples were just here");
-        // The final fragment has no fragment after it: the plan says its last
-        // sample lasts as long as the previous one. Inside the fragment that is
-        // the duration of the second-to-last sample; with a one-sample fragment,
+        // The final fragment has no fragment after it. If its last sample
+        // states a duration, that is the one: it is the only stated duration
+        // anywhere the writer believes. Otherwise the plan says the last sample
+        // lasts as long as the previous one: inside the fragment that is the
+        // duration of the second-to-last sample; with a one-sample fragment,
         // the last duration the writer settled on anywhere; with no history at
         // all, one tick.
-        let final_duration = match (durations.last().copied(), self.prev_duration) {
-            (Some(inside), _) => inside,
-            (None, Some(previous)) => previous,
-            (None, None) => 1,
+        let final_duration = match (
+            open.samples.last().and_then(|sample| sample.duration),
+            durations.last().copied(),
+            self.prev_duration,
+        ) {
+            (Some(stated), _, _) if stated > 0 => stated,
+            (Some(_), Some(inside), _) | (None, Some(inside), _) => inside,
+            (Some(_) | None, None, Some(previous)) => previous,
+            (Some(_) | None, None, None) => 1,
         };
 
         let sealed = Sealed {
@@ -1230,36 +1299,43 @@ mod tests {
         assert_eq!(total, 100);
     }
 
-    /// Zero-byte samples at one PTS would ride the byte and span caps forever:
-    /// [`MAX_FRAGMENT_SAMPLES`] is the bound that always bites. 10 001 such
-    /// samples give a fragment of exactly the cap and one for the remainder.
+    /// One-byte samples at one PTS ride the byte and span caps forever:
+    /// [`MAX_FRAGMENT_SAMPLES`] is the bound that always bites, and the ruling's
+    /// input is 25 000 of them with only the first a keyframe. Every fragment
+    /// holds at most the cap, the fragments hold all 25 000 samples between
+    /// them, and no call fails.
     ///
     /// Equal PTS is also the input the decode-time synthesis handles worst: the
     /// clamp forces each sample one tick past the last, so durations stay
     /// positive and decode times strictly increase even here.
     #[test]
     fn fragments_close_at_the_sample_cap() {
-        let samples: Vec<Sample> = (0..=MAX_FRAGMENT_SAMPLES)
+        let samples: Vec<Sample> = (0..25_000)
             .map(|number| Sample {
                 pts: 0,
                 dts: None,
                 duration: None,
                 keyframe: number == 0,
-                data: Vec::new(),
+                data: vec![7],
             })
             .collect();
         let out = fragments(&video_config(), samples);
-        assert_eq!(out.len(), 2, "the cap closes one fragment, finish the rest");
-        let (_, first) = walk(&out[0]);
+        let counts: Vec<usize> = out.iter().map(|fragment| walk(fragment).1.len()).collect();
+        for (number, &count) in counts.iter().enumerate() {
+            assert!(
+                count <= MAX_FRAGMENT_SAMPLES,
+                "fragment {number} holds {count} samples, over the cap of {MAX_FRAGMENT_SAMPLES}"
+            );
+        }
+        let total: usize = counts.iter().sum();
+        assert_eq!(total, 25_000, "every sample reached a fragment");
         assert_eq!(
-            first.len(),
-            MAX_FRAGMENT_SAMPLES,
-            "a fragment holds exactly the cap, never one more"
-        );
-        let durations: Vec<u32> = first.iter().map(|&(duration, _)| duration).collect();
-        assert!(
-            durations.iter().all(|&duration| duration >= 1),
-            "equal PTS still gives positive durations"
+            counts
+                .iter()
+                .filter(|&&count| count == MAX_FRAGMENT_SAMPLES)
+                .count(),
+            2,
+            "two fragments fill the cap before the last 5 000 samples"
         );
     }
 
@@ -1285,6 +1361,202 @@ mod tests {
         assert!(
             matches!(error, MediaError::Malformed(_)),
             "a wrapped timeline is the file's lie, not ours: {error:?}"
+        );
+    }
+
+    /// 29.97 fps at timescale 1000 with every sample stating `duration: 33`
+    /// while its PTS is the nearest tick: 33 is short of what the timeline
+    /// between two samples actually is, so writing the stated value mid-stream
+    /// would run every later presentation time early - over 10 s by 16.7 min.
+    /// Mid-stream durations come from decode times, so for every sample
+    /// `tfdt + sum(previous durations) + cts` is the source PTS plus the offset.
+    #[test]
+    fn stated_durations_do_not_shift_presentation() {
+        let samples: Vec<Sample> = (0..3000_i64)
+            .map(|i| Sample {
+                pts: (2 * i * 1001 + 30) / 60, // round(i * 1001 / 30)
+                dts: None,
+                duration: Some(33),
+                keyframe: i % 30 == 0,
+                data: vec![0x41],
+            })
+            .collect();
+        let out = fragments(&video_config(), samples.clone());
+        assert_eq!(
+            out.len(),
+            3000 / 30,
+            "one fragment per keyframed GOP, nothing else closed one"
+        );
+        let offset = 1000_u64; // TIME_OFFSET_MS at timescale 1000.
+        let mut index = 0_usize;
+        for (number, fragment) in out.iter().enumerate() {
+            let (tfdt, timeline) = walk(fragment);
+            let mut start = tfdt;
+            for (&(duration, cts), sample) in timeline.iter().zip(&samples[index..]) {
+                assert_eq!(
+                    start.wrapping_add(cts as u64),
+                    (sample.pts as u64) + offset,
+                    "sample {index} of fragment {number}: tfdt, the durations \
+                     before it and cts must name its presentation time"
+                );
+                start += u64::from(duration);
+                index += 1;
+            }
+        }
+        assert_eq!(index, 3000, "every sample reached a fragment");
+    }
+
+    /// A given decode time is a fact about the file, not a hint: with every
+    /// sample of a fragment carrying one, the writer uses it as given (clamped
+    /// and checked), and a fragment that mixes given with unstated is
+    /// `Malformed`.
+    ///
+    /// The ruling's pair, PTS `[0, 300, 100, 200]` against DTS `[-100, 0, 100,
+    /// 200]`, is an ordinary B-frame GOP - and exactly what synthesis would
+    /// also have produced - so the test carries a second writer whose given
+    /// decode times synthesis would not have found, and checks the mix rule on
+    /// a third. Without that pair of extras, "ignore given decode times again"
+    /// would pass the ruling's input unchanged.
+    #[test]
+    fn given_dts_is_used() {
+        fn written(writer: &mut FragmentWriter) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let bytes = writer.finish().expect("finish").expect("samples pushed");
+            out.extend(split_fragments(&bytes));
+            out
+        }
+
+        let pts = [0_i64, 300, 100, 200];
+        let check = |dts: [i64; 4]| {
+            let mut writer = FragmentWriter::new(&video_config());
+            for i in 0..4 {
+                writer
+                    .push(Sample {
+                        pts: pts[i],
+                        dts: Some(dts[i]),
+                        duration: None,
+                        keyframe: i == 0,
+                        data: vec![0x42],
+                    })
+                    .expect("no fragment closes inside four samples");
+            }
+            let out = written(&mut writer);
+            assert_eq!(out.len(), 1);
+            let (tfdt, timeline) = walk(&out[0]);
+            assert_eq!(timeline.len(), 4);
+            let mut start = tfdt;
+            for i in 0..4 {
+                assert_eq!(
+                    start,
+                    (dts[i] + 1000) as u64,
+                    "sample {i}: the decode time on the wire is the one given, offset"
+                );
+                assert_eq!(
+                    (start as i64) + timeline[i].1,
+                    pts[i] + 1000,
+                    "sample {i}: dts plus cts is the presentation time"
+                );
+                start += u64::from(timeline[i].0);
+            }
+        };
+
+        check([-100, 0, 100, 200]); // the ruling's pair
+        check([0, 60, 120, 180]); // not what synthesis (-100, 0, 100, 200) would give
+
+        // Mixed within one fragment is half a timeline, and half is none.
+        let mut writer = FragmentWriter::new(&video_config());
+        writer
+            .push(Sample {
+                pts: 0,
+                dts: Some(-50),
+                duration: None,
+                keyframe: true,
+                data: vec![1],
+            })
+            .expect("opens");
+        writer
+            .push(sample(100, false))
+            .expect("still one open fragment");
+        let error = writer.finish().expect_err("half given, half synthesized");
+        assert!(
+            matches!(error, MediaError::Malformed(_)),
+            "a mixed fragment is malformed input: {error:?}"
+        );
+    }
+
+    /// Audio does not reorder, so its decode times are its presentation times
+    /// and its composition offsets are zero - including when a PTS falls below
+    /// the fragment's running floor and the clamp pushes that pair back, which
+    /// is the only way audio can differ from its PTS at all.
+    #[test]
+    fn audio_dts_equals_pts() {
+        let audio = [0_i64, 21, 42, 64];
+        let out = fragments(&audio_config(), audio.iter().map(|&pts| sample(pts, false)));
+        assert_eq!(out.len(), 1);
+        let (tfdt, timeline) = walk(&out[0]);
+        assert_eq!(timeline.len(), 4);
+        assert_eq!(
+            tfdt,
+            audio[0] as u64 + 48_000,
+            "the first decode time is the first PTS, offset by one second of audio ticks"
+        );
+        for (&(_duration, cts), &pts) in timeline.iter().zip(&audio) {
+            assert_eq!(
+                cts, 0,
+                "a track that never reorders has nothing to offset at PTS {pts}"
+            );
+        }
+
+        // A PTS below the floor clamps forward, and the offset goes negative -
+        // still the sample's own PTS against its own clamped decode time.
+        let dip = [100_i64, 0];
+        let out = fragments(&audio_config(), dip.iter().map(|&pts| sample(pts, false)));
+        assert_eq!(out.len(), 1);
+        let (tfdt, timeline) = walk(&out[0]);
+        assert_eq!(
+            tfdt,
+            100 + 48_000,
+            "the first audio decode time is its PTS even when the next PTS dips"
+        );
+        assert_eq!(timeline[0].1, 0);
+        assert_eq!(
+            timeline[0].0, 1,
+            "the dip clamps the second sample to one tick after the first"
+        );
+        assert_eq!(
+            timeline[1].1, -101,
+            "and its composition offset goes negative, which trun version 1 signs"
+        );
+    }
+
+    /// After a failed call the writer's state is half-moved: the open and held
+    /// fragments are gone and the timeline floor has shifted. Every later call
+    /// repeats the failure instead of inventing a fragment from the wreckage.
+    #[test]
+    fn writer_stays_failed_after_an_error() {
+        let mut writer = FragmentWriter::new(&video_config());
+        writer
+            .push(sample(0, true))
+            .expect("the first sample opens a fragment");
+        writer
+            .push(sample(i64::MAX, false))
+            .expect("the span cap closes it cleanly");
+        let error = writer
+            .finish()
+            .expect_err("the gap between the fragments does not fit a duration");
+        assert!(matches!(error, MediaError::Malformed(_)));
+
+        let error = writer
+            .push(sample(0, true))
+            .expect_err("the failure stands");
+        assert!(
+            matches!(error, MediaError::Malformed(_)),
+            "a dead writer says so instead of reopening: {error:?}"
+        );
+        let error = writer.finish().expect_err("and still says so");
+        assert!(
+            matches!(error, MediaError::Malformed(_)),
+            "finish after failure is the same verdict: {error:?}"
         );
     }
 

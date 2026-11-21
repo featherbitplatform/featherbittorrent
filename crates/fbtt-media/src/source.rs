@@ -18,7 +18,9 @@ use crate::codec::{Codec, TrackKind};
 /// `dts` is `None` when the source has only presentation times, which is
 /// Matroska: the writer then synthesizes decode times so a B-frame's composition
 /// offset is still signed the way `trun` version 1 says (see [`fmp4`](crate::fmp4)).
-/// When the source does know a decode time - MP4 in, later - it is used as given.
+/// When the source does know a decode time - MP4 in, later - it is used as given,
+/// subject to the same strictly-increasing clamp. A fragment cannot mix the two:
+/// some samples with and some without is `Malformed`.
 ///
 /// `duration` is `None` when the container does not state one, which is most
 /// samples in both containers: the writer then takes it from the next sample's
@@ -29,7 +31,11 @@ pub struct Sample {
     pub pts: i64,
     /// Decode time, when the source states one.
     pub dts: Option<i64>,
-    /// Duration, when the source states one.
+    /// Duration, when the source states one. Only the last sample of a stream
+    /// gets its stated value written (it is what `finish` would otherwise have
+    /// to guess); every other duration on the wire comes from the decode
+    /// timeline, because a stated value that differed from the gap between
+    /// decode times would shift everything after it.
     pub duration: Option<u32>,
     /// Whether a decoder can start from this sample: a keyframe, or the first
     /// sample after a seek.
