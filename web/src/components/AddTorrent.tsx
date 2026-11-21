@@ -9,15 +9,17 @@
  * the same for both, and so is the tick that starts the torrent paused.
  *
  * What this page can rule out by itself never reaches the server: a file with nothing in it, a file
- * too big to be a torrent file, a field that cannot be a magnet link. Those are refusals here, said
- * in the dialog, with no request spent finding out what the browser already knew. What only the
- * server knows - that this torrent is already in the list - comes back as its own words inside this
- * dialog, which keeps every field exactly as it was typed: an error that emptied the form made the
- * person rebuild the thing they had just asked for.
+ * too big to be a torrent file, a drop of several files at once, a name that cannot be a torrent
+ * file's name, a field that cannot be a magnet link. Those are refusals here, said in the dialog, with
+ * no request spent finding out what the browser already knew - and a drop that is refused leaves the
+ * file picked before it, still picked. What only the server knows - that this torrent is already in the list -
+ * comes back as its own words inside this dialog, which keeps every field exactly as it was typed: an
+ * error that emptied the form made the person rebuild the thing they had just asked for.
  *
  * The dialog is a real `<dialog>`: `useModalDialog` opens it before paint, holds the keyboard inside
- * it, and hands the focus back to the header button that opened it when it goes away. Escape closes
- * it and asks the server nothing.
+ * it, and hands the focus back to the header button that opened it when it goes away. Escape closes it
+ * and asks the server nothing - and while its request is on the wire the dialog cannot be closed at
+ * all, by Escape, by the close button or by Cancel, because the answer is still owed.
  *
  * @module components/AddTorrent
  */
@@ -45,6 +47,12 @@ const MAX_TORRENT_BYTES = 10 * 1024 * 1024
 const TOO_LARGE_COPY = 'That file is too large to be a torrent.'
 const EMPTY_FILE_COPY = 'That file is empty.'
 
+/** Why a name will not be sent: a torrent file is recognised by its suffix, whatever case it wears. */
+const NOT_TORRENT_COPY = 'That is not a .torrent file.'
+
+/** Why a drop of several files at once is a selection or a folder, not the one torrent this takes. */
+const ONE_FILE_COPY = 'Drop one torrent file at a time.'
+
 /** Why a field will not be sent. The server parses magnet links; this only refuses what cannot be one. */
 const NOT_A_MAGNET_COPY = 'That is not a magnet link.'
 
@@ -56,13 +64,16 @@ function looksLikeMagnet(value: string): boolean {
   return value.toLowerCase().startsWith('magnet:?')
 }
 
-/** What is wrong with this file, in the person's language, or null when it is worth uploading. */
+/** Whether a name ends the way a torrent file's name ends, case included or not as typed. */
+function isTorrentName(name: string): boolean {
+  return name.toLowerCase().endsWith('.torrent')
+}
+
+/** What is wrong with this already-accepted file, in the person's language, or null when it is worth uploading. */
 function fileProblem(file: File | null): string | null {
   if (file === null) return null
   if (file.size === 0) return EMPTY_FILE_COPY
   if (file.size > MAX_TORRENT_BYTES) return TOO_LARGE_COPY
-  // A file the browser could not name is a file nobody can find again on the disk.
-  if (file.name.trim() === '') return TOO_LARGE_COPY
   return null
 }
 
@@ -94,8 +105,19 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
   const [refusal, setRefusal] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const magnetRef = useRef<HTMLInputElement>(null)
+  // The submit guard, on a ref rather than on `busy`: a second press in the same tick reads state the
+  // first has set but React has not yet painted, and two adds would put the same torrent on the wire
+  // twice. A ref is true the moment the request starts, and it is what Close, Cancel and Escape read.
+  const submittingRef = useRef(false)
 
-  const { ref, onKeyDown } = useModalDialog(onClose, '#add-magnet')
+  // Escape and the close X answer the way Cancel already does: not at all while a request is owed an
+  // answer. The ref, not the state, because the guard has to hold from the instant the request starts.
+  function requestClose(): void {
+    if (submittingRef.current) return
+    onClose()
+  }
+
+  const { ref, onKeyDown } = useModalDialog(requestClose, '#add-magnet')
   const onPathChange = useCallback((next: string) => {
     setPath(next)
   }, [])
@@ -114,13 +136,29 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
     setRefusal(fileProblem(next))
   }
 
+  /** Take a file the person offered, or say why it is not taken - leaving the earlier pick alone. */
+  function takeFile(next: File | null): void {
+    if (next !== null && !isTorrentName(next.name)) {
+      setRefusal(NOT_TORRENT_COPY)
+      return
+    }
+    pickFile(next)
+  }
+
   function onDrop(event: DragEvent<HTMLDivElement>): void {
     event.preventDefault()
-    pickFile(event.dataTransfer?.files[0] ?? null)
+    const files = event.dataTransfer?.files
+    if (files !== undefined && files.length > 1) {
+      // Several at once is a folder or a multiselect, not the one torrent this dialog takes; the
+      // file already picked, if there was one, is still the file that will be sent.
+      setRefusal(ONE_FILE_COPY)
+      return
+    }
+    takeFile(files?.[0] ?? null)
   }
 
   async function add(): Promise<void> {
-    if (busy || path === '') return
+    if (submittingRef.current || busy || path === '') return
     const magnet = (magnetRef.current?.value ?? '').trim()
     const picked = source === 'file' ? file : null
     if (source === 'magnet' && !looksLikeMagnet(magnet)) {
@@ -136,6 +174,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
       }
     }
 
+    submittingRef.current = true
     setBusy(true)
     setRefusal(null)
     try {
@@ -150,6 +189,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
       // The server's own words, here, with every field left exactly as it was.
       setRefusal(errorMessage(cause))
     } finally {
+      submittingRef.current = false
       setBusy(false)
     }
   }
@@ -168,8 +208,9 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
         <button
           type="button"
           aria-label="Close"
-          onClick={onClose}
-          className="-mr-2 flex h-9 w-9 flex-none cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-700 hover:text-strong"
+          disabled={busy}
+          onClick={requestClose}
+          className="-mr-2 flex h-9 w-9 flex-none cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-700 hover:text-strong disabled:cursor-default disabled:opacity-55"
         >
           <X className="h-4.5 w-4.5" aria-hidden="true" />
         </button>
@@ -198,7 +239,9 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
               tabIndex={source === tab.key ? 0 : -1}
               onClick={() => {
                 setSource(tab.key)
-                setRefusal(null)
+                // The reason the file box holds comes back with the tab, recomputed from the file as
+                // it is now; on the magnet tab there is no file problem to show.
+                setRefusal(tab.key === 'file' ? fileProblem(file) : null)
               }}
               className={`min-h-8.5 cursor-pointer rounded-control px-3.5 text-[13px] transition-colors ${
                 source === tab.key
@@ -256,7 +299,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
                   accept=".torrent,application/x-bittorrent"
                   className="sr-only"
                   onChange={(event: ChangeEvent<HTMLInputElement>) => {
-                    pickFile(event.target.files?.[0] ?? null)
+                    takeFile(event.target.files?.[0] ?? null)
                   }}
                 />
               </label>

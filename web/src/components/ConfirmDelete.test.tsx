@@ -13,7 +13,7 @@
  */
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import ConfirmDelete from './ConfirmDelete'
 import { createClient } from '../api/client'
 import type { Api } from '../api/client'
@@ -56,17 +56,22 @@ function server(answer: () => Response = () => new Response(null, { status: 204 
   }
 }
 
+/**
+ * Focus the opener the moment it attaches. React sets refs before any layout effect runs - including
+ * the dialog's own, which is where the dialog reads its opener - while a layout effect in this
+ * harness would land too late for that reading, after `showModal` has already moved the focus away.
+ */
+const focusOnAttach = (node: HTMLButtonElement | null): void => {
+  if (node !== null) node.focus()
+}
+
 /** The dialog in the shape the screen puts it in: mounted only while open, with the polite region already on the page and the Remove button that opened it holding the focus, the way a click leaves it. */
 function Harness({ client, events }: { client: Api; events: string[] }) {
   const [open, setOpen] = useState(true)
-  const openerRef = useRef<HTMLButtonElement>(null)
-  useLayoutEffect(() => {
-    openerRef.current?.focus()
-  }, [])
   return (
     <>
       <div role="status" aria-live="polite" />
-      <button ref={openerRef} type="button">
+      <button ref={focusOnAttach} type="button">
         Remove
       </button>
       {open && (
@@ -185,6 +190,25 @@ describe('what the remove dialog sends', () => {
       'a refused removal closed the dialog, announced a removal, or tried again',
     ).toBe(true)
   })
+
+  it('pressing_a_remove_button_twice_sends_one_removal', async () => {
+    const { client, seen } = server()
+    openConfirm(client)
+    await flush()
+
+    // Two presses inside one commit, one on each removal button: the second arrives before the first
+    // has painted itself as busy, and a torrent should only ever be asked about once.
+    const del = screen.getByRole('button', { name: 'Remove and delete files' })
+    const keep = screen.getByRole('button', { name: 'Remove and keep files' })
+    act(() => {
+      fireEvent.click(del)
+      fireEvent.click(keep)
+    })
+    await flush()
+    expect(removeRequests(seen).length, 'pressing the removal buttons twice sent the removal twice').toBe(
+      1,
+    )
+  })
 })
 
 describe('the remove dialog in words', () => {
@@ -242,5 +266,28 @@ describe('the keyboard', () => {
       'Escape left the remove dialog holding the focus or asking the server',
     ).toBe(true)
     expect(container.querySelector('dialog'), 'the remove dialog element stayed in the page').toBeNull()
+  })
+
+  it('focus_returns_to_the_opener', async () => {
+    const { client } = server()
+    const { opener } = openConfirm(client)
+    await flush()
+
+    // `showModal()` moves the focus into the dialog, wherever it was - which is why the dialog has to
+    // have read the opener *before* it was called, and hand the focus back to it on the way out.
+    const dialog = screen.getByRole('dialog')
+    expect(
+      document.activeElement !== null &&
+        dialog.contains(document.activeElement) &&
+        document.activeElement !== opener,
+      'the remove dialog did not take the focus out of the button that opened it',
+    ).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await flush()
+    expect(
+      screen.queryByRole('dialog') === null && document.activeElement === opener,
+      'closing the remove dialog did not give the focus back to the button that opened it',
+    ).toBe(true)
   })
 })

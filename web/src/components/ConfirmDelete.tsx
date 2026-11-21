@@ -10,11 +10,13 @@
  * It makes the removal itself, through the same client the screen reads with, because a refusal is
  * worth showing where the question was asked: a `torrent_not_found` that closed the dialog would read
  * as a removal that worked. Only a 204 closes it, and it closes by being dropped from the tree -
- * `useModalDialog` hands the focus back to the Remove button that opened it on the way out.
+ * `useModalDialog` hands the focus back to the Remove button that opened it on the way out. While the
+ * answer is on the wire the dialog cannot be closed at all - Cancel, Escape and the close X all go
+ * quiet together - because the removal it would walk away from has not been refused yet.
  *
  * @module components/ConfirmDelete
  */
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
@@ -47,10 +49,21 @@ export interface ConfirmDeleteProps {
 export default function ConfirmDelete({ id, name, client, onClose, onRemoved }: ConfirmDeleteProps) {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const { ref, onKeyDown } = useModalDialog(onClose, '[data-cancel]')
+  // The guard against a second press in the same tick, on a ref: `busy` is set by the first press but
+  // not yet painted for the second, and two removals of one torrent would be two requests for it.
+  const submittingRef = useRef(false)
+
+  // Escape and the close X answer the way Cancel does: not at all while the answer is on its way.
+  function requestClose(): void {
+    if (submittingRef.current) return
+    onClose()
+  }
+
+  const { ref, onKeyDown } = useModalDialog(requestClose, '[data-cancel]')
 
   async function remove(deleteFiles: boolean): Promise<void> {
-    if (busy) return
+    if (submittingRef.current || busy) return
+    submittingRef.current = true
     setBusy(true)
     setError(null)
     try {
@@ -59,6 +72,7 @@ export default function ConfirmDelete({ id, name, client, onClose, onRemoved }: 
       // The dialog keeps the question and answers it with the server's own words, because "the
       // dialog closed" and "the torrent is gone" are not the same claim.
       setError(errorMessage(cause))
+      submittingRef.current = false
       setBusy(false)
       return
     }
@@ -81,8 +95,9 @@ export default function ConfirmDelete({ id, name, client, onClose, onRemoved }: 
         <button
           type="button"
           aria-label="Close"
-          onClick={onClose}
-          className="-mr-2 flex h-9 w-9 flex-none cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-700 hover:text-strong"
+          disabled={busy}
+          onClick={requestClose}
+          className="-mr-2 flex h-9 w-9 flex-none cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-700 hover:text-strong disabled:cursor-default disabled:opacity-55"
         >
           <X className="h-4.5 w-4.5" aria-hidden="true" />
         </button>
@@ -98,7 +113,7 @@ export default function ConfirmDelete({ id, name, client, onClose, onRemoved }: 
       </div>
 
       <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-ink-700 px-5.5 py-4">
-        <Button data-cancel variant="secondary" onClick={onClose} disabled={busy}>
+        <Button data-cancel variant="secondary" onClick={requestClose} disabled={busy}>
           Cancel
         </Button>
         <Button

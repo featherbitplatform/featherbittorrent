@@ -7,7 +7,10 @@
  * than promised: there is no box to type a path into, so there is no path to type wrong. A folder is
  * listed the first time it is opened and not again while the dialog stays open, so a tree that grows
  * is a tree that asked once per folder, and a 403 shows the server's reason instead of a guess about
- * what was done wrong.
+ * what was done wrong. `list()` answers the bare *names* of the folders inside a path
+ * (`crates/fbtt-core/src/fs_list.rs`), never their absolute paths, so a child's path is built here by
+ * [`childPath`] joining the name onto its parent - taking the name for a path of its own would ask
+ * the server about `music space` and be told it is outside the allowed folders.
  *
  * The picked folder and everything above it stay open, so a pick is visible instead of remembered
  * somewhere off screen. The two notes the prototype draws are here too: `default` on the folder the
@@ -19,6 +22,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { Folder, FolderOpen } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
+import { displaySafe } from '../format'
+import { childPath } from '../paths'
 import Banner from './Banner'
 
 /** The note on the row that is the server's configured download folder. */
@@ -123,7 +128,7 @@ function FolderRow({
         ) : (
           <Folder className="h-3.75 w-3.75 flex-none" aria-hidden="true" />
         )}
-        <span className="min-w-0 truncate font-mono text-[12px]">{path}</span>
+        <span className="min-w-0 truncate font-mono text-[12px]">{displaySafe(path)}</span>
         {note !== null && <span className="ml-auto flex-none text-[12px] text-muted">{note}</span>}
       </button>
       {open && error !== null && (
@@ -141,20 +146,24 @@ function FolderRow({
       )}
       {open && dirs !== null && dirs.length > 0 && (
         <ul role="list">
-          {dirs.map((child: string) => (
-            <FolderRow
-              key={child}
-              client={client}
-              path={child}
-              depth={depth + 1}
-              isDefault={false}
-              isRoot={false}
-              selected={selected}
-              open={isOpen(child)}
-              isOpen={isOpen}
-              onPick={onPick}
-            />
-          ))}
+          {dirs.map((name: string) => {
+            // `list()` named the folder; only this join makes it a path the server recognises.
+            const child = childPath(path, name)
+            return (
+              <FolderRow
+                key={child}
+                client={client}
+                path={child}
+                depth={depth + 1}
+                isDefault={false}
+                isRoot={false}
+                selected={selected}
+                open={isOpen(child)}
+                isOpen={isOpen}
+                onPick={onPick}
+              />
+            )
+          })}
         </ul>
       )}
     </li>

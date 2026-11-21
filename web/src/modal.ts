@@ -1,21 +1,20 @@
 /**
  * The two things a `<dialog>` does not do by itself: keep the keyboard inside itself, and give the
- * focus back when it goes away.
+ * focus back when it goes.
  *
- * `showModal()` puts the element in the top layer and blocks the page behind it, but Tab still walks
- * out of it into the table underneath, and a dialog that is unmounted rather than closed - which is
- * how a screen closes one, by dropping it from the tree - never returns the focus to the button that
- * opened it. This hook does both, so the Add dialog and the remove dialog are the same behaviour
- * rather than two copies of it, and each dialog's own tests are about the dialog and not about the
- * trap.
+ * `showModal()` puts the element in the top layer, blocks the page behind it and moves the focus
+ * inside - a browser takes it from whatever held it - but Tab still walks out of the dialog into the
+ * table underneath, and a dialog that is unmounted rather than closed, which is how a screen closes
+ * one, never hands the focus back on its own. This hook does both, so the Add dialog and the remove
+ * dialog are one behaviour rather than two copies of it, and each dialog's own tests are about the
+ * dialog and not about the trap.
  *
- * Opening happens in a layout effect and the rest in a passive one, and the split is the point. The
- * layout effect is what keeps a dialog from painting shut for one frame; the opener, by contrast,
- * has to be read *after* everything that mounts the dialog has had its say about focus - a screen
- * that focuses the row it just acted on, or a test harness that focuses the button that opened the
- * dialog, is still running its own layout effect when this component's has finished. Capture the
- * opener any earlier and the focus is handed back to whatever held it before the dialog was even
- * mounted.
+ * Opening and the reading of the opener happen in the same layout effect, in that order, and the
+ * order is the whole point: by the time `showModal()` returns the focus is already inside the dialog,
+ * so an opener read after it is a control of the dialog's own - disconnected the moment the dialog
+ * goes away, which leaves the focus on `body` and the person back at the top of the page. A layout
+ * effect is also the only place a dialog can be opened before it paints. The opener is therefore
+ * captured on the line above `showModal()`, and restored in the cleanup of the same effect.
  *
  * @module modal
  */
@@ -28,12 +27,15 @@ export interface ModalDialog {
   onKeyDown(event: KeyboardEvent<HTMLDialogElement>): void
 }
 
-/** Everything a Tab key can land on, in the order the keyboard reaches them. */
-const FOCUSABLE =
+/**
+ * Everything a Tab key can land on, in the order the keyboard reaches them. Exported because
+ * `dialog-shim` has to answer `showModal()` with the same element a browser would have focused.
+ */
+export const FOCUSABLE_SELECTOR =
   'a[href], area, button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), iframe, object, embed, [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
 
 function focusableWithin(root: HTMLDialogElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE))
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
 }
 
 /**
@@ -43,11 +45,12 @@ function focusableWithin(root: HTMLDialogElement): HTMLElement[] {
  * is how it is told to go away, and unmounting is what returns the focus. Escape is intercepted
  * before the browser sees it - otherwise it reaches whatever is behind the dialog too - and is
  * reported as `onClose` and nothing else, so a dialog that closes on Escape has asked the server
- * nothing by construction.
+ * nothing by construction. A component that cannot be interrupted mid-request guards its own
+ * `onClose`, which is why Escape and the close button go quiet together with Cancel.
  *
  * @param onClose What to do when the person asks out: Escape, or the component's own close control.
- * @param initialFocus Selector for the control to start in. Without it the first control in the dialog
- *   gets the focus.
+ * @param initialFocus Selector for the control to start in. Without it, and when nothing matches it,
+ *   the focus stays where `showModal()` put it: the first control in the dialog.
  */
 export function useModalDialog(onClose: () => void, initialFocus?: string): ModalDialog {
   const ref = useRef<HTMLDialogElement>(null)
@@ -60,24 +63,22 @@ export function useModalDialog(onClose: () => void, initialFocus?: string): Moda
   }, [onClose])
 
   useLayoutEffect(() => {
-    ref.current?.showModal()
-  }, [])
-
-  useEffect(() => {
     const root = ref.current
     if (root === null) return
-    const opener = document.activeElement
-    const target =
-      (initialFocus === undefined ? null : root.querySelector<HTMLElement>(initialFocus)) ??
-      focusableWithin(root)[0] ??
-      root
-    target.focus()
+    // The line above `showModal()`, not below it: `showModal` has already taken the focus by then,
+    // and what it took it from is the thing this dialog owes the focus back to.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    root.showModal()
+    const target = initialFocus === undefined ? null : root.querySelector<HTMLElement>(initialFocus)
+    if (target !== null) target.focus()
 
     return () => {
-      // jsdom has no `close` (see `dialog-shim`), and a dialog dropped from the tree after Escape is
-      // already closed, so both cases are tolerated here rather than in the app source.
+      // jsdom has no `close` (see `dialog-shim`), and a dialog dropped from the tree is closed by
+      // the removal itself, so both cases are tolerated here rather than in the app source.
       if (typeof root.close === 'function') root.close()
-      if (opener instanceof HTMLElement && opener.isConnected) opener.focus()
+      // Never hand the focus to a control of this dialog's own: it went away with the dialog, and
+      // focusing a detached node is how the page ends up with the focus on nothing.
+      if (opener !== null && opener.isConnected && !root.contains(opener)) opener.focus()
     }
   }, [initialFocus])
 

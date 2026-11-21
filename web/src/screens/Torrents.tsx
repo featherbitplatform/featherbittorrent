@@ -19,8 +19,8 @@
  * injected at build time - and none of it earns a place in the once-a-second round.
  *
  * The header's Add torrent button and the toolbar over the table are the two ways into the server's
- * write side. The toolbar belongs to the chosen row: Pause and Remove go with any choice, Resume only
- * with a row that says it is paused, and all three go quiet while a request is on the wire so nobody
+ * write side. The toolbar belongs to the chosen row: Remove goes with any choice, Pause only with a
+ * row that is not already paused, Resume only with one that says it is paused, and all three go quiet while a request is on the wire so nobody
  * presses a fourth time at something already happening. Removal is a question rather than a click
  * (`ConfirmDelete`), and Add is a dialog of its own (`AddTorrent`). Each of them makes its own call
  * and reports its own failure where it happened - inside the dialog for a dialog, in the banner above
@@ -200,7 +200,7 @@ export default function Torrents({
       <Button
         size="sm"
         variant="secondary"
-        disabled={selectedRow === null || busy}
+        disabled={selectedRow === null || selectedRow.rowState === 'paused' || busy}
         onClick={() => {
           void act('pause')
         }}

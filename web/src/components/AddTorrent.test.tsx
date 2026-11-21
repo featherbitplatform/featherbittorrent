@@ -17,11 +17,12 @@
  */
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import AddTorrent from './AddTorrent'
 import { createClient } from '../api/client'
 import type { Api } from '../api/client'
 import { installDialogShim } from '../dialog-shim'
+import { childPath } from '../paths'
 
 afterEach(cleanup)
 installDialogShim()
@@ -40,7 +41,7 @@ function json(status: number, body: string): Response {
   return new Response(body, { status, headers: { 'content-type': 'application/json' } })
 }
 
-/** The server the dialog talks to: the two fs routes, and the add route, answering whatever the test asks it to. `refuse` names paths that answer `path_not_allowed` even though they are inside a root, the way a server would for a folder that went off limits; `rootsAnswer` replaces the roots answer with a failure of the test's choosing. */
+/** The server the dialog talks to: the two fs routes, and the add route, answering whatever the test asks it to. `refuse` names paths that answer `path_not_allowed` even though they are inside a root, the way a server would for a folder that went off limits; `rootsAnswer` replaces the roots answer with a failure of the test's choosing. `dirs` maps each asked path to the bare folder *names* `list()` really answers - never to their absolute paths. */
 function server(
   options: {
     roots?: string[]
@@ -88,17 +89,22 @@ function server(
   }
 }
 
-/** The dialog inside the shape the screen puts it in: mounted only while it is open, with the page's polite region already on the page and the button that opened it before it. The layout effect hands that button the focus before the dialog's own effect runs, which is what a click does in a browser and what the dialog has to see in order to hand the focus back. */
+/**
+ * Focus the opener the moment it attaches. React sets refs before any layout effect runs - including
+ * the dialog's own, which is where the dialog reads its opener - while a layout effect in this
+ * harness would land too late for that reading, after `showModal` has already moved the focus away.
+ */
+const focusOnAttach = (node: HTMLButtonElement | null): void => {
+  if (node !== null) node.focus()
+}
+
+/** The dialog inside the shape the screen puts it in: mounted only while it is open, with the page's polite region already on the page and the button that opened it before it, holding the focus the way the click that opened the dialog leaves it. */
 function Harness({ client, events }: { client: Api; events: string[] }) {
   const [open, setOpen] = useState(true)
-  const openerRef = useRef<HTMLButtonElement>(null)
-  useLayoutEffect(() => {
-    openerRef.current?.focus()
-  }, [])
   return (
     <>
       <div role="status" aria-live="polite" />
-      <button ref={openerRef} type="button">
+      <button ref={focusOnAttach} type="button">
         Add torrent
       </button>
       {open && (
@@ -173,8 +179,8 @@ describe('the folder the torrent goes into', () => {
     const { client, seen } = server({
       roots: ['/downloads', '/usb/media'],
       dirs: {
-        '/downloads': ['/downloads/films', '/downloads/linux'],
-        '/downloads/films': ['/downloads/films/subtitles'],
+        '/downloads': ['films', 'linux'],
+        '/downloads/films': ['subtitles'],
         '/downloads/linux': [],
         '/usb/media': [],
       },
@@ -258,6 +264,85 @@ describe('the folder the torrent goes into', () => {
       'the picker hid the reason the server gave for refusing a folder',
     ).toBe(true)
   })
+
+  it('the_picker_joins_names_to_the_parent', async () => {
+    const { client, seen } = server({
+      roots: ['/downloads'],
+      dirs: { '/downloads': ['films', 'music space'], '/downloads/music space': ['Música'] },
+    })
+    const { container } = openDialog(client)
+    await flush()
+
+    // `list()` answers bare names; only a join makes one a path the server recognises. The row is the
+    // parent's path with the name on the end of it, not the name by itself.
+    expect(
+      rowPaths(container).join(','),
+      'the folder picker drew a child folder under its bare name instead of the parent path joined with it',
+    ).toBe('/downloads,/downloads/films,/downloads/music space')
+
+    // Opening that row asks the server about the joined path - never about the bare name - and the
+    // names it answers with join the same way.
+    pressFolder(container, '/downloads/music space')
+    await flush()
+    expect(
+      listPaths(seen).join(','),
+      'the folder picker asked list() about a bare folder name instead of the parent joined with it',
+    ).toBe('/downloads,/downloads/music space')
+    expect(
+      rowPaths(container).includes('/downloads/music space/Música'),
+      'the folders inside a joined child were not drawn under their joined paths',
+    ).toBe(true)
+
+    fireEvent.change(magnetField(), { target: { value: MAGNET } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await flush()
+    expect(
+      addedJson(seen)?.save_path === '/downloads/music space',
+      'the add did not save to the parent path joined with the folder name that was picked',
+    ).toBe(true)
+  })
+
+  it('a_refused_child_folder_keeps_the_parent_listing', async () => {
+    const { client } = server({
+      roots: ['/downloads'],
+      dirs: { '/downloads': ['films', 'linux'] },
+      refuse: ['/downloads/linux'],
+    })
+    const { container } = openDialog(client)
+    await flush()
+    pressFolder(container, '/downloads/linux')
+    await flush()
+
+    // A `403 path_not_allowed` on opening a child is the server's reason, shown inside the tree, and
+    // nothing else gives way: the folders that did answer stay listed, and the tree is still open on
+    // the row that was pressed.
+    const text = container.textContent ?? ''
+    expect(
+      text.includes('that path is not one of the folders this server allows') &&
+        rowPaths(container).includes('/downloads/films') &&
+        chosenPath(container) === '/downloads/linux',
+      'a refused child folder lost the parent listing or the reason the server gave for refusing it',
+    ).toBe(true)
+  })
+})
+
+describe('joining a folder name to the path of its parent', () => {
+  const cases: [string, string, string][] = [
+    ['/data', 'films', '/data/films'],
+    ['/data/', 'films', '/data/films'],
+    ['/', 'srv', '/srv'],
+    ['C:\\Users\\me', 'Films', 'C:\\Users\\me\\Films'],
+    ['C:\\', 'Films', 'C:\\Films'],
+    ['/downloads', 'music space', '/downloads/music space'],
+    ['/downloads', 'Música', '/downloads/Música'],
+  ]
+  for (const [parent, name, joined] of cases) {
+    it(`joins ${JSON.stringify(parent)} and ${JSON.stringify(name)}`, () => {
+      expect(childPath(parent, name), `childPath(${parent}, ${name}) is not the joined path`).toBe(
+        joined,
+      )
+    })
+  }
 })
 
 describe('a .torrent file', () => {
@@ -266,6 +351,18 @@ describe('a .torrent file', () => {
 
   const torrentFile = (): File =>
     new File([torrentBytes()], 'sintel.torrent', { type: 'application/x-bittorrent' })
+
+  const otherBytes = (): Uint8Array<ArrayBuffer> =>
+    new Uint8Array([0x64, 0x65, 0x3a, 0x65, 0x65, 0x65, 0x65, 0x65])
+
+  /** A second real torrent file, by name only: the tests below argue about names, not contents. */
+  const otherTorrent = (name: string): File =>
+    new File([otherBytes()], name, { type: 'application/x-bittorrent' })
+
+  const sentBytes = (seen: Seen[]): string => {
+    const body = addRequest(seen)?.body
+    return body instanceof ArrayBuffer ? Array.from(new Uint8Array(body)).join(',') : 'no bytes'
+  }
 
   function openFileTab(container: HTMLElement): void {
     fireEvent.click(screen.getByRole('tab', { name: 'Torrent file' }))
@@ -365,12 +462,102 @@ describe('a .torrent file', () => {
       'an empty file was accepted or sent to the server',
     ).toBe(true)
   })
+
+  it('a_drop_of_several_files_keeps_the_earlier_pick', async () => {
+    const { client, seen } = server()
+    const { container } = openDialog(client)
+    await flush()
+    openFileTab(container)
+
+    fireEvent.drop(dropArea(container), { dataTransfer: { files: [torrentFile()] } })
+    await flush()
+    fireEvent.drop(dropArea(container), {
+      dataTransfer: { files: [torrentFile(), otherTorrent('second.torrent')] },
+    })
+    await flush()
+
+    // Several files at once is a folder or a multiselect, not the one torrent this dialog takes - and
+    // the refusal says so instead of quietly keeping the first of them.
+    expect(
+      (container.textContent ?? '').includes('Drop one torrent file at a time.'),
+      'a drop of several files at once was taken as one of them',
+    ).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await flush()
+    expect(
+      postCount(seen) === 1 && sentBytes(seen) === Array.from(torrentBytes()).join(','),
+      'the refused multi-file drop replaced or lost the file that was picked before it',
+    ).toBe(true)
+  })
+
+  it('a_dropped_file_that_is_not_a_torrent_is_refused', async () => {
+    const { client, seen } = server()
+    const { container } = openDialog(client)
+    await flush()
+    openFileTab(container)
+
+    fireEvent.drop(dropArea(container), { dataTransfer: { files: [torrentFile()] } })
+    await flush()
+    fireEvent.drop(dropArea(container), { dataTransfer: { files: [otherTorrent('notes.txt')] } })
+    await flush()
+
+    // A name that cannot belong to a torrent file is refused out loud, and the file picked before it
+    // stays picked - the readout under the box still names it.
+    expect(
+      (container.textContent ?? '').includes('That is not a .torrent file.') &&
+        (container.textContent ?? '').includes('sintel.torrent') &&
+        postCount(seen) === 0,
+      'a dropped file that is not named like a .torrent was accepted as one',
+    ).toBe(true)
+
+    // The suffix is matched whatever case it wears, and a real `.Torrent` replaces the earlier pick.
+    fireEvent.drop(dropArea(container), { dataTransfer: { files: [otherTorrent('Sintel.Torrent')] } })
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await flush()
+    expect(
+      postCount(seen) === 1 &&
+        sentBytes(seen) === Array.from(otherBytes()).join(',') &&
+        (container.textContent ?? '').includes('That is not a .torrent file.') === false,
+      'a torrent file with capitals in its suffix was refused, or the accepted one was not sent',
+    ).toBe(true)
+  })
+
+  it('the_file_refusal_comes_back_with_the_tab', async () => {
+    const { client, seen } = server()
+    const { container } = openDialog(client)
+    await flush()
+    openFileTab(container)
+
+    const huge = new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'huge.torrent')
+    fireEvent.drop(dropArea(container), { dataTransfer: { files: [huge] } })
+    await flush()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Magnet' }))
+    await flush()
+    expect(
+      (container.textContent ?? '').includes('That file is too large to be a torrent.') === false &&
+        postCount(seen) === 0,
+      'switching to the magnet tab kept the file tab refusal on screen',
+    ).toBe(true)
+
+    // The magnet tab has no file to be wrong about, so its banner is empty - but the picked file is
+    // still huge, and the reason comes back with the tab that shows it.
+    fireEvent.click(screen.getByRole('tab', { name: 'Torrent file' }))
+    await flush()
+    expect(
+      (container.textContent ?? '').includes('That file is too large to be a torrent.') &&
+        (screen.getByRole('button', { name: 'Add' }) as HTMLButtonElement).disabled,
+      'switching back to the file tab lost the refusal the picked file still deserves',
+    ).toBe(true)
+  })
 })
 
 describe('what the server answers', () => {
   it('an_add_error_keeps_the_dialog_open', async () => {
     const { client, seen } = server({
-      dirs: { '/downloads': ['/downloads/films'], '/downloads/films': [] },
+      dirs: { '/downloads': ['films'], '/downloads/films': [] },
       add: () =>
         json(409, '{"error":{"code":"duplicate_torrent","message":"that torrent is already in the list"}}'),
     })
@@ -446,6 +633,24 @@ describe('what the server answers', () => {
     await flush()
     expect(postCount(seen), 'a magnet link with capital letters was refused').toBe(1)
   })
+  it('pressing_add_twice_sends_one_request', async () => {
+    const { client, seen } = server()
+    openDialog(client)
+    await flush()
+
+    fireEvent.change(magnetField(), { target: { value: MAGNET } })
+    await flush()
+
+    // Two presses inside one commit: the second arrives before the first has painted itself as busy,
+    // so only a guard that is true the moment the request starts keeps the torrent from going up twice.
+    const add = screen.getByRole('button', { name: 'Add' })
+    act(() => {
+      fireEvent.click(add)
+      fireEvent.click(add)
+    })
+    await flush()
+    expect(postCount(seen), 'pressing Add twice before the answer sent the torrent twice').toBe(1)
+  })
 })
 
 describe('the keyboard', () => {
@@ -485,5 +690,29 @@ describe('the keyboard', () => {
       'Escape left the add dialog open, sent something, or kept the focus',
     ).toBe(true)
     expect(container.querySelector('dialog'), 'the add dialog element stayed in the page').toBeNull()
+  })
+
+  it('focus_returns_to_the_opener', async () => {
+    const { client } = server()
+    openDialog(client)
+    await flush()
+
+    // `showModal()` moves the focus into the dialog, wherever it was - which is why the dialog has to
+    // have read the opener *before* it was called, and hand the focus back to it on the way out.
+    const opener = screen.getByRole('button', { name: 'Add torrent' })
+    const dialog = screen.getByRole('dialog')
+    expect(
+      document.activeElement !== null &&
+        dialog.contains(document.activeElement) &&
+        document.activeElement !== opener,
+      'the add dialog did not take the focus out of the button that opened it',
+    ).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await flush()
+    expect(
+      screen.queryByRole('dialog') === null && document.activeElement === opener,
+      'closing the add dialog did not give the focus back to the button that opened it',
+    ).toBe(true)
   })
 })

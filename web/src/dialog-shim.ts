@@ -9,13 +9,19 @@
  * meaning stays the component's job: the two buttons that answer the question, Escape, the fields a
  * refusal has to leave where they were.
  *
+ * `showModal` moves the focus, and that part matters more than it looks: it is the whole reason a
+ * dialog has to read the control that opened it *before* calling it, so a stub that left the focus
+ * where it was would let a component pass every test with an opener it can never hand the focus back
+ * to. This stub takes the focus to the first control inside the dialog, the way the browser does.
+ *
  * @module dialog-shim
  */
+import { FOCUSABLE_SELECTOR } from './modal'
 
 /**
- * Gives every `HTMLDialogElement` in the environment `showModal` and `close`, opening and shutting the
- * `open` attribute the way the browser does. Idempotent, so a test file can install it at the top
- * without caring who else installed it.
+ * Gives every `HTMLDialogElement` in the environment `showModal` and `close`: opening sets `open` and
+ * takes the focus to the first control inside it, shutting clears `open`. Idempotent, so a test file
+ * can install it at the top without caring who else installed it.
  */
 export function installDialogShim(): void {
   const proto = window.HTMLDialogElement?.prototype
@@ -25,8 +31,10 @@ export function installDialogShim(): void {
     Object.defineProperty(proto, 'showModal', {
       configurable: true,
       writable: true,
-      value: function showModal(): void {
+      value: function showModal(this: HTMLDialogElement): void {
         this.setAttribute('open', '')
+        const first = this.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
+        if (first !== null) first.focus()
       },
     })
   }
@@ -35,7 +43,7 @@ export function installDialogShim(): void {
     Object.defineProperty(proto, 'close', {
       configurable: true,
       writable: true,
-      value: function close(): void {
+      value: function close(this: HTMLDialogElement): void {
         this.removeAttribute('open')
       },
     })

@@ -181,12 +181,12 @@ describe('the toolbar over the table', () => {
       'the toolbar offered Resume for a row that is already running',
     ).toBe(true)
 
-    // A paused row: the other way round.
+    // A paused row: the other way round - Pause has nothing left to do for it.
     fireEvent.click(row(container, 'b'))
     await flush()
     expect(
-      enabled('Pause') && enabled('Resume') && enabled('Remove'),
-      'the toolbar refused to resume a paused row or refused to pause it',
+      !enabled('Pause') && enabled('Resume') && enabled('Remove'),
+      'the toolbar offered Pause for a row that is already paused',
     ).toBe(true)
 
     // And the action goes to the torrent that is chosen, not to some other row.
