@@ -162,17 +162,18 @@ pub(super) async fn status(State(shared): State<Arc<Shared>>, headers: HeaderMap
 
 /// `DELETE /api/v1/auth/web-session`: end this browser's session and take its cookie away.
 ///
-/// The token is the one this request authenticated with - the cookie if it is here, otherwise the bearer
-/// header, which is what [`crate::auth`] accepts when both are present - so a page signed in some other way
-/// ends that session and not somebody else's. A `DELETE` carries no query token anywhere on this API, so
-/// there is no third credential to look at.
+/// The token is the one this request authenticated with. [`crate::auth`] accepts the bearer header whenever
+/// it is present, so that is what this revokes when it is here and only the cookie's session when it is not.
+/// A `DELETE` carrying a valid `Bearer` and somebody else's cookie would otherwise end that other session
+/// while its caller stayed signed in, having skipped the CSRF check as a bearer call. A `DELETE` carries no
+/// query token anywhere on this API, so there is no third credential to look at.
 ///
 /// The cookie is cleared whether or not a session was revoked: with logins off a caller may reach this
 /// route with nothing to end, and logging out of nothing still has to take the cookie away from the browser
 /// that asked. Revoking a session whose cookie had already been dropped, or whose browser is not this one,
 /// is the same ordinary answer.
 pub(super) async fn sign_out(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    if let Some(token) = session_cookie(&headers).or_else(|| bearer(&headers)) {
+    if let Some(token) = bearer(&headers).or_else(|| session_cookie(&headers)) {
         // Who it was, before it stops being anyone's: the subject is this server's own name for the caller,
         // cleaned on its way into a log line like everything else that came from a file.
         let subject = shared.auth.sessions().check(token);

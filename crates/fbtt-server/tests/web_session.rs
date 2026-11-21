@@ -577,6 +577,67 @@ async fn sign_out_ends_the_cookie_session() {
     served.stop().await;
 }
 
+/// Sign-out ends the session the caller authenticated with, not whichever credential the route happens to look
+/// at first. A `DELETE` carrying a bearer header is a bearer call all the way through: the guard answers it
+/// from the header and never asks the cookie to prove itself, so a route that then revoked the cookie's session
+/// would end somebody else's browser while its own caller stayed signed in.
+#[tokio::test]
+async fn sign_out_revokes_the_credential_that_authorised_it() {
+    let served = Served::start("web-sign-out-which-credential", with_alice).await;
+    let client = http();
+    // Two sessions from two sign-ins. The first is the one that signs out - as a header, which is also what
+    // its own browser is holding in its cookie - and the second is the one this request's cookie happens to
+    // carry, belonging to a browser that is not in this test at all.
+    let (bearer_a, _csrf_a) = sign_in(&served).await;
+    let (cookie_b, csrf_b) = sign_in(&served).await;
+    let url = served.url("/api/v1/auth/web-session");
+    let torrents = served.url("/api/v1/torrents");
+
+    let response = within(
+        client
+            .delete(&url)
+            .bearer_auth(&bearer_a)
+            .header(reqwest::header::COOKIE, format!("fbtt_session={cookie_b}"))
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a sign-out carrying its bearer token was refused",
+    );
+
+    // The cookie was never asked to authorise this call, so its session is still here.
+    assert_eq!(
+        get_with_cookie(&client, &torrents, &cookie_b)
+            .await
+            .status(),
+        StatusCode::OK,
+        "sign-out revoked a session other than the caller's",
+    );
+
+    // And the session that did authorise it is gone. A session token is a bearer token as well, so the same
+    // value comes back now as the answer for a token this server has never heard of.
+    let (status, code) = error_of(get_with_cookie(&client, &torrents, &bearer_a).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the session that signed out is still live",
+    );
+    assert_eq!(code, "unauthorized");
+
+    // The other browser is untouched by any of it, and signs out with its own token.
+    let signed_out = delete_with_cookie(&client, &url, &cookie_b, Some(&csrf_b)).await;
+    assert_eq!(
+        signed_out.status(),
+        StatusCode::NO_CONTENT,
+        "the cookie's own sign-out was refused",
+    );
+
+    served.stop().await;
+}
+
 /// When the cookie carries `Secure` is a question about how this server is reached rather than about the
 /// request, which is why it is configured. Under `auto` the answer comes from what a proxy says it saw; under
 /// `always` nothing is asked, which is what the person behind a proxy that forwards no proto sets.
