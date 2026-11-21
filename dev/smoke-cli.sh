@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # The release-safe CLI smoke, shared by every packaging smoke (dev/smoke-linux.sh, dev/package-macos.sh):
 # one binary, one scratch home, and nothing that reaches outside the machine. Checks in order, each failure a
-# clear line on stderr and exit 1: --version starts with `featherbittorrent <version>` (a build marker like
-# ` (headless)` or ` (full)` may follow the version, so that check matches by prefix); --help names serve,
+# clear line on stderr and exit 1: --version is exactly `featherbittorrent <version> (full)` or
+# `featherbittorrent <version> (headless)`; the last argument names which of the two the artifact is, and
+# when it is named the check compares the binary's own marker against it, so a full artifact holding the
+# headless binary (or the other way around) fails here; --help names serve,
 # user and device; serve --help shows none of the debug-only flags; serve --offline is refused with exit 2,
 # which is what proves the artifact is a release build; then user set with a piped password and user list
 # write and read back an argon2id login in the platform's own config directory, which holds the hash and not
@@ -12,10 +14,15 @@
 # keyboard it was never meant to have. Prints one ok line per check, then `cli smoke ok: <version>` and, on the
 # last line, `config: <path>`: the config file this smoke created, which dev/smoke-linux.sh checks survives
 # removing the package. Windows twin: dev/smoke-cli.ps1.
-# Usage: bash dev/smoke-cli.sh <binary> <version> <home>
+# Usage: bash dev/smoke-cli.sh <binary> <version> <home> [full|headless]
 #   <binary>  the binary to smoke: target/release/featherbittorrent, /usr/bin/featherbittorrent, ...
 #   <version> what it has to print, as bash dev/release-version.sh resolves it
 #   <home>    an existing scratch HOME, written to here and removed by the caller. Never the real one.
+#   <variant> the build the artifact was made from, full or headless. When named, check 1 compares the
+#             binary's version marker against it, so a full artifact holding the headless binary (or the
+#             other way around) fails rather than at install time. The default is headless, which is the
+#             build a plain cargo build produces, so an existing caller that does not name a variant
+#             keeps working as it did.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -25,10 +32,15 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 one_line() { local text="${1//$'\n'/ }"; printf '%s' "${text:0:200}"; }
 
 # Arguments first, before any platform or tool question, so a test can exercise the refusals anywhere.
-[[ $# -eq 3 ]] || fail "usage: bash dev/smoke-cli.sh <binary> <version> <home>"
+[[ $# -eq 3 || $# -eq 4 ]] || fail "usage: bash dev/smoke-cli.sh <binary> <version> <home> [full|headless]"
 bin="$1"
 version="$2"
 home="$3"
+variant="${4:-headless}"
+case "$variant" in
+  full|headless) ;;
+  *) fail "invalid variant '$variant' (expected full or headless)" ;;
+esac
 [[ -n "$bin" && -n "$version" && -n "$home" ]] || fail "an argument is empty (binary '$bin', version '$version', home '$home')"
 [[ -f "$bin" && -x "$bin" ]] || fail "no executable binary at $bin"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || fail "'$version' is not a version"
@@ -60,14 +72,21 @@ fi
 # words are easier to read than mixed into the text being compared. The stdin they get is /dev/null, so running
 # this smoke by hand from a terminal cannot let a command reach for the keyboard.
 
-# 1. The version the artifact was built with, spelled the way the release page names it. A build marker
-# may follow the version (` (headless)` or ` (full)`), so this check is a prefix one; the version argument
-# is refused above unless it is plain version characters, none of which bash treats as pattern syntax,
-# so only the trailing `*` below patterns.
+# 1. The version the artifact was built with, spelled the way the release page names it. The binary's
+# command name is featherbittorrent in both builds (it is the package's binary name, which the package
+# manager installs as /usr/bin/featherbittorrent whatever the package is called), so what distinguishes
+# a full from a headless artifact is the build marker: (full) or (headless). The whole string is compared,
+# so a full package holding the headless binary (or the other way around) fails here rather than at
+# install time.
 status=0; printed="$( "${scratch[@]}" "$bin" --version </dev/null )" || status=$?
 [[ $status -eq 0 ]] || fail "--version exited $status (expected 0): $(one_line "$printed")"
-[[ "$printed" == "featherbittorrent $version"* ]] || fail "--version printed '$(one_line "$printed")', expected output starting with 'featherbittorrent $version'"
-echo "ok: --version starts with featherbittorrent $version"
+# The whole string is compared: the command name, the version and the build marker, so a full artifact
+# holding the headless binary (or the other way around) fails here rather than at install time.
+expected="featherbittorrent $version ($variant)"
+if [[ "$printed" != "$expected" ]]; then
+  fail "--version printed '$(one_line "$printed")', expected '$expected'"
+fi
+echo "ok: --version names the build: $(one_line "$printed")"
 
 # 2. Help that names what the binary can do. Word boundaries, because a help text about a "server" is not one
 # that mentions the serve subcommand.

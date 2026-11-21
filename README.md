@@ -14,34 +14,48 @@ the server role (`serve`), the remote backend, authentication and streaming, shi
 [0.2.2](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2) fix what came after them.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
-files, each carrying man pages, shell completions, the licenses and the docs. Every artifact is built and
-smoke tested in a clean container or runner before anything is published, and the release workflow publishes
-them all on a `v*` tag.
+files, each carrying man pages, shell completions, the licenses and the docs. Web UI milestone 1, on this
+branch, puts a browser UI in the full build: a sign-in, the live torrent table, the detail pane, and add,
+pause, resume and remove, with the off switch in `server.web_ui` and `FBTT_WEB_UI`
+([docs/web-ui.md](docs/web-ui.md)). Every release now ships two builds: the full build, `featherbittorrent`,
+which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and
+changes nothing for the TUI. Every artifact is built and smoke tested in a clean container or runner before
+anything is published, and the release workflow publishes them all on a `v*` tag.
 
 ## Install
 
 Downloads are on the [releases page](https://github.com/featherbitplatform/featherbittorrent/releases), each
-file beside its own `.sha256`. [docs/install.md](docs/install.md) says which file is for your system, how to
-check it and where installing puts its files. Installing never starts anything: no package installs or enables
-a service, none creates an account, and nothing runs after the install. To have `serve` start at boot under
-systemd, launchd or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a
-time, all of it opt-in.
+file beside its own `.sha256`. Every release ships two builds: the full build, `featherbittorrent`, which
+serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end.
+[docs/install.md](docs/install.md) names both, says which file is for your system, how to check it and where
+installing puts its files. Installing never starts anything: no package installs or enables a service, none
+creates an account, and nothing runs after the install. To have `serve` start at boot under systemd, launchd
+or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a time, all of it
+opt-in. The web UI's sign-in, the off switch and where to serve it are in
+[docs/web-ui.md](docs/web-ui.md).
 
 ## Build and run
 
 A stable Rust toolchain (edition 2024, `rust-version = 1.99`) is enough; `rust-toolchain.toml` picks it up with rustup.
 
 ```
-cargo build --workspace
-cargo run -p featherbittorrent
+# The headless build, today's binary:
+cargo build -p featherbittorrent
+# The full build, which serves the web UI. Build the front end first, because the web-ui feature
+# embeds web/dist and the build refuses to start without it:
+npm --prefix web ci && npm --prefix web run build
+cargo build -p featherbittorrent --features web-ui
 ```
 
+The two builds print which one they are: `featherbittorrent --version` says `(full)` for the build that
+serves the web UI and `(headless)` for the one that does not.
+
 Run it from a terminal emulator: it takes the screen (raw mode plus the alternate screen) and gives
-it back when it quits. `featherbittorrent --version` works anywhere. `featherbittorrent serve` runs
-the library headless with its HTTP API, first run asked through a short wizard; on any network you do
-not own, put the [featherbit gateway](https://github.com/featherbitplatform/gateway) or another API
-gateway or reverse proxy in front of it for TLS, throttling and further authentication. The server's
-own guide is [docs/server.md](docs/server.md).
+it back when it quits. `featherbittorrent serve` runs the library headless with its HTTP API, first run
+asked through a short wizard; on any network you do not own, put the [featherbit gateway](https://github.com/featherbitplatform/gateway) or
+another API gateway or reverse proxy in front of it for TLS, throttling and further authentication. The
+server's own guide is [docs/server.md](docs/server.md), and the full build's web UI, its sign-in and its
+off switch are in [docs/web-ui.md](docs/web-ui.md).
 
 ## Usage
 

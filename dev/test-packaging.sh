@@ -7,9 +7,9 @@
 # just the two fixtures; dev/package-linux.sh maps X.Y.Z-pre to the tilde form deb and rpm need
 # (--print-versions), holds the requirements rpm derives from the real binary to the allow list
 # (--check-rpm-reqs), and refuses missing arguments, a version that is not X.Y.Z(-pre), and an arch
-# other than x86_64 or aarch64, all before it asks anything about the platform, which is why these
-# tests run on macOS too; and dev/test-service-examples.sh passes, because the packages ship those
-# examples as documentation. The fixtures are excerpts of objdump -T and objdump -p output for the
+# other than x86_64 or aarch64, and a variant other than full or headless, all before it asks anything
+# about the platform, which is why these tests run on macOS too; and dev/test-service-examples.sh passes,
+# because the packages ship those examples as documentation. The fixtures are excerpts of objdump -T and objdump -p output for the
 # binary dev/package-linux.sh builds in almalinux:9 (the failing copies are hand-edited from them), so
 # they name no machine's paths. Nothing here contacts the network, builds anything, or installs
 # anything.
@@ -127,7 +127,9 @@ status=0; reqs_out="$(bash "$package_sh" --check-rpm-reqs <<<"$reqs_std" 2>&1)" 
 [[ $status -eq 0 ]] || fail "package-linux.sh --check-rpm-reqs refused the real build's requirements (exit $status): $reqs_out"
 reqs_extra="$(printf '%s\nlibssl.so.3()(64bit)' "$reqs_std")"
 status=0; reqs_out="$(bash "$package_sh" --check-rpm-reqs <<<"$reqs_extra" 2>&1)" || status=$?
-[[ $status -eq 1 ]] || fail "package-linux.sh --check-rpm-reqs exited $status on a list holding libssl.so.3()(64bit), expected 1: $reqs_out"
+# The refusal is exit 2, the same code every argument and content refusal in package-linux.sh takes:
+# a list the declared dependencies do not cover is one of them.
+[[ $status -eq 2 ]] || fail "package-linux.sh --check-rpm-reqs exited $status on a list holding libssl.so.3()(64bit), expected 2: $reqs_out"
 grep -qF 'libssl.so.3()(64bit)' <<<"$reqs_out" || fail "the refusal did not name libssl.so.3()(64bit): $reqs_out"
 grep -qF 'allow list' <<<"$reqs_out" || fail "the refusal did not mention the allow list: $reqs_out"
 grep -qF 'depends' <<<"$reqs_out" || fail "the refusal did not mention the .deb depends: $reqs_out"
@@ -135,11 +137,16 @@ echo 'ok: package-linux.sh accepts the requirements of the real build and refuse
 
 # 7. dev/package-linux.sh validates its arguments before any platform or tool question. None of these
 # refusals may mention Linux, because here they run on macOS and still have to mean the same thing.
+# 7a. package-linux.sh validates its arguments before any platform or tool question. None of these
+# refusals may mention Linux, because here they run on macOS and still have to mean the same thing.
+# The variant argument is optional (full is the default), so a version-and-arch with no variant is a
+# complete command, and one that names a third variant is refused with exit 2 as the script's own
+# usage line says.
 refusal() { # <what the message must say> <package-linux.sh argument>...
   local want="$1"; shift
   local status=0 out
   out="$(bash "$package_sh" "$@" 2>&1)" || status=$?
-  [[ $status -eq 1 ]] || fail "package-linux.sh $* exited $status, expected 1: $out"
+  [[ $status -eq 2 ]] || fail "package-linux.sh $* exited $status, expected 2: $out"
   grep -qF -- "$want" <<<"$out" || fail "package-linux.sh $* did not say '$want': $out"
   # The two refusal lines that live after the argument checks. Seeing either would mean the script
   # asked about the platform before its arguments, which is what dev/test-packaging.sh tests against.
@@ -147,12 +154,30 @@ refusal() { # <what the message must say> <package-linux.sh argument>...
     fail "package-linux.sh $* asked about the platform before its arguments: $out"
   fi
 }
-refusal usage
+refusal 'usage'
 refusal 'invalid version' 0.1 x86_64
 refusal 'invalid version' 1.2.3/4 x86_64
 refusal 'invalid version' --print-versions 0.1
 refusal 'invalid arch' 0.1.0 armv7
+refusal 'invalid variant' 0.1.0 x86_64 both
 echo 'ok: package-linux.sh refuses bad arguments with one line each, before any platform check'
+
+# 7b. The variant refusal is exit 2, and the message must name the variant as the argument that was
+# refused rather than the version or the arch: the exit code is the gate the release workflow relies on,
+# and the line is what a person reads when a matrix cell names a spelling the script does not accept.
+status=0; out="$(bash "$package_sh" 0.1.0 x86_64 both 2>&1)" || status=$?
+[[ $status -eq 2 ]] || fail "package-linux.sh 0.1.0 x86_64 both exited $status, expected 2: $out"
+grep -qF 'invalid variant' <<<"$out" || fail "the variant refusal did not name the variant: $out"
+grep -qF 'expected full or headless' <<<"$out" || fail "the variant refusal did not name the two it accepts: $out"
+# A valid variant passes the argument checks: the run gets as far as the platform question, which is the
+# next line, so on a non-Linux host the refusal that shows up is the platform's and says nothing about
+# the variant. On Linux the run goes further and asks for the arch to match, which is also nothing about
+# the variant.
+status=0; out="$(bash "$package_sh" 0.1.0 x86_64 full 2>&1)" || status=$?
+if grep -qF 'invalid variant' <<<"$out"; then
+  fail "a valid variant was refused as one: $out"
+fi
+echo 'ok: package-linux.sh refuses an unknown variant with exit 2 and accepts a valid one'
 
 # 8. The service examples the packages ship as documentation: no package installs, enables or starts a
 # service, so each example is a file a person copies where their own service manager looks.

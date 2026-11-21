@@ -11,11 +11,15 @@
 # Fedora's container images skip documentation files by default (dpkg path-excludes, dnf tsflags=nodocs), so
 # this script clears both before installing: a check about a man page or a doc file has to be about the
 # package, not about how the image was shaved down for download.
-# Usage: bash dev/smoke-linux.sh <deb|rpm|tar.gz> <dist-dir> <version>
+# Usage: bash dev/smoke-linux.sh <deb|rpm|tar.gz> <dist-dir> <version> [full|headless]
 # Run as root inside a throwaway container (it installs and removes system packages), e.g.
-#   docker run --rm -v "$PWD:/src" -w /src debian:12 bash dev/smoke-linux.sh deb target/dist 0.1.0
-#   docker run --rm -v "$PWD:/src" -w /src fedora:41 bash dev/smoke-linux.sh rpm target/dist 0.1.0
-#   docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash dev/smoke-linux.sh tar.gz target/dist 0.1.0
+#   docker run --rm -v "$PWD:/src" -w /src debian:12 bash dev/smoke-linux.sh deb target/dist 0.1.0 full
+#   docker run --rm -v "$PWD:/src" -w /src fedora:41 bash dev/smoke-linux.sh rpm target/dist 0.1.0 headless
+#   docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash dev/smoke-linux.sh tar.gz target/dist 0.1.0 full
+# The variant is the build the artifact was made from: full is the default and holds the web UI,
+# headless does not. It changes the package and archive names this script looks for and the package
+# it installs and removes, and the CLI smoke checks that the binary's own version string names that
+# same build, so an artifact holding the other variant's binary fails before it is published.
 # It refuses to run anywhere else: outside a container and outside CI, exactly like ../terminal's twin.
 # Output: one line per check on stdout, then `smoke ok: <format> on <PRETTY_NAME> <arch>`. The first thing
 # that is wrong is one clear line on stderr and exit 1. Nothing here contacts the internet beyond the
@@ -29,20 +33,27 @@ need() { command -v "$1" >/dev/null || fail "this image has no $1"; }
 # Arguments before any container or platform question, so a test can exercise the refusals on any OS (the
 # rule every dev/ script here follows). The artifact is named by the machine's own arch, because the matrix
 # runs each package on its native architecture.
-[[ $# -eq 3 ]] || fail "usage: bash dev/smoke-linux.sh <deb|rpm|tar.gz> <dist-dir> <version>"
+[[ $# -eq 3 || $# -eq 4 ]] || fail "usage: bash dev/smoke-linux.sh <deb|rpm|tar.gz> <dist-dir> <version> [full|headless]"
 format="$1"
 dist="$2"
 version="$3"
+variant="${4:-full}"
 case "$format" in
   deb|rpm|tar.gz) ;;
   *) fail "unknown format '$format' (expected deb, rpm or tar.gz)" ;;
 esac
+case "$variant" in
+  full|headless) ;;
+  *) fail "unknown variant '$variant' (expected full or headless)" ;;
+esac
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
   || fail "invalid version '$version' (expected X.Y.Z or X.Y.Z-pre)"
 arch="$(uname -m)"
+# full is the release name; headless carries -headless in the artifact and package names.
+if [[ "$variant" == headless ]]; then prefix="featherbittorrent-headless"; else prefix="featherbittorrent"; fi
 case "$format" in
-  tar.gz) name="featherbittorrent-${version}-${arch}-unknown-linux-gnu" ;;
-  *)      name="featherbittorrent-${version}-linux-${arch}" ;;
+  tar.gz) name="${prefix}-${version}-${arch}-unknown-linux-gnu" ;;
+  *)      name="${prefix}-${version}-linux-${arch}" ;;
 esac
 file="$dist/$name.$format"
 [[ -f "$file" ]] || fail "no artifact at $file"
@@ -120,7 +131,8 @@ esac
 # data tar as objects dpkg tracks and removes, while cargo-generate-rpm names no %dir, so dnf removes every
 # file it owns and leaves the empty directories it created for them behind. That is RPM's ordinary behaviour
 # for any package that does not list a directory, not a defect in ours, and step 7 says which of the two it
-# is looking at.
+# is looking at. The man pages and completions keep the product's own name in both variants; the doc folder
+# follows the package, so the headless package's files are asked for under its own name.
 installed_file_list() { # <one path per line> -> the same paths, without the directories
   local p
   while IFS= read -r p; do
@@ -140,7 +152,7 @@ check_installed() { # <what installed it> <one path per line, absolute>
            /usr/share/bash-completion/completions/featherbittorrent \
            "$zsh_dir/_featherbittorrent" \
            /usr/share/fish/vendor_completions.d/featherbittorrent.fish \
-           /usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service; do
+           "/usr/share/doc/$prefix/examples/systemd/system/featherbittorrent.service"; do
     grep -qFx -- "$p" <<<"$files" || fail "the $what does not own $p"
     [[ -e "$p" ]] || fail "$p is not there after the $what install"
   done
@@ -173,9 +185,9 @@ case "$format" in
     done
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends "$(realpath "$file")"
-    files="$(dpkg -L featherbittorrent)"
+    files="$(dpkg -L "$prefix")"
     check_installed '.deb' "$files"
-    check_no_service_paths 'dpkg -L featherbittorrent' "$files"
+    check_no_service_paths "dpkg -L $prefix" "$files"
     installed_files="$(installed_file_list "$files")"
     cli_bin=/usr/bin/featherbittorrent
     ;;
@@ -184,9 +196,9 @@ case "$format" in
     # Fedora and Rocky container images set in /etc/dnf/dnf.conf, which would skip every %doc file: the man
     # pages, the docs and the example units are what this smoke checks, and a real system installs them.
     dnf install -y -q --setopt=install_weak_deps=False --setopt=tsflags= "$(realpath "$file")"
-    files="$(rpm -ql featherbittorrent)"
+    files="$(rpm -ql "$prefix")"
     check_installed '.rpm' "$files"
-    check_no_service_paths 'rpm -ql featherbittorrent' "$files"
+    check_no_service_paths "rpm -ql $prefix" "$files"
     installed_files="$(installed_file_list "$files")"
     cli_bin=/usr/bin/featherbittorrent
     ;;
@@ -203,17 +215,17 @@ case "$format" in
 esac
 check_no_service_state
 
-# 5. The shared CLI smoke, run against whatever this format put in front of us: --version matched by prefix
-# against this run's version (the binary may print a build marker after it, ` (headless)` or ` (full)`),
-# the help texts, serve --offline refused with exit 2 (the release-build proof) and a login written and
-# read back through the platform's own paths. Its last two lines are the version and the config file it
-# created; the config path is kept for step 7. Output goes to a file first so a failure still shows every
-# line it printed.
+# 5. The shared CLI smoke, run against whatever this format put in front of us: --version checked
+# exactly, whole string, against this run's version and build marker (` (full)` or ` (headless)` on the
+# product's own name in front of it), the help texts, serve --offline refused with exit 2 (the
+# release-build proof) and a login written and read back through the platform's own paths. Its last two
+# lines are the version and the config file it created; the config path is kept for step 7. Output goes
+# to a file first so a failure still shows every line it printed.
 rm -rf "$scratch_home"
 mkdir -p "$scratch_home"
 cli_log="$(mktemp)" || fail "could not make a temporary file for dev/smoke-cli.sh's output"
 status=0
-bash "$(dirname "$0")/smoke-cli.sh" "$cli_bin" "$version" "$scratch_home" >"$cli_log" 2>&1 || status=$?
+bash "$(dirname "$0")/smoke-cli.sh" "$cli_bin" "$version" "$scratch_home" "$variant" >"$cli_log" 2>&1 || status=$?
 cat "$cli_log"
 [[ $status -eq 0 ]] || fail "dev/smoke-cli.sh exited $status against $cli_bin (everything it printed is above)"
 config_path="$(sed -n 's/^config: //p' "$cli_log" | tail -1)"
@@ -246,8 +258,8 @@ fi
 # be gone is every file the package did own, the list captured at step 3 rather than a handful of paths
 # anyone remembered.
 case "$format" in
-  deb) apt-get purge -y -qq featherbittorrent ;;
-  rpm) dnf remove -y -q featherbittorrent ;;
+  deb) apt-get purge -y -qq "$prefix" ;;
+  rpm) dnf remove -y -q "$prefix" ;;
 esac
 if [[ "$format" != tar.gz ]]; then
   left=''
@@ -255,8 +267,8 @@ if [[ "$format" != tar.gz ]]; then
     if [[ -n "$p" ]] && [[ -e "$p" ]]; then left="$left $p"; fi
   done <<<"$installed_files"
   [[ -z "$left" ]] || fail "removal left files it owns behind:$left"
-  if [[ "$format" == deb && -e /usr/share/doc/featherbittorrent ]]; then
-    fail "purge left /usr/share/doc/featherbittorrent behind, and the .deb owns that directory"
+  if [[ "$format" == deb && -e "/usr/share/doc/$prefix" ]]; then
+    fail "purge left /usr/share/doc/$prefix behind, and the .deb owns that directory"
   fi
   [[ -f "$config_path" ]] \
     || fail "removal took away the user's config at $config_path, which the package never owned"
@@ -275,7 +287,7 @@ if [[ "$format" != tar.gz ]]; then
     # gone, so the list comes from what is present rather than from two remembered names. A find that fails
     # on a directory that *is* there still says so, because that one is worth stopping for.
     empty_dirs=''
-    for d in /usr/share/doc/featherbittorrent /usr/share/licenses/featherbittorrent; do
+    for d in "/usr/share/doc/$prefix" /usr/share/licenses/featherbittorrent; do
       if [[ -d "$d" ]]; then
         status=0
         listed="$(find "$d" -type d | sort)" || status=$?

@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     Windows twin of dev/smoke-cli.sh; keep the two in sync. Checks in order, each failure one clear line on
-    stderr and exit 1: --version starts with `featherbittorrent <version>` (a build marker like ` (headless)`
-    or ` (full)` may follow the version, so that check matches by prefix); --help names serve, user and
+    stderr and exit 1: --version is exactly `featherbittorrent <version> (full)` or
+    `featherbittorrent <version> (headless)`, so the artifact's own build marker is part of what is checked,
+    and a full artifact holding the headless binary (or the other way around) fails here; --help names
+    serve, user and
     device; serve --help shows none of the debug-only flags; serve --offline is refused with exit 2, which is
     what proves the artifact is a release build; then user set with a piped password and user list write and
     read back an argon2id login in a config file that holds the hash and not the password. Prints one ok line
@@ -69,22 +71,24 @@ $env:FBTT_CONFIG_DIR = $configDir
 $env:FBTT_DATA_DIR = $dataDir
 if (Test-Path -LiteralPath $configFile) { Write-Failure "$configFile already exists: give the smoke a fresh scratch directory" }
 
-# 1. The version the artifact was built with, spelled the way the release page names it. A build marker
-# may follow the version (` (headless)` or ` (full)`), so this check is a prefix one; the -Version argument
-# is refused above unless it is plain version characters, none of which PowerShell's -like treats as a
-# wildcard, so only the trailing `*` below patterns. -cnotlike keeps the comparison case-sensitive. stderr
-# is left to the log: what is captured here is what the check compares. Checks 1 to 3 and user list take
-# their stdin from a pipeline that carries nothing, which gives a native command an empty stdin and an
-# immediate EOF (checked in PowerShell 7.4 against /bin/cat: no bytes read, prompt exit). serve --offline
-# gets the same thing from the empty file it redirects, and user set is the one call given input of its
-# own, the two password lines. Nothing here can wait on a terminal this smoke has no business reading.
+# 1. The version the artifact was built with, spelled the way the release page names it, with the
+# build marker in front of it: `featherbittorrent <v> (full)` or `featherbittorrent-headless <v>
+# (headless)`. The marker is checked exactly, whole string, so a headless package holding the full
+# binary (or the other way around) fails here rather than at install time. stderr is left to the log:
+# what is captured here is what the check compares. Checks 1 to 3 and user list take their stdin from
+# a pipeline that carries nothing, which gives a native command an empty stdin and an immediate EOF
+# (checked in PowerShell 7.4 against /bin/cat: no bytes read, prompt exit). serve --offline gets the
+# same thing from the empty file it redirects, and user set is the one call given input of its own,
+# the two password lines. Nothing here can wait on a terminal this smoke has no business reading.
 $printed = [string]($null | & $Binary --version | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Failure "--version exited $LASTEXITCODE (expected 0)" }
 $printed = $printed.Trim()
-if ($printed -cnotlike "featherbittorrent $Version*") {
-    Write-Failure "--version printed '$(Get-OneLineExcerpt $printed)', expected output starting with 'featherbittorrent $Version'"
+$expectedFull = "featherbittorrent $Version (full)"
+$expectedHeadless = "featherbittorrent $Version (headless)"
+if ($printed -cne $expectedFull -and $printed -cne $expectedHeadless) {
+    Write-Failure "--version printed '$(Get-OneLineExcerpt $printed)', expected '$expectedFull' or '$expectedHeadless'"
 }
-Write-Host "ok: --version starts with featherbittorrent $Version"
+Write-Host "ok: --version names the build: $printed"
 
 # 2. Help that names what the binary can do, with word boundaries: a help text about a "server" is not one
 # that mentions the serve subcommand.

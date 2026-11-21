@@ -17,8 +17,25 @@
 # the Debian 12 image below, so it needs only the glibc it runs on. rust-toolchain.toml picks the stable
 # toolchain out of the builder image. The release archives are a separate build: their binary is built on
 # glibc 2.34, RHEL 9's, so that it runs on systems older than this one (see .github/workflows/release.yml).
+# This image is the full variant: the web-ui feature turns on, which embeds web/dist, so a separate build
+# stage runs the front end before the Rust build can start.
 FROM rust:1-bookworm AS build
 WORKDIR /app
+
+# Node 22 is what the front end builds with (web/package.json says >=22). Pinned to a tag so a release
+# does not change because the base image's Node moves: the layer is the build's only entry to the
+# front end, and a release's bytes are the bytes the tag named.
+FROM node:22-bookworm AS web-build
+WORKDIR /app
+
+# The front end's manifest and lockfile first, so npm ci's layer caches a web/ change; the real sources
+# go in after it, so an edit to a component does not cost a full dependency install. The build refuses to
+# start without its output, and build.rs refuses to compile the server crate without it, so a layer that
+# skips the front end is a build that fails loudly rather than one that ships a server with no UI.
+COPY web/package.json web/package-lock.json web/
+RUN npm --prefix web ci
+COPY web ./web
+RUN npm --prefix web run build
 
 # The lockfile, manifest and toolchain file first, and a stub source tree beside them: what cargo has to
 # have to build 400+ dependencies is their manifests, not this workspace's code, so an empty `lib.rs` per
@@ -52,10 +69,13 @@ RUN mkdir -p \
 
 # The real sources, each one touched: cargo decides what to recompile by mtime, and a file copied out of
 # the build context can carry an mtime older than the stub it replaces, which would leave the empty stub
-# compiled into the image instead of the code.
+# compiled into the image instead of the code. The front end's output comes in from the web-build stage
+# alongside, because build.rs reads it from ../../web/dist and the server crate's feature asks for it.
 COPY crates ./crates
+COPY --from=web-build /app/web/dist ./web/dist
 RUN find crates -name '*.rs' -exec touch {} + \
- && cargo build --locked --release -p featherbittorrent
+ && cargo build --locked --release -p featherbittorrent --features web-ui \
+ && cargo clean -p featherbittorrent
 
 FROM debian:12
 RUN apt-get update \
