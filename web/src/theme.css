@@ -37,6 +37,7 @@
   --color-ink-50: #f5f5f7; /* the title, and the number a person is looking for */
 
   /* ---- Brand: Electric Violet. The mark is 500 and is never retuned; controls are 600. ---- */
+  --color-violet-500: #863bff; /* the mark itself, and the colour a downloading row and its bar wear: the terminal's accent (`VIOLET_500` in `fbtt-tui/src/theme.rs`) */
   --color-violet-600: #7c49e3; /* the UI fill */
   --color-violet-400: #a584ff; /* the accent lifted for text and edges on ink */
   --color-violet-300: #bea8ff; /* violet text on ink */
