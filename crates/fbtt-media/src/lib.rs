@@ -31,7 +31,7 @@ pub use fmp4::{FragmentWriter, init_segment};
 pub use open::open_track;
 pub use probe::{MediaInfo, TrackInfo, probe};
 pub use source::{FragmentStream, Sample, TrackConfig};
-pub use subtitle::{Cue, SubtitleFormat, file_cues, subtitle_format};
+pub use subtitle::{Cue, SubtitleFormat, embedded_cues, file_cues, subtitle_format};
 
 /// Which container a file is.
 ///
@@ -101,6 +101,9 @@ pub const MAX_CUES: usize = 100_000;
 
 /// The widest window of source time a cue request may ask for.
 pub const CUE_WINDOW_MAX_MS: u64 = 600_000;
+
+/// The most frames an embedded subtitle read may walk through in one call, any track, before it gives up.
+pub const MAX_CUE_SCAN_FRAMES: u64 = 1_000_000;
 
 /// The longest a video fragment runs, however few keyframes the file has.
 pub const MAX_FRAGMENT_MS: u64 = 5000;

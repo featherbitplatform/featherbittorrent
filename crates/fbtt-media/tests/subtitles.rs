@@ -2,9 +2,15 @@
 //! input: a file is read only once, in a single pass, and a hostile file must
 //! give its good cues back, or no cues, never a panic, never a hang.
 
-use fbtt_media::{Cue, MediaError, SUBTITLE_FILE_CAP, SubtitleFormat, file_cues, subtitle_format};
+use fbtt_media::{
+    CUE_WINDOW_MAX_MS, Cue, MAX_CUE_SCAN_FRAMES, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP,
+    SubtitleFormat, embedded_cues, file_cues, subtitle_format,
+};
 use std::fs;
+use std::io::Cursor;
 use std::time::{Duration, Instant};
+
+mod common;
 
 /// The fixture's three cues: the times `expected.json` records for the same
 /// text the fixture holds, and the two-line cue joined with a newline.
@@ -335,4 +341,361 @@ fn events_header_is_a_whole_line() {
     assert_eq!(cues[0].start_ms, 1000);
     assert_eq!(cues[0].end_ms, 2000);
     assert_eq!(cues[0].text, "x");
+}
+
+// ---------------------------------------------------------------------------
+// Embedded subtitles: cues read out of a Matroska or WebM file's own track.
+// ---------------------------------------------------------------------------
+
+const MKV: &str = "h264-aac-opus-srt-ass.mkv";
+
+/// The three cues `expected.json` records for the fixture's SRT track (4) and
+/// ASS track (5): the same times and text both tracks hold.
+fn embedded_expected() -> Vec<Cue> {
+    vec![
+        Cue {
+            start_ms: 500,
+            end_ms: 2000,
+            text: "First subtitle line\nspanning two lines".into(),
+        },
+        Cue {
+            start_ms: 2500,
+            end_ms: 3000,
+            text: "Second subtitle line".into(),
+        },
+        Cue {
+            start_ms: 3200,
+            end_ms: 3900,
+            text: "Third subtitle line".into(),
+        },
+    ]
+}
+
+/// The cues of the fixture that overlap the window `[from_ms, to_ms)`: the
+/// brief's keep rule, `end_ms > from_ms && start_ms < to_ms`, applied to the
+/// three cues both subtitle tracks hold.
+fn window_cues(from_ms: u64, to_ms: u64) -> Vec<Cue> {
+    embedded_expected()
+        .into_iter()
+        .filter(|cue| cue.end_ms > from_ms && cue.start_ms < to_ms)
+        .collect()
+}
+
+#[test]
+fn embedded_srt_window() {
+    let bytes = fixture(MKV);
+    // The whole window: the fixture's three cues, in the order expected.json
+    // records them.
+    let cues = embedded_cues(Cursor::new(bytes.clone()), 4, 0, 4000).expect("the srt track");
+    assert_eq!(cues, embedded_expected());
+    // A late window: only the cues that overlap it, the 500..2000 cue gone.
+    let cues = embedded_cues(Cursor::new(bytes), 4, 3000, 4000).expect("the srt track");
+    assert_eq!(cues, window_cues(3000, 4000));
+}
+
+#[test]
+fn embedded_ass_window() {
+    let bytes = fixture(MKV);
+    let cues = embedded_cues(Cursor::new(bytes), 5, 0, 4000).expect("the ass track");
+    assert_eq!(cues.len(), 3);
+    assert_eq!(
+        cues[0],
+        Cue {
+            start_ms: 500,
+            end_ms: 2000,
+            text: "First ASS line\nspanning two lines".into(),
+        }
+    );
+    assert_eq!(cues[1].start_ms, 2500);
+    assert_eq!(cues[1].end_ms, 3000);
+    // The ASS cue's text, free of its {...} override blocks: the tags are
+    // removed, and the comma the cue holds is kept whole.
+    assert!(!cues[1].text.contains('{') && !cues[1].text.contains('}'));
+    assert_eq!(cues[1].text, "Second cue, italic text");
+    assert_eq!(
+        cues[2],
+        Cue {
+            start_ms: 3200,
+            end_ms: 3900,
+            text: "Third ASS line".into(),
+        }
+    );
+}
+
+#[test]
+fn window_too_large_is_refused() {
+    let bytes = fixture(MKV);
+    // A window one past the cap.
+    let err = embedded_cues(Cursor::new(bytes.clone()), 4, 0, CUE_WINDOW_MAX_MS + 1)
+        .expect_err("a window over the cap is refused");
+    assert!(
+        matches!(err, MediaError::Unsupported(_)),
+        "a window over the cap is Unsupported, got {err:?}"
+    );
+    // An empty window.
+    let err =
+        embedded_cues(Cursor::new(bytes), 4, 4000, 4000).expect_err("an empty window is refused");
+    assert!(
+        matches!(err, MediaError::Unsupported(_)),
+        "an empty window is Unsupported, got {err:?}"
+    );
+}
+
+#[test]
+fn embedded_non_text_track_is_unsupported() {
+    let bytes = fixture(MKV);
+    // Track 1 is the fixture's video.
+    let err = embedded_cues(Cursor::new(bytes.clone()), 1, 0, 4000)
+        .expect_err("a video track is not a subtitle track");
+    assert!(
+        matches!(err, MediaError::Unsupported(_)),
+        "a video track is Unsupported, got {err:?}"
+    );
+    // Track 99 is not one of the file's tracks.
+    let err =
+        embedded_cues(Cursor::new(bytes), 99, 0, 4000).expect_err("a missing track is refused");
+    assert!(
+        matches!(err, MediaError::Unsupported(_)),
+        "a missing track is Unsupported, got {err:?}"
+    );
+}
+
+#[test]
+fn embedded_late_window_seeks() {
+    // A one-track Matroska with cues at 0 s, 15 s and 30 s (with Cues and
+    // CueRelativePosition, the layout ffmpeg writes). The window 29 000 to
+    // 31 000 is reached by a seek: the 30 s cue comes back and the others do
+    // not. The blocks are `SimpleBlock`s - the demuxer's `next_frame` steps
+    // cleanly out of a `SimpleBlock` after a seek, and that is the shape this
+    // test's seek must land in. Without a `BlockDuration` the 30 s cue's end
+    // is the fallback, its start plus 5000.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    let info = common::info_element(1_000_000);
+    let c0 = common::cluster(0, &[common::simple_block(1, 0, false, b"zero")]);
+    let c1 = common::cluster(15_000, &[common::simple_block(1, 0, false, b"fifteen")]);
+    let c2 = common::cluster(30_000, &[common::simple_block(1, 0, false, b"thirty")]);
+    let clusters = [c0, c1, c2];
+
+    // One cue per cluster, pointing at its block's offset within the cluster.
+    // The cue's cluster position is the cluster's offset in the segment data,
+    // which is the SeekHead's length plus everything assembled before it.
+    let relative = cluster_block_offset(&clusters[0]);
+    // The SeekHead names each cluster individually (the layout a real
+    // multiplexer writes), so its length is learned from a placeholder with the
+    // same count of entries: tracks, info, one per cluster, and the cues.
+    let cluster_id: &[u8] = &common::CLUSTER;
+    let placeholder = common::seek_head_named(
+        &(0..2 + clusters.len() + 1)
+            .map(|_| (cluster_id, 0u64))
+            .collect::<Vec<_>>(),
+    );
+    let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
+    let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
+    let c0_at = info_at + u64::try_from(info.len()).expect("Info under 4 GiB");
+    let c1_at = c0_at + u64::try_from(clusters[0].len()).expect("a cluster under 4 GiB");
+    let c2_at = c1_at + u64::try_from(clusters[1].len()).expect("a cluster under 4 GiB");
+    let cues = common::cues_element(&[
+        (0, c0_at, relative),
+        (15_000, c1_at, relative),
+        (30_000, c2_at, relative),
+    ]);
+
+    // The SeekHead names each cluster individually at its offset, so the
+    // demuxer's seek lands in the right cluster instead of walking from the
+    // first.
+    let segment = common::indexed_segment_each_cluster(&tracks, 1_000_000, &clusters, Some(&cues));
+    let file = common::matroska_file(&segment);
+
+    let cues = embedded_cues(Cursor::new(file), 1, 29_000, 31_000).expect("the seek lands");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 30_000,
+            // No BlockDuration: the end is the fallback, start plus 5000.
+            end_ms: 35_000,
+            text: "thirty".into(),
+        }],
+        "the 30 s cue, and only it, overlaps the window"
+    );
+}
+
+/// The `CueRelativePosition` for a cluster's first block: the length of the
+/// cluster's leading `Timecode` element, in bytes, measured from the cluster's
+/// data start (after its id and size vint). The Matroska specification counts
+/// the relative position from the first byte after the cluster's size field,
+/// and the demuxer adds it to the cluster's data offset, so the value here is
+/// just the `Timecode` element's length.
+fn cluster_block_offset(cluster: &[u8]) -> u64 {
+    // The cluster's data opens with a `Timecode` element: one-byte id, one-byte
+    // size vint (every synthetic timecode is small), and the value, whose width
+    // the vint's low bits count. The data starts at byte 4 + 1 (past the
+    // four-byte id and the one-byte size vint), so the `Timecode` element's
+    // length is measured from there.
+    let data_start = 4 + 1;
+    let vint_byte = cluster[data_start + 1];
+    let value_len = (vint_byte & 0x7f).count_ones();
+    1 + 1 + value_len as u64
+}
+
+#[test]
+fn embedded_hostile_frames_are_bounded() {
+    // One subtitle track that has no frame at all, and a video track whose
+    // MAX_CUE_SCAN_FRAMES + 1 frames all sit inside the window: the walk must
+    // give up with Malformed after reading that many frames, not read on.
+    let tracks = common::tracks(&[
+        common::track_entry(1, 0x11, b"S_TEXT/UTF8"),
+        common::track_entry(2, 1, b"V_MPEG4/ISO/AVC"),
+    ]);
+    // MAX_CUE_SCAN_FRAMES + 1 video frames, one per small cluster, all at 0 s
+    // (inside the window), none of them the subtitle track: the read must give
+    // up after MAX_CUE_SCAN_FRAMES frames, not read on.
+    let clusters: Vec<Vec<u8>> = (0..MAX_CUE_SCAN_FRAMES + 1)
+        .map(|_| common::cluster(0, &[common::simple_block(2, 0, true, &[0x41, 0x01])]))
+        .collect();
+
+    let start = Instant::now();
+    let err = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4000,
+    )
+    .expect_err("MAX_CUE_SCAN_FRAMES other-track frames is Malformed");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "MAX_CUE_SCAN_FRAMES other-track frames is Malformed, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "the bound must be reached quickly, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn embedded_empty_frames_are_bounded() {
+    // One ASS subtitle track whose MAX_SKIPPED_FRAMES + 1 frames all give no
+    // cue (blocks with fewer than nine fields): the walk must give up with
+    // Malformed after that many frames of the track itself, not read on.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/ASS")]);
+    // MAX_SKIPPED_FRAMES + 1 frames, one per small cluster, all at 0 s, all
+    // with a short ASS block (three fields, not nine): each gives no cue, so
+    // the skipped bound is what stops the read.
+    let clusters: Vec<Vec<u8>> = (0..MAX_SKIPPED_FRAMES as u64 + 1)
+        .map(|_| common::cluster(0, &[common::simple_block(1, 0, false, b"0,0,Default")]))
+        .collect();
+
+    let err = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4000,
+    )
+    .expect_err("MAX_SKIPPED_FRAMES empty frames is Malformed");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "MAX_SKIPPED_FRAMES empty frames is Malformed, got {err:?}"
+    );
+}
+
+#[test]
+fn embedded_ass_short_block_is_skipped() {
+    // An S_TEXT/ASS track with one block that has fewer than nine fields and
+    // one valid nine-field block: only the valid one comes back.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/ASS")]);
+    // The short block: three fields, not nine. The valid block: nine fields,
+    // the text in the ninth.
+    let short = common::cluster(0, &[common::simple_block(1, 0, false, b"0,0,Default")]);
+    let valid = common::cluster(
+        1_000,
+        &[common::simple_block(
+            1,
+            0,
+            false,
+            b"0,0,Default,,0,0,0,,Valid text",
+        )],
+    );
+    let clusters = [short, valid];
+
+    let cues = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4000,
+    )
+    .expect("the ass track");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 1_000,
+            // No BlockDuration: the end is the fallback, start plus 5000.
+            end_ms: 6_000,
+            text: "Valid text".into(),
+        }],
+        "the short block is skipped, only the valid one comes back"
+    );
+}
+
+#[test]
+fn embedded_last_cue_ends_at_next_cue() {
+    // Two cues at 3500 and 4100 with no BlockDuration and nothing else between
+    // them, window 0 to 4000: the first cue's end is the next cue's start
+    // (4100), not the 5000 ms fallback, because the walk records the first
+    // cue of the track at or past the window.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    let c0 = common::cluster(3_500, &[common::simple_block(1, 0, false, b"first")]);
+    let c1 = common::cluster(4_100, &[common::simple_block(1, 0, false, b"second")]);
+    let clusters = [c0, c1];
+
+    let cues = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4_000,
+    )
+    .expect("the srt track");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 3_500,
+            // The next cue's start, not the 5000 ms fallback.
+            end_ms: 4_100,
+            text: "first".into(),
+        }],
+        "the last cue in the window ends at the next cue's start"
+    );
+}
+
+#[test]
+fn embedded_total_text_is_capped() {
+    // About five blocks of 1 MiB of text each, inside the window: the total
+    // kept text passes SUBTITLE_FILE_CAP and the call is Malformed.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    // Five blocks, each 1 MiB of 'x', spaced 1 s apart inside the window.
+    let payload = vec![b'x'; 1_024 * 1_024];
+    let clusters: Vec<Vec<u8>> = (0..5)
+        .map(|i| common::cluster(i * 1_000, &[common::simple_block(1, 0, false, &payload)]))
+        .collect();
+
+    let err = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        5_000,
+    )
+    .expect_err("the total kept text is over the cap");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "five 1 MiB blocks is Malformed, got {err:?}"
+    );
 }
