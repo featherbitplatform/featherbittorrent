@@ -28,26 +28,13 @@ use crate::capped::{CappedLen, ReadBudget};
 use crate::codec::{Codec, TrackKind};
 use crate::probe::{TrackInfo, matroska_audio_rate, matroska_error, matroska_kind, open_matroska};
 use crate::source::{Sample, SourceError, SourceResult, TrackConfig, TrackSource};
-use crate::{ELEMENT_CAP, MediaError};
+use crate::{ELEMENT_CAP, MAX_SKIPPED_FRAMES, MediaError};
 use matroska_demuxer::{
     ContentCompAlgo, ContentEncAlgo, ContentEncoding, ContentEncodingValue, Frame, MatroskaFile,
     TrackEntry,
 };
 use std::io::{Read, Seek};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-
-/// The most frames a source walks through - other tracks' frames, frames before
-/// the start time, frames ahead of a keyframe that never arrives - without
-/// emitting one, before it gives up.
-///
-/// Every legitimate need is far below this: a one second keyframe distance
-/// means a video seek skips a GOP's worth of frames at most, and interleaving
-/// between tracks multiplies that by the track count, not by the file size. A
-/// stream that never produces an emittable frame - a track with no frames at
-/// all, a start time past every frame - would otherwise walk a 100 GiB file
-/// sample by sample while its caller waits, which is the hang the plan's rules
-/// forbid. The bound is deliberately far above any real stream.
-pub const MAX_SKIPPED_FRAMES: u64 = 100_000;
 
 /// The video track timescale: 90 kHz, which is Matroska's own default rate
 /// (`TimestampScale` 1 ms expressed per second), so a video PTS transfers from
@@ -90,7 +77,7 @@ pub struct MkvSource<R: Read + Seek> {
     /// out through [`next_sample`](TrackSource::next_sample) like any other.
     pending: Option<PendingFrame>,
     /// Frames read without one being emitted since the last emitted frame.
-    skipped: u64,
+    skipped: usize,
     /// Where the samples actually begin, in milliseconds of source time: the
     /// requested start until the first frame arrives, then that frame's PTS.
     reported_start_ms: u64,
@@ -200,10 +187,7 @@ impl<R: Read + Seek> MkvSource<R> {
     fn walk_beyond_patience(&mut self) -> Option<MediaError> {
         self.skipped += 1;
         if self.skipped > MAX_SKIPPED_FRAMES {
-            Some(MediaError::Malformed(format!(
-                "track {} produced no sample within {MAX_SKIPPED_FRAMES} frames",
-                self.track
-            )))
+            Some(MediaError::Malformed("no keyframe found".to_string()))
         } else {
             None
         }
@@ -636,7 +620,7 @@ fn hunt_first_frame_of_track<R: Read + Seek>(
     slot: &mut Frame,
     track: u64,
 ) -> Result<Option<PendingFrame>, MediaError> {
-    let mut skipped = 0u64;
+    let mut skipped = 0usize;
     loop {
         if !guarded_next(file, slot, "frames while looking for the first frame")? {
             return Ok(None);

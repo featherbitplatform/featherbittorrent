@@ -738,8 +738,9 @@ impl FragmentWriter {
     /// Seals whatever is left and flushes whatever was held back, in one Vec:
     /// the held fragment with its last duration now known from the final one,
     /// and the final fragment with its last sample lasting as long as it
-    /// states, or as long as the sample before it did, or 1 tick with nothing
-    /// to borrow.
+    /// states, or as long as the last gap inside its own fragment, or as long
+    /// as the seam it opens against the held fragment, or as long as the
+    /// sample before it did anywhere, or 1 tick with nothing to borrow.
     ///
     /// `Ok(None)` when no sample is outstanding. A player cannot be told a
     /// fragment ended before its last sample ended, so the last duration at the
@@ -778,22 +779,36 @@ impl FragmentWriter {
             first_dts,
         } = synthesize(&open.samples, self.is_audio, &mut self.last_dts)?;
         let last_dts = *dts.last().expect("samples were just here");
+        // The seam this final fragment opens against the held fragment: the
+        // distance from the held fragment's last decode time to this one's
+        // first. The held fragment is about to be flushed with exactly this
+        // duration, so when this fragment has one sample and its own timeline
+        // says nothing, the seam is what its sample can borrow - the reviewer's
+        // N1 fix: `prev_duration` is still `None` when nothing was ever
+        // encoded, and without the seam the sample would land on 1 tick.
+        let seam_gap = self
+            .held
+            .as_ref()
+            .map(|previous| clamp_gap(first_dts, previous.last_dts))
+            .transpose()?;
         // The final fragment has no fragment after it. If its last sample
         // states a duration, that is the one: it is the only stated duration
         // anywhere the writer believes. Otherwise the plan says the last sample
         // lasts as long as the previous one: inside the fragment that is the
-        // duration of the second-to-last sample; with a one-sample fragment,
-        // the last duration the writer settled on anywhere; with no history at
-        // all, one tick.
+        // duration of the second-to-last sample; against a held fragment, the
+        // seam between them; then the last duration the writer settled on
+        // anywhere; with no history at all, one tick.
         let final_duration = match (
             open.samples.last().and_then(|sample| sample.duration),
             durations.last().copied(),
+            seam_gap,
             self.prev_duration,
         ) {
-            (Some(stated), _, _) if stated > 0 => stated,
-            (Some(_), Some(inside), _) | (None, Some(inside), _) => inside,
-            (Some(_) | None, None, Some(previous)) => previous,
-            (Some(_) | None, None, None) => 1,
+            (Some(stated), _, _, _) if stated > 0 => stated,
+            (Some(_) | None, Some(inside), _, _) => inside,
+            (Some(_) | None, None, Some(gap), _) => gap,
+            (Some(_) | None, None, None, Some(previous)) => previous,
+            (Some(_) | None, None, None, None) => 1,
         };
 
         let sealed = Sealed {
@@ -1196,6 +1211,49 @@ mod tests {
                 "a signed composition offset needs version 1"
             );
         }
+    }
+
+    /// The reviewer's N1 for `finish`: a one-sample final fragment flushed
+    /// together with a held fragment borrows its duration from the seam
+    /// between them, not from `prev_duration` - which is still `None` when
+    /// nothing was ever encoded, making the fallback 1 tick. PTS `[0 key, 40,
+    /// 80 key]` with no durations: the keyframe at 80 seals `[0, 40]` into the
+    /// held fragment, and `finish` flushes both. The held fragment's last
+    /// duration is the seam (`80 - 40`), and so is the final fragment's only
+    /// sample - the order is stated duration, last gap inside its own
+    /// fragment, seam gap, previous duration, 1.
+    #[test]
+    fn one_sample_final_fragment_borrows_the_seam_gap() {
+        let out = fragments(
+            &video_config(),
+            [sample(0, true), sample(40, false), sample(80, true)],
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "the keyframe at 80 seals [0, 40] into the held fragment; finish flushes it with the one-sample final fragment"
+        );
+        let (tfdt1, timeline1) = walk(&out[0]);
+        assert_eq!(timeline1.len(), 2);
+        assert_eq!(
+            timeline1[1].0, 40,
+            "the held fragment's last duration is the seam (80 - 40)"
+        );
+        let (tfdt2, timeline2) = walk(&out[1]);
+        assert_eq!(
+            timeline2.len(),
+            1,
+            "the final fragment holds the single sample"
+        );
+        assert_eq!(
+            timeline2[0].0, 40,
+            "the one-sample final fragment borrows the seam gap, not 1 tick"
+        );
+        assert_eq!(
+            tfdt2,
+            tfdt1 + u64::from(timeline1[0].0) + u64::from(timeline1[1].0),
+            "and the fragment still starts exactly where the last one ended"
+        );
     }
 
     /// Keyframes that never come must not mean one endless fragment: 300

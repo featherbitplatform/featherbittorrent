@@ -24,7 +24,7 @@ pub mod source;
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind, sample_entry};
 pub use fmp4::{FragmentWriter, init_segment};
-pub use mkv::{MAX_SKIPPED_FRAMES, MkvSource, open_track};
+pub use mkv::{MkvSource, open_track};
 pub use probe::{MediaInfo, TrackInfo, probe};
 pub use source::{FragmentStream, Sample, SourceError, SourceResult, TrackConfig, TrackSource};
 
@@ -91,6 +91,21 @@ pub const MAX_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
 /// keyframes at all would otherwise grow a fragment's table for as long as its longest
 /// non-keyframe run, and the cap is what bounds that array.
 pub const MAX_FRAGMENT_SAMPLES: usize = 10_000;
+
+/// The most frames a source walks through - other tracks' frames, frames before
+/// the start time, frames ahead of a keyframe that never arrives - without
+/// emitting one, before it gives up.
+///
+/// Every legitimate need is far below this: a one second keyframe distance
+/// means a video seek skips a GOP's worth of frames at most, and interleaving
+/// between tracks multiplies that by the track count, not by the file size. A
+/// stream that never produces an emittable frame - a track with no frames at
+/// all, a start time past every frame - would otherwise walk a 100 GiB file
+/// sample by sample while its caller waits, which is the hang the plan's rules
+/// forbid. The bound is deliberately far above any real stream; hitting it is
+/// the `Malformed("no keyframe found")` verdict [`open_track`]
+/// reports for a track that never delivers.
+pub const MAX_SKIPPED_FRAMES: usize = 100_000;
 
 /// Why a file could not be used.
 #[derive(Debug, thiserror::Error)]
