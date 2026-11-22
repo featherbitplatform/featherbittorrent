@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod media_io;
 mod routes;
 mod server;
 // The front end this build carries, if it carries one: the page, its files, and the headers on them.

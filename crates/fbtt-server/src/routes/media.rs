@@ -1,0 +1,944 @@
+//! Playing a torrent's file from the library: what it holds, one track of it as fragmented MP4, when its
+//! subtitles say what, and the subtitle files that sit beside it.
+//!
+//! All four routes answer about one file of one torrent, named the way the rest of this API names it - the
+//! 40 or 64 hex digits [`stream`] takes, and the index of the file in the torrent's own list. Three things
+//! decide the shape of these handlers:
+//!
+//! - **The container work runs on the blocking pool.** fbtt-media reads through `std::io` and seeks the way
+//!   a file does, and the reader behind it is an engine object that answers on the runtime. So each handler
+//!   does its probing, demuxing and parsing inside `tokio::task::spawn_blocking`, over a
+//!   [`BlockingReader`], and never on the connection's task: a worker that took a slow peer's word for a
+//!   piece would take every other connection sharing it down for the wait.
+//! - **The work is bounded three ways.** One read or seek gets the timeout in [`Shared::media_read_timeout`]
+//!   ([`READ_TIMEOUT`] until somebody shortens it), so a piece that never arrives is an answer rather than a
+//!   thread that never comes back; a stream nobody is draining any more is dropped after [`IDLE_SEND`] of
+//!   nothing being taken from it; and [`MEDIA_PERMITS`] of these jobs run at once in the whole server,
+//!   because every one of them is a thread, a demuxer and a read-ahead held open on the engine.
+//! - **What the client sees is decided before the first byte.** A route that cannot play the file says so
+//!   with a status code; once bytes are on their way the status is spent, so an error that arrives later ends
+//!   the body and goes to the log. The stream route therefore lets its blocking job answer a `oneshot` with
+//!   its verdict on the file - the content type and the time it really started at, or the error - and only
+//!   then hands the fragments over as the body.
+//!
+//! The codes are the ones the plan set: `unsupported_media` for bytes this crate cannot play, `not_found` for
+//! a torrent, file or pad that is not there, `no_metadata` for a torrent whose metadata has not arrived (the
+//! same answer [`stream`] gives for the same torrent), `invalid_request` for an index or query that does not
+//! parse, `read_timeout` for pieces that did not arrive, `too_large` for a subtitle file over the cap, and
+//! three `503`s for the ways this server is temporarily full.
+//!
+//! Cue text is remote text like any other and goes through [`clean`] - one line at a time, so a cue keeps the
+//! line breaks it had: see [`clean_cue_lines`].
+
+use std::io::{self, BufReader, Read as _};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::response::Response;
+use fbt::{FileStatus, InfoHashes, SessionError, TorrentHandle};
+use fbtt_media::{self as media, Cue, MediaError, SubtitleFormat, TrackInfo};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
+use tokio::task::JoinError;
+
+use super::clean;
+use super::stream::{no_metadata, parse_id};
+use super::{RouteError, Shared};
+use crate::media_io::BlockingReader;
+
+/// How many media routes one server runs at once, across all four of them.
+///
+/// Every one of them is a thread on the blocking pool, a container demuxer carrying its own read budget, and
+/// an engine file reader with the read-ahead that goes with it. The blocking pool starts several hundred
+/// threads if nothing tells it not to, and the engine's own bound of open readers applies to one torrent
+/// ([`SessionError::TooManyReaders`]) - which is no bound at all across a library. Eight is what the plan
+/// sets: room for a household's players and a probe or two, and a ceiling on what a page that reloads
+/// itself can make this machine do.
+pub(super) const MEDIA_PERMITS: usize = 8;
+
+/// How long one read or one seek of a media route may take before it becomes the client's `504`.
+///
+/// Sixty seconds is longer than any piece of a healthy torrent takes to arrive and much shorter than the
+/// indefinite wait an unbounded bridge would settle into. An operator with a sick tracker, or a test that
+/// cannot wait a minute, shortens it through [`Server::set_media_read_timeout`](crate::Server).
+pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a media stream may go with nothing taken from it before its job stops making more.
+///
+/// A player that stops reading - a tab backgrounded mid-seek, a phone locked over a buffer - leaves the job
+/// holding a thread, a demuxer, a file reader and a permit for work nobody is collecting. Ten minutes of a
+/// full queue is longer than any ordinary player goes without wanting the next part, and short enough that a
+/// tab nobody came back to does not hold a permit for the rest of the run. The read timeout is the shorter
+/// leash of the two, and the one that fires when it is the *engine* that is stuck rather than the viewer.
+pub(super) const IDLE_SEND: Duration = Duration::from_secs(600);
+
+/// How much of a file the probe and the cue routes read at a time.
+///
+/// Both read a container header - and a Matroska header is a tree of elements the demuxer walks a little at
+/// a time - out of a torrent file, where a read is a request to a peer rather than a copy. Without a buffer
+/// that walk is thousands of reads. 64 KiB is a piece's worth of slack: enough to make a header cost a
+/// handful of reads, small enough that eight of these jobs are not holding half a megabyte of bytes nobody
+/// has looked at yet.
+const HEADER_READ: usize = 64 * 1024;
+
+/// How many finished fragments the stream route buffers between the job and the connection.
+///
+/// The job decodes ahead so a slow connection never makes it wait, and the connection plays at its own pace.
+/// Four fragments - a few tens of seconds of video - is enough slack for that, and it is the bound that
+/// keeps a stalled player from making the job put the rest of the film into a queue nobody drains.
+const FRAGMENTS_QUEUED: usize = 4;
+
+/// `X-Fbtt-Start-Ms`: the time the first sample of a stream actually started at.
+///
+/// A seek lands where the container can land, which is not where the viewer asked to go - the rules are in
+/// [`media::open_track`]'s own words - so a player that asked for 2000 ms can be handed a keyframe from
+/// 1801 ms. This header is the answer to "where did it really start", which a page needs before it draws a
+/// subtitle or a seek bar against the same clock.
+const X_FBTT_START_MS: HeaderName = HeaderName::from_static("x-fbtt-start-ms");
+
+/// The two path segments of the routes that name one file: `/{torrent}/{file}`.
+#[derive(Debug, Deserialize)]
+pub(super) struct TorrentFile {
+    /// The torrent's hash: the 40-hex wire hash or the 64-hex v2 hash, in either case.
+    torrent: String,
+    /// Its file to play, by index in the metadata's file list (pad files included).
+    file: String,
+}
+
+/// The three path segments of the two routes that name one track: `/{torrent}/{file}/tracks/{track}`.
+#[derive(Debug, Deserialize)]
+pub(super) struct TrackPath {
+    torrent: String,
+    file: String,
+    track: String,
+}
+
+/// `start_ms` on the stream route: where to start the track, in milliseconds of the file's own timeline.
+///
+/// A string rather than a number so that an unparsable value gets this API's `400 invalid_request` with the
+/// words this route uses, rather than a rejection in axum's own shape.
+#[derive(Debug, Deserialize)]
+pub(super) struct StreamQuery {
+    start_ms: Option<String>,
+}
+
+/// `from_ms` and `to_ms` on the cue route: the window, in milliseconds of the file's own timeline.
+#[derive(Debug, Deserialize)]
+pub(super) struct Window {
+    from_ms: Option<String>,
+    to_ms: Option<String>,
+}
+
+/// The path of [`subtitle_file`]: `{sub}` is the index of a subtitle file in the same torrent.
+#[derive(Debug, Deserialize)]
+pub(super) struct SubtitlePath {
+    torrent: String,
+    file: String,
+    sub: String,
+}
+
+/// What `GET /api/v1/media/{torrent}/{file}` answers: what the file is, and what could be played with it.
+#[derive(Debug, Serialize)]
+pub(super) struct ProbeAnswer {
+    /// `matroska`, `webm` or `mp4`, spelled as the container spells its own name.
+    container: String,
+    /// How long it is, when the container states a length; `null` when it does not.
+    duration_ms: Option<u64>,
+    /// How far the times this file's tracks carry are shifted to reach the player's clock, which a page
+    /// needs to line a cue or a seek bar up with what it is playing. See [`media::TIME_OFFSET_MS`].
+    time_offset_ms: u64,
+    /// The tracks, in the order the container lists them, subtitle tracks included.
+    tracks: Vec<TrackRow>,
+    /// The subtitle files in the same torrent that could be handed to the player beside this one.
+    external_subtitles: Vec<SubtitleRow>,
+}
+
+/// One track, as a player needs it in order to offer the track.
+#[derive(Debug, Serialize)]
+pub(super) struct TrackRow {
+    /// The container's own track number: the number the two track routes take back as `{track}`.
+    id: u32,
+    /// `video`, `audio` or `subtitle`.
+    kind: &'static str,
+    /// The codec, named as `ffprobe` and the web's codec vocabulary name it.
+    codec: String,
+    /// The RFC 6381 strings that name this track's codec to a manifest or a `canPlayType` call. Empty for a
+    /// codec this crate cannot put into a fragmented MP4 sample entry, which is the track's "not playable
+    /// from here" signal.
+    mime_codecs: Vec<String>,
+    /// The track's language, when the file states one; `null` for a file that only says "undetermined",
+    /// which is the containers' default and not a fact about the track.
+    language: Option<String>,
+    /// The track's title, when the container carries one.
+    name: Option<String>,
+    /// Whether a player should pick this track when the viewer expressed no preference.
+    default: bool,
+    /// Whether this subtitle track plays even for a viewer who did not ask for subtitles.
+    forced: bool,
+    /// Whether this subtitle track's payload is text this crate can rewrite as WebVTT.
+    text: bool,
+}
+
+impl TrackRow {
+    /// A track row from what the container said about the track.
+    fn of(track: &TrackInfo) -> Self {
+        TrackRow {
+            id: track.id,
+            kind: kind_name(track.kind),
+            codec: track.codec.name().to_string(),
+            mime_codecs: track.mime_codecs.clone(),
+            language: track.language.as_deref().map(clean),
+            name: track.name.as_deref().map(clean),
+            default: track.default,
+            forced: track.forced,
+            text: track.codec.text_subtitle(),
+        }
+    }
+}
+
+/// What kind of media a track is, in the one spelling this API uses for it.
+fn kind_name(kind: media::TrackKind) -> &'static str {
+    match kind {
+        media::TrackKind::Video => "video",
+        media::TrackKind::Audio => "audio",
+        media::TrackKind::Subtitle => "subtitle",
+    }
+}
+
+/// One subtitle file that could be played beside the file this request named.
+#[derive(Debug, Serialize)]
+pub(super) struct SubtitleRow {
+    /// Its index in the same torrent's file list: what `{sub}` takes.
+    file: usize,
+    /// Its name, cleaned like every other name this server repeats.
+    name: String,
+    /// `srt`, `ass` or `vtt`, from the extension the format was recognised from.
+    format: &'static str,
+}
+
+/// What the two cue routes answer.
+#[derive(Debug, Serialize)]
+pub(super) struct CueAnswer {
+    cues: Vec<CueRow>,
+}
+
+/// One line of a subtitle, with its text already cleaned for display.
+#[derive(Debug, Serialize)]
+pub(super) struct CueRow {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+impl CueRow {
+    /// A cue as this API answers it: the times as the file gave them, the text one line at a time through
+    /// [`clean_cue_lines`].
+    fn of(cue: Cue) -> Self {
+        CueRow {
+            start_ms: cue.start_ms,
+            end_ms: cue.end_ms,
+            text: clean_cue_lines(&cue.text),
+        }
+    }
+}
+
+/// A cue's text, cleaned one line at a time.
+///
+/// [`clean`] over the whole string would turn every newline in it into a space, and a two-line cue would
+/// arrive as one line with its second line's words glued to its first. So each line goes through on its own
+/// and the breaks are put back: what arrives has no control characters in it - the escape a terminal's
+/// colour codes leave inside a `.srt` someone copied from one, the bidi override that makes a name read the
+/// other way - and exactly the lines the file had, with a carriage return that some `.srt` files carry
+/// dropped rather than kept as an invisible character. A line that is nothing once cleaned is dropped
+/// rather than spending a line of the viewer's screen on it.
+fn clean_cue_lines(text: &str) -> String {
+    text.lines()
+        .map(clean)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `GET /api/v1/media/{torrent}/{file}`: what this file is, what tracks it has, and what could be played
+/// beside it.
+///
+/// The answer is the file's own description, and this is the route that decides whether the other three have
+/// anything to do: a file that is not Matroska, WebM or MP4, one too short to hold a container header, and
+/// one whose header does not hold together are `415 unsupported_media`, with what was found in the message,
+/// so a player looks for another file instead of guessing. A torrent this server does not have, an index
+/// past the end of its list, and a pad file are `404`; a torrent whose metadata has not arrived is
+/// `409 no_metadata`, the answer [`stream`] gives it.
+pub(super) async fn probe(
+    State(shared): State<Arc<Shared>>,
+    Path(params): Path<TorrentFile>,
+) -> Result<Json<ProbeAnswer>, RouteError> {
+    let hashes = parse_id(&params.torrent)?;
+    let file = file_index(&params.file)?;
+    let permit = media_permit(&shared)?;
+    let (torrent, files) = listed(&shared, &hashes, file).await?;
+    // The sidecar list comes off the file list this route already holds, so it is worked out here rather than
+    // carried down to the blocking pool: it costs no reads, and the job has enough to carry.
+    let beside = external_subtitles(&files, file);
+    let (reader, _stop) = open_reader(&shared, &torrent, file).await?;
+    let answer = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let header = BufReader::with_capacity(HEADER_READ, reader);
+        let info = media::probe(header).map_err(media_problem)?;
+        let answer = ProbeAnswer {
+            container: info.container.name().to_string(),
+            duration_ms: info.duration_ms,
+            time_offset_ms: media::TIME_OFFSET_MS,
+            tracks: info.tracks.iter().map(TrackRow::of).collect(),
+            external_subtitles: beside,
+        };
+        Ok::<ProbeAnswer, RouteError>(answer)
+    })
+    .await
+    {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(problem)) => return Err(problem),
+        Err(problem) => return Err(job_failed(problem)),
+    };
+    Ok(Json(answer))
+}
+
+/// `GET /api/v1/media/{torrent}/{file}/tracks/{track}/stream?start_ms=N`: one track of one file as
+/// fragmented MP4, starting at or after `start_ms`.
+///
+/// The content type comes from the stream - `video/mp4` or `audio/mp4` with the track's RFC 6381 codec
+/// string - because the bytes are fragmented MP4 whatever the file was. [`X_FBTT_START_MS`] says where the
+/// first sample really started, which for a video track is the keyframe the container could land on rather
+/// than the time that was asked for. `Cache-Control: no-store`, because this body is the answer to a seek: a
+/// cache that replayed it would be playing the wrong part of the film.
+///
+/// The bytes are the init segment and then fragments, out of a queue [`FRAGMENTS_QUEUED`] deep. What the
+/// job does is [`play`]; what decides the status code is the `oneshot` it answers before it has produced
+/// anything the client can see.
+pub(super) async fn track_stream(
+    State(shared): State<Arc<Shared>>,
+    Path(params): Path<TrackPath>,
+    Query(query): Query<StreamQuery>,
+) -> Result<Response, RouteError> {
+    let hashes = parse_id(&params.torrent)?;
+    let file = file_index(&params.file)?;
+    let track = track_number(&params.track)?;
+    let start_ms = match query.start_ms.as_deref() {
+        // No `start_ms` at all is the start of the file, which is what `open_track` wants spelled as zero.
+        None => 0,
+        Some(wanted) => wanted.parse::<u64>().map_err(|_| {
+            RouteError::invalid_request("start_ms is a time in milliseconds, or absent")
+        })?,
+    };
+    let permit = media_permit(&shared)?;
+    let (torrent, _) = listed(&shared, &hashes, file).await?;
+    let (reader, stop) = open_reader(&shared, &torrent, file).await?;
+    let (heads, head) = oneshot::channel();
+    let (fragments, queue) = mpsc::channel::<Vec<u8>>(FRAGMENTS_QUEUED);
+    let id = params.torrent.clone();
+    // Not awaited: this job *is* the rest of the request, and it ends by itself when the body below is
+    // dropped. The permit travels inside it, because the permit is about this work and not about the handler
+    // that started it - the same reason [`login::verify_password`] carries its permit down, and see [`play`]
+    // for the three things that end this one.
+    tokio::task::spawn_blocking(move || {
+        let out = Playing {
+            id,
+            file,
+            heads,
+            fragments,
+            _permit: permit,
+        };
+        play(reader, track, start_ms, out)
+    });
+    // The verdict on the file, before a byte of it has been promised to anybody.
+    let head = match head.await {
+        Ok(Ok(head)) => head,
+        Ok(Err(problem)) => return Err(problem),
+        // The job stopped without answering at all: it panicked, or this handler was already going away.
+        Err(_) => return Err(RouteError::internal("the media stream did not answer")),
+    };
+    let mut response = Response::new(Body::from_stream(Fragments {
+        next: queue,
+        _stop: stop,
+    }));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&head.mime)
+            .map_err(|_| RouteError::internal("the track's content type is not usable"))?,
+    );
+    headers.insert(X_FBTT_START_MS, head.start_ms.into());
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// What the stream route has to know before it answers: what the bytes are, and where they started.
+struct Head {
+    mime: String,
+    start_ms: u64,
+}
+
+/// Everything [`play`] owns on the request's side of the boundary between the handler and the job: where
+/// the parts and the verdict go, who to name in a log line, and the pool place this work is holding.
+///
+/// Its own type because the four destinations and the identity of a stream belong to the job and not to any
+/// of the handler's arguments: the handler builds all of it, hands it over, and keeps nothing.
+struct Playing {
+    /// The torrent as the client spelled it, for the log line about a stream that ended. A hex id, which is
+    /// already the display form [`tracing`] sees in the torrent routes.
+    id: String,
+    /// The file index, for the same line: the name is the viewer's business and never logged.
+    file: usize,
+    /// Where the mime type and the landed start time go, or the verdict on the file if there is no body.
+    heads: oneshot::Sender<Result<Head, RouteError>>,
+    /// Where the fragments go, one part at a time, to the body the handler is already holding.
+    fragments: mpsc::Sender<Vec<u8>>,
+    /// This route's place in the media pool. Never read: dropped with the job.
+    _permit: OwnedSemaphorePermit,
+}
+
+/// The blocking half of [`track_stream`]: open the track, answer the head, then feed the queue.
+///
+/// This job is the request for as long as it runs, and three things end it: the track ran out, nobody is
+/// collecting fragments any more (the body was dropped, which is the viewer hanging up), or the file or the
+/// engine refused something. The first two are ordinary and are not worth a log line beyond a `debug` of who
+/// gave up; the third is logged with the torrent and the file - never the file's name, which is the
+/// viewer's business - and ends the stream where it stands, because the status code was spent hours of
+/// buffering ago.
+///
+/// The place in the pool travels inside `out`, so that it goes back when *this* work is over and not when
+/// the handler that started it happened to return.
+fn play(reader: BlockingReader, track: u32, start_ms: u64, out: Playing) {
+    let Playing {
+        id,
+        file,
+        heads,
+        fragments,
+        _permit,
+    } = out;
+    let runtime = tokio::runtime::Handle::current();
+    let mut stream = match media::open_track(reader, track, start_ms) {
+        Ok(stream) => stream,
+        Err(problem) => {
+            // Nothing has been written, so the client can still be given a code for this file.
+            let _ = heads.send(Err(media_problem(problem)));
+            return;
+        }
+    };
+    let mime = stream.mime();
+    // The first part before the head is answered, because producing it is where a header's worth of waiting
+    // on the engine happens: an error here is still an error a status code can describe.
+    let first = match stream.next_fragment() {
+        Ok(Some(bytes)) => bytes,
+        // A track with nothing in it: the head is still true, and the body is empty.
+        Ok(None) => {
+            let _ = heads.send(Ok(Head {
+                mime,
+                start_ms: stream.start_ms(),
+            }));
+            return;
+        }
+        Err(problem) => {
+            let _ = heads.send(Err(media_problem(problem)));
+            return;
+        }
+    };
+    let head = Head {
+        mime,
+        start_ms: stream.start_ms(),
+    };
+    if heads.send(Ok(head)).is_err() {
+        // The answer is not going to be sent at all: the request is gone.
+        return;
+    }
+    let mut part = Some(first);
+    loop {
+        let Some(bytes) = part.take() else { return };
+        // A queue nobody is emptying is a viewer who has stopped wanting this: stop decoding rather than
+        // spend the rest of the track on it. Checked before the work rather than after it, so a hang-up
+        // costs one fragment's worth of demuxing and not the whole file.
+        if fragments.is_closed() {
+            tracing::debug!(torrent = %id, file, "the viewer stopped playing this stream");
+            return;
+        }
+        match runtime.block_on(tokio::time::timeout(
+            IDLE_SEND,
+            fragments.clone().send(bytes),
+        )) {
+            Ok(Ok(())) => {}
+            // The body went away in the middle of a send: the same hang-up as the check above, one part
+            // later, with the queue's receiver already gone.
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::debug!(
+                    torrent = %id,
+                    file,
+                    seconds = IDLE_SEND.as_secs(),
+                    "nothing was taken from this stream for that long",
+                );
+                return;
+            }
+        }
+        part = match stream.next_fragment() {
+            Ok(next) => next,
+            // Past the first part the status code is spent: the body ends where it stands, which is what a
+            // player reads as the end of what is fetchable, and the reason for it goes here rather than to
+            // the viewer.
+            Err(problem) => {
+                tracing::debug!(
+                    torrent = %id,
+                    file,
+                    problem = %clean(&problem.to_string()),
+                    "the media stream ended early",
+                );
+                return;
+            }
+        };
+    }
+}
+
+/// The body of a media stream: the queue the job feeds, and the handle that tells the job to stop.
+///
+/// Ending this is what hangs up: dropping it drops the watch sender [`BlockingReader`] waits on, which is
+/// what wakes a read that is waiting for a piece that is never going to arrive. The channel ending is what
+/// ends the body: the job is finished, successfully or not, and said so where the viewer cannot see it.
+struct Fragments {
+    next: mpsc::Receiver<Vec<u8>>,
+    /// Held and never sent on: see [`BlockingReader`].
+    _stop: watch::Sender<()>,
+}
+
+impl futures_util::Stream for Fragments {
+    type Item = Result<Vec<u8>, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // A part is either more of the film or the end of it. The job's own failures never reach this body:
+        // the only thing that can tell a viewer about them is where the bytes stop.
+        match self.get_mut().next.poll_recv(cx) {
+            Poll::Ready(Some(bytes)) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// `GET /api/v1/media/{torrent}/{file}/tracks/{track}/cues?from_ms=A&to_ms=B`: when this track's subtitles
+/// say what, within the window the viewer is about to play.
+///
+/// The window is checked before anything is read: `to_ms` has to come after `from_ms`, and the pair has to
+/// fit inside [`media::CUE_WINDOW_MAX_MS`], so a query naming a year of a film is refused by this route
+/// rather than by the demuxer's own bound. An absent bound is the edge of the window this route knows about:
+/// no `from_ms` is the start of the file, no `to_ms` is the widest window there is. A track that is not a
+/// text subtitle track - a video track, a bitmap subtitle track, a number the file does not carry - is
+/// `415 unsupported_media`, because there are no cues of any format to give for it.
+pub(super) async fn track_cues(
+    State(shared): State<Arc<Shared>>,
+    Path(params): Path<TrackPath>,
+    Query(query): Query<Window>,
+) -> Result<Json<CueAnswer>, RouteError> {
+    let hashes = parse_id(&params.torrent)?;
+    let file = file_index(&params.file)?;
+    let track = track_number(&params.track)?;
+    let from_ms = match query.from_ms.as_deref() {
+        None => 0,
+        Some(given) => ms(given, "from_ms")?,
+    };
+    let to_ms = match query.to_ms.as_deref() {
+        None => media::CUE_WINDOW_MAX_MS,
+        Some(given) => ms(given, "to_ms")?,
+    };
+    if to_ms <= from_ms {
+        return Err(RouteError::invalid_request("to_ms has to be after from_ms"));
+    }
+    if to_ms - from_ms > media::CUE_WINDOW_MAX_MS {
+        return Err(RouteError::invalid_request(format!(
+            "a cue window is at most {} ms",
+            media::CUE_WINDOW_MAX_MS
+        )));
+    }
+    let permit = media_permit(&shared)?;
+    let (torrent, _) = listed(&shared, &hashes, file).await?;
+    let (reader, _stop) = open_reader(&shared, &torrent, file).await?;
+    let cues = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let file = BufReader::with_capacity(HEADER_READ, reader);
+        let found = media::embedded_cues(file, track, from_ms, to_ms).map_err(media_problem)?;
+        Ok::<Vec<Cue>, RouteError>(found)
+    })
+    .await
+    {
+        Ok(Ok(cues)) => cues,
+        Ok(Err(problem)) => return Err(problem),
+        Err(problem) => return Err(job_failed(problem)),
+    };
+    Ok(Json(CueAnswer {
+        cues: cues.into_iter().map(CueRow::of).collect(),
+    }))
+}
+
+/// `GET /api/v1/media/{torrent}/{file}/subtitles/{sub}`: the cues of a subtitle file of the same torrent, in
+/// the same shape the embedded route gives.
+///
+/// `{file}` is the video the subtitle belongs to and `{sub}` the file to read; both have to be files of this
+/// torrent and not pads. This route then reads `{sub}` whole - it is a text file, and a cue needs its timing
+/// line and its text lines together - under [`media::SUBTITLE_FILE_CAP`], which the torrent's own metadata
+/// answers before a byte is fetched: a sidecar of a hundred megabytes is refused with no reads at all, and
+/// one whose metadata lied about its length gets the same answer the moment the byte past the cap turns up.
+pub(super) async fn subtitle_file(
+    State(shared): State<Arc<Shared>>,
+    Path(params): Path<SubtitlePath>,
+) -> Result<Json<CueAnswer>, RouteError> {
+    let hashes = parse_id(&params.torrent)?;
+    let file = file_index(&params.file)?;
+    let sub = file_index(&params.sub)?;
+    let permit = media_permit(&shared)?;
+    let (torrent, files) = listed(&shared, &hashes, file).await?;
+    let Some(row) = files.iter().find(|row| row.index == sub) else {
+        return Err(RouteError::not_found("no such subtitle file"));
+    };
+    if row.pad {
+        return Err(RouteError::not_found("no such subtitle file"));
+    }
+    let name = display_name(row);
+    let Some(format) = media::subtitle_format(&name) else {
+        return Err(unsupported_media(format!(
+            "{name} is not a subtitle file: .srt, .ass, .ssa and .vtt are"
+        )));
+    };
+    // The cap, from the torrent's metadata: a file this route could not possibly send is refused before it
+    // spends a permit's worth of engine reads finding that out.
+    if row.len > media::SUBTITLE_FILE_CAP {
+        return Err(too_large(row.len));
+    }
+    let (reader, _stop) = open_reader(&shared, &torrent, sub).await?;
+    let cues = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // One byte past the cap is enough to know the file is over it, and it is what makes the cap a bound
+        // on the bytes this job holds rather than on a promise the metadata made.
+        let mut bytes = Vec::new();
+        // This read is the route's own work rather than the crate's, so its failure is put into the same
+        // verdict a reader failure inside fbtt-media gets by hand: a timeout is still a timeout, and a file
+        // that has gone is still a file that has gone.
+        reader
+            .take(media::SUBTITLE_FILE_CAP + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| media_problem(MediaError::Io(err)))?;
+        if bytes.len() as u64 > media::SUBTITLE_FILE_CAP {
+            return Err(too_large(bytes.len() as u64));
+        }
+        let found = media::file_cues(&bytes, format).map_err(media_problem)?;
+        Ok::<Vec<Cue>, RouteError>(found)
+    })
+    .await
+    {
+        Ok(Ok(cues)) => cues,
+        Ok(Err(problem)) => return Err(problem),
+        Err(problem) => return Err(job_failed(problem)),
+    };
+    Ok(Json(CueAnswer {
+        cues: cues.into_iter().map(CueRow::of).collect(),
+    }))
+}
+
+/// The file list, with the file this request named found in it: the lookup all four routes do, spelled once
+/// so that they answer "no such torrent", "no metadata" and "no such file" alike.
+///
+/// A pad file is `404` rather than a playable file with nothing in it: a pad has no bytes to demux, and
+/// fbt-api's own stream route refuses one too.
+async fn listed(
+    shared: &Arc<Shared>,
+    hashes: &InfoHashes,
+    file: usize,
+) -> Result<(TorrentHandle, Vec<FileStatus>), RouteError> {
+    let Some(torrent) = shared.session().torrent(hashes) else {
+        return Err(RouteError::not_found("no such torrent"));
+    };
+    let files = match torrent.files().await {
+        Ok(files) => files,
+        Err(SessionError::NoMetadata) => return Err(no_metadata()),
+        Err(SessionError::Shutdown) => return Err(shutting_down()),
+        // Anything else is this server's own trouble, and the engine's words for it may name a file on this
+        // machine: the log gets those, the client gets what it can act on.
+        Err(problem) => {
+            tracing::warn!(
+                problem = %clean(&problem.to_string()),
+                "the file list of a torrent could not be read",
+            );
+            return Err(RouteError::internal("the file list could not be read"));
+        }
+    };
+    let Some(row) = files.iter().find(|row| row.index == file) else {
+        return Err(RouteError::not_found("no such file"));
+    };
+    if row.pad {
+        return Err(RouteError::not_found("no such file"));
+    }
+    Ok((torrent, files))
+}
+
+/// A reader for one file of one torrent, ready to be read from a blocking thread.
+///
+/// The engine's reader is opened here, while the handler still runs on the runtime that owns the session, and
+/// given the timeout and the hang-up watch this run is serving under. The `watch::Sender` that comes back is
+/// the other half of that: whoever holds it is what keeps a pending read awake, and dropping it is what
+/// wakes one. Hold it for as long as the reading matters - in the handler for the three routes that answer
+/// JSON, in the body of the stream route.
+async fn open_reader(
+    shared: &Arc<Shared>,
+    torrent: &TorrentHandle,
+    file: usize,
+) -> Result<(BlockingReader, watch::Sender<()>), RouteError> {
+    let reader = match torrent.open_file(file).await {
+        Ok(reader) => reader,
+        Err(problem) => return Err(engine_problem(&problem)),
+    };
+    let (stop, waiting) = watch::channel(());
+    let reader = BlockingReader::new(
+        reader,
+        tokio::runtime::Handle::current(),
+        shared.media_read_timeout(),
+        waiting,
+    );
+    Ok((reader, stop))
+}
+
+/// This server's place in the media pool, or the `503` that says none is free.
+///
+/// `try_acquire_owned` rather than an await: a media route is not somewhere to sit and wait for somebody
+/// else's demuxer to finish, and a client told to come back in a second is better off than one whose
+/// request is held open while it waits. The permit is owned because the stream route hands its permit to the
+/// job that outlives this handler.
+fn media_permit(shared: &Arc<Shared>) -> Result<OwnedSemaphorePermit, RouteError> {
+    shared
+        .media_permits()
+        .try_acquire_owned()
+        .map_err(|_| too_many_media_streams())
+}
+
+/// The file index a path segment names.
+///
+/// Parsed here rather than by the path extractor, so that a segment that is not a number gets this API's
+/// `400 invalid_request` in this API's words.
+fn file_index(given: &str) -> Result<usize, RouteError> {
+    given.parse::<usize>().map_err(|_| {
+        RouteError::invalid_request("a file index is a number, in the torrent's own file list")
+    })
+}
+
+/// `{track}`: the container's own track number.
+fn track_number(given: &str) -> Result<u32, RouteError> {
+    given.parse::<u32>().map_err(|_| {
+        RouteError::invalid_request("a track number is a number this file's probe reported")
+    })
+}
+
+/// One millisecond bound of a cue window.
+fn ms(given: &str, what: &str) -> Result<u64, RouteError> {
+    given.parse::<u64>().map_err(|_| {
+        RouteError::invalid_request(format!("{what} is a time in milliseconds, or absent"))
+    })
+}
+
+/// The name to show for a file: the last component of the path the torrent carries, which is what a player
+/// has to name a track after, cleaned like every other name this server repeats.
+fn display_name(row: &FileStatus) -> String {
+    match row.path.file_name() {
+        Some(name) => clean(name.to_string_lossy().as_ref()),
+        None => clean(row.path.to_string_lossy().as_ref()),
+    }
+}
+
+/// The subtitle files of one torrent, spelled the way a viewer wants a list of them: the ones named after
+/// the video first, then the rest in the order the torrent lists them.
+///
+/// One video and four subtitle files is the ordinary shape of a download, and someone picking from that list
+/// wants `movie.en.srt` before `captions.zh.ass`: sharing the video's name is the best sign available that a
+/// sidecar belongs to this file, and index order after that is at least stable. The file the request named is
+/// left out - it is the one being played, and it is not a subtitle for itself.
+fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
+    let base = files
+        .iter()
+        .find(|row| row.index == video)
+        .map(display_name)
+        .map(|name| match name.rsplit_once('.') {
+            Some((stem, _)) if !stem.is_empty() => stem.to_ascii_lowercase(),
+            _ => name.to_ascii_lowercase(),
+        });
+    let mut rows: Vec<(bool, usize, SubtitleRow)> = files
+        .iter()
+        .filter(|row| !row.pad && row.index != video)
+        .filter_map(|row| {
+            let name = display_name(row);
+            let format = media::subtitle_format(&name)?;
+            let mine = name.to_ascii_lowercase();
+            let beside = base.as_deref().is_some_and(|base| mine.starts_with(base));
+            Some((
+                // A row that did not match the video's name sorts after one that did.
+                !beside,
+                row.index,
+                SubtitleRow {
+                    file: row.index,
+                    name,
+                    format: format_name(format),
+                },
+            ))
+        })
+        .collect();
+    rows.sort_by_key(|(later, index, _)| (*later, *index));
+    rows.into_iter().map(|(_, _, row)| row).collect()
+}
+
+/// A subtitle format, in the one spelling this API uses for it.
+fn format_name(format: SubtitleFormat) -> &'static str {
+    match format {
+        SubtitleFormat::Srt => "srt",
+        SubtitleFormat::Ass => "ass",
+        SubtitleFormat::Vtt => "vtt",
+    }
+}
+
+/// A container, codec or reader verdict, in the shape this API answers with.
+///
+/// Both halves of fbtt-media's "this cannot be played here" - a codec or container it does not read, and a
+/// header that does not hold together - are the same thing to a player: nothing will make these bytes play,
+/// so look for another file, which is what `415` says, with the crate's own words about what it found in the
+/// message. The reader failures are the other half of the story, and they are sorted by what the client can
+/// do about them: pieces that have not arrived are worth asking for again (`504`), a file that has left this
+/// machine is not (`404`), and a request nobody is still reading is nobody's error (`503`).
+fn media_problem(problem: MediaError) -> RouteError {
+    match problem {
+        MediaError::Unsupported(message) | MediaError::Malformed(message) => {
+            unsupported_media(clean(&message))
+        }
+        MediaError::Io(err) => match err.kind() {
+            io::ErrorKind::TimedOut => read_timeout(),
+            io::ErrorKind::NotFound => RouteError::not_found("the file is gone"),
+            // The viewer stopped reading, so there is no answer left to give. What a request nobody is
+            // waiting for any more answers hardly matters; `503` is the truth of it.
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted => shutting_down(),
+            // A stream that ends in the middle of a header is the crate's own `Malformed` verdict arriving
+            // as a reader failure instead: the file is not playable from here either way.
+            io::ErrorKind::UnexpectedEof => {
+                unsupported_media("the file ends before its container header does")
+            }
+            kind => {
+                tracing::warn!(
+                    problem = %clean(&err.to_string()),
+                    ?kind,
+                    "reading a torrent file for the media routes failed",
+                );
+                RouteError::internal("the torrent file could not be read")
+            }
+        },
+    }
+}
+
+/// A verdict from the engine itself, before any of the file's bytes were read.
+///
+/// The two the client can act on are the two the plan names: a torrent whose metadata has not arrived gets
+/// the same `409` [`stream`] gives it, and a torrent with sixteen readers on it is at the engine's own
+/// limit, so it gets that limit's answer with the second fbt-api's `busy` asks a client to wait. The rest are
+/// this server failing at its job, and the engine's words for them may name a path on this machine.
+fn engine_problem(problem: &SessionError) -> RouteError {
+    match problem {
+        SessionError::NoMetadata => no_metadata(),
+        SessionError::InvalidFileIndex { .. } => RouteError::not_found("no such file"),
+        SessionError::TooManyReaders => too_many_readers(),
+        SessionError::Shutdown => shutting_down(),
+        // The engine's own disk trouble: a file moved out from under this run is not a file anybody can
+        // name any more.
+        SessionError::Storage(err) if err.kind() == io::ErrorKind::NotFound => {
+            RouteError::not_found("the file is not on this machine any more")
+        }
+        other => {
+            tracing::warn!(
+                problem = %clean(&other.to_string()),
+                "the engine could not open this file for the media routes",
+            );
+            RouteError::internal("the torrent file could not be opened")
+        }
+    }
+}
+
+/// A blocking media job that stopped without answering: it panicked, and a panic in a job is this server's
+/// failure rather than a verdict about somebody's file.
+fn job_failed(problem: JoinError) -> RouteError {
+    tracing::error!(
+        problem = %clean(&problem.to_string()),
+        "a media job did not finish",
+    );
+    RouteError::internal("the media job did not finish")
+}
+
+/// `415 unsupported_media`: these bytes will not play from this route, in fbtt-media's own words about what
+/// it found.
+fn unsupported_media(message: impl Into<String>) -> RouteError {
+    RouteError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_media",
+        message,
+    )
+}
+
+/// `504 read_timeout`: the file is probably fine, and the pieces this request needed did not come.
+fn read_timeout() -> RouteError {
+    RouteError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "read_timeout",
+        "the pieces this file needs have not arrived",
+    )
+}
+
+/// `413 too_large`: a subtitle file bigger than this route reads, in the size it turns out to be.
+fn too_large(bytes: u64) -> RouteError {
+    RouteError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large",
+        format!(
+            "a subtitle file is at most {} bytes, this one is {bytes}",
+            media::SUBTITLE_FILE_CAP
+        ),
+    )
+}
+
+/// `503 too_many_readers` with `Retry-After: 1`: the engine's own limit of open readers on one torrent, the
+/// answer for a client with sixteen streams on one file.
+fn too_many_readers() -> RouteError {
+    let mut error = RouteError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "too_many_readers",
+        "this torrent already has as many open readers as it allows",
+    );
+    error.retry_after_secs = Some(1);
+    error
+}
+
+/// `503 too_many_media_streams` with `Retry-After: 1`: every place this server has for demuxing a file is
+/// busy. This is this crate's pool, not one torrent's readers, so it gets its own code and a client that
+/// backs off does not need to know the difference.
+fn too_many_media_streams() -> RouteError {
+    let mut error = RouteError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "too_many_media_streams",
+        "this server is playing as many files as it allows",
+    );
+    error.retry_after_secs = Some(1);
+    error
+}
+
+/// `503 shutting_down`: the engine has stopped taking work, which is what [`stream`] says in the same case.
+fn shutting_down() -> RouteError {
+    RouteError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "shutting_down",
+        "the server is stopping",
+    )
+}

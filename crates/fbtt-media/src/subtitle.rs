@@ -13,7 +13,7 @@
 //!
 //! Subtitles embedded in a Matroska or WebM file are read the same way:
 //! [`embedded_cues`] opens the file through the same guarded, budgeted
-//! Matroska open [`open_track`](crate::mkv::open_track) uses, walks the
+//! Matroska open [`open_track`](crate::open_track) uses, walks the
 //! frames of one subtitle track, and keeps the cues that overlap the asked
 //! window. A frame is at most the file cap and a track is at most the cue
 //! cap, so a hostile file holds one decoded string and a bounded cue list.
@@ -688,7 +688,7 @@ fn clean_html_tags(text: &str) -> String {
 /// until the MP4 path lands.
 ///
 /// The file is opened exactly the way
-/// [`open_track`](crate::mkv::open_track) opens it: through the crate's
+/// [`open_track`](crate::open_track) opens it: through the crate's
 /// budgeted, capped Matroska open, and every frame read and seek wrapped in
 /// the same `catch_unwind` guard, so a hostile file answers with a
 /// [`MediaError`], never a panic.
