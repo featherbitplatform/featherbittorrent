@@ -186,20 +186,17 @@ fn srt_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
             !lines[i].trim().is_empty() && lines[i].trim().chars().all(|c| c.is_ascii_digit());
         if number_here {
             i += 1;
-            if i >= lines.len() || srt_timing(lines[i]).is_none() {
-                // A number with no timing line after it: a block out of
-                // place, to the next empty line.
-                skip_block(&lines, &mut i);
-                continue;
+            if i >= lines.len() {
+                break;
             }
-        } else if srt_timing(lines[i]).is_none() {
-            // Not a number and not a timing: a text line or garbage, and it
-            // runs to the next empty line.
+        }
+        // The timing line, parsed once. A number with no timing line after
+        // it, or a line that is neither a number nor a timing, is a block out
+        // of place: skip it to the next empty line.
+        let Some((start_ms, end_ms)) = srt_timing(lines[i]) else {
             skip_block(&lines, &mut i);
             continue;
-        }
-        let timing = srt_timing(lines[i]).expect("checked above");
-        let (start_ms, end_ms) = timing;
+        };
         i += 1;
         let text_start = i;
         while i < lines.len() && !lines[i].is_empty() {
@@ -326,24 +323,74 @@ fn ascii_u64(field: &str) -> Option<u64> {
     Some(v as u64)
 }
 
-/// ASS: the `[Events]` section, a `Format:` line that names its columns, and
-/// one cue per `Dialogue:` line.
+/// The `[Events]` section of an ASS file: from just after its header to the
+/// next `[...]` section header, or to the end of the file when there is none.
+/// `None` when the file has no `[Events]` section.
 ///
-/// The `Format:` line is read only from inside the `[Events]` section: a
-/// `[V4+ Styles]` `Format:` line never applies to `Dialogue:` lines. With no
-/// `[Events]` section, `Dialogue:` lines anywhere use the standard column
-/// order. When the section has no `Format:` line, the standard order is used
-/// too. The standard order is the one the prompt spells out: Layer, Start,
-/// End, Style, Name, MarginL, MarginR, MarginV, Effect, Text.
-fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
-    // The [Events] section, or the whole file when there is no section header.
-    let events = match text.find("[Events]") {
-        Some(pos) => text[pos..].trim_start_matches("[Events]"),
-        None => text,
+/// A section header is a line that starts with `[` (after any leading
+/// whitespace). Scanning line by line keeps a `[` inside a `Dialogue:` text
+/// from being mistaken for one.
+fn events_section(text: &str) -> Option<&str> {
+    let header = "[Events]";
+    let pos = text.find(header)?;
+    let body = &text[pos + header.len()..];
+    // The next section header is the first line, after the header's own line,
+    // that starts with `[`. Find it by walking the body line by line, tracking
+    // the byte offset of each line's start.
+    let mut rest = body;
+    // Skip the header's own line (the part of the first line after "[Events]").
+    let first_newline = rest.find(['\n', '\r']);
+    rest = match first_newline {
+        Some(nl) => {
+            // A `\r\n` is two bytes.
+            let advance = if rest.as_bytes().get(nl) == Some(&b'\r')
+                && rest.as_bytes().get(nl + 1) == Some(&b'\n')
+            {
+                nl + 2
+            } else {
+                nl + 1
+            };
+            &rest[advance..]
+        }
+        None => return Some(body),
     };
-    // The column order, from the section's Format: line, or the standard
-    // order when there is none.
-    let format_fields: Vec<String> = split_lines(events)
+    // Walk the remaining lines. The offset of a line start in `body` is
+    // `body.len() - remaining.len()` at the moment the line is read.
+    loop {
+        let line_start = body.len() - rest.len();
+        let line_end = rest.find(['\n', '\r']).map_or(rest.len(), |nl| {
+            if rest.as_bytes().get(nl) == Some(&b'\r')
+                && rest.as_bytes().get(nl + 1) == Some(&b'\n')
+            {
+                nl + 1
+            } else {
+                nl
+            }
+        });
+        let line = &rest[..line_end];
+        if line.trim_start().starts_with('[') {
+            return Some(&body[..line_start]);
+        }
+        if line_end >= rest.len() {
+            return Some(body);
+        }
+        rest = &rest[line_end + 1..];
+    }
+}
+
+/// The standard ASS/SSA column order, used when there is no `[Events]`
+/// section or its `Format:` line names none of Start, End or Text.
+fn standard_ass_columns() -> Vec<&'static str> {
+    vec![
+        "layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text",
+    ]
+}
+
+/// The `Format:` column names from inside the `[Events]` section only: a
+/// `[V4+ Styles]` `Format:` line never applies to `Dialogue:` lines. `None`
+/// when the section has no `Format:` line.
+fn events_format_fields(section: &str) -> Option<Vec<String>> {
+    split_lines(section)
         .iter()
         .find_map(|line| {
             let fields = line.trim().strip_prefix("Format:")?;
@@ -355,15 +402,49 @@ fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
                     .collect::<Vec<_>>(),
             )
         })
-        .unwrap_or_else(|| {
-            [
-                "layer", "start", "end", "style", "name", "marginl", "marginr", "marginv",
-                "effect", "text",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        });
+        .filter(|fields| !fields.is_empty())
+}
+
+/// ASS: the `[Events]` section, a `Format:` line that names its columns, and
+/// one cue per `Dialogue:` line.
+///
+/// The `Format:` line is read only from inside a found `[Events]` section: a
+/// `[V4+ Styles]` `Format:` line never applies to `Dialogue:` lines. With no
+/// `[Events]` section, `Dialogue:` lines anywhere use the standard column
+/// order. When the section has no `Format:` line, the standard order is used
+/// too. The standard order is the one the prompt spells out: Layer, Start,
+/// End, Style, Name, MarginL, MarginR, MarginV, Effect, Text.
+fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
+    // With a [Events] section, the cues are its Dialogue lines and the
+    // Format: line its own. Without one, the cues are the Dialogue lines
+    // anywhere in the file, and the column order is the standard one.
+    let (scope, format_fields) = match events_section(text) {
+        Some(section) => {
+            // Fall back to the standard order when the section's Format: line
+            // is missing or names none of Start, End or Text.
+            let fields = match events_format_fields(section) {
+                Some(f)
+                    if f.iter().any(|c| c == "start")
+                        && f.iter().any(|c| c == "end")
+                        && f.iter().any(|c| c == "text") =>
+                {
+                    f
+                }
+                _ => standard_ass_columns()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            };
+            (section, fields)
+        }
+        None => (
+            text,
+            standard_ass_columns()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+    };
     let (start_col, end_col, text_col) = match (
         format_fields.iter().position(|f| f == "start"),
         format_fields.iter().position(|f| f == "end"),
@@ -373,7 +454,7 @@ fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
         _ => return Ok(Vec::new()),
     };
     let mut cues = Vec::new();
-    for line in split_lines(events) {
+    for line in split_lines(scope) {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("Dialogue:") else {
             continue;
@@ -506,49 +587,59 @@ fn skip_block_vtt(lines: &[&str], i: &mut usize) {
 /// ASS text: `{...}` override blocks gone, `\N` and `\n` newlines, `\h` a
 /// space. The rest of the text is kept, so a cue that does not use overrides
 /// is unchanged. An unclosed `{` keeps the rest of the text as literal.
+///
+/// The delimiters `{`, `}` and `\` are ASCII, so every offset `find` returns
+/// is a char boundary, and the runs between them are copied as slices. That
+/// is what keeps a 3- or 4-byte character whole: the offset arithmetic never
+/// looks at the bytes of a character, only at the ASCII delimiters.
 fn clean_ass(text: &str) -> String {
     let mut out = String::new();
-    let mut i = 0usize;
-    while i < text.len() {
-        let c = text.as_bytes()[i] as char;
-        match c {
-            '{' => {
-                // Drop to the closing brace, or keep the rest as literal when
-                // there is none.
-                match text[i + 1..].find('}') {
-                    Some(close) => i = i + 2 + close,
-                    None => {
-                        out.push_str(&text[i..]);
-                        break;
-                    }
+    let mut rest = text;
+    loop {
+        // The next `{` or `\`, whichever comes first.
+        let brace = rest.find('{');
+        let backslash = rest.find('\\');
+        let hit = match (brace, backslash) {
+            (Some(b), Some(s)) if b < s => b,
+            (Some(b), _) => b,
+            (None, Some(s)) => s,
+            (None, None) => break,
+        };
+        // Copy the run before the hit, whole.
+        out.push_str(&rest[..hit]);
+        let is_brace = brace == Some(hit);
+        if is_brace {
+            match rest[hit + 1..].find('}') {
+                Some(close) => {
+                    // Drop the override block.
+                    rest = &rest[hit + 2 + close..];
+                }
+                None => {
+                    // An unclosed brace: keep the rest as literal.
+                    out.push_str(&rest[hit..]);
+                    return out;
                 }
             }
-            '\\' => {
-                let next = text.as_bytes().get(i + 1).copied();
-                match next {
-                    Some(b'N') | Some(b'n') => {
-                        i += 2;
-                        out.push('\n');
-                    }
-                    Some(b'h') => {
-                        i += 2;
-                        out.push(' ');
-                    }
-                    _ => {
-                        // A lone backslash: keep it, and advance one char.
-                        let char_len = (text.as_bytes()[i] as char).len_utf8();
-                        out.push_str(&text[i..i + char_len]);
-                        i += char_len;
-                    }
+        } else {
+            match rest.as_bytes().get(hit + 1) {
+                Some(b'N') | Some(b'n') => {
+                    out.push('\n');
+                    rest = &rest[hit + 2..];
                 }
-            }
-            _ => {
-                let char_len = (text.as_bytes()[i] as char).len_utf8();
-                out.push_str(&text[i..i + char_len]);
-                i += char_len;
+                Some(b'h') => {
+                    out.push(' ');
+                    rest = &rest[hit + 2..];
+                }
+                _ => {
+                    // A lone backslash: keep it, and advance one char.
+                    let char_len = rest[hit..].chars().next().map_or(1, char::len_utf8);
+                    out.push_str(&rest[hit..hit + char_len]);
+                    rest = &rest[hit + char_len..];
+                }
             }
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -556,37 +647,39 @@ fn clean_ass(text: &str) -> String {
 /// their closing forms, which the WebVTT engine renders. The kept tags match
 /// case-insensitively and are kept as written. An unclosed `<` keeps the rest
 /// of the text as literal.
+///
+/// `<` and `>` are ASCII, so every offset `find` returns is a char boundary,
+/// and the runs between them are copied as slices. That is what keeps a
+/// 3- or 4-byte character whole.
 fn clean_html_tags(text: &str) -> String {
     let mut out = String::new();
-    let mut i = 0usize;
-    while i < text.len() {
-        if text.as_bytes()[i] == b'<' {
-            match text[i + 1..].find('>') {
-                Some(close) => {
-                    let tag = text[i + 1..i + 1 + close].trim();
-                    let kept = matches!(
-                        tag.to_ascii_lowercase().as_str(),
-                        "i" | "b" | "u" | "/i" | "/b" | "/u"
-                    );
-                    if kept {
-                        out.push('<');
-                        out.push_str(tag);
-                        out.push('>');
-                    }
-                    i = i + 2 + close;
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        // Copy the run before the tag, whole.
+        out.push_str(&rest[..open]);
+        let tag_body = &rest[open + 1..];
+        match tag_body.find('>') {
+            Some(close) => {
+                let tag = tag_body[..close].trim();
+                let kept = matches!(
+                    tag.to_ascii_lowercase().as_str(),
+                    "i" | "b" | "u" | "/i" | "/b" | "/u"
+                );
+                if kept {
+                    out.push('<');
+                    out.push_str(tag);
+                    out.push('>');
                 }
-                None => {
-                    // An unclosed tag: keep the rest as literal text.
-                    out.push_str(&text[i..]);
-                    break;
-                }
+                rest = &tag_body[close + 1..];
             }
-        } else {
-            let char_len = (text.as_bytes()[i] as char).len_utf8();
-            out.push_str(&text[i..i + char_len]);
-            i += char_len;
+            None => {
+                // An unclosed tag: keep the rest as literal text, tag and all.
+                out.push_str(&rest[open..]);
+                return out;
+            }
         }
     }
+    out.push_str(rest);
     out
 }
 

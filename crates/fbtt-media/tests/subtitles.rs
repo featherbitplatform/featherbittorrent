@@ -188,3 +188,64 @@ fn zero_length_cues_do_not_count() {
         .expect("zero-length cues do not count toward the cap");
     assert!(cues.is_empty(), "all zero-length cues are dropped");
 }
+
+/// A cue's text in each format, holding every width of UTF-8 character: a
+/// curly apostrophe and an ellipsis (2 bytes), CJK (3 bytes), the four-byte
+/// character U+1F600, and U+FFFD. Each must come back exactly as written.
+const NON_ASCII: &str = "It’s fine… 你好 \u{1F600} \u{FFFD}";
+
+#[test]
+fn non_ascii_text_survives() {
+    // SRT: the text comes back whole, and a kept tag next to non-ASCII text
+    // keeps the text whole too.
+    let srt = format!("1\n00:00:00,500 --> 00:00:02,000\n{i}\n", i = NON_ASCII);
+    let cues = file_cues(srt.as_bytes(), SubtitleFormat::Srt).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, NON_ASCII);
+    // A kept tag next to non-ASCII text.
+    let srt_tagged = "1\n00:00:00,500 --> 00:00:02,000\n<i>\u{2019}</i> and \u{4F60}\u{597D}\n";
+    let cues = file_cues(srt_tagged.as_bytes(), SubtitleFormat::Srt).expect("no panic");
+    assert_eq!(cues[0].text, "<i>\u{2019}</i> and \u{4F60}\u{597D}");
+
+    // VTT: the same text comes back whole.
+    let vtt = format!(
+        "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\n{i}\n",
+        i = NON_ASCII
+    );
+    let cues = file_cues(vtt.as_bytes(), SubtitleFormat::Vtt).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, NON_ASCII);
+
+    // ASS: the same text comes back whole, with an override block removed.
+    let ass = format!(
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.50,0:00:02.00,Default,,0,0,0,,{{\\i1}}{i}\n",
+        i = NON_ASCII
+    );
+    let cues = file_cues(ass.as_bytes(), SubtitleFormat::Ass).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, NON_ASCII);
+}
+
+#[test]
+fn ass_without_events_section_uses_standard_order() {
+    // A file with a [V4+ Styles] section but no [Events] section: the Styles
+    // Format: line must not apply, and the Dialogue line uses the standard
+    // column order.
+    let bytes = b"[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,x\n";
+    let cues = file_cues(bytes, SubtitleFormat::Ass).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].start_ms, 1000);
+    assert_eq!(cues[0].end_ms, 2000);
+    assert_eq!(cues[0].text, "x");
+}
+
+#[test]
+fn ass_text_keeps_commas() {
+    // A comma inside the dialogue text stays whole: the text is everything
+    // after the last column's leading commas, not the last comma-separated
+    // field.
+    let bytes = b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,a, b, c\n";
+    let cues = file_cues(bytes, SubtitleFormat::Ass).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, "a, b, c");
+}
