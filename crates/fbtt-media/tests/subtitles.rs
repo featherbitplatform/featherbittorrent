@@ -576,15 +576,15 @@ fn embedded_hostile_frames_are_bounded() {
 
 #[test]
 fn embedded_empty_frames_are_bounded() {
-    // One subtitle track whose MAX_SKIPPED_FRAMES + 1 frames all give no cue
-    // (empty text): the walk must give up with Malformed after that many
-    // frames of the track itself, not read on.
-    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    // One ASS subtitle track whose MAX_SKIPPED_FRAMES + 1 frames all give no
+    // cue (blocks with fewer than nine fields): the walk must give up with
+    // Malformed after that many frames of the track itself, not read on.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/ASS")]);
     // MAX_SKIPPED_FRAMES + 1 frames, one per small cluster, all at 0 s, all
-    // with empty text: each gives no cue, so the skipped bound is what stops
-    // the read.
+    // with a short ASS block (three fields, not nine): each gives no cue, so
+    // the skipped bound is what stops the read.
     let clusters: Vec<Vec<u8>> = (0..MAX_SKIPPED_FRAMES as u64 + 1)
-        .map(|_| common::cluster(0, &[common::simple_block(1, 0, false, b"")]))
+        .map(|_| common::cluster(0, &[common::simple_block(1, 0, false, b"0,0,Default")]))
         .collect();
 
     let err = embedded_cues(
