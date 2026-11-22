@@ -2,9 +2,9 @@
 //!
 //! It is pure, synchronous Rust over `Read + Seek`: no tokio, no network, no engine. A caller hands
 //! it any reader it likes - a file, a piece of a torrent behind a timeout, a `Cursor` over bytes in a
-//! test - and this crate probes it ([`probe`()]), turns one of its tracks into fragmented MP4
-//! ([`init_segment`], [`FragmentWriter`]), and reads text subtitles into cues (`subtitle`, from
-//! Task 5). It copies
+//! test - and this crate probes it ([`probe`()]), opens one of its Matroska tracks for streaming
+//! ([`open_track`]), turns a track's samples into fragmented MP4 ([`init_segment`], [`FragmentStream`]),
+//! and reads text subtitles into cues (`subtitle`, from Task 5). It copies
 //! bytes: nothing here decodes or transcodes, which is what the plan's "no transcoding, no native
 //! libraries" rule asks of it.
 //!
@@ -17,14 +17,16 @@
 pub mod capped;
 pub mod codec;
 pub mod fmp4;
+pub mod mkv;
 pub mod probe;
 pub mod source;
 
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind, sample_entry};
 pub use fmp4::{FragmentWriter, init_segment};
+pub use mkv::{MAX_SKIPPED_FRAMES, MkvSource, open_track};
 pub use probe::{MediaInfo, TrackInfo, probe};
-pub use source::{Sample, TrackConfig};
+pub use source::{FragmentStream, Sample, SourceError, SourceResult, TrackConfig, TrackSource};
 
 /// Which container a file is.
 ///

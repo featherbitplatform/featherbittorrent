@@ -32,8 +32,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// hundreds of millions of calls on an [`ELEMENT_CAP`](crate::ELEMENT_CAP) byte budget, and in
 /// production every call
 /// goes through a blocking reader. A 2 hour MKV with a cue point every second costs about 200k
-/// calls, so a million is a real header's worth with room to spare.
-pub const MAX_HEADER_OPS: u64 = 1 << 20;
+/// calls opening and probing, and seeking to the last second walks the same cue table again, so
+/// a million is that file's worth with only about five times room to spare. `open_track` reads
+/// a whole film's cue table through one lifted budget, which is a real second walk, and a table
+/// with 60k entries costs over 2M calls on its own, so the bound sits at 4M: still small enough
+/// that a file whose element sizes are junk exhausts it rather than reading the whole file, and
+/// measured behaviour, not guesswork.
+pub const MAX_HEADER_OPS: u64 = 1 << 22;
 
 /// How many bytes a reader may hand out in total, shared by everything reading through it.
 ///

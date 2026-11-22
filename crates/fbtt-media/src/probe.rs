@@ -177,9 +177,30 @@ fn matroska_tracks<R: Read + Seek>(file: &MatroskaFile<R>) -> Result<Vec<TrackIn
     Ok(tracks)
 }
 
+/// The audio properties `sample_entry` and `open_track` ask a Matroska track for,
+/// shared by the two so a rate Matroska states in its own units is converted in
+/// one place.
+///
+/// Matroska's `SamplingFrequency` is in hertz and fractional; the sample entry
+/// and the fragment timescale want a whole number, so this rounds, and the
+/// element's own default (8 kHz, which the demuxer reports when the track left
+/// the element out) passes through unchanged.
+pub(crate) fn matroska_audio_rate(track: &TrackEntry) -> u32 {
+    let hz = track.audio().map(|audio| audio.sampling_frequency());
+    match hz {
+        Some(hz) if hz.is_finite() && hz >= 1.0 => hz.round().min(u32::MAX as f64) as u32,
+        // A rate below 1 Hz or a NaN is junk; the element's default is what a
+        // player assumes for a track that states no rate at all.
+        _ => 8000,
+    }
+}
+
 /// What kind of media a Matroska track holds, or `None` for the track types
 /// that hold none: complex, logo, button, control and metadata tracks.
-fn matroska_kind(track: &TrackEntry) -> Option<TrackKind> {
+///
+/// [`open_track`](crate::mkv::open_track) maps the same track types the same way, which is
+/// why this is `pub(crate)` rather than private to the probe.
+pub(crate) fn matroska_kind(track: &TrackEntry) -> Option<TrackKind> {
     match track.track_type() {
         TrackType::Video => Some(TrackKind::Video),
         TrackType::Audio => Some(TrackKind::Audio),
@@ -376,7 +397,11 @@ fn mp4_track(track: &mp4_atom::Trak) -> Result<Option<TrackInfo>, MediaError> {
 /// cannot read is `Unsupported`, and so is an EBML header that is not Matroska
 /// at all. A read failure stays `Io`, so a torrent piece that has not arrived
 /// stays distinct from a file that is broken.
-fn matroska_error(error: DemuxError) -> MediaError {
+///
+/// Task 3 maps the demuxer's mid-stream failures with it too, which is why it is
+/// `pub(crate)`: a frame read that fails is the same verdict as a header read that
+/// fails, and the two paths must not drift apart on what counts as `Io`.
+pub(crate) fn matroska_error(error: DemuxError) -> MediaError {
     match error {
         DemuxError::IoError(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
             MediaError::Malformed("file ends inside an element".to_string())
