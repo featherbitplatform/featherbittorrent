@@ -181,12 +181,13 @@ Direction 2 reverses the non-goal "search across indexing sites" (section 4). Ch
    - `web/`, the `web-ui` feature, and the torrent table and detail pane with live updates.
    - Add, pause, resume and delete, and sign-in with a password.
    - CI builds and tests both builds. The release ships the full build beside the headless one.
-2. **The rest of parity:**
+2a. **The media player (plan `docs/superpowers/plans/2026-11-21-web-ui-milestone-2-media-player.md`):**
+   - browser streaming, with the media player: its audio-track and subtitle choosers, built on the server-side remux in goal 3.
+2b. **The rest of parity:**
    - the local TUI's "serve the web UI" action (section 2a);
    - file priorities;
    - settings;
    - devices;
-   - browser streaming, with the media player: its audio-track and subtitle choosers, built on the server-side remux in goal 3.
 3. **The desktop app:**
    - the Tauri crate, This computer and remote servers;
    - the tray, start at login, `.torrent` file associations and the `magnet:` link handler;
