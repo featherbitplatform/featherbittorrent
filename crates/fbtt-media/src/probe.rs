@@ -92,13 +92,16 @@ pub fn probe<R: Read + Seek>(mut reader: R) -> Result<MediaInfo, MediaError> {
 /// A `MatroskaFile` opened over a capped and budgeted reader, with the demuxer's panics turned
 /// back into errors.
 ///
-/// Two things a hostile file can do are not errors in `matroska-demuxer` 0.8.1. A `SeekHead` that
-/// carries two `Seek` entries pointing at a `SeekHead` hits an `expect_err` (`lib.rs:1916`), and a
-/// `SeekPosition` big enough to overflow the position arithmetic panics on the addition
-/// (`lib.rs:1903`, and the same shape at `lib.rs:1499` for cue positions). A torrent's file is
-/// attacker controlled, so every Matroska open in fbtt goes through here and a panic comes back as
-/// `MediaError::Malformed`, which is what the crate already says about a header that does not hold
-/// together.
+/// Two things a hostile file can do are still not errors in the pinned
+/// `matroska-demuxer` fork. A `SeekHead` that carries two `Seek` entries
+/// pointing at a `SeekHead` hits an `expect_err`, and a `SeekPosition` big
+/// enough to overflow the position arithmetic panics on the addition. The
+/// upstream's third panic shape - the same unchecked addition done to cue
+/// cluster positions - is what the fork's `checked_add` replaced: a cue point
+/// whose sum overflows is dropped instead. A torrent's file is attacker
+/// controlled, so every Matroska open in fbtt goes through here and a panic
+/// comes back as `MediaError::Malformed`, which is what the crate already
+/// says about a header that does not hold together.
 ///
 /// The reader is wrapped in [`CappedLen`]: no element may be given more than [`ELEMENT_CAP`]
 /// bytes, and the whole open may not read more than `budget`. The budget is the caller's, because

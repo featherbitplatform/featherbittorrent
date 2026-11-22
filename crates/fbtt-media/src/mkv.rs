@@ -3,17 +3,19 @@
 //! [`open_track`] takes a reader, a track number and a start time, and hands
 //! back an [`MkvSource`]: a [`TrackSource`] that yields exactly that track's
 //! samples, in the order the container stores them, starting at the first sync
-//! point at or before the requested time. The samples are the container's own
+//! point at or after the requested time. The samples are the container's own
 //! bytes - this crate copies, it does not decode - plus the timestamps, keyframe
 //! flags and durations the container states, in the timescale
 //! [`FragmentStream`](crate::FragmentStream) puts on the wire.
 //!
-//! Everything here treats the file as hostile. `matroska-demuxer` 0.8.1 panics
-//! on some of its own arithmetic when the input is junk - a cue's relative
-//! position added to a cluster offset, a block timestamp added to a cluster
-//! timestamp - and it reads every frame of every track through one stream, so
-//! the walk to a track's samples, its seek points and its first frame all run
-//! under a [`catch_unwind`], with [`CappedLen`] and [`ReadBudget`] holding the
+//! Everything here treats the file as hostile. The pinned featherbit fork of
+//! `matroska-demuxer` overflow-checks the cue and offset arithmetic whose
+//! additions upstream 0.8.1 could panic on with junk input, but the indexing
+//! additions upstream panicked on (a doubled `SeekHead` reference, a seek
+//! position overflowing the position arithmetic) are panics in the fork too,
+//! and it reads every frame of every track through one stream - so the walk
+//! to a track's samples, its seek points and its first frame all run under a
+//! [`catch_unwind`], with [`CappedLen`] and [`ReadBudget`] holding the
 //! demuxer's trust in declared sizes down before any of it is reached. A hostile
 //! file produces a [`SourceError`], never a panic and never
 //! a hang.

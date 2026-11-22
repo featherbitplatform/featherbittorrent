@@ -183,6 +183,8 @@ subtle = "2.6"
 # and WebM (Zlib OR MIT OR Apache-2.0, and `#![forbid(unsafe_code)]` like every crate here), `mp4-atom`
 # is the box codec `fbtt-media` reads MP4 with and writes its fragmented MP4 with (MIT OR Apache-2.0).
 # Neither decodes nor transcodes anything: both are container codecs, which is what "no native
-# libraries" (plan Global Constraints) asks for.
-matroska-demuxer = "0.8.1"
+# libraries" (plan Global Constraints) asks for. The `matroska-demuxer` pin is the owner's fork,
+# which fixes seeking with `CueRelativePosition` and adds overflow checks on hostile cue, block
+# and timestamp values.
+matroska-demuxer = { git = "https://github.com/featherbitplatform/matroska-demuxer", tag = "v0.8.1+featherbit.1" }
 mp4-atom = "0.17.1"
