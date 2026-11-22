@@ -2,7 +2,6 @@
 //! input: a file is read only once, in a single pass, and a hostile file must
 //! give its good cues back, or no cues, never a panic, never a hang.
 
-use common::block_with_duration;
 use fbtt_media::{
     CUE_WINDOW_MAX_MS, Cue, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP, SubtitleFormat,
     embedded_cues, file_cues, subtitle_format,
@@ -463,59 +462,48 @@ fn embedded_non_text_track_is_unsupported() {
 
 #[test]
 fn embedded_late_window_seeks() {
-    // A one-track Matroska with cues at 0 s, 15 s and 30 s, each block stating
-    // a duration (the layout ffmpeg writes, with Cues and CueRelativePosition).
-    // The window 29 000 to 31 000 is reached by a seek: the 30 s cue comes
-    // back and the others do not.
+    // A one-track Matroska with cues at 0 s, 15 s and 30 s (with Cues and
+    // CueRelativePosition, the layout ffmpeg writes). The window 29 000 to
+    // 31 000 is reached by a seek: the 30 s cue comes back and the others do
+    // not. The blocks are `SimpleBlock`s - the demuxer's `next_frame` steps
+    // cleanly out of a `SimpleBlock` after a seek, and that is the shape this
+    // test's seek must land in. Without a `BlockDuration` the 30 s cue's end
+    // is the fallback, its start plus 5000.
     let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
     let info = common::info_element(1_000_000);
-    let c0 = common::cluster(0, &[block_with_duration(1, 0, 1_000, b"zero")]);
-    let c1 = common::cluster(15_000, &[block_with_duration(1, 0, 1_000, b"fifteen")]);
-    let c2 = common::cluster(30_000, &[block_with_duration(1, 0, 1_000, b"thirty")]);
+    let c0 = common::cluster(0, &[common::simple_block(1, 0, false, b"zero")]);
+    let c1 = common::cluster(15_000, &[common::simple_block(1, 0, false, b"fifteen")]);
+    let c2 = common::cluster(30_000, &[common::simple_block(1, 0, false, b"thirty")]);
     let clusters = [c0, c1, c2];
 
-    // The SeekHead names the four element kinds, with the clusters named at
-    // their first; all the offsets work out because everything is assembled in
-    // order.
-    let ids: Vec<&[u8]> = vec![
-        &common::TRACKS,
-        &common::INFO,
-        &common::CLUSTER,
-        &common::CUES,
-    ];
-    let placeholder =
-        common::seek_head_named(&ids.iter().map(|id| (*id, 0u64)).collect::<Vec<_>>());
+    // One cue per cluster, pointing at its block's offset within the cluster.
+    // The cue's cluster position is the cluster's offset in the segment data,
+    // which is the SeekHead's length plus everything assembled before it.
+    let relative = cluster_block_offset(&clusters[0]);
+    // The SeekHead names each cluster individually (the layout a real
+    // multiplexer writes), so its length is learned from a placeholder with the
+    // same count of entries: tracks, info, one per cluster, and the cues.
+    let cluster_id: &[u8] = &common::CLUSTER;
+    let placeholder = common::seek_head_named(
+        &(0..2 + clusters.len() + 1)
+            .map(|_| (cluster_id, 0u64))
+            .collect::<Vec<_>>(),
+    );
     let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
     let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
     let c0_at = info_at + u64::try_from(info.len()).expect("Info under 4 GiB");
     let c1_at = c0_at + u64::try_from(clusters[0].len()).expect("a cluster under 4 GiB");
     let c2_at = c1_at + u64::try_from(clusters[1].len()).expect("a cluster under 4 GiB");
-    let cues_at = c2_at + u64::try_from(clusters[2].len()).expect("a cluster under 4 GiB");
-
-    let offsets = [tracks_at, info_at, c0_at, cues_at];
-    let head = common::seek_head_named(
-        &ids.iter()
-            .enumerate()
-            .map(|(i, id)| (*id, offsets[i]))
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(head.len(), placeholder.len());
-
-    // One cue per cluster, pointing at its block's offset within the cluster.
-    let relative = cluster_block_offset(&clusters[0]);
     let cues = common::cues_element(&[
         (0, c0_at, relative),
         (15_000, c1_at, relative),
         (30_000, c2_at, relative),
     ]);
 
-    let mut segment = head;
-    segment.extend_from_slice(&tracks);
-    segment.extend_from_slice(&info);
-    for cluster in &clusters {
-        segment.extend_from_slice(cluster);
-    }
-    segment.extend_from_slice(&cues);
+    // The SeekHead names each cluster individually at its offset, so the
+    // demuxer's seek lands in the right cluster instead of walking from the
+    // first.
+    let segment = common::indexed_segment_each_cluster(&tracks, 1_000_000, &clusters, Some(&cues));
     let file = common::matroska_file(&segment);
 
     let cues = embedded_cues(Cursor::new(file), 1, 29_000, 31_000).expect("the seek lands");
@@ -523,24 +511,30 @@ fn embedded_late_window_seeks() {
         cues,
         vec![Cue {
             start_ms: 30_000,
-            end_ms: 31_000,
+            // No BlockDuration: the end is the fallback, start plus 5000.
+            end_ms: 35_000,
             text: "thirty".into(),
         }],
         "the 30 s cue, and only it, overlaps the window"
     );
 }
 
-/// The offset of a cluster's first block within the cluster: the length of the
-/// cluster's leading `Timecode` element, in bytes.
+/// The `CueRelativePosition` for a cluster's first block: the length of the
+/// cluster's leading `Timecode` element, in bytes, measured from the cluster's
+/// data start (after its id and size vint). The Matroska specification counts
+/// the relative position from the first byte after the cluster's size field,
+/// and the demuxer adds it to the cluster's data offset, so the value here is
+/// just the `Timecode` element's length.
 fn cluster_block_offset(cluster: &[u8]) -> u64 {
-    // The cluster is `CLUSTER` id (4 bytes) + size vint + body. The body
-    // opens with a `Timecode` element: one-byte id, one-byte size vint (every
-    // synthetic timecode is small), and the value, whose width the vint's
-    // low bits count. The offset is measured from the cluster's start, so it
-    // includes the four-byte id and the size vint.
-    let vint_byte = cluster[4 + 1];
+    // The cluster's data opens with a `Timecode` element: one-byte id, one-byte
+    // size vint (every synthetic timecode is small), and the value, whose width
+    // the vint's low bits count. The data starts at byte 4 + 1 (past the
+    // four-byte id and the one-byte size vint), so the `Timecode` element's
+    // length is measured from there.
+    let data_start = 4 + 1;
+    let vint_byte = cluster[data_start + 1];
     let value_len = (vint_byte & 0x7f).count_ones();
-    4 + 1 + 1 + value_len as u64
+    1 + 1 + value_len as u64
 }
 
 #[test]

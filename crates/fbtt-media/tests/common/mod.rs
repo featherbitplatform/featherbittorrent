@@ -27,9 +27,6 @@ pub const TIMECODE_SCALE: [u8; 3] = [0x2A, 0xD7, 0xB1];
 pub const CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
 pub const TIMECODE: [u8; 1] = [0xE7];
 pub const SIMPLE_BLOCK: [u8; 1] = [0xA3];
-pub const BLOCK: [u8; 1] = [0xA1];
-pub const BLOCK_GROUP: [u8; 1] = [0xA0];
-pub const BLOCK_DURATION: [u8; 1] = [0x9B];
 pub const CUES: [u8; 4] = [0x1C, 0x53, 0xBB, 0x6B];
 pub const CUE_POINT: [u8; 1] = [0xBB];
 pub const CUE_TIME: [u8; 1] = [0xB3];
@@ -52,27 +49,6 @@ pub fn simple_block(track: u64, offset: i16, keyframe: bool, payload: &[u8]) -> 
             payload.to_vec(),
         ]
         .concat(),
-    )
-}
-
-/// A `BlockGroup` holding one `Block` and a `BlockDuration`: the shape that
-/// states a per-frame duration, counted in the file's `TimestampScale` units.
-/// A `Block` element is exactly the block's bytes, so the duration lives in
-/// the group around it.
-pub fn block_with_duration(track: u64, offset: i16, duration: u64, payload: &[u8]) -> Vec<u8> {
-    let block = ebml(
-        &BLOCK,
-        &[
-            vec![0x80 | u8::try_from(track).expect("a small track number")],
-            offset.to_be_bytes().to_vec(),
-            vec![0x00],
-            payload.to_vec(),
-        ]
-        .concat(),
-    );
-    ebml(
-        &BLOCK_GROUP,
-        &[block, ebml(&BLOCK_DURATION, &duration.to_be_bytes())].concat(),
     )
 }
 
@@ -177,6 +153,72 @@ pub fn indexed_segment(
             .map(|(index, id)| (*id, offsets[index]))
             .collect::<Vec<_>>(),
     );
+    assert_eq!(head.len(), placeholder.len());
+
+    let mut body = head;
+    body.extend_from_slice(tracks);
+    body.extend_from_slice(&info);
+    for cluster in clusters {
+        body.extend_from_slice(cluster);
+    }
+    if let Some(cues) = cues {
+        body.extend_from_slice(cues);
+    }
+    body
+}
+
+/// A `SeekHead` that names `tracks` and `info`, then every cluster
+/// individually at its offset, and (when `cues` is given) the cues after them.
+///
+/// Naming each cluster - rather than the `CLUSTER` id once, as
+/// [`indexed_segment`] does - is what a real multiplexer writes, and it is what
+/// the demuxer's cueless seek walk needs: it steps from one named cluster to
+/// the next, and a single `CLUSTER` entry stops it at the first one. A test
+/// that proves a seek lands on a later cluster builds its file with this, so
+/// the seek the reader performs is the one that works, not the re-open from the
+/// start that reads forward.
+///
+/// The head is built once with placeholder offsets to learn its length, then
+/// again with the real ones; all elements after it sit at known offsets because
+/// everything ahead of them is already assembled.
+pub fn indexed_segment_each_cluster(
+    tracks: &[u8],
+    scale: u64,
+    clusters: &[Vec<u8>],
+    cues: Option<&[u8]>,
+) -> Vec<u8> {
+    let info = info_element(scale);
+    // One Seek entry per cluster, plus tracks, info and the cues when there are
+    // any. The placeholder carries the same count of entries with zero offsets,
+    // so the two heads are the same length.
+    let cluster_count = clusters.len();
+    let cues_entry = cues.is_some() as usize;
+    let entry_count = 2 + cluster_count + cues_entry;
+    let cluster_id: &[u8] = &CLUSTER;
+    let placeholder = seek_head_named(
+        &(0..entry_count)
+            .map(|_| (cluster_id, 0u64))
+            .collect::<Vec<_>>(),
+    );
+    let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
+    let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
+    let mut at = info_at + u64::try_from(info.len()).expect("Info under 4 GiB");
+    let mut offsets: Vec<u64> = vec![tracks_at, info_at];
+    for cluster in clusters {
+        offsets.push(at);
+        at += u64::try_from(cluster.len()).expect("a cluster under 4 GiB");
+    }
+    let cues_at = at;
+    // Each cluster is named under the `CLUSTER` id at its own offset, and the
+    // cues under the `CUES` id.
+    let mut entries: Vec<(&[u8], u64)> = vec![(&TRACKS, tracks_at), (&INFO, info_at)];
+    for index in 0..cluster_count {
+        entries.push((&CLUSTER, offsets[2 + index]));
+    }
+    if cues.is_some() {
+        entries.push((&CUES, cues_at));
+    }
+    let head = seek_head_named(&entries);
     assert_eq!(head.len(), placeholder.len());
 
     let mut body = head;
