@@ -11,8 +11,8 @@
 //! `moov` may sit at either end of the file. The box walk that finds it (`read_moov`, shared with
 //! [`probe`](crate::probe::probe)) skips `ftyp`, `free`, `mdat` and anything else by seeking, so a
 //! file with its `moov` behind 40 GB of media data pays the same few hundred bytes as one with the
-//! table first, and that walk plus [`sized_moov_header`](crate::probe::sized_moov_header)'s bound
-//! is the crate's only moov cap.
+//! table first, and that walk plus [`sized_moov_header`](crate::probe::sized_moov_header) refusing
+//! a `moov` longer than [`MOOV_CAP`](crate::MOOV_CAP) is the crate's only moov cap.
 //!
 //! # What is bounded
 //!
@@ -68,6 +68,9 @@ use std::io::{Read, Seek, SeekFrom};
 /// from is dropped at the open, and with it every other track's tables and the boxes around these,
 /// so what stays alive for the length of a stream is one track's tables and nothing else.
 struct Tables {
+    /// The track's own `track_ID`: every verdict these tables give is stated about it, and the walk
+    /// has nothing else to name a track by.
+    track: u32,
     /// Ticks per second, from this track's `mdhd`: the timeline the fragments carry.
     timescale: u32,
     /// `stts`: how many samples each `sample_delta` covers. Never empty, and no entry covers none.
@@ -173,8 +176,8 @@ struct Cursor {
 }
 
 impl Cursor {
-    /// A walk that has consumed nothing.
-    fn start(tables: &Tables) -> Cursor {
+    /// A walk that has consumed nothing, or the verdict its first `stsc` group makes impossible.
+    fn start(tables: &Tables) -> Result<Cursor, MediaError> {
         let stts = tables
             .stts
             .first()
@@ -184,7 +187,7 @@ impl Cursor {
             .stsc
             .first()
             .expect("a validated track has at least one stsc entry");
-        Cursor {
+        Ok(Cursor {
             index: 0,
             dts: 0,
             stts: 0,
@@ -193,31 +196,43 @@ impl Cursor {
             ctts_left: ctts.map_or(0, |entry| entry.sample_count),
             ctts_value: ctts.map_or(0, |entry| entry.sample_offset),
             stsc: 0,
-            group_chunks_left: chunks_in_group(tables, 0),
+            group_chunks_left: chunks_in_group(tables, 0)?,
             in_chunk_left: stsc.samples_per_chunk,
             chunk: 0,
             chunk_bytes: 0,
             stss: 0,
-        }
+        })
     }
 
     /// A walk that has consumed everything, which is the answer to a seek past the track's end.
-    fn end(tables: &Tables) -> Cursor {
-        let mut cursor = Cursor::start(tables);
+    fn end(tables: &Tables) -> Result<Cursor, MediaError> {
+        let mut cursor = Cursor::start(tables)?;
         cursor.index = tables.count;
-        cursor
+        Ok(cursor)
     }
 }
 
 /// How many chunks `stsc` group `index` covers: up to the next group's first chunk, and to the end
 /// of the offset table for the last one.
-fn chunks_in_group(tables: &Tables, index: usize) -> u64 {
+///
+/// The subtraction is checked even though [`validate_chunks`] has already put the two numbers in
+/// order: this function is what the walk's chunk cursor is built from, and a group whose own first
+/// chunk sat past the limit it is measured against would wrap to a chunk count of 2^64 and send the
+/// walk off the end of the offset table looking for chunks that were never there.
+fn chunks_in_group(tables: &Tables, index: usize) -> Result<u64, MediaError> {
     let first = u64::from(tables.stsc[index].first_chunk);
     let limit = match tables.stsc.get(index + 1) {
         Some(next) => u64::from(next.first_chunk),
         None => tables.offsets.chunks() + 1,
     };
-    limit - first
+    limit.checked_sub(first).ok_or_else(|| {
+        MediaError::Malformed(format!(
+            "track {}'s stsc group {} starts at chunk {first}, which is not before the chunk \
+             {limit} it would have to end on",
+            tables.track,
+            index + 1
+        ))
+    })
 }
 
 /// The next sample's coordinates, or `None` when the walk is past the track's last one.
@@ -226,10 +241,26 @@ fn chunks_in_group(tables: &Tables, index: usize) -> u64 {
 /// index, and the run positions the cursor keeps) plus the chunk's running byte count. A walk that
 /// is deciding whether to take a sample can look at it, keep the cursor, and hand the same sample
 /// to the reader later.
-fn peek(tables: &Tables, at: &Cursor) -> Option<Meta> {
+///
+/// One answer here can be impossible, and it is the arithmetic's fault rather than the file's
+/// shape: a chunk's samples are contiguous, so this sample's offset is its chunk's offset plus the
+/// bytes of it already consumed, and a file stating an offset at the top of a 64 bit address space
+/// has samples whose bytes are past any address.
+fn peek(tables: &Tables, at: &Cursor) -> Result<Option<Meta>, MediaError> {
     if at.index >= tables.count {
-        return None;
+        return Ok(None);
     }
+    let base = tables.offsets.at(at.chunk);
+    let offset = base.checked_add(at.chunk_bytes).ok_or_else(|| {
+        MediaError::Malformed(format!(
+            "track {}'s sample {} sits {} bytes into chunk {}, whose offset of {base} leaves no \
+             room for it in a 64 bit address space",
+            tables.track,
+            at.index + 1,
+            at.chunk_bytes,
+            at.chunk + 1
+        ))
+    })?;
     let size = match &tables.sizes {
         Sizes::Identical { size } => *size,
         Sizes::Different(sizes) => {
@@ -248,20 +279,21 @@ fn peek(tables: &Tables, at: &Cursor) -> Option<Meta> {
             .get(at.stss)
             .is_some_and(|number| u64::from(*number) == at.index + 1),
     };
-    Some(Meta {
-        offset: tables.offsets.at(at.chunk) + at.chunk_bytes,
+    Ok(Some(Meta {
+        offset,
         size,
         dts: at.dts,
         pts: at.dts + i128::from(at.ctts_value),
         duration: stts.sample_delta,
         sync,
-    })
+    }))
 }
 
-/// Consume the sample [`peek`] just described, moving every cursor on to the next one.
-fn step(tables: &Tables, at: &mut Cursor) {
-    let Some(meta) = peek(tables, at) else {
-        return;
+/// Consume the sample [`peek`] just described, moving every cursor on to the next one, or giving
+/// the verdict [`peek`] or the next group's chunk count made impossible.
+fn step(tables: &Tables, at: &mut Cursor) -> Result<(), MediaError> {
+    let Some(meta) = peek(tables, at)? else {
+        return Ok(());
     };
     at.index += 1;
     at.dts += i128::from(meta.duration);
@@ -305,20 +337,21 @@ fn step(tables: &Tables, at: &mut Cursor) {
     // `stsc` group, whose chunks hold a different number of samples.
     at.in_chunk_left -= 1;
     if at.in_chunk_left > 0 {
-        return;
+        return Ok(());
     }
     at.chunk += 1;
     at.chunk_bytes = 0;
     at.group_chunks_left -= 1;
     if at.group_chunks_left > 0 {
         at.in_chunk_left = tables.stsc[at.stsc].samples_per_chunk;
-        return;
+        return Ok(());
     }
     if let Some(next) = tables.stsc.get(at.stsc + 1) {
         at.stsc += 1;
         at.in_chunk_left = next.samples_per_chunk;
-        at.group_chunks_left = chunks_in_group(tables, at.stsc);
+        at.group_chunks_left = chunks_in_group(tables, at.stsc)?;
     }
+    Ok(())
 }
 
 /// One MP4 track, opened for reading.
@@ -393,7 +426,7 @@ impl<R: Read + Seek> Mp4Source<R> {
     /// to hand the writer, and a sample the writer cannot put on a timeline should be an error from
     /// this function rather than a `Malformed` from three modules away.
     fn next_sample_of_track(&mut self) -> Result<Option<Sample>, MediaError> {
-        let Some(meta) = peek(&self.tables, &self.cursor) else {
+        let Some(meta) = peek(&self.tables, &self.cursor)? else {
             return Ok(None);
         };
         let data = self.read_sample(&meta)?;
@@ -402,7 +435,7 @@ impl<R: Read + Seek> Mp4Source<R> {
         let dts = i64::try_from(meta.dts).map_err(|_| self.time_overflow("decode", meta.dts))?;
         let duration = meta.duration;
         let sync = meta.sync;
-        step(&self.tables, &mut self.cursor);
+        step(&self.tables, &mut self.cursor)?;
         if !self.emitted {
             self.reported_start_ms = ms_from_ticks(meta.pts, self.tables.timescale);
             self.emitted = true;
@@ -524,6 +557,7 @@ fn tables_from(stbl: Stbl, track: u32, timescale: u32) -> Result<Tables, MediaEr
         }
     };
     let tables = Tables {
+        track,
         timescale,
         stts: stts.entries,
         ctts: ctts.map(|ctts| ctts.entries).unwrap_or_default(),
@@ -533,7 +567,7 @@ fn tables_from(stbl: Stbl, track: u32, timescale: u32) -> Result<Tables, MediaEr
         offsets,
         count,
     };
-    validate(&tables, track)?;
+    validate(&tables)?;
     Ok(tables)
 }
 
@@ -545,7 +579,8 @@ fn tables_from(stbl: Stbl, track: u32, timescale: u32) -> Result<Tables, MediaEr
 /// here has no answer about where its samples are, and it fails before the file's media data is
 /// asked for, which is what makes the verdict about the file rather than about a reader that
 /// stopped answering.
-fn validate(tables: &Tables, track: u32) -> Result<(), MediaError> {
+fn validate(tables: &Tables) -> Result<(), MediaError> {
+    let track = tables.track;
     if tables.timescale == 0 {
         return Err(MediaError::Malformed(format!(
             "track {track} has an mdhd timescale of 0"
@@ -617,8 +652,16 @@ fn validate(tables: &Tables, track: u32) -> Result<(), MediaError> {
         )));
     }
     // `stss`: which of them a decoder can start from. Ascending because the walk reads them as a
-    // sorted list, which is what a writer of the box is supposed to produce.
+    // sorted list, which is what a writer of the box is supposed to produce. A box that is there and
+    // names nothing is a different claim from no box at all: no box says every sample is a sync
+    // sample, an empty one says none is, and a walk of such a track has no sample it may start on.
     if let Some(entries) = &tables.stss {
+        if entries.is_empty() {
+            return Err(MediaError::Malformed(format!(
+                "track {track}'s stss box is there and names no sync sample, so a decoder has \
+                 nowhere to start"
+            )));
+        }
         for pair in entries.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(MediaError::Malformed(format!(
@@ -638,7 +681,7 @@ fn validate(tables: &Tables, track: u32) -> Result<(), MediaError> {
     }
     // The chunk tables last: an empty offset table needs no check of its own, because `stsc`
     // covering any samples at all across zero chunks fails the count check inside it.
-    validate_chunks(tables, track)
+    validate_chunks(tables)
 }
 
 /// `stsc` and the chunk offset table, together: the chunks they describe, and the samples in them.
@@ -647,7 +690,8 @@ fn validate(tables: &Tables, track: u32) -> Result<(), MediaError> {
 /// offset table), so the two tables together say how many samples the track holds a second time -
 /// and a track whose chunk table reaches past its offset table has samples whose bytes have no
 /// stated place in the file.
-fn validate_chunks(tables: &Tables, track: u32) -> Result<(), MediaError> {
+fn validate_chunks(tables: &Tables) -> Result<(), MediaError> {
+    let track = tables.track;
     if tables.stsc.is_empty() {
         return Err(MediaError::Malformed(format!(
             "track {track} has an empty stsc table"
@@ -697,7 +741,7 @@ fn validate_chunks(tables: &Tables, track: u32) -> Result<(), MediaError> {
     // Then what the two tables say about the samples between them.
     let mut chunked = 0_u128;
     for index in 0..tables.stsc.len() {
-        let in_group = u128::from(chunks_in_group(tables, index));
+        let in_group = u128::from(chunks_in_group(tables, index)?);
         chunked += in_group * u128::from(tables.stsc[index].samples_per_chunk);
     }
     if chunked != u128::from(tables.count) {
@@ -712,13 +756,18 @@ fn validate_chunks(tables: &Tables, track: u32) -> Result<(), MediaError> {
 /// The tables walked once: the arithmetic every sample is checked against, and the sample a seek
 /// asked for lands on.
 ///
+/// `target` is the time asked for in the track's own ticks, and 0 is a time like any other: a video
+/// track whose first sync sample is its third one starts on that sample when it is opened at 0 ms
+/// too, because the two frames in front of it are not decodable on their own.
+///
 /// For video the landing is the last sync sample whose presentation time is at or before the
 /// target: the samples ahead of it are reference material for what follows, `stss` exists to name
 /// those sync samples, and this is the landing a player asks a seek to give. A track with no `stss`
 /// has every sample sync, so the answer for one is the last sample at or before the target. When
 /// no sync sample reaches back that far - a seek to the first 200 ms of a track whose opening frame
-/// is not a keyframe - the first sync sample is as close as the file gets, and a stream from there
-/// is still one a decoder can start from.
+/// is not a keyframe, or a track whose first keyframe is not its first sample opened at 0 - the
+/// first sync sample is as close as the file gets, and a stream from there is still one a decoder
+/// can start from.
 ///
 /// For audio it is the first sample at or after the target, because every audio frame is
 /// independently decodable and nothing before it is needed to decode it. A target past the track's
@@ -727,19 +776,15 @@ fn validate_chunks(tables: &Tables, track: u32) -> Result<(), MediaError> {
 ///
 /// The walk also decides nothing about the file that the tables do not say: it checks that a
 /// sample's offset and size still fit a byte address, and that its times fit a timeline. It walks
-/// the whole track whether or not a seek was asked for, so a track whose four hundred thousandth
-/// sample has an impossible offset is refused at the open rather than four hundred thousand
-/// samples into a stream, and it stops when the sample count says the samples are done.
-fn scan(
-    tables: &Tables,
-    kind: TrackKind,
-    target: Option<i128>,
-    track: u32,
-) -> Result<Cursor, MediaError> {
-    let mut cursor = Cursor::start(tables);
+/// the whole track even when the target is the first tick of it, so a track whose four hundred
+/// thousandth sample has an impossible offset is refused at the open rather than four hundred
+/// thousand samples into a stream, and it stops when the sample count says the samples are done.
+fn scan(tables: &Tables, kind: TrackKind, target: i128) -> Result<Cursor, MediaError> {
+    let track = tables.track;
+    let mut cursor = Cursor::start(tables)?;
     let mut landing: Option<Cursor> = None;
     let mut first_sync: Option<Cursor> = None;
-    while let Some(meta) = peek(tables, &cursor) {
+    while let Some(meta) = peek(tables, &cursor)? {
         let number = cursor.index + 1;
         if meta.offset.checked_add(u64::from(meta.size)).is_none() {
             return Err(MediaError::Malformed(format!(
@@ -755,11 +800,8 @@ fn scan(
                 )));
             }
         }
-        match (target, kind) {
-            // No seek asked for: nothing to decide, and every sample the stream hands out carries
-            // its own verdict on this sample's arithmetic if it needs one.
-            (None, _) => {}
-            (Some(target), TrackKind::Video) => {
+        match kind {
+            TrackKind::Video => {
                 if meta.sync {
                     first_sync.get_or_insert_with(|| cursor.clone());
                     if meta.pts <= target {
@@ -767,25 +809,24 @@ fn scan(
                     }
                 }
             }
-            (Some(target), TrackKind::Audio) => {
+            TrackKind::Audio => {
                 if landing.is_none() && meta.pts >= target {
                     landing = Some(cursor.clone());
                 }
             }
-            (Some(_), TrackKind::Subtitle) => {
+            TrackKind::Subtitle => {
                 unreachable!("subtitle tracks are refused before this")
             }
         }
-        step(tables, &mut cursor);
+        step(tables, &mut cursor)?;
     }
-    Ok(match landing {
-        Some(at) => at,
-        None if target.is_none() => Cursor::start(tables),
-        // A video seek with nothing at or before it, and an audio seek with nothing at or after
-        // it: the closest the file gets, which for audio is past its end.
-        None if kind == TrackKind::Video => first_sync.unwrap_or_else(|| Cursor::end(tables)),
+    // Nothing at or before the video target, and nothing at or after the audio one: the closest the
+    // file gets. For video that is `stss`'s first sync sample, the one `first_sync` stopped on; for
+    // audio, whose walk never sets `first_sync` at all, it is past the track's end.
+    match landing.or(first_sync) {
+        Some(at) => Ok(at),
         None => Cursor::end(tables),
-    })
+    }
 }
 
 /// Open one MP4 track for fragmented MP4: the MP4 half of [`open_track`](crate::open_track), as
@@ -793,8 +834,9 @@ fn scan(
 ///
 /// `track` is the container's own `track_ID`, which the public wrapper narrows from a `u32`;
 /// `start_ms` is source time, and what it means here is what [`scan`] does with it: video lands on
-/// the last sync sample at or before it, audio on the first sample at or after it, and zero opens
-/// from the track's first sample with no seek at all.
+/// the last sync sample at or before it, audio on the first sample at or after it. Zero is a target
+/// like any other, so a video track whose first keyframe is its third sample starts on that
+/// keyframe rather than on the two frames in front of it.
 ///
 /// The header is read by the same box walk and under the same bounds as [`probe`](crate::probe::probe)
 /// reads it, then the track's own tables are cross-checked and walked, and only after all of that
@@ -812,11 +854,12 @@ fn scan(
 /// no media a player would offer (timecode, metadata and helper tracks), a subtitle track or a
 /// codec no fragmented MP4 sample entry can name, a fragmented input (`moov` with `mvex`, or a top
 /// level `moof` on the way to the `moov`), and a track whose `stsc` samples from a second `stsd`
-/// entry. [`MediaError::Malformed`] for a `moov` that does not parse or that only this walk can
-/// reach, an `mdhd` timescale of 0, tables that contradict each other (see [`validate`]), more
-/// samples than [`MAX_MP4_SAMPLES`], a track with no samples, and a sample whose byte offset or
-/// timeline does not fit (see [`scan`]). [`MediaError::Io`] for a reader that failed, which
-/// includes a `moov` this reader has not been given yet.
+/// entry. [`MediaError::Malformed`] for a `moov` that does not parse, one that declares more than
+/// [`MOOV_CAP`](crate::MOOV_CAP) bytes or that only this walk can reach, an `mdhd` timescale of 0,
+/// tables that contradict each other (see [`validate`]), more samples than [`MAX_MP4_SAMPLES`], a
+/// track with no samples, and a sample whose byte offset or timeline does not fit (see [`scan`]).
+/// [`MediaError::Io`] for a reader that failed, which includes a `moov` this reader has not been
+/// given yet.
 ///
 /// # Panics
 ///
@@ -881,18 +924,23 @@ pub(crate) fn open_source<R: Read + Seek>(
         .map_or((0, 0), |visual| (visual.width, visual.height));
     let tables = tables_from(trak.mdia.minf.stbl, track, timescale)?;
     // The target in the track's own ticks, since the tables count in those and a landing has to be
-    // compared to them rather than to milliseconds.
-    let target = if start_ms == 0 {
-        None
+    // compared to them rather than to milliseconds. Which way the division rounds is the two kinds'
+    // difference: a video landing may sit before the target, because a decoder needs the sync sample
+    // and the frames behind it, so video takes the whole ticks the division reaches; audio can use
+    // nothing from before the target, so audio rounds up - 209 ms at 44100 Hz is 9216.9 ticks, and
+    // the sample sitting on 9216 is 0.9 ms short of the time that was asked for.
+    let product = u128::from(start_ms) * u128::from(timescale);
+    let ticks = if info.kind == TrackKind::Audio {
+        product.div_ceil(1_000)
     } else {
-        let ticks = u128::from(start_ms) * u128::from(timescale) / 1000;
-        Some(i128::try_from(ticks).map_err(|_| {
-            MediaError::Malformed(format!(
-                "start time {start_ms} ms is past what timescale {timescale} can count"
-            ))
-        })?)
+        product / 1_000
     };
-    let cursor = scan(&tables, info.kind, target, track)?;
+    let target = i128::try_from(ticks).map_err(|_| {
+        MediaError::Malformed(format!(
+            "start time {start_ms} ms is past what timescale {timescale} can count"
+        ))
+    })?;
+    let cursor = scan(&tables, info.kind, target)?;
     Ok(Mp4Source {
         reader,
         config: TrackConfig {

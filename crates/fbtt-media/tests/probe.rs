@@ -19,8 +19,8 @@ use std::thread;
 use std::time::Duration;
 
 use fbtt_media::{
-    CappedLen, Codec, Container, ELEMENT_CAP, MAX_HEADER_OPS, MediaError, MediaInfo, ReadBudget,
-    TrackKind, probe,
+    CappedLen, Codec, Container, ELEMENT_CAP, MAX_HEADER_OPS, MOOV_CAP, MediaError, MediaInfo,
+    ReadBudget, TrackKind, probe,
 };
 use serde_json::Value;
 
@@ -794,7 +794,7 @@ fn probe_mp4_moov_to_eof_is_bounded() {
     );
     let message = error.to_string();
     assert!(
-        message.contains(ELEMENT_CAP.to_string().as_str()),
+        message.contains(MOOV_CAP.to_string().as_str()),
         "the refusal should name the cap the run broke: {message}"
     );
 }
@@ -833,7 +833,7 @@ fn probe_mp4_moov_over_cap_is_refused() {
     );
     let message = error.to_string();
     assert!(
-        message.contains(ELEMENT_CAP.to_string().as_str()),
+        message.contains(MOOV_CAP.to_string().as_str()),
         "the refusal should name the cap the declaration broke: {message}"
     );
 }

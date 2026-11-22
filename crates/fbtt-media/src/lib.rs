@@ -9,8 +9,9 @@
 //! plan's "no transcoding, no native libraries" rule asks of it.
 //!
 //! Everything a file claims is treated as untrusted: sizes are bounded by [`CappedLen`] and
-//! [`ELEMENT_CAP`], the calls a header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], and a
-//! file that lies about itself yields a [`MediaError`], never a panic.
+//! [`ELEMENT_CAP`] - with [`MOOV_CAP`] tighter for an MP4 `moov`, which is read whole - the calls a
+//! header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], and a file that lies about itself
+//! yields a [`MediaError`], never a panic.
 
 #![forbid(unsafe_code)]
 
@@ -77,6 +78,18 @@ pub const TIME_OFFSET_MS: u64 = 1000;
 /// this many bytes.
 pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;
 
+/// The most contents a `moov` may declare itself to hold, which is what one probe or one open pays
+/// for a header.
+///
+/// A `moov` is read whole: `mp4_atom` sizes its buffer from the declaration and decodes every table
+/// box inside it, so a `moov` costs several times its own size at the peak of a single open, and
+/// every player seek is an open. That is why this cap is tighter than [`ELEMENT_CAP`]: 256 MiB of
+/// `moov` is 64 million 4 byte `stsz` entries, already a few hundred MB before this crate looks at
+/// any of them. It is the bound on the sample tables a decoded header holds (see
+/// [`MAX_MP4_SAMPLES`], which bounds the walk over them), and 64 MiB of entries is 16 million
+/// samples, dozens of times past what a file worth streaming declares.
+pub const MOOV_CAP: u64 = 64 * 1024 * 1024;
+
 /// The most of a sidecar subtitle file is read: a caption track nobody can scroll is not worth
 /// unbounded memory.
 pub const SUBTITLE_FILE_CAP: u64 = 4 * 1024 * 1024;
@@ -119,19 +132,16 @@ pub const MAX_FRAGMENT_SAMPLES: usize = 10_000;
 /// reads a single sample's bytes (see [`MAX_MP4_SAMPLES`]).
 pub const MAX_SKIPPED_FRAMES: usize = 100_000;
 
-/// The most samples one MP4 track's sample tables may describe.
+/// The most samples one MP4 track's sample tables may describe, which is what bounds one walk of
+/// them.
 ///
-/// `stsz` states a count before it states any sizes, so a count is trusted only
-/// past this bound: a `u32` allows four billion samples, and the arrays that
-/// grow with a count are the container's own - one `u32` per sample in a `stsz`
-/// whose sizes vary, and one chunk offset per chunk, which in what ffmpeg writes
-/// for a track with no interleaving is one per sample too. Four billion of those
-/// is 16 GB of sizes and 32 GB of 64 bit offsets before this crate looks at
-/// anything else. The cap keeps them, and the one walk per open that checks them
-/// and finds a seek landing (an addition per sample, never a copy), inside what
-/// a file worth streaming is worth: 20 million samples is 80 MB of sizes and
-/// 160 MB of offsets, and dozens of times what a four hour video track holds at
-/// 30 frames a second.
+/// This does not bound the tables themselves: `mp4_atom` decodes a `moov`'s tables while it reads
+/// the box, so a count is looked at only after the arrays it grew have been paid for, and it is
+/// [`MOOV_CAP`] on the box that keeps that cost finite. What this bounds is the pass after the
+/// decode: the one walk per open that checks every sample's byte offset and timeline and finds the
+/// sample a seek lands on, an addition per sample and never a copy. A `u32` count allows four
+/// billion samples, and a file that got one past the caps would be walked for minutes before it was
+/// refused; 20 million is dozens of times what a four hour video track holds at 30 frames a second.
 pub const MAX_MP4_SAMPLES: u64 = 20_000_000;
 
 /// Why a file could not be used.

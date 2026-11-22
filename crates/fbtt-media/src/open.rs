@@ -16,8 +16,9 @@ use std::io::{Read, Seek};
 ///
 /// `track` is the container's own track number - Matroska's `TrackNumber`, MP4's `track_ID`, the
 /// number [`probe`](crate::probe::probe) reports as a
-/// [`TrackInfo`](crate::probe::TrackInfo)'s `id`. `start_ms` is source time, and zero opens from
-/// the track's first sample with no seek at all.
+/// [`TrackInfo`](crate::probe::TrackInfo)'s `id`. `start_ms` is source time, and zero is a request
+/// for the start of the timeline rather than the absence of a request: the container's own rule,
+/// below, is what decides where that lands.
 ///
 /// The container is sniffed from the reader's first eight bytes, exactly as the probe sniffs it,
 /// and the reader then belongs to that container: Matroska and WebM go to the `mkv` module, MP4 to
@@ -30,9 +31,12 @@ use std::io::{Read, Seek};
 ///
 /// A seek lands differently per container, because the containers describe different starting
 /// points. A Matroska video stream starts at the first keyframe at or after `start_ms`, which is
-/// where the demuxer's own forward walk arrives; an MP4 video stream starts at the last sync
-/// sample at or before it, the landing `stss` exists to describe. Audio needs no rule in either,
-/// every audio frame being independently decodable, and starts at or after `start_ms`. The stream's
+/// where the demuxer's own forward walk arrives; an MP4 video stream starts at the last sync sample
+/// at or before it, the landing `stss` exists to describe - which for a file whose opening frame is
+/// not a keyframe is its first keyframe, at `start_ms` 0 too. Audio needs no rule in either, every
+/// audio frame being independently decodable, and starts at or after `start_ms`: an MP4 audio track
+/// counts samples in its own ticks, so its target rounds up to the next whole one and a request for
+/// 209 ms of a 44100 Hz track does not land on the sample at 9216 ticks, 0.9 ms short. The stream's
 /// [`start_ms`](crate::FragmentStream::start_ms) is where the samples really began, so an MP4 video
 /// stream that landed on a keyframe earlier than the time that was asked for reports that earlier
 /// time rather than the one it was handed.
@@ -54,9 +58,10 @@ use std::io::{Read, Seek};
 /// element, a demuxer panic, a `TimestampScale` or start time no timeline can hold, a frame
 /// timestamp or duration too wide for the track's timeline, and a Matroska walk of
 /// [`MAX_SKIPPED_FRAMES`](crate::MAX_SKIPPED_FRAMES) frames that produced nothing; for an MP4
-/// `mdhd` timescale of 0, sample tables that contradict each other, a track with no samples or with
-/// more than [`MAX_MP4_SAMPLES`](crate::MAX_MP4_SAMPLES) of them, and a sample whose byte offset or
-/// timeline does not fit.
+/// `moov` declaring more than [`MOOV_CAP`](crate::MOOV_CAP) bytes, an `mdhd` timescale of 0,
+/// sample tables that contradict each other, a track with no samples or with more than
+/// [`MAX_MP4_SAMPLES`](crate::MAX_MP4_SAMPLES) of them, and a sample whose byte offset or timeline
+/// does not fit.
 ///
 /// A reader that fails stays [`MediaError::Io`] - a torrent piece that has not arrived is not a
 /// verdict about the file, and neither is a sample whose bytes are past what the stream holds. The

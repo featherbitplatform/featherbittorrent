@@ -1,7 +1,7 @@
 //! Container sniffing and the two header readers behind [`probe`].
 use crate::capped::{CappedLen, ReadBudget};
 use crate::codec::{self, Codec, TrackKind};
-use crate::{Container, ELEMENT_CAP, MediaError};
+use crate::{Container, ELEMENT_CAP, MOOV_CAP, MediaError};
 use matroska_demuxer::{DemuxError, MatroskaFile, TrackEntry, TrackType};
 use mp4_atom::{FourCC, Header, Moov, ReadAtom, ReadFrom};
 use std::io::{Read, Seek, SeekFrom};
@@ -342,26 +342,28 @@ fn capped_size(size: usize) -> u64 {
 
 /// A `moov` header whose declared size `mp4_atom` can be trusted to read.
 ///
-/// A declared size is checked against [`ELEMENT_CAP`] because `read_body` sizes its buffer from
-/// the declaration. A size of 0 means "runs to the end of the file", which `mp4_atom` reports as
-/// `None`, and `read_body` then copies the stream with `io::copy` and no bound at all (its
-/// `header.rs:126`), so a `moov` that claims to run to the end of a 4 GiB file is read as 4 GiB
-/// of `Vec`. The run to the end is measured here instead, refused when it is longer than a header
-/// may be, and otherwise handed back as the declared size the bounded reader wants.
+/// A declared size is checked against [`MOOV_CAP`] rather than [`ELEMENT_CAP`] because `read_body`
+/// sizes its buffer from the declaration and decodes the sample tables inside it, so a `moov` is
+/// paid for at several times its own size per open - and a player seek is an open. A size of 0 means
+/// "runs to the end of the file", which `mp4_atom` reports as `None`, and `read_body` then copies
+/// the stream with `io::copy` and no bound at all (its `header.rs:126`), so a `moov` that claims to
+/// run to the end of a 4 GiB file is read as 4 GiB of `Vec`. The run to the end is measured here
+/// instead, refused when it is longer than a header may be, and otherwise handed back as the
+/// declared size the bounded reader wants.
 ///
 /// Task 4 reads a source file's `moov` the same way when it writes fragmented MP4 headers out of
 /// an existing file (the `mp4in` module behind [`open_track`](crate::open_track)), which is why this
-/// is `pub(crate)`. The box walk that finds the header, and this bound on its contents, are the
-/// crate's only moov cap: an MP4 open pays for one `moov` worth of bytes, whichever of its tracks
-/// is opened.
+/// is `pub(crate)`. The box walk that finds the header, and this bound on its contents
+/// ([`MOOV_CAP`]), are the crate's only moov cap: an MP4 open pays for one `moov` worth of bytes,
+/// whichever of its tracks is opened.
 pub(crate) fn sized_moov_header<R: Read + Seek>(
     reader: &mut R,
     header: &Header,
 ) -> Result<Header, MediaError> {
     let size = match header.size {
-        Some(size) if capped_size(size) > ELEMENT_CAP => {
+        Some(size) if capped_size(size) > MOOV_CAP => {
             return Err(MediaError::Malformed(format!(
-                "moov declares more than {ELEMENT_CAP} bytes"
+                "moov declares more than {MOOV_CAP} bytes"
             )));
         }
         Some(size) => Some(size),
@@ -370,9 +372,9 @@ pub(crate) fn sized_moov_header<R: Read + Seek>(
             let end = reader.seek(SeekFrom::End(0))?;
             reader.seek(SeekFrom::Start(here))?;
             let remaining = end.saturating_sub(here);
-            if remaining > ELEMENT_CAP {
+            if remaining > MOOV_CAP {
                 return Err(MediaError::Malformed(format!(
-                    "moov runs to the end of the file, which is more than {ELEMENT_CAP} bytes"
+                    "moov runs to the end of the file, which is more than {MOOV_CAP} bytes"
                 )));
             }
             Some(usize::try_from(remaining).unwrap_or(usize::MAX))

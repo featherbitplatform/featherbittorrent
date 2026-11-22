@@ -53,7 +53,8 @@
 //! (or, for the cue, as a stream that ends with nothing to play), never as
 //! a panic and never as a hang.
 use fbtt_media::{
-    FragmentStream, MAX_MP4_SAMPLES, MediaError, Sample, TIME_OFFSET_MS, open_track, probe,
+    FragmentStream, MAX_MP4_SAMPLES, MOOV_CAP, MediaError, Sample, TIME_OFFSET_MS, open_track,
+    probe,
 };
 use matroska_demuxer::{Frame, MatroskaFile};
 use serde_json::Value;
@@ -885,12 +886,14 @@ fn source_kept_video(frames: &[Frame]) -> Vec<(bool, &Frame)> {
 // that stops answering, for the error-kind test.
 // ---------------------------------------------------------------------------
 
-struct CountingReader {
-    inner: File,
+/// A reader that counts the bytes it hands out, whatever is behind it: the tests that ask what an
+/// open or a stream cost, and the one that asks how far an open got before it refused.
+struct CountingReader<R> {
+    inner: R,
     bytes: Arc<AtomicU64>,
 }
 
-impl Read for CountingReader {
+impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
         let read = self.inner.read(buf)?;
         self.bytes.fetch_add(read as u64, Ordering::Relaxed);
@@ -898,7 +901,7 @@ impl Read for CountingReader {
     }
 }
 
-impl Seek for CountingReader {
+impl<R: Seek> Seek for CountingReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, IoError> {
         self.inner.seek(pos)
     }
@@ -2841,9 +2844,19 @@ struct TableTrack {
 /// The edit list is skipped here exactly as the source skips it, so the times
 /// are the track's own and not the presentation's.
 fn table_track(name: &str, track_id: u32) -> TableTrack {
+    table_track_in(&fixture_bytes(name), track_id)
+}
+
+/// The same oracle read out of bytes that are not the fixture's own.
+///
+/// A test that patches a table has to move the oracle with it, or it is comparing the stream to the
+/// file the patch left behind. `assert_stream_matches` still takes the fixture's name, because the
+/// sample bytes it compares come from there: that is honest only while the patch moved numbers in
+/// the tables and left the media data where the tables say it is, which is what every caller here
+/// does - a sync sample number, a chunk number, a timescale.
+fn table_track_in(bytes: &[u8], track_id: u32) -> TableTrack {
     use mp4_atom::ReadAtom;
-    let bytes = fixture_bytes(name);
-    let mut reader = Cursor::new(&bytes[..]);
+    let mut reader = Cursor::new(bytes);
     let trak = loop {
         let header = <Option<mp4_atom::Header> as mp4_atom::ReadFrom>::read_from(&mut reader)
             .expect("a top level box header")
@@ -2956,6 +2969,35 @@ fn ms_of(ticks: i64, timescale: u32) -> i64 {
 /// have left it.
 fn box_at(bytes: &[u8], name: &[u8; 4]) -> usize {
     let body = deep_find(bytes, name).expect("the box a patch is placed in");
+    body.as_ptr() as usize - bytes.as_ptr() as usize
+}
+
+/// `deep_find`'s descent collecting every box of a kind instead of stopping at the first one.
+fn boxes_named<'a>(bytes: &'a [u8], name: &[u8; 4], out: &mut Vec<&'a [u8]>) {
+    let containers: [[u8; 4]; 5] = [*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl"];
+    for entry in boxes(bytes) {
+        if &entry.kind == name {
+            out.push(entry.body);
+        }
+        if containers.contains(&entry.kind) {
+            boxes_named(entry.body, name, out);
+        }
+    }
+}
+
+/// Where the body of the `nth` box of a kind sits, counting in the same document order `box_at`'s
+/// single answer comes from. A `moov` lists its tracks as `trak` boxes in track order, so the
+/// second `mdhd` is the second track's own and the first belongs to the first track.
+fn nth_box_at(bytes: &[u8], name: &[u8; 4], nth: usize) -> usize {
+    let mut bodies = Vec::new();
+    boxes_named(bytes, name, &mut bodies);
+    let body = bodies.get(nth).unwrap_or_else(|| {
+        panic!(
+            "{} boxes of this kind in the file, need {}",
+            bodies.len(),
+            nth + 1
+        )
+    });
     body.as_ptr() as usize - bytes.as_ptr() as usize
 }
 
@@ -3265,6 +3307,55 @@ fn remux_mp4_moov_last_video() {
     assert_stream_matches(MOOV_LAST, &audio, 0, &fragments);
 }
 
+/// A track whose opening frame is not a keyframe opens on its first keyframe at 0 ms too.
+///
+/// `stss` names the samples a decoder can start from, and a seek into the middle of a track already
+/// honors it: the landing is the last sync sample at or before the target, and a seek with no sync
+/// sample at or before it takes the first one. A request for 0 ms is the same kind of request, so
+/// the same rule has to answer it: the frames in front of the first keyframe are not decodable on
+/// their own, and a stream that starts on them is one the player throws away before it shows
+/// anything. The patch moves this fixture's first sync sample from 1 to 3, and three separate
+/// things have to say the third sample: the oracle's flags, the keyframe flags on the wire, and the
+/// time the stream reports it started at.
+#[test]
+fn mp4_video_from_zero_starts_on_sync() {
+    let mut bytes = fixture_bytes(MOOV_LAST);
+    let stss = box_at(&bytes, b"stss");
+    assert_eq!(
+        u32_at(&bytes, stss + 8),
+        1,
+        "the fixture opens on its own first sample, which its stss names as sync"
+    );
+    // A sync sample number and nothing else: the box keeps its size, the media data its place, and
+    // so `assert_stream_matches` is still comparing against the file's own bytes.
+    put_u32(&mut bytes, stss + 8, 3);
+    let track = table_track_in(&bytes, 1);
+    let landing = track
+        .samples
+        .iter()
+        .position(|sample| sample.sync)
+        .expect("a sync sample in a track with a sync table");
+    assert_eq!(landing, 2, "the first keyframe is now the third sample");
+    let mut stream = open_track(Cursor::new(bytes), 1, 0)
+        .expect("a track that does not open on a keyframe is no hard case");
+    let fragments = drain_fragments(&mut stream);
+    let emitted = streamed_samples(&fragments);
+    assert!(
+        emitted[0].keyframe,
+        "the stream starts on a sample a decoder can start from"
+    );
+    assert_eq!(
+        emitted[0].pts, track.samples[landing].pts,
+        "on that sample's own time, not on the frames in front of it"
+    );
+    assert_eq!(
+        stream.start_ms(),
+        ms_of(track.samples[landing].pts, track.timescale) as u64,
+        "and start_ms is the time the samples really began at"
+    );
+    assert_stream_matches(MOOV_LAST, &track, landing, &fragments);
+}
+
 /// The first AAC frame at or after 1500 ms, asked of the track's own tables and of the stream.
 ///
 /// Audio lands forward: the stream starts on the first sample whose presentation time reaches the
@@ -3272,6 +3363,12 @@ fn remux_mp4_moov_last_video() {
 /// one AAC frame - 1024 samples at 48 kHz, 21.3 ms - because the track's own spacing is 1024
 /// ticks, so the first sample at or after 72000 ticks is 72704, 14.7 ms late, and no landing on
 /// this file could be closer than that.
+///
+/// The second half asks for 209 ms of the same track with its timescale rewritten to 44100, because
+/// 48000 divides 1000 exactly and so can never show what the target's rounding does: 209 ms at
+/// 44100 Hz is 9216.9 ticks, and the only question is whether the sample sitting on 9216 ticks - a
+/// frame 0.9 ms short of the request - is close enough to start on. It is not, and a stream that
+/// started on it would report a start of 208 ms for a request for 209.
 #[test]
 fn remux_mp4_audio_starts_at_or_after() {
     let track = table_track(FASTSTART, 2);
@@ -3314,6 +3411,72 @@ fn remux_mp4_audio_starts_at_or_after() {
             "nothing is emitted from before the start time"
         );
     }
+
+    // The same track at a timescale that does not divide 1000, which is the only shape where the
+    // target's rounding is the answer. A version 0 `mdhd` is 32 bytes: version and flags, creation
+    // and modification times, the timescale, a duration, a language code and a pre-defined word,
+    // and the timescale is the one field both sides of this test read as the track's rate. Nothing
+    // else about the track moves, so the file's own bytes are still the samples' bytes.
+    let mut at_44100 = fixture_bytes(FASTSTART);
+    let video_mdhd = nth_box_at(&at_44100, b"mdhd", 0);
+    assert_eq!(
+        u32_at(&at_44100, video_mdhd + 12),
+        10_240,
+        "the boxes come in track order, so the first mdhd is the video track's"
+    );
+    let mdhd = nth_box_at(&at_44100, b"mdhd", 1);
+    assert_eq!(
+        u32_at(&at_44100, mdhd + 12),
+        48_000,
+        "and the second is the AAC track this half asks for"
+    );
+    put_u32(&mut at_44100, mdhd + 12, 44_100);
+    let track_44100 = table_track_in(&at_44100, 2);
+    assert_eq!(
+        track_44100.timescale, 44_100,
+        "the oracle reads the field the patch moved"
+    );
+    let want_ms = 209_u64;
+    let product = u128::from(want_ms) * u128::from(track_44100.timescale);
+    assert_ne!(
+        product % 1_000,
+        0,
+        "209 ms at 44100 Hz is not a whole number of ticks, which is the whole point"
+    );
+    // The exact form of "at or after the start time": a sample's ticks reach the milliseconds that
+    // were asked for exactly when its ticks times 1000 reach those milliseconds times the
+    // timescale, with no division, and so no rounding, on either side.
+    let want = track_44100
+        .samples
+        .iter()
+        .position(|sample| {
+            u128::try_from(sample.pts).expect("a non negative pts") * 1_000 >= product
+        })
+        .expect("a sample at or after 209 ms");
+    assert_eq!(
+        want, 10,
+        "the eleventh sample, 10240 ticks in, is the first at or after 9216.9 ticks"
+    );
+    let mut stream = open_track(Cursor::new(at_44100), 2, want_ms)
+        .expect("a track whose timescale does not divide 1000");
+    let fragments = drain_fragments(&mut stream);
+    let first = streamed_samples(&fragments)[0].pts;
+    assert!(
+        u128::try_from(first).expect("a non negative pts") * 1_000 >= product,
+        "an audio stream never starts before the time it was asked for: {first} ticks at 44100 Hz \
+         for a {want_ms} ms request"
+    );
+    assert_eq!(
+        first, track_44100.samples[want].pts,
+        "and it starts on the sample its own tables give"
+    );
+    assert!(
+        stream.start_ms() >= want_ms,
+        "so the start it reports is not below the time it was asked for either: {} ms for a \
+         {want_ms} ms request",
+        stream.start_ms()
+    );
+    assert_stream_matches(FASTSTART, &track_44100, want, &fragments);
 }
 
 /// Both MP4 fixtures at 60 % of their bytes: two verdicts, neither a panic, and each of them the
@@ -3432,13 +3595,65 @@ fn mp4_huge_sample_count_is_refused() {
     );
 }
 
+/// A `moov` whose declared size passes [`MOOV_CAP`] is refused at its header, before its bytes are
+/// read.
+///
+/// The cap has to be on the box, because nothing after the parse can bound what the parse
+/// allocated: `mp4_atom` sizes its read buffer from the declaration and decodes every sample table
+/// inside the box, so a `moov` costs several times its own size at the peak of a single open, and
+/// every player seek is an open. The patch declares one byte more than the cap worth of `moov`
+/// contents in the faststart file's own size field, where this fixture states 6138 bytes of tables,
+/// and then asks how much the open read before it refused: the few headers it had to read, or the
+/// 57 KB body the declaration asked for.
+#[test]
+fn mp4_oversized_moov_is_refused() {
+    let mut bytes = fixture_bytes(FASTSTART);
+    let size_at = moov_size_at(&bytes);
+    let moov_size = u32_at(&bytes, size_at);
+    assert!(
+        moov_size < 8 * 1024,
+        "the patch rewrites this fixture's own moov size field: {moov_size} bytes of tables"
+    );
+    // The size field states the whole box, header included, and `mp4_atom` reports the body that
+    // excludes it: the body is the quantity `read_body` allocates for and so the quantity the cap is
+    // stated on, which makes the cap plus one of contents this box size.
+    put_u32(
+        &mut bytes,
+        size_at,
+        u32::try_from(MOOV_CAP + 1 + 8).expect("the cap plus one fits a size field"),
+    );
+    let read = Arc::new(AtomicU64::new(0));
+    let counting = CountingReader {
+        inner: Cursor::new(bytes),
+        bytes: Arc::clone(&read),
+    };
+    let verdict =
+        open_track(counting, 1, 0).expect_err("a moov declaring the cap plus one is not a header");
+    let taken = read.load(Ordering::Relaxed);
+    match verdict {
+        MediaError::Malformed(message) => assert!(
+            message.contains(&MOOV_CAP.to_string()),
+            "the refusal names the cap the declaration broke: {message}"
+        ),
+        other => panic!("an oversized moov is Malformed, got {other:?}"),
+    }
+    assert!(
+        taken < 4 * 1024,
+        "the cap stops the read rather than the read filling what it was promised: {taken} bytes \
+         read before the refusal"
+    );
+}
+
 /// Tables that contradict each other are caught at the open, before any media data is asked for.
 ///
-/// Three shapes of one mistake, patched into the faststart file's video track: `stts` covering
+/// Five shapes of one mistake, patched into the faststart file's video track: `stts` covering
 /// fewer samples than `stsz` sizes, which would leave a walk out of durations or out of sizes
 /// partway through; `stss` naming a sample `stsz` never sized, which is a sync flag for a sample
-/// with no bytes; and `stsc` starting at chunk 2, which leaves the first chunk's offset describing
-/// nothing and the track's first samples with no stated place to start.
+/// with no bytes; `stsc` starting at chunk 2, which leaves the first chunk's offset describing
+/// nothing and the track's first samples with no stated place to start; the last `stsc` group
+/// starting one past the last chunk the offset table has an offset for, which is the same claim
+/// made from the other end; and a `stss` that is present and names nothing, which is not what no
+/// `stss` means - no box says every sample is decodable on its own, an empty box says none is.
 #[test]
 fn mp4_inconsistent_tables_are_malformed() {
     let mut bytes = fixture_bytes(FASTSTART);
@@ -3471,6 +3686,63 @@ fn mp4_inconsistent_tables_are_malformed() {
         ),
         other => panic!("an stsc that does not start at chunk 1 is Malformed, got {other:?}"),
     }
+    // The same claim from the other end, which is the one a walk cannot survive: a group whose own
+    // `first_chunk` is past the last chunk the offset table has an offset for. Groups ascend, so it
+    // is the last one that is free to claim a chunk nobody allocated. This track's two groups cover
+    // chunks 1 and 2, and `stco` holds 39 offsets, so the number that is one too many is 40.
+    let mut bytes = fixture_bytes(FASTSTART);
+    let stsc = box_at(&bytes, b"stsc");
+    let groups = usize::try_from(u32_at(&bytes, stsc + 4)).expect("a group count fits usize");
+    let chunks = u64::from(u32_at(&bytes, box_at(&bytes, b"stco") + 4));
+    assert_eq!(
+        groups, 2,
+        "the fixture's video track groups its chunks twice"
+    );
+    assert_eq!(chunks, 39, "and its 40 samples sit in 39 chunks");
+    let last_group = stsc + 8 + 12 * (groups - 1);
+    put_u32(
+        &mut bytes,
+        last_group,
+        u32::try_from(chunks + 1).expect("one past the last chunk fits a chunk field"),
+    );
+    match open_track(Cursor::new(bytes), 1, 0).expect_err("a group whose first chunk has no offset")
+    {
+        MediaError::Malformed(message) => assert!(
+            message.contains("stsc") && message.contains("no offset"),
+            "the refusal says which chunk has no offset in a table of {chunks}: {message}"
+        ),
+        other => panic!("a first chunk past the offset table is Malformed, got {other:?}"),
+    }
+    // A `stss` with no entries at all. The box being there means this is not a track whose samples
+    // are all sync samples, and the box naming nothing means no sample is one either, so the walk
+    // has no sample it may start a stream on. The box shrinks by the entries it loses, and so does
+    // every box around it, because a container reads its children up to its own declared length and
+    // then checks what it read against that length.
+    let mut bytes = fixture_bytes(FASTSTART);
+    let stss = box_at(&bytes, b"stss");
+    let syncs = usize::try_from(u32_at(&bytes, stss + 4)).expect("a sync count fits usize");
+    assert!(
+        syncs > 0,
+        "the fixture's video track names {syncs} sync samples"
+    );
+    let around: Vec<usize> = [b"stss", b"stbl", b"minf", b"mdia", b"trak", b"moov"]
+        .iter()
+        .map(|name| box_at(&bytes, name) - 8)
+        .collect();
+    let dropped = u32::try_from(4 * syncs).expect("the entries fit a size field");
+    put_u32(&mut bytes, stss + 4, 0); // entry_count
+    bytes.splice(stss + 8..stss + 8 + 4 * syncs, []);
+    for field in around {
+        let size = u32_at(&bytes, field);
+        put_u32(&mut bytes, field, size - dropped);
+    }
+    match open_track(Cursor::new(bytes), 1, 0).expect_err("a sync table naming nothing") {
+        MediaError::Malformed(message) => assert!(
+            message.contains("stss") && message.contains("no sync sample"),
+            "an empty stss is not a track with no stss: {message}"
+        ),
+        other => panic!("a present but empty stss is Malformed, got {other:?}"),
+    }
 }
 
 /// A fragmented MP4 is not a source file for this remuxer: `moov` carrying `mvex` is refused, and
@@ -3479,8 +3751,9 @@ fn mp4_inconsistent_tables_are_malformed() {
 /// A fragmented file's `moov` parses the same way any other does - its track simply has empty
 /// sample tables, the real ones being in the fragments - so the refusal has to come from `mvex`
 /// (or from a top level `moof` the box walk notes on its way to the `moov`) rather than from a
-/// failed parse. The patch puts a valid `mvex` between the `moov` header and its first `trak`,
-/// where the specification puts it, and grows the `moov` to cover it.
+/// failed parse, and so both halves get their own bytes: the first puts a valid `mvex` between the
+/// `moov` header and its first `trak`, where the specification puts it, and grows the `moov` to
+/// cover it, and the second puts a `moof` in front of a `moov` that carries no `mvex` at all.
 ///
 /// The probe is asked about the same bytes because that split is the one this crate chose: the
 /// header of a fragmented file can be described, a stream of it cannot. A player that wants the
@@ -3522,4 +3795,33 @@ fn mp4_fragmented_input_is_unsupported() {
         4,
         "and still has the tracks its moov describes"
     );
+
+    // The other half of the verdict, which needs its own bytes: a `moof` at the top level with a
+    // `moov` that says nothing about fragments. `mvex` is the fragment configuration *inside* a
+    // moov, and nothing forces a file that writes fragments to state it there, so the box walk has
+    // to notice a `moof` on its way past as well. 24 bytes is the smallest one that parses: the box
+    // header and an `mfhd`, which is a fullbox and so pays the version and flags word too. Nothing
+    // above it changes size, because `moof` is its own top level box, and the sample offsets the
+    // `moov` states now point 24 bytes early - which is beside the point, since this file is
+    // refused before anything asks for a sample.
+    let mut bytes = fixture_bytes(FASTSTART);
+    let at = moov_size_at(&bytes);
+    let moof: Vec<u8> = [
+        24_u32.to_be_bytes().to_vec(),
+        b"moof".to_vec(),
+        16_u32.to_be_bytes().to_vec(),
+        b"mfhd".to_vec(),
+        0_u32.to_be_bytes().to_vec(), // version and flags
+        1_u32.to_be_bytes().to_vec(), // fragment_sequence_number
+    ]
+    .concat();
+    assert_eq!(moof.len(), 24, "a moof with one mfhd");
+    bytes.splice(at..at, moof);
+    match open_track(Cursor::new(bytes), 1, 0).expect_err("fragments are not a source table") {
+        MediaError::Unsupported(message) => assert!(
+            message.contains("fragmented MP4"),
+            "a top level moof says as much about a file as a moov carrying mvex: {message}"
+        ),
+        other => panic!("a fragmented MP4 input is Unsupported, got {other:?}"),
+    }
 }
