@@ -2,14 +2,14 @@
 //!
 //! A subtitle file comes from a torrent and is hostile input: nothing here may
 //! panic on one, hang on one, or allocate more than a multiple of the file's
-//! own size. Malformed cue blocks inside an otherwise valid file are skipped,
-//! never an error: a caption file with one bad cue still has the rest of the
-//! conversation to show. The only whole-file error is the cue count, which
-//! keeps one file from holding a million cues behind a small byte budget.
+//! own size. The parsers borrow their lines from the decoded text rather than
+//! copy them, so a 4 MiB file holds one decoded `String` and a few small
+//! scratch buffers, not a `Vec<String>` of every line.
 //!
-//! Embedded subtitles, the cues a Matroska or MP4 track carries for itself,
-//! are not read here. They need a track's frames, and those arrive with the
-//! Matroska and MP4 readers.
+//! Malformed cue blocks inside an otherwise valid file are skipped, never an
+//! error: a caption file with one bad cue still has the rest of the
+//! conversation to show. The only whole-file error is the cue count, which is
+//! enforced the moment a kept cue would be number [`MAX_CUES`] + 1.
 
 use crate::{MAX_CUES, MediaError, SUBTITLE_FILE_CAP};
 
@@ -42,10 +42,13 @@ pub enum SubtitleFormat {
 
 /// What format a subtitle file is, from its name's extension.
 ///
-/// `.srt`, `.ass`, `.ssa` and `.vtt`, case-insensitive. Anything else, a file
-/// with no name, or a name with no extension is no subtitle file here.
+/// `.srt`, `.ass`, `.ssa` and `.vtt`, case-insensitive. A name without a
+/// dot, or with an empty stem (`"srt"`, `".srt"`), is no subtitle file here.
 pub fn subtitle_format(file_name: &str) -> Option<SubtitleFormat> {
-    let ext = file_name.rsplit('.').next()?;
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
     match ext.to_ascii_lowercase().as_str() {
         "srt" => Some(SubtitleFormat::Srt),
         "ass" | "ssa" => Some(SubtitleFormat::Ass),
@@ -58,12 +61,14 @@ pub fn subtitle_format(file_name: &str) -> Option<SubtitleFormat> {
 ///
 /// The file is at most [`SUBTITLE_FILE_CAP`] bytes, and no file may hold more
 /// than [`MAX_CUES`] cues: past either bound it is [`MediaError::Unsupported`]
-/// and [`MediaError::Malformed`] respectively, before or during the parse.
-/// A cue whose block does not parse is skipped, so a hostile file gives its
-/// good cues back and drops the rest rather than failing the file.
+/// and [`MediaError::Malformed`] respectively. The cue cap is enforced while
+/// parsing, the moment a kept cue would be number `MAX_CUES + 1`, so a file
+/// of a million cues does not grow a list of a million cues first.
 ///
-/// A cue with `end_ms <= start_ms` is dropped too: it would never be on
-/// screen, and a file of them would only grow the list.
+/// A cue whose block does not parse is skipped, so a hostile file gives its
+/// good cues back and drops the rest rather than failing the file. A cue with
+/// `end_ms <= start_ms` is dropped before it counts: it would never be on
+/// screen, and a file of them is not a file with too many cues.
 pub fn file_cues(bytes: &[u8], format: SubtitleFormat) -> Result<Vec<Cue>, MediaError> {
     if (bytes.len() as u64) > SUBTITLE_FILE_CAP {
         return Err(MediaError::Unsupported(format!(
@@ -74,17 +79,11 @@ pub fn file_cues(bytes: &[u8], format: SubtitleFormat) -> Result<Vec<Cue>, Media
     }
     let text = decode(bytes);
     let mut cues: Vec<Cue> = match format {
-        SubtitleFormat::Srt => srt_cues(&text),
-        SubtitleFormat::Ass => ass_cues(&text),
-        SubtitleFormat::Vtt => vtt_cues(&text),
+        SubtitleFormat::Srt => srt_cues(&text)?,
+        SubtitleFormat::Ass => ass_cues(&text)?,
+        SubtitleFormat::Vtt => vtt_cues(&text)?,
     };
-    if cues.len() > MAX_CUES {
-        return Err(MediaError::Malformed(format!(
-            "subtitle file holds more than {MAX_CUES} cues"
-        )));
-    }
     cues.sort_by_key(|cue| cue.start_ms);
-    cues.retain(|cue| cue.end_ms > cue.start_ms);
     Ok(cues)
 }
 
@@ -99,41 +98,77 @@ fn decode(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The file's lines, accepting `\n`, `\r\n` and a lone `\r`.
+/// The file's lines, as borrowed slices of `text`, accepting `\n`, `\r\n`
+/// and a lone `\r` as one line ending.
 ///
 /// Subtitle files are written by hand, by converters and by players on every
 /// platform, so all three line endings occur in the wild. A `\r\n` is one
 /// line ending, not two, so a cue's number line and its timing line stay
-/// adjacent. A trailing newline leaves one empty line, and the parsers treat
-/// empty lines as the separators they are.
-fn lines(text: &str) -> Vec<String> {
+/// adjacent. The lines borrow from `text`, so a 4 MiB file holds one decoded
+/// `String` and a slice of its line starts, not a copy of every line.
+fn lines(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    let mut current = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\n' => {
-                out.push(std::mem::take(&mut current));
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&text[start..i]);
+                i += 1;
+                start = i;
             }
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
+            b'\r' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    out.push(&text[start..i]);
+                    i += 2;
+                } else {
+                    out.push(&text[start..i]);
+                    i += 1;
                 }
-                out.push(std::mem::take(&mut current));
+                start = i;
             }
-            _ => current.push(c),
+            _ => i += 1,
         }
     }
-    if !current.is_empty() {
-        out.push(current);
+    if start < bytes.len() || (start == 0 && bytes.is_empty()) || !text.is_empty() {
+        // A trailing line without a newline, or the empty string.
+        if start < text.len() {
+            out.push(&text[start..]);
+        }
     }
     out
+}
+
+/// Add a cue to `cues`, dropping it when it has no text or `end_ms` does not
+/// exceed `start_ms`, and refusing the file when a kept cue would be number
+/// [`MAX_CUES`] + 1.
+fn push_cue(
+    cues: &mut Vec<Cue>,
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+) -> Result<(), MediaError> {
+    if text.is_empty() || end_ms <= start_ms {
+        return Ok(());
+    }
+    if cues.len() >= MAX_CUES {
+        return Err(MediaError::Malformed(format!(
+            "subtitle file holds more than {MAX_CUES} cues"
+        )));
+    }
+    cues.push(Cue {
+        start_ms,
+        end_ms,
+        text,
+    });
+    Ok(())
 }
 
 /// SRT cue blocks: an optional number line, a timing line, one or more text
 /// lines, then an empty line. A block whose timing line does not parse is
 /// skipped to its empty line, and the rest of the file still parses.
-fn srt_cues(text: &str) -> Vec<Cue> {
+fn srt_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     let mut cues = Vec::new();
     let lines = lines(text);
     let mut i = 0;
@@ -148,87 +183,93 @@ fn srt_cues(text: &str) -> Vec<Cue> {
         // The cue number, when there is one: it is the line before a timing
         // line, never a text line.
         let number_here =
-            lines[i].trim().chars().all(|c| c.is_ascii_digit()) && !lines[i].trim().is_empty();
+            !lines[i].trim().is_empty() && lines[i].trim().chars().all(|c| c.is_ascii_digit());
         if number_here {
             i += 1;
-            if i >= lines.len() || srt_timing(&lines[i]).is_none() {
-                // A number with no timing line after it: a block out of place,
-                // to the next empty line.
+            if i >= lines.len() || srt_timing(lines[i]).is_none() {
+                // A number with no timing line after it: a block out of
+                // place, to the next empty line.
                 skip_block(&lines, &mut i);
                 continue;
             }
-        } else if srt_timing(&lines[i]).is_none() {
+        } else if srt_timing(lines[i]).is_none() {
             // Not a number and not a timing: a text line or garbage, and it
             // runs to the next empty line.
             skip_block(&lines, &mut i);
             continue;
         }
-        let (start_ms, end_ms) = match srt_timing(&lines[i]) {
-            Some(timing) => timing,
-            None => unreachable!("checked above"),
-        };
+        let timing = srt_timing(lines[i]).expect("checked above");
+        let (start_ms, end_ms) = timing;
         i += 1;
-        let mut text_lines = Vec::new();
+        let text_start = i;
         while i < lines.len() && !lines[i].is_empty() {
-            text_lines.push(lines[i].clone());
             i += 1;
         }
-        let text = clean_html_tags(&text_lines.join("\n"));
-        push_cue(&mut cues, start_ms, end_ms, text);
+        let mut text = String::new();
+        for (idx, line) in lines[text_start..i].iter().enumerate() {
+            if idx > 0 {
+                text.push('\n');
+            }
+            text.push_str(line);
+        }
+        push_cue(&mut cues, start_ms, end_ms, clean_html_tags(&text))?;
     }
-    cues
+    Ok(cues)
 }
 
 /// Walk past a line that is not a cue block's start.
-fn skip_block(lines: &[String], i: &mut usize) {
+fn skip_block(lines: &[&str], i: &mut usize) {
     while *i < lines.len() && !lines[*i].is_empty() {
         *i += 1;
     }
 }
 
-/// `HH:MM:SS,mmm --> HH:MM:SS,mmm`.
+/// `HH:MM:SS,mmm --> HH:MM:SS.mmm`, the milliseconds separated by `,` or `.`,
+/// and only the first whitespace-separated token after `-->` is the end time:
+/// SRT `X1:` coordinates and anything else are ignored.
 fn srt_timing(line: &str) -> Option<(u64, u64)> {
     let line = line.trim();
     let (start, rest) = line.split_once("-->")?;
     let start = srt_time(start.trim())?;
-    let end = srt_time(rest.trim())?;
+    let end = srt_time(rest.split_whitespace().next()?)?;
     Some((start, end))
 }
 
-/// One SRT time, `HH:MM:SS,mmm`, in milliseconds.
+/// One SRT time, `HH:MM:SS,mmm` or `HH:MM:SS.mmm`, in milliseconds.
 ///
-/// The fields are parsed as decimal strings and combined with checked
+/// The fields are parsed as ASCII decimal strings and combined with checked
 /// arithmetic, so an hours value that overflows `u64` milliseconds is a cue
 /// that does not parse, not a panic. A cue whose timestamp does not fit the
 /// millisecond arithmetic of the file is skipped, and the rest of the file
 /// still comes back.
 fn srt_time(field: &str) -> Option<u64> {
-    let (hms, millis) = field.split_once(',')?;
+    let field = field.trim();
+    let (hms, millis) = field.rsplit_once(',').or_else(|| field.rsplit_once('.'))?;
     let (h, ms) = hms.split_once(':')?;
     let (m, s) = ms.split_once(':')?;
-    let millis: u64 = millis.trim().parse().ok()?;
+    let millis = ascii_u64(millis.trim())?;
     if millis > 999 {
         return None;
     }
-    let h = parse_hms(h.trim(), 3_600_000)?;
-    let m = parse_hms(m.trim(), 60_000)?;
-    let s = parse_hms(s.trim(), 1_000)?;
+    let h = parse_hms(h.trim(), 3_600_000, u64::MAX)?;
+    let m = parse_hms(m.trim(), 60_000, 59)?;
+    let s = parse_hms(s.trim(), 1_000, 59)?;
     h.checked_add(m)?.checked_add(s)?.checked_add(millis)
 }
 
 /// One ASS time, `H:MM:SS.cc`, in milliseconds.
 fn ass_time(field: &str) -> Option<u64> {
     let field = field.trim();
-    let (hms, cents) = field.split_once('.')?;
-    let cents: u64 = cents.trim().parse().ok()?;
+    let (hms, cents) = field.rsplit_once('.')?;
+    let cents = ascii_u64(cents.trim())?;
     if cents > 99 {
         return None;
     }
     let (h, ms) = hms.split_once(':')?;
     let (m, s) = ms.split_once(':')?;
-    let h = parse_hms(h.trim(), 3_600_000)?;
-    let m = parse_hms(m.trim(), 60_000)?;
-    let s = parse_hms(s.trim(), 1_000)?;
+    let h = parse_hms(h.trim(), 3_600_000, u64::MAX)?;
+    let m = parse_hms(m.trim(), 60_000, 59)?;
+    let s = parse_hms(s.trim(), 1_000, 59)?;
     h.checked_add(m)?
         .checked_add(s)?
         .checked_add(cents.checked_mul(10)?)
@@ -236,57 +277,76 @@ fn ass_time(field: &str) -> Option<u64> {
 
 /// One WebVTT time, `[HH:]MM:SS.mmm`, in milliseconds.
 fn vtt_time(field: &str) -> Option<u64> {
-    let (hms, millis) = field.split_once('.')?;
-    let millis: u64 = millis.trim().parse().ok()?;
+    let field = field.trim();
+    let (hms, millis) = field.rsplit_once('.')?;
+    let millis = ascii_u64(millis.trim())?;
     if millis > 999 {
         return None;
     }
-    let parts: Vec<&str> = hms.split(':').collect();
-    let (h, m, s) = match parts.as_slice() {
+    let (h, m, s) = match hms.split(':').collect::<Vec<_>>().as_slice() {
         [h, m, s] => (*h, *m, *s),
-        [m, s] => ("0", *m, *s),
+        [m, s] => ("", *m, *s),
         _ => return None,
     };
-    let h = parse_hms(h.trim(), 3_600_000)?;
-    let m = parse_hms(m.trim(), 60_000)?;
-    let s = parse_hms(s.trim(), 1_000)?;
+    let h = parse_hms(h.trim(), 3_600_000, u64::MAX)?;
+    let m = parse_hms(m.trim(), 60_000, 59)?;
+    let s = parse_hms(s.trim(), 1_000, 59)?;
     h.checked_add(m)?.checked_add(s)?.checked_add(millis)
 }
 
-/// One decimal field, as a multiple of `per`, with the field's own range
-/// capped so the multiplication is checked against a known bound.
+/// One ASCII decimal field, as a multiple of `per`, not exceeding `max`.
 ///
-/// The cap is `1_000_000_000` per field. A field that fits the format's own
-/// range but overflows the milliseconds of the whole timestamp is then
-/// caught by the checked multiplication, which is the same shape as a field
-/// that overflows the format's range.
-fn parse_hms(field: &str, per: u64) -> Option<u64> {
-    let v: u128 = field.trim().parse().ok()?;
-    if v >= 1_000_000_000 {
+/// A leading `+` or `-` makes the field unparsable: the formats use unsigned
+/// fields, and a signed one is a cue out of place. The value is multiplied
+/// with checked arithmetic, so a value that fits the field's own range but
+/// overflows the milliseconds of the whole timestamp is a no-cue, not a
+/// panic.
+fn parse_hms(field: &str, per: u64, max: u64) -> Option<u64> {
+    let v = ascii_u64(field.trim())?;
+    if v > max {
         return None;
     }
-    let ms = v * per as u128;
-    u64::try_from(ms).ok()
+    v.checked_mul(per)
+}
+
+/// An ASCII decimal unsigned integer. A leading `+` or `-`, or any non-digit
+/// byte, is `None`.
+fn ascii_u64(field: &str) -> Option<u64> {
+    let bytes = field.as_bytes();
+    let mut v: u128 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u128)?;
+        if v > u64::MAX as u128 {
+            return None;
+        }
+    }
+    Some(v as u64)
 }
 
 /// ASS: the `[Events]` section, a `Format:` line that names its columns, and
 /// one cue per `Dialogue:` line.
 ///
-/// When there is no `[Events]` section, the whole file is the events, and the
-/// standard column order is used. When the `[Events]` section has no
-/// `Format:` line, the standard order is used too. The standard order is the
-/// one the prompt spells out: Layer, Start, End, Style, Name, MarginL,
-/// MarginR, MarginV, Effect, Text.
-fn ass_cues(text: &str) -> Vec<Cue> {
+/// The `Format:` line is read only from inside the `[Events]` section: a
+/// `[V4+ Styles]` `Format:` line never applies to `Dialogue:` lines. With no
+/// `[Events]` section, `Dialogue:` lines anywhere use the standard column
+/// order. When the section has no `Format:` line, the standard order is used
+/// too. The standard order is the one the prompt spells out: Layer, Start,
+/// End, Style, Name, MarginL, MarginR, MarginV, Effect, Text.
+fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     // The [Events] section, or the whole file when there is no section header.
     let events = match text.find("[Events]") {
         Some(pos) => text[pos..].trim_start_matches("[Events]"),
         None => text,
     };
-    let format_fields: Vec<String> = events
-        .lines()
+    // The column order, from the section's Format: line, or the standard
+    // order when there is none.
+    let format_fields: Vec<String> = split_lines(events)
+        .iter()
         .find_map(|line| {
-            let fields = line.strip_prefix("Format:")?;
+            let fields = line.trim().strip_prefix("Format:")?;
             Some(
                 fields
                     .split(',')
@@ -310,15 +370,17 @@ fn ass_cues(text: &str) -> Vec<Cue> {
         format_fields.iter().position(|f| f == "text"),
     ) {
         (Some(s), Some(e), Some(t)) => (s, e, t),
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let mut cues = Vec::new();
-    for line in events.lines() {
+    for line in split_lines(events) {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("Dialogue:") else {
             continue;
         };
-        let fields: Vec<&str> = rest.split(',').collect();
+        // Split at most text_col + 1 fields: the text is the last one, whole,
+        // so a comma inside the text stays whole.
+        let fields: Vec<&str> = rest.splitn(text_col + 1, ',').collect();
         if fields.len() <= text_col {
             continue;
         }
@@ -328,26 +390,23 @@ fn ass_cues(text: &str) -> Vec<Cue> {
             (Some(s), Some(e)) => (s, e),
             _ => continue,
         };
-        // The text is everything after the text column's leading commas, so a
-        // comma inside the text stays whole.
-        let mut tail = rest;
-        for _ in 0..text_col {
-            let Some(pos) = tail.find(',') else {
-                break;
-            };
-            tail = &tail[pos + 1..];
-        }
-        let text = clean_ass(tail);
-        push_cue(&mut cues, start, end, text);
+        let text = clean_ass(fields[text_col]);
+        push_cue(&mut cues, start, end, text)?;
     }
-    cues
+    Ok(cues)
+}
+
+/// The lines of `text` for the ASS parser: the same three line endings as
+/// [`lines`], borrowed.
+fn split_lines(text: &str) -> Vec<&str> {
+    lines(text)
 }
 
 /// WebVTT: the `WEBVTT` header, `NOTE`/`STYLE`/`REGION` blocks and cue timing
 /// lines. A cue may open with an identifier line before its timing line, and
 /// the timing line may carry cue settings after the end time, which are
 /// ignored.
-fn vtt_cues(text: &str) -> Vec<Cue> {
+fn vtt_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     let mut cues = Vec::new();
     let lines = lines(text);
     let mut i = 0;
@@ -375,16 +434,16 @@ fn vtt_cues(text: &str) -> Vec<Cue> {
             break;
         }
         // NOTE, STYLE and REGION blocks run to the next blank line.
-        if is_vtt_block(&lines[i]) {
+        if is_vtt_block(lines[i]) {
             i += 1;
             while i < lines.len() && !lines[i].is_empty() {
                 i += 1;
             }
             continue;
         }
-        let timing_line = if vtt_timing(&lines[i]).is_some() {
+        let timing_line = if vtt_timing(lines[i]).is_some() {
             i
-        } else if i + 1 < lines.len() && vtt_timing(&lines[i + 1]).is_some() {
+        } else if i + 1 < lines.len() && vtt_timing(lines[i + 1]).is_some() {
             // An identifier line, when there is one.
             i + 1
         } else {
@@ -393,94 +452,100 @@ fn vtt_cues(text: &str) -> Vec<Cue> {
             skip_block_vtt(&lines, &mut i);
             continue;
         };
-        let (start_ms, end_ms) = match vtt_timing(&lines[timing_line]) {
+        let (start_ms, end_ms) = match vtt_timing(lines[timing_line]) {
             Some(timing) => timing,
             None => continue,
         };
         i = timing_line + 1;
-        let mut text_lines = Vec::new();
+        let text_start = i;
         while i < lines.len() && !lines[i].is_empty() {
-            text_lines.push(lines[i].clone());
             i += 1;
         }
-        let text = clean_html_tags(&text_lines.join("\n"));
-        push_cue(&mut cues, start_ms, end_ms, text);
+        let mut text = String::new();
+        for (idx, line) in lines[text_start..i].iter().enumerate() {
+            if idx > 0 {
+                text.push('\n');
+            }
+            text.push_str(line);
+        }
+        push_cue(&mut cues, start_ms, end_ms, clean_html_tags(&text))?;
     }
-    cues
+    Ok(cues)
 }
 
 /// A `NOTE`, `STYLE` or `REGION` block's first line.
 fn is_vtt_block(line: &str) -> bool {
     let trimmed = line.trim_start();
-    ["NOTE", "STYLE", "REGION"]
-        .iter()
-        .any(|tag| trimmed == *tag || trimmed.starts_with(&format!("{tag} ")))
+    ["NOTE", "STYLE", "REGION"].iter().any(|tag| {
+        trimmed == *tag
+            || trimmed.starts_with(tag)
+                && trimmed.len() > tag.len()
+                && trimmed.as_bytes()[tag.len()] == b' '
+    })
 }
 
-/// `00:00:00.500 --> 00:00:02.000`, the hours optional, cue settings after
-/// the end time ignored.
+/// `00:00:00.500 --> 00:00:02.000`, the hours optional, only the first
+/// whitespace-separated token after `-->` is the end time: cue settings are
+/// ignored.
 fn vtt_timing(line: &str) -> Option<(u64, u64)> {
     let line = line.trim();
     let (start, rest) = line.split_once("-->")?;
     let start = vtt_time(start.trim())?;
-    let end_field = rest.split_whitespace().next()?;
-    let end = vtt_time(end_field)?;
+    let end = vtt_time(rest.split_whitespace().next()?)?;
     Some((start, end))
 }
 
 /// Skip a VTT block that is not a cue: a line that is neither a block header
 /// nor a timing line, running to the next blank.
-fn skip_block_vtt(lines: &[String], i: &mut usize) {
+fn skip_block_vtt(lines: &[&str], i: &mut usize) {
     while *i < lines.len() && !lines[*i].is_empty() {
         *i += 1;
     }
 }
 
-/// A cleaned cue, dropped when it has no time or nothing to say.
-fn push_cue(cues: &mut Vec<Cue>, start_ms: u64, end_ms: u64, text: String) {
-    if text.is_empty() {
-        return;
-    }
-    cues.push(Cue {
-        start_ms,
-        end_ms,
-        text,
-    });
-}
-
 /// ASS text: `{...}` override blocks gone, `\N` and `\n` newlines, `\h` a
-/// space. The rest of the text is kept, so a cue that does not use
-/// overrides is unchanged.
+/// space. The rest of the text is kept, so a cue that does not use overrides
+/// is unchanged. An unclosed `{` keeps the rest of the text as literal.
 fn clean_ass(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
+    let mut i = 0usize;
+    while i < text.len() {
+        let c = text.as_bytes()[i] as char;
+        match c {
             '{' => {
-                // Drop to the closing brace, or the end when there is none.
-                match chars[i + 1..].iter().position(|&c| c == '}') {
+                // Drop to the closing brace, or keep the rest as literal when
+                // there is none.
+                match text[i + 1..].find('}') {
                     Some(close) => i = i + 2 + close,
-                    None => break,
+                    None => {
+                        out.push_str(&text[i..]);
+                        break;
+                    }
                 }
             }
-            '\\' => match chars.get(i + 1) {
-                Some('N') | Some('n') => {
-                    i += 2;
-                    out.push('\n');
+            '\\' => {
+                let next = text.as_bytes().get(i + 1).copied();
+                match next {
+                    Some(b'N') | Some(b'n') => {
+                        i += 2;
+                        out.push('\n');
+                    }
+                    Some(b'h') => {
+                        i += 2;
+                        out.push(' ');
+                    }
+                    _ => {
+                        // A lone backslash: keep it, and advance one char.
+                        let char_len = (text.as_bytes()[i] as char).len_utf8();
+                        out.push_str(&text[i..i + char_len]);
+                        i += char_len;
+                    }
                 }
-                Some('h') => {
-                    i += 2;
-                    out.push(' ');
-                }
-                _ => {
-                    out.push(chars[i]);
-                    i += 1;
-                }
-            },
-            c => {
-                out.push(c);
-                i += 1;
+            }
+            _ => {
+                let char_len = (text.as_bytes()[i] as char).len_utf8();
+                out.push_str(&text[i..i + char_len]);
+                i += char_len;
             }
         }
     }
@@ -488,29 +553,38 @@ fn clean_ass(text: &str) -> String {
 }
 
 /// SRT and VTT text: `<...>` tags gone, except `<i>`, `<b>` and `<u>` and
-/// their closing forms, which the WebVTT engine renders.
+/// their closing forms, which the WebVTT engine renders. The kept tags match
+/// case-insensitively and are kept as written. An unclosed `<` keeps the rest
+/// of the text as literal.
 fn clean_html_tags(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '<' {
-            let Some(close) = chars[i + 1..].iter().position(|&c| c == '>') else {
-                // An unclosed tag: drop to the end.
-                break;
-            };
-            let tag: String = chars[i + 1..i + 1 + close].iter().collect();
-            let tag = tag.trim();
-            let kept = matches!(tag, "i" | "b" | "u" | "/i" | "/b" | "/u");
-            if kept {
-                out.push('<');
-                out.push_str(tag);
-                out.push('>');
+    let mut i = 0usize;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'<' {
+            match text[i + 1..].find('>') {
+                Some(close) => {
+                    let tag = text[i + 1..i + 1 + close].trim();
+                    let kept = matches!(
+                        tag.to_ascii_lowercase().as_str(),
+                        "i" | "b" | "u" | "/i" | "/b" | "/u"
+                    );
+                    if kept {
+                        out.push('<');
+                        out.push_str(tag);
+                        out.push('>');
+                    }
+                    i = i + 2 + close;
+                }
+                None => {
+                    // An unclosed tag: keep the rest as literal text.
+                    out.push_str(&text[i..]);
+                    break;
+                }
             }
-            i = i + 2 + close;
         } else {
-            out.push(chars[i]);
-            i += 1;
+            let char_len = (text.as_bytes()[i] as char).len_utf8();
+            out.push_str(&text[i..i + char_len]);
+            i += char_len;
         }
     }
     out
@@ -568,9 +642,11 @@ mod tests {
 
     #[test]
     fn huge_hours_are_skipped_not_a_panic() {
-        let bytes = b"1\r\n99999999999999999999:00:00,000 --> 99999999999999999999:00:01,000\r\nHuge\r\n\r\n2\r\n00:00:01,000 --> 00:00:02,000\r\nSmall\r\n";
+        // 20 digits of hours: overflows u64, no cue. 13 digits: fits u64 but
+        // overflows u64 milliseconds, also no cue.
+        let bytes = b"1\r\n99999999999999999999:00:00,000 --> 99999999999999999999:00:01,000\r\nHuge\r\n\r\n2\r\n6000000000000:00:00,000 --> 6000000000000:00:01,000\r\nBig\r\n\r\n3\r\n00:00:01,000 --> 00:00:02,000\r\nSmall\r\n";
         let cues = file_cues(bytes, SubtitleFormat::Srt).expect("no panic");
-        assert_eq!(cues.len(), 1, "the huge cue is skipped");
+        assert_eq!(cues.len(), 1, "the huge cues are skipped");
         assert_eq!(cues[0].start_ms, 1000);
         assert_eq!(cues[0].text, "Small");
     }
@@ -643,5 +719,59 @@ mod tests {
         assert_eq!(cues[0].start_ms, 500);
         assert_eq!(cues[0].end_ms, 2000);
         assert_eq!(cues[0].text, "Default order");
+    }
+
+    #[test]
+    fn unclosed_tags_stay_text() {
+        // SRT: an unclosed < keeps the rest as literal.
+        let bytes = b"1\r\n00:00:00,000 --> 00:00:01,000\r\n1 < 2 and more\r\n";
+        let cues = file_cues(bytes, SubtitleFormat::Srt).expect("no panic");
+        assert_eq!(cues[0].text, "1 < 2 and more");
+        // ASS: an unclosed { keeps the rest as literal.
+        let bytes = b"Dialogue: 0,0:00:00.50,0:00:02.00,Default,,0,0,0,,a { b\r\n";
+        let cues = file_cues(bytes, SubtitleFormat::Ass).expect("no panic");
+        assert_eq!(cues[0].text, "a { b");
+    }
+
+    #[test]
+    fn srt_dot_milliseconds_and_coordinates() {
+        // SRT accepts . before the milliseconds, and X1: coordinates after
+        // the end time are ignored.
+        let bytes = b"1\r\n00:00:00.500 --> 00:00:02.000 X1:123\r\nDot\r\n";
+        let cues = file_cues(bytes, SubtitleFormat::Srt).expect("no panic");
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start_ms, 500);
+        assert_eq!(cues[0].end_ms, 2000);
+        assert_eq!(cues[0].text, "Dot");
+    }
+
+    #[test]
+    fn minutes_over_59_are_skipped() {
+        // A minutes field over 59 makes the cue unparsable, not a panic.
+        let bytes = b"1\r\n00:75:00,000 --> 00:75:01,000\r\nBad\r\n\r\n2\r\n00:00:01,000 --> 00:00:02,000\r\nGood\r\n";
+        let cues = file_cues(bytes, SubtitleFormat::Srt).expect("no panic");
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start_ms, 1000);
+        assert_eq!(cues[0].text, "Good");
+    }
+
+    #[test]
+    fn ass_lone_cr_line_endings() {
+        // The fixture sub.ass with every \n replaced by \r gives the same
+        // cues as ass_file.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sub.ass"
+        ))
+        .expect("sub.ass");
+        let original: Vec<u8> = bytes
+            .iter()
+            .map(|b| if *b == b'\n' { b'\r' } else { *b })
+            .collect();
+        let cues = file_cues(&original, SubtitleFormat::Ass).expect("no panic");
+        assert_eq!(cues.len(), 3, "the ass fixture with lone CR has three cues");
+        assert_eq!(cues[0].start_ms, 500);
+        assert_eq!(cues[0].end_ms, 2000);
+        assert_eq!(cues[0].text, "First ASS line\nspanning two lines");
     }
 }

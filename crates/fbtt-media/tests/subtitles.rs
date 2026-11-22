@@ -104,6 +104,9 @@ fn subtitle_format_is_by_extension() {
     assert_eq!(subtitle_format("movie.txt"), None);
     assert_eq!(subtitle_format("movie"), None);
     assert_eq!(subtitle_format("movie.srt.bak"), None);
+    // A name with no stem, or a bare extension, is no subtitle file.
+    assert_eq!(subtitle_format("srt"), None);
+    assert_eq!(subtitle_format(".srt"), None);
 }
 
 #[test]
@@ -145,11 +148,12 @@ fn too_many_cues_is_malformed() {
 
 #[test]
 fn huge_timestamp_is_skipped() {
-    // 20 digits of hours: the milliseconds overflow a u64, so the cue is
-    // unparsable and skipped, and the valid cue still comes back.
-    let bytes = b"1\r\n99999999999999999999:00:00,000 --> 99999999999999999999:00:01,000\r\nHuge\r\n\r\n2\r\n00:00:01,000 --> 00:00:02,000\r\nSmall\r\n";
+    // 6 000 000 000 000 hours: fits u64, but times 3 600 000 exceeds
+    // u64::MAX, so the cue is unparsable and skipped. The 20-digit case is
+    // over u64 itself, also skipped.
+    let bytes = b"1\r\n6000000000000:00:00,000 --> 6000000000000:00:01,000\r\nHuge\r\n\r\n2\r\n99999999999999999999:00:00,000 --> 99999999999999999999:00:01,000\r\nOver\r\n\r\n3\r\n00:00:01,000 --> 00:00:02,000\r\nSmall\r\n";
     let cues = file_cues(bytes, SubtitleFormat::Srt).expect("no panic");
-    assert_eq!(cues.len(), 1, "the huge cue is skipped, not a panic");
+    assert_eq!(cues.len(), 1, "the huge cues are skipped, not a panic");
     assert_eq!(
         cues[0],
         Cue {
@@ -168,4 +172,19 @@ fn a_file_over_the_cap_is_unsupported() {
         matches!(err, MediaError::Unsupported(_)),
         "a file over the cap is Unsupported, got {err:?}"
     );
+}
+
+#[test]
+fn zero_length_cues_do_not_count() {
+    // 100 001 SRT cues with end == start: they are all dropped, so the cue
+    // cap is never reached and the file is Ok, not Malformed.
+    let block = "1\n00:00:00,000 --> 00:00:00,000\nx\n\n";
+    let mut s = String::with_capacity(100_001 * block.len());
+    for _ in 0..100_001 {
+        s.push_str(block);
+    }
+    assert!(s.len() <= 4 * 1024 * 1024, "the input fits the file cap");
+    let cues = file_cues(s.as_bytes(), SubtitleFormat::Srt)
+        .expect("zero-length cues do not count toward the cap");
+    assert!(cues.is_empty(), "all zero-length cues are dropped");
 }
