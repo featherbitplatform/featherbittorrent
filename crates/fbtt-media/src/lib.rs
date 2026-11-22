@@ -2,11 +2,11 @@
 //!
 //! It is pure, synchronous Rust over `Read + Seek`: no tokio, no network, no engine. A caller hands
 //! it any reader it likes - a file, a piece of a torrent behind a timeout, a `Cursor` over bytes in a
-//! test - and this crate probes it ([`probe`()]), opens one of its Matroska tracks for streaming
-//! ([`open_track`]), turns a track's samples into fragmented MP4 ([`init_segment`], [`FragmentStream`]),
-//! and reads text subtitles into cues (`subtitle`, from Task 5). It copies
-//! bytes: nothing here decodes or transcodes, which is what the plan's "no transcoding, no native
-//! libraries" rule asks of it.
+//! test - and this crate probes it ([`probe`()]), opens one of its video or audio tracks for
+//! streaming ([`open_track`], whichever of Matroska, WebM or MP4 holds it), turns a track's samples
+//! into fragmented MP4 ([`init_segment`], [`FragmentStream`]), and reads text subtitles into cues
+//! (`subtitle`, from Task 5). It copies bytes: nothing here decodes or transcodes, which is what the
+//! plan's "no transcoding, no native libraries" rule asks of it.
 //!
 //! Everything a file claims is treated as untrusted: sizes are bounded by [`CappedLen`] and
 //! [`ELEMENT_CAP`], the calls a header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], and a
@@ -18,6 +18,8 @@ pub mod capped;
 pub mod codec;
 pub mod fmp4;
 mod mkv;
+mod mp4in;
+mod open;
 pub mod probe;
 mod source;
 pub mod subtitle;
@@ -25,7 +27,7 @@ pub mod subtitle;
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind, sample_entry};
 pub use fmp4::{FragmentWriter, init_segment};
-pub use mkv::open_track;
+pub use open::open_track;
 pub use probe::{MediaInfo, TrackInfo, probe};
 pub use source::{FragmentStream, Sample, TrackConfig};
 pub use subtitle::{Cue, SubtitleFormat, file_cues, subtitle_format};
@@ -111,9 +113,26 @@ pub const MAX_FRAGMENT_SAMPLES: usize = 10_000;
 /// all, a start time past every frame - would otherwise walk a 100 GiB file
 /// sample by sample while its caller waits, which is the hang the plan's rules
 /// forbid. The bound is deliberately far above any real stream; hitting it is
-/// the `Malformed("no keyframe found")` verdict [`open_track`]
-/// reports for a track that never delivers.
+/// the `Malformed("too many frames without a sample")` verdict [`open_track`]
+/// reports for a Matroska track that never delivers. An MP4 track needs no
+/// bound like it: its samples are counted in the tables this walks before it
+/// reads a single sample's bytes (see [`MAX_MP4_SAMPLES`]).
 pub const MAX_SKIPPED_FRAMES: usize = 100_000;
+
+/// The most samples one MP4 track's sample tables may describe.
+///
+/// `stsz` states a count before it states any sizes, so a count is trusted only
+/// past this bound: a `u32` allows four billion samples, and the arrays that
+/// grow with a count are the container's own - one `u32` per sample in a `stsz`
+/// whose sizes vary, and one chunk offset per chunk, which in what ffmpeg writes
+/// for a track with no interleaving is one per sample too. Four billion of those
+/// is 16 GB of sizes and 32 GB of 64 bit offsets before this crate looks at
+/// anything else. The cap keeps them, and the one walk per open that checks them
+/// and finds a seek landing (an addition per sample, never a copy), inside what
+/// a file worth streaming is worth: 20 million samples is 80 MB of sizes and
+/// 160 MB of offsets, and dozens of times what a four hour video track holds at
+/// 30 frames a second.
+pub const MAX_MP4_SAMPLES: u64 = 20_000_000;
 
 /// Why a file could not be used.
 #[derive(Debug, thiserror::Error)]

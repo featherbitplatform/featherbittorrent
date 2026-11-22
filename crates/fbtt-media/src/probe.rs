@@ -69,19 +69,46 @@ pub struct MediaInfo {
 /// in each case there is no header to have got wrong. A file that starts like one
 /// of the three and whose header does not parse is [`MediaError::Malformed`].
 pub fn probe<R: Read + Seek>(mut reader: R) -> Result<MediaInfo, MediaError> {
+    match sniff(&mut reader)? {
+        Container::Matroska | Container::WebM => probe_matroska(&mut reader),
+        Container::Mp4 => probe_mp4(&mut reader),
+    }
+}
+
+/// Which container the eight bytes a caller read are, by the magic rule [`probe`] uses.
+///
+/// `Matroska` here means "EBML", which is Matroska *or* WebM: the two differ only
+/// in the EBML header's `DocType`, which is deeper than these eight bytes, so
+/// [`probe`] refines the answer when it reads that header and [`open_track`](crate::open_track)
+/// does not care at all - a track of either streams the same way.
+///
+/// [`MediaError::Unsupported`] for bytes that are neither magic, with the same
+/// message [`probe`] gives.
+pub(crate) fn sniff_container(magic: &[u8; 8]) -> Result<Container, MediaError> {
+    if magic[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Ok(Container::Matroska);
+    }
+    if magic[4..] == *b"ftyp" || magic[4..] == *b"moov" {
+        return Ok(Container::Mp4);
+    }
+    Err(MediaError::Unsupported(format!(
+        "not a Matroska, WebM or MP4 file: starts with {magic:02X?}"
+    )))
+}
+
+/// The container, read off the first eight bytes of a stream and rewound after.
+///
+/// A stream too short to hold those bytes is [`MediaError::Unsupported`] - there
+/// is no header in it to have got wrong - and any other read failure stays
+/// [`MediaError::Io`], which is how a torrent piece that has not arrived yet
+/// reaches a caller.
+pub(crate) fn sniff<R: Read + Seek>(reader: &mut R) -> Result<Container, MediaError> {
     let mut magic = [0u8; 8];
     match reader.read_exact(&mut magic) {
-        Ok(()) if magic[..4] == [0x1a, 0x45, 0xdf, 0xa3] => {
+        Ok(()) => {
             reader.rewind()?;
-            probe_matroska(&mut reader)
+            sniff_container(&magic)
         }
-        Ok(()) if magic[4..] == *b"ftyp" || magic[4..] == *b"moov" => {
-            reader.rewind()?;
-            probe_mp4(&mut reader)
-        }
-        Ok(()) => Err(MediaError::Unsupported(format!(
-            "not a Matroska, WebM or MP4 file: starts with {magic:02X?}"
-        ))),
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Err(
             MediaError::Unsupported("too short to hold a container header".to_string()),
         ),
@@ -201,7 +228,7 @@ pub(crate) fn matroska_audio_rate(track: &TrackEntry) -> u32 {
 /// What kind of media a Matroska track holds, or `None` for the track types
 /// that hold none: complex, logo, button, control and metadata tracks.
 ///
-/// [`open_track`](crate::mkv::open_track) maps the same track types the same way, which is
+/// [`open_track`](crate::open_track) maps the same track types the same way, which is
 /// why this is `pub(crate)` rather than private to the probe.
 pub(crate) fn matroska_kind(track: &TrackEntry) -> Option<TrackKind> {
     match track.track_type() {
@@ -223,7 +250,7 @@ fn ms_from_timecode(duration: f64, scale: u64) -> Option<u64> {
     }
 }
 
-/// The most top level boxes [`probe_mp4`] looks through before it gives up on
+/// The most top level boxes [`read_moov`] looks through before it gives up on
 /// finding a `moov`.
 ///
 /// Skipping a box is a seek, so the walk is cheap per box, but its length is the
@@ -232,17 +259,29 @@ fn ms_from_timecode(duration: f64, scale: u64) -> Option<u64> {
 /// behind 4096 boxes.
 const MAX_MOOV_SEARCH_BOXES: usize = 4096;
 
-/// The MP4 header, walking top level boxes until `moov`.
+/// The MP4 header: the `moov` box, and whether a `moof` turned up on the way to it.
 ///
 /// `mp4-atom`'s `moov` parser gives the same typed view it gives an MP4 muxer, so this reads track
 /// metadata through the models the writer uses. The `moov`'s own size goes through
 /// [`sized_moov_header`] before its bytes are read, because `mp4_atom` sizes its buffer from the
-/// declaration. Boxes before it (`ftyp`, `free`, and `mdat` in a file with `moov` last) are skipped
-/// by seeking, so a large media data box costs nothing, and the walk gives up after
+/// declaration. Boxes before it (`ftyp`, `free`, `moof`, and `mdat` in a file with `moov` last) are
+/// skipped by seeking, so a large media data box costs nothing, and the walk gives up after
 /// [`MAX_MOOV_SEARCH_BOXES`] of them: how many boxes there are is the file's choice, not ours.
-fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
+///
+/// The second half of the answer is how a reader tells a fragmented file: `mp4-atom` parses the
+/// `moov` of one happily - its sample tables are simply empty, the real ones being in the
+/// fragments - so `open_track` needs to know a `moof` was there, and `probe` does not care which
+/// kind of MP4 a file is.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] for a stream that ends, or runs to its end inside a box, without a
+/// `moov`; [`MediaError::Malformed`] for a `moov` that does not parse, or one only reachable past
+/// the box limit; [`MediaError::Io`] for a reader that failed.
+pub(crate) fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<(Moov, bool), MediaError> {
     let mut skipped = 0_usize;
-    let moov = loop {
+    let mut saw_moof = false;
+    loop {
         let Some(header) = <Option<Header> as ReadFrom>::read_from(reader).map_err(atom_error)?
         else {
             return Err(MediaError::Unsupported(
@@ -251,8 +290,10 @@ fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
         };
         if header.kind == FourCC::new(b"moov") {
             let moov = sized_moov_header(reader, &header)?;
-            break Moov::read_atom(&moov, reader).map_err(atom_error)?;
+            let moov = Moov::read_atom(&moov, reader).map_err(atom_error)?;
+            return Ok((moov, saw_moof));
         }
+        saw_moof |= header.kind == FourCC::new(b"moof");
         skipped += 1;
         if skipped > MAX_MOOV_SEARCH_BOXES {
             return Err(MediaError::Malformed(format!(
@@ -271,7 +312,14 @@ fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
         })?;
         // `Header::size` excludes the header, so this lands on the next box.
         reader.seek(SeekFrom::Current(body))?;
-    };
+    }
+}
+
+/// The MP4 header, through [`read_moov`], plus the tracks it describes.
+fn probe_mp4<R: Read + Seek>(reader: &mut R) -> Result<MediaInfo, MediaError> {
+    // A fragmented file's tracks are still tracks: the probe reports them, and
+    // `open_track` is the one that refuses to stream them (see `read_moov`).
+    let (moov, _saw_moof) = read_moov(reader)?;
 
     let mvhd = &moov.mvhd;
     let mut tracks = Vec::new();
@@ -302,7 +350,10 @@ fn capped_size(size: usize) -> u64 {
 /// may be, and otherwise handed back as the declared size the bounded reader wants.
 ///
 /// Task 4 reads a source file's `moov` the same way when it writes fragmented MP4 headers out of
-/// an existing file, which is why this is `pub(crate)`.
+/// an existing file (the `mp4in` module behind [`open_track`](crate::open_track)), which is why this
+/// is `pub(crate)`. The box walk that finds the header, and this bound on its contents, are the
+/// crate's only moov cap: an MP4 open pays for one `moov` worth of bytes, whichever of its tracks
+/// is opened.
 pub(crate) fn sized_moov_header<R: Read + Seek>(
     reader: &mut R,
     header: &Header,
@@ -342,7 +393,11 @@ fn ms_from_timescale(timescale: u32, duration: u64) -> Option<u64> {
 }
 
 /// An MP4 track, or `None` for a track whose handler carries no media.
-fn mp4_track(track: &mp4_atom::Trak) -> Result<Option<TrackInfo>, MediaError> {
+///
+/// [`open_track`](crate::open_track) reads the same fields the probe reports - kind, codec and its
+/// RFC 6381 strings - out of the track it is about to stream, so the mapping from a `hdlr` handler
+/// and a sample entry to a [`TrackInfo`] lives here once, and this is `pub(crate)` for that reason.
+pub(crate) fn mp4_track(track: &mp4_atom::Trak) -> Result<Option<TrackInfo>, MediaError> {
     let handler = track.mdia.hdlr.handler;
     let kind = if handler == FourCC::new(b"vide") {
         TrackKind::Video

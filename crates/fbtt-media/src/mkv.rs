@@ -1,12 +1,15 @@
 //! One Matroska track, remuxed into fragmented MP4 from any start time.
 //!
-//! [`open_track`] takes a reader, a track number and a start time, and hands
+//! [`open_source`] takes a reader, a track number and a start time, and hands
 //! back an [`MkvSource`]: a [`TrackSource`] that yields exactly that track's
 //! samples, in the order the container stores them, starting at the first sync
 //! point at or after the requested time. The samples are the container's own
 //! bytes - this crate copies, it does not decode - plus the timestamps, keyframe
 //! flags and durations the container states, in the timescale
 //! [`FragmentStream`](crate::FragmentStream) puts on the wire.
+//! [`open_track`](crate::open_track) is the public entry point: it sends a
+//! Matroska or WebM file here and an MP4 one to `mp4in`, and boxes whichever
+//! source comes back into that stream.
 //!
 //! Everything here treats the file as hostile. The pinned featherbit fork of
 //! `matroska-demuxer` overflow-checks the cue and offset arithmetic whose
@@ -30,7 +33,7 @@ use crate::capped::{CappedLen, ReadBudget};
 use crate::codec::{Codec, TrackKind};
 use crate::probe::{TrackInfo, matroska_audio_rate, matroska_error, matroska_kind, open_matroska};
 use crate::source::{
-    FragmentStream, Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource,
+    Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource, mp4_mime,
 };
 use crate::{ELEMENT_CAP, MAX_SKIPPED_FRAMES, MediaError};
 use matroska_demuxer::{
@@ -53,9 +56,9 @@ const VIDEO_TIMESCALE: u32 = 90_000;
 /// passed over after the demuxer has already read it - the seeking that skips
 /// whole clusters happens in the seek, not in the walk.
 ///
-/// The reader type stays private on purpose: [`open_track`] boxes this into a
-/// [`FragmentStream`] and hands that out, because the point of a source is its
-/// samples, not its type.
+/// The reader type stays private on purpose: [`open_track`](crate::open_track)
+/// boxes this into a [`FragmentStream`](crate::FragmentStream) and hands that
+/// out, because the point of a source is its samples, not its type.
 ///
 /// `R` stays the caller's own reader inside [`CappedLen`]: a `Box<dyn Read +
 /// Seek>` would erase a torrent reader's timeouts into the reader trait's
@@ -68,7 +71,9 @@ pub(crate) struct MkvSource<R: Read + Seek> {
     config: TrackConfig,
     /// `Content-Type` for a fragmented MP4 stream of this track: the container
     /// for the track's kind plus its RFC 6381 codec string, see [`mp4_mime`].
-    mime: String,
+    /// `pub(crate)` because [`open_track`](crate::open_track) reads it out before
+    /// the box takes the source's name with it.
+    pub(crate) mime: String,
     /// The container's own track number, compared against each frame's.
     track: u64,
     /// Nanoseconds of source time per container timestamp unit.
@@ -212,10 +217,16 @@ impl<R: Read + Seek> MkvSource<R> {
 
     /// Count one frame walked without emitting, and say whether the walk has
     /// gone on long enough to be a stream that never delivers.
+    ///
+    /// The verdict talks about frames rather than keyframes because that is what
+    /// is being counted: the other tracks' frames, the frames below a start time,
+    /// and the frames ahead of a keyframe that never arrives all add to it.
     fn walk_beyond_patience(&mut self) -> Option<MediaError> {
         self.skipped += 1;
         if self.skipped > MAX_SKIPPED_FRAMES {
-            Some(MediaError::Malformed("no keyframe found".to_string()))
+            Some(MediaError::Malformed(
+                "too many frames without a sample".to_string(),
+            ))
         } else {
             None
         }
@@ -472,11 +483,13 @@ enum FrameAction {
     Emit(bool),
 }
 
-/// Open one Matroska track for fragmented MP4.
+/// Open one Matroska or WebM track for fragmented MP4: the Matroska half of
+/// [`open_track`](crate::open_track), as the concrete source it boxes.
 ///
-/// `track` is the container's own `TrackNumber`; a track number above what a
-/// `u32` holds names a track this crate cannot open (`probe` refuses such a
-/// track the same way). `start_ms` is source time, and a seek lands forward,
+/// `track` is the container's own `TrackNumber`, which the public wrapper
+/// narrows from a `u32`; a track number above what a `u32` holds names a track
+/// this crate cannot open (`probe` refuses such a track the same way).
+/// `start_ms` is source time, and a seek lands forward,
 /// never back: the demuxer's walk gives the first frame at or after the
 /// target, and video's keyframe rule starts the stream at the first sync
 /// point at or after `start_ms` - the latest-at-or-before landing players
@@ -486,10 +499,10 @@ enum FrameAction {
 /// by one, so its samples start at or after it too. Zero opens from the
 /// track's first sample with no seek at all.
 ///
-/// The stream's [`mime`](FragmentStream::mime) is the fragmented MP4
-/// `Content-Type` for this track - `video/mp4` or `audio/mp4` plus the
-/// track's RFC 6381 codec string - because the bytes it produces are
-/// fragmented MP4 whatever the source container was.
+/// The source's `mime` field becomes the stream's [`mime`](crate::FragmentStream::mime):
+/// the fragmented MP4 `Content-Type` for this track - `video/mp4` or
+/// `audio/mp4` plus the track's RFC 6381 codec string - because the bytes it
+/// produces are fragmented MP4 whatever the source container was.
 ///
 /// The reader is wrapped in [`CappedLen`] with [`ELEMENT_CAP`], so the header
 /// parse and every frame read see a stream that refuses to claim more room
@@ -523,21 +536,6 @@ enum FrameAction {
 /// # Panics
 ///
 /// None. The demuxer's panics are caught, unwound, and reported.
-pub fn open_track<R: Read + Seek + Send + 'static>(
-    reader: R,
-    track: u32,
-    start_ms: u64,
-) -> Result<FragmentStream, MediaError> {
-    let source = open_source(reader, u64::from(track), start_ms)?;
-    // Read the mime out of the source before the box eats the name.
-    let mime = source.mime.clone();
-    FragmentStream::new(Box::new(source), mime)
-}
-
-/// The same open as [`open_track`], unbuilt into a stream: the concrete
-/// source, for this module's tests and for the box `open_track` puts it in.
-/// `track` is the container's full `TrackNumber` here; the public wrapper
-/// narrows a `u32` to it.
 pub(crate) fn open_source<R: Read + Seek>(
     reader: R,
     track: u64,
@@ -647,26 +645,6 @@ pub(crate) fn open_source<R: Read + Seek>(
         run_len: 0,
         frame: slot,
     })
-}
-
-/// The `Content-Type` a fragmented MP4 stream of this track is served under:
-/// the MP4 container for the track's kind, plus the track's RFC 6381 codec
-/// string - `video/mp4; codecs="avc1.64000A"`, `audio/mp4; codecs="opus"`.
-/// The codec string is not worked out twice: Task 1's `matroska_codec`
-/// already computed it when the track was identified, and this pastes that
-/// exact entry in. A codec the probe gave no RFC 6381 string gets the bare
-/// container type, which a `SourceBuffer` still accepts for the init segment
-/// it is about to parse.
-fn mp4_mime(kind: TrackKind, mime_codecs: &[String]) -> String {
-    let container = match kind {
-        TrackKind::Video => "video/mp4",
-        TrackKind::Audio => "audio/mp4",
-        TrackKind::Subtitle => unreachable!("subtitle tracks are refused before this"),
-    };
-    match mime_codecs.first() {
-        Some(codec) => format!("{container}; codecs=\"{codec}\""),
-        None => container.to_string(),
-    }
 }
 
 /// The bytes the container stripped off every block, in prepend order, or

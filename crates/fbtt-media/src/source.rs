@@ -6,7 +6,8 @@
 //! [`TrackConfig`] carries what [`init_segment`](crate::init_segment) and
 //! [`FragmentWriter`](crate::FragmentWriter) need before the first sample
 //! arrives. The sources themselves live in the container modules:
-//! [`mkv`](crate::mkv) opens a Matroska track; MP4 in is the plan's Task 4.
+//! [`mkv`](crate::mkv) opens a Matroska or WebM track, `mp4in` an MP4 one, and
+//! [`open_track`](crate::open_track) picks between them.
 use crate::codec::{Codec, TrackKind};
 
 /// One sample of one track: a packet out of a container, with its timestamps.
@@ -215,6 +216,26 @@ pub(crate) trait TrackSource: Send {
     /// this at zero and mean it.
     fn start_ms(&self) -> u64 {
         0
+    }
+}
+
+/// The `Content-Type` a fragmented MP4 stream of this track is served under:
+/// the MP4 container for the track's kind, plus the track's RFC 6381 codec
+/// string - `video/mp4; codecs="avc1.64000A"`, `audio/mp4; codecs="opus"`.
+/// The codec string is not worked out twice: the probe already computed it when
+/// the track was identified (see [`crate::codec`]), and this pastes that exact
+/// entry in, whichever container the track came from. A codec the probe gave no
+/// RFC 6381 string gets the bare container type, which a `SourceBuffer` still
+/// accepts for the init segment it is about to parse.
+pub(crate) fn mp4_mime(kind: TrackKind, mime_codecs: &[String]) -> String {
+    let container = match kind {
+        TrackKind::Video => "video/mp4",
+        TrackKind::Audio => "audio/mp4",
+        TrackKind::Subtitle => unreachable!("subtitle tracks are refused before this"),
+    };
+    match mime_codecs.first() {
+        Some(codec) => format!("{container}; codecs=\"{codec}\""),
+        None => container.to_string(),
     }
 }
 

@@ -1,6 +1,6 @@
-// Dumps one Matroska track as a fragmented-MP4 stream: the init segment and
-// every fragment, in order, to a file. A scratch tool for ffprobe to verify
-// the remuxer against an independent parser.
+// Dumps one track of a Matroska, WebM or MP4 file as a fragmented-MP4 stream:
+// the init segment and every fragment, in order, to a file. A scratch tool for
+// ffprobe to verify the remuxer against an independent parser.
 use fbtt_media::open_track;
 use std::fs::File;
 use std::io::{Seek, Write};
