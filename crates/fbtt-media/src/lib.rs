@@ -19,12 +19,14 @@ pub mod codec;
 pub mod fmp4;
 pub mod probe;
 pub mod source;
+pub mod subtitle;
 
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind, sample_entry};
 pub use fmp4::{FragmentWriter, init_segment};
 pub use probe::{MediaInfo, TrackInfo, probe};
 pub use source::{Sample, TrackConfig};
+pub use subtitle::{Cue, SubtitleFormat, file_cues, subtitle_format};
 
 /// Which container a file is.
 ///
@@ -73,6 +75,11 @@ pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;
 /// The most of a sidecar subtitle file is read: a caption track nobody can scroll is not worth
 /// unbounded memory.
 pub const SUBTITLE_FILE_CAP: u64 = 4 * 1024 * 1024;
+
+/// The most cues one subtitle file may hold: a cue table is one flat list, so a file with a
+/// million cues behind a small byte budget would grow it without limit. Past this, the file is
+/// [`MediaError::Malformed`] rather than a memory spike.
+pub const MAX_CUES: usize = 100_000;
 
 /// The widest window of source time a cue request may ask for.
 pub const CUE_WINDOW_MAX_MS: u64 = 600_000;
