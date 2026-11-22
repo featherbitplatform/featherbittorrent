@@ -781,8 +781,8 @@ fn open_and_read<R: Read + Seek>(
     // A seek that gave no frame at all: a file without cues, whose last
     // cluster the seek ran into and ended the stream on. Re-open from the
     // start and read forward - the reader sits after the failed open, so
-    // rewind it first. An empty window is a normal answer, not a signal to
-    // re-read the file: only a seek that read nothing at all re-opens.
+    // rewind it first. A window past the file's known end reports `saw_frame`
+    // true, so it does not re-open: the duration already decided the answer.
     if seek_ms > 0 && !saw_frame {
         reader.rewind()?;
         let (rewound, _) = read_track(&mut reader, track, from_ms, to_ms, 0)?;
@@ -846,14 +846,16 @@ fn read_track<R: Read + Seek>(
     // the track holds. The seek would give no frame and the fallback would
     // re-read the whole file from the start, so the duration decides it first,
     // before any seek. The duration is unknown when the file states none, or
-    // when the value is not a finite, non-negative number of milliseconds.
+    // when the value is not a finite, positive number of milliseconds.
+    // `saw_frame` is true: the file was read and its end is known, so the
+    // caller does not re-open it.
     if file
         .info()
         .duration()
         .and_then(|duration| duration_ms(duration, scale))
         .is_some_and(|duration_ms| from_ms >= duration_ms)
     {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), true));
     }
     let mut slot = Frame::default();
     if seek_ms > 0 {
@@ -1018,11 +1020,13 @@ fn frame_start_ms(timestamp: u64, scale: u64) -> Result<u64, MediaError> {
     u64::try_from(ms).map_err(|_| overflow())
 }
 
-/// The file's `Duration`, in milliseconds, when it is a finite, non-negative
-/// number of the file's timeline. A non-finite or negative value is unknown.
+/// The file's `Duration`, in milliseconds, when it is a finite, positive
+/// number of the file's timeline. A non-finite, negative, or zero value is
+/// unknown: a recording cut short can carry `Duration` 0, and treating it as
+/// a known end would make every window return empty.
 fn duration_ms(duration: f64, scale: u64) -> Option<u64> {
     let ms = duration * (scale as f64 / 1_000_000.0);
-    if ms.is_finite() && ms >= 0.0 && ms.round() <= u64::MAX as f64 {
+    if ms.is_finite() && ms > 0.0 && ms.round() <= u64::MAX as f64 {
         Some(ms.round() as u64)
     } else {
         None

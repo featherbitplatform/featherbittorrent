@@ -755,18 +755,24 @@ fn embedded_total_text_is_capped() {
 
 #[test]
 fn embedded_preroll_text_is_capped() {
-    // Five blocks of 1 MiB of text each, all BEFORE the window but after the
-    // seek point: the total pushed text passes SUBTITLE_FILE_CAP and the call
-    // is Malformed at once, not only after the walk finishes. The cues do not
-    // overlap the window, so a check that ran only over the kept cues would
-    // never see them and would return Ok(empty).
+    // Five blocks of 1 MiB of text each, all in the pre-roll: after the seek
+    // point (19 000) but before the window (29 000). The total pushed text
+    // passes SUBTITLE_FILE_CAP and the call is Malformed at once, not only
+    // after the walk finishes. The cues do not overlap the window, so a check
+    // that ran only over the kept cues would never see them and would return
+    // Ok(empty).
     let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
-    // Five blocks, each 1 MiB of 'x', spaced 1 s apart from 0 to 4 s. The
+    // Five blocks, each 1 MiB of 'x', spaced 1 s apart from 20 s to 24 s. The
     // window is 29 000 to 31 000, the seek is 19 000, so every block is read
-    // (start under the window's end) but none overlaps the window.
+    // after the seek (real pre-roll) and none overlaps the window.
     let payload = vec![b'x'; 1_024 * 1_024];
     let clusters: Vec<Vec<u8>> = (0..5)
-        .map(|i| common::cluster(i * 1_000, &[common::simple_block(1, 0, false, &payload)]))
+        .map(|i| {
+            common::cluster(
+                20_000 + i * 1_000,
+                &[common::simple_block(1, 0, false, &payload)],
+            )
+        })
         .collect();
 
     let err = embedded_cues(
@@ -829,30 +835,34 @@ fn embedded_cue_after_late_video_frame_is_kept() {
 
 #[test]
 fn embedded_window_after_end_is_empty() {
-    // The late-window file with a Duration: a window starting after the
-    // duration gives Ok(empty) without the seek, and without the fallback's
-    // full re-read. The file is built long enough in frames that a re-read
-    // from the start would trip MAX_CUE_SCAN_FRAMES (Malformed) and read the
-    // 30 s cue, so only the duration check stands between the window and both.
+    // A window starting after the Duration and after the last cue gives
+    // Ok(empty) without the seek, and without the fallback's full re-read.
+    // The Duration is 42 000, the window is 45 000 to 47 000, and the last
+    // cue is the 30 s cue. The seek target is 35 000, which is past the 30 s
+    // cue, so the demuxer yields no frame and the fallback re-read runs. The
+    // file is built long enough in frames that the re-read trips
+    // MAX_CUE_SCAN_FRAMES (Malformed), so only the duration check stands
+    // between the window and the re-read.
     let tracks = common::tracks(&[
         common::track_entry(1, 0x11, b"S_TEXT/UTF8"),
         common::track_entry(2, 1, b"V_MPEG4/ISO/AVC"),
     ]);
-    let info = common::info_with_duration(1_000_000, 32_000);
+    let info = common::info_with_duration(1_000_000, 42_000);
     let relative = cluster_block_offset(&common::cluster(
         30_000,
         &[common::simple_block(1, 0, false, b"thirty")],
     ));
-    // The cues: 0 s, 15 s and 30 s. The seek to 39 000 lands past the 30 s
+    // The cues: 0 s, 15 s and 30 s. The seek to 35 000 lands past the 30 s
     // cue and finds no frame, so without the duration check the fallback
     // re-reads the whole file from the start.
     let c0 = common::cluster(0, &[common::simple_block(1, 0, false, b"zero")]);
     let c1 = common::cluster(15_000, &[common::simple_block(1, 0, false, b"fifteen")]);
     let c2 = common::cluster(30_000, &[common::simple_block(1, 0, false, b"thirty")]);
 
-    // MAX_CUE_SCAN_FRAMES + 1 video frames, 1000 per cluster, all at 0 s: a
-    // full re-read walks them all and gives up with Malformed. The subtitle
-    // track's 30 s cue sits in the first cluster, before the video run.
+    // MAX_CUE_SCAN_FRAMES + 1 video frames, 1000 per cluster, all at 0 s: the
+    // fallback's full re-read walks them all and gives up with Malformed. The
+    // seek to 35 000 finds no frame (it is past the 30 s cue), so the re-read
+    // is what the duration check stands between the window and.
     let per_cluster = 1_000usize;
     let video_count = (MAX_CUE_SCAN_FRAMES + 1) as usize;
     let video_cluster_count = video_count.div_ceil(per_cluster);
@@ -918,12 +928,81 @@ fn embedded_window_after_end_is_empty() {
     let cues = embedded_cues(
         Cursor::new(common::matroska_file(&segment)),
         1,
-        39_000,
-        41_000,
+        45_000,
+        47_000,
     )
     .expect("a window past the end is an empty answer, not a re-read");
     assert!(
         cues.is_empty(),
         "a window starting after the duration is empty, got {cues:?}"
+    );
+}
+
+#[test]
+fn embedded_zero_duration_is_unknown() {
+    // The late-window file with Duration 0. A recording cut short can carry
+    // Duration 0, and treating it as a known end would make every window
+    // return empty. The duration is unknown, so the window 29 000 to 31 000
+    // still seeks to 19 000 and returns the 30 s cue.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    let info = common::info_with_duration(1_000_000, 0);
+    let c0 = common::cluster(0, &[common::simple_block(1, 0, false, b"zero")]);
+    let c1 = common::cluster(15_000, &[common::simple_block(1, 0, false, b"fifteen")]);
+    let c2 = common::cluster(30_000, &[common::simple_block(1, 0, false, b"thirty")]);
+    let clusters = [c0.clone(), c1.clone(), c2.clone()];
+    let relative = cluster_block_offset(&c2);
+    let placeholder = common::seek_head_named(&[
+        (&common::TRACKS, 0u64),
+        (&common::INFO, 0),
+        (&common::CLUSTER, 0),
+        (&common::CUES, 0),
+    ]);
+    let tracks_at = u64::try_from(placeholder.len()).expect("a SeekHead under 4 GiB");
+    let info_at = tracks_at + u64::try_from(tracks.len()).expect("Tracks under 4 GiB");
+    let c0_at = info_at + u64::try_from(info.len()).expect("Info under 4 GiB");
+    let c1_at = c0_at + u64::try_from(c0.len()).expect("a cluster under 4 GiB");
+    let c2_at = c1_at + u64::try_from(c1.len()).expect("a cluster under 4 GiB");
+    let cues = common::cues_element(&[
+        (0, c0_at, relative),
+        (15_000, c1_at, relative),
+        (30_000, c2_at, relative),
+    ]);
+    let head = common::seek_head_named(&[
+        (&common::TRACKS, tracks_at),
+        (&common::INFO, info_at),
+        (&common::CLUSTER, c0_at),
+        (
+            &common::CUES,
+            c2_at + u64::try_from(c2.len()).expect("a cluster under 4 GiB"),
+        ),
+    ]);
+    assert_eq!(
+        head.len(),
+        placeholder.len(),
+        "the SeekHead length is entry-count driven"
+    );
+    let mut segment = head;
+    segment.extend_from_slice(&tracks);
+    segment.extend_from_slice(&info);
+    for cluster in &clusters {
+        segment.extend_from_slice(cluster);
+    }
+    segment.extend_from_slice(&cues);
+    let cues = embedded_cues(
+        Cursor::new(common::matroska_file(&segment)),
+        1,
+        29_000,
+        31_000,
+    )
+    .expect("Duration 0 is unknown, the seek runs");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 30_000,
+            // No BlockDuration: the end is the fallback, start plus 5000.
+            end_ms: 35_000,
+            text: "thirty".into(),
+        }],
+        "Duration 0 does not make the window empty"
     );
 }
