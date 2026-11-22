@@ -2,8 +2,9 @@
 //! input: a file is read only once, in a single pass, and a hostile file must
 //! give its good cues back, or no cues, never a panic, never a hang.
 
-use fbtt_media::{Cue, MediaError, SubtitleFormat, file_cues, subtitle_format};
+use fbtt_media::{Cue, MediaError, SUBTITLE_FILE_CAP, SubtitleFormat, file_cues, subtitle_format};
 use std::fs;
+use std::time::{Duration, Instant};
 
 /// The fixture's three cues: the times `expected.json` records for the same
 /// text the fixture holds, and the two-line cue joined with a newline.
@@ -248,4 +249,90 @@ fn ass_text_keeps_commas() {
     let cues = file_cues(bytes, SubtitleFormat::Ass).expect("no panic");
     assert_eq!(cues.len(), 1);
     assert_eq!(cues[0].text, "a, b, c");
+}
+
+#[test]
+fn cleaners_are_linear() {
+    // The tag cleaners must not rescan the text they have already walked: a
+    // 4 MiB line of delimiters is one pass, not one pass per delimiter. Each
+    // of these hostile inputs must return within two seconds.
+    let cap = SUBTITLE_FILE_CAP as usize;
+    let ass_head = "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,";
+    let srt_head = "1\n00:00:01,000 --> 00:00:02,000\n";
+
+    // One ASS Dialogue line whose text is `{}` repeated.
+    let fill = (cap - ass_head.len() - 4) / 2;
+    let ass_braces = format!("{ass_head}{}", "{}".repeat(fill));
+    assert!(ass_braces.len() < cap, "the braces input fits the file cap");
+    let start = Instant::now();
+    let cues = file_cues(ass_braces.as_bytes(), SubtitleFormat::Ass).expect("no panic");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cleaning a 4 MiB line of {{}} pairs must be linear, took {:?}",
+        start.elapsed()
+    );
+    // The `{}` pairs are empty override blocks: nothing to show.
+    assert!(cues.is_empty(), "empty override blocks leave no text");
+
+    // One ASS Dialogue line whose text is `\` repeated.
+    let fill = cap - ass_head.len() - 4;
+    let ass_backslashes = format!("{ass_head}{}", "\\".repeat(fill));
+    assert!(
+        ass_backslashes.len() < cap,
+        "the backslash input fits the file cap"
+    );
+    let start = Instant::now();
+    file_cues(ass_backslashes.as_bytes(), SubtitleFormat::Ass).expect("no panic");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cleaning a 4 MiB line of lone backslashes must be linear, took {:?}",
+        start.elapsed()
+    );
+
+    // One SRT cue whose text is `<>` repeated.
+    let fill = (cap - srt_head.len() - 4) / 2;
+    let srt_tags = format!("{srt_head}{}", "<>".repeat(fill));
+    assert!(srt_tags.len() < cap, "the tag input fits the file cap");
+    let start = Instant::now();
+    file_cues(srt_tags.as_bytes(), SubtitleFormat::Srt).expect("no panic");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cleaning a 4 MiB line of <> tags must be linear, took {:?}",
+        start.elapsed()
+    );
+
+    // One SRT cue whose text is `<` repeated: every tag unclosed, so the
+    // whole run is kept as literal, in one pass.
+    let fill = cap - srt_head.len() - 4;
+    let srt_open = format!("{srt_head}{}", "<".repeat(fill));
+    assert!(srt_open.len() < cap, "the open-tag input fits the file cap");
+    let start = Instant::now();
+    let cues = file_cues(srt_open.as_bytes(), SubtitleFormat::Srt).expect("no panic");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cleaning a 4 MiB line of lone < must be linear, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(cues.len(), 1, "an unclosed < keeps the rest as literal");
+    assert_eq!(cues[0].text, "<".repeat(fill));
+}
+
+#[test]
+fn events_header_is_a_whole_line() {
+    // `[Events]` inside a Title: line is not a section: the real section's
+    // Dialogue line must be found.
+    let bytes = b"[Script Info]\nTitle: [Events] demo\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,x\n";
+    let cues = file_cues(bytes, SubtitleFormat::Ass).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].start_ms, 1000);
+    assert_eq!(cues[0].end_ms, 2000);
+    assert_eq!(cues[0].text, "x");
+
+    // The same file with a lower-case header: ASCII case-insensitive.
+    let lower = b"[Script Info]\nTitle: [Events] demo\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,x\n";
+    let cues = file_cues(lower, SubtitleFormat::Ass).expect("no panic");
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].start_ms, 1000);
+    assert_eq!(cues[0].end_ms, 2000);
+    assert_eq!(cues[0].text, "x");
 }

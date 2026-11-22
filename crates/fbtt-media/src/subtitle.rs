@@ -323,59 +323,66 @@ fn ascii_u64(field: &str) -> Option<u64> {
     Some(v as u64)
 }
 
-/// The `[Events]` section of an ASS file: from just after its header to the
-/// next `[...]` section header, or to the end of the file when there is none.
-/// `None` when the file has no `[Events]` section.
+/// A line whose trimmed text is exactly `[Events]`, compared ASCII
+/// case-insensitively, so `[events]` and `  [Events]  ` are headers too.
+/// Comparing by byte keeps the check from allocating.
+fn is_events_header(line: &str) -> bool {
+    let b = line.trim().as_bytes();
+    b.len() == 8
+        && b[0] == b'['
+        && b[7] == b']'
+        && b[1..7]
+            .iter()
+            .zip(b"events".iter())
+            .all(|(a, c)| a.to_ascii_lowercase() == *c)
+}
+
+/// A section header: a line whose trimmed text starts with `[` and ends with
+/// `]`. Scanning line by line keeps a `[` inside a `Dialogue:` text from being
+/// mistaken for one.
+fn is_section_header(line: &str) -> bool {
+    let b = line.trim().as_bytes();
+    b.len() >= 2 && b[0] == b'[' && b[b.len() - 1] == b']'
+}
+
+/// The `[Events]` section of an ASS file: from just after its header line to
+/// the next `[...]` section header, or to the end of the file when there is
+/// none. `None` when the file has no `[Events]` header.
 ///
-/// A section header is a line that starts with `[` (after any leading
-/// whitespace). Scanning line by line keeps a `[` inside a `Dialogue:` text
-/// from being mistaken for one.
+/// The header is a whole line, compared ASCII case-insensitively: the text
+/// `[Events]` inside a `Title:` line is not a section. A line start's offset
+/// is the distance between its pointer and the text's, so the scan is one
+/// forward pass over the bytes.
 fn events_section(text: &str) -> Option<&str> {
-    let header = "[Events]";
-    let pos = text.find(header)?;
-    let body = &text[pos + header.len()..];
-    // The next section header is the first line, after the header's own line,
-    // that starts with `[`. Find it by walking the body line by line, tracking
-    // the byte offset of each line's start.
-    let mut rest = body;
-    // Skip the header's own line (the part of the first line after "[Events]").
-    let first_newline = rest.find(['\n', '\r']);
-    rest = match first_newline {
-        Some(nl) => {
-            // A `\r\n` is two bytes.
-            let advance = if rest.as_bytes().get(nl) == Some(&b'\r')
-                && rest.as_bytes().get(nl + 1) == Some(&b'\n')
-            {
-                nl + 2
-            } else {
-                nl + 1
-            };
-            &rest[advance..]
-        }
-        None => return Some(body),
+    let lines = split_lines(text);
+    let header = lines.iter().position(|line| is_events_header(line))?;
+    let base = text.as_ptr() as usize;
+    let offset_of = |line: &&str| line.as_ptr() as usize - base;
+    let header_line = lines[header];
+    // The body begins just past the header line's ending.
+    let after = offset_of(&header_line) + header_line.len();
+    let nl = text[after..].find(['\n', '\r'])?;
+    let advance = if text.as_bytes().get(after + nl) == Some(&b'\r')
+        && text.as_bytes().get(after + nl + 1) == Some(&b'\n')
+    {
+        nl + 2
+    } else {
+        nl + 1
     };
-    // Walk the remaining lines. The offset of a line start in `body` is
-    // `body.len() - remaining.len()` at the moment the line is read.
-    loop {
-        let line_start = body.len() - rest.len();
-        let line_end = rest.find(['\n', '\r']).map_or(rest.len(), |nl| {
-            if rest.as_bytes().get(nl) == Some(&b'\r')
-                && rest.as_bytes().get(nl + 1) == Some(&b'\n')
-            {
-                nl + 1
-            } else {
-                nl
-            }
-        });
-        let line = &rest[..line_end];
-        if line.trim_start().starts_with('[') {
-            return Some(&body[..line_start]);
+    let body = &text[after + advance..];
+    // The next section header ends the section.
+    let mut offset = 0usize;
+    for line in split_lines(body) {
+        if is_section_header(line) {
+            return Some(&body[..offset]);
         }
-        if line_end >= rest.len() {
-            return Some(body);
-        }
-        rest = &rest[line_end + 1..];
+        offset += line.len();
+        offset += match body.get(offset..offset + 2) {
+            Some("\r\n") => 2,
+            _ => 1,
+        };
     }
+    Some(body)
 }
 
 /// The standard ASS/SSA column order, used when there is no `[Events]`
@@ -592,23 +599,17 @@ fn skip_block_vtt(lines: &[&str], i: &mut usize) {
 /// is a char boundary, and the runs between them are copied as slices. That
 /// is what keeps a 3- or 4-byte character whole: the offset arithmetic never
 /// looks at the bytes of a character, only at the ASCII delimiters.
+///
+/// One `find` per step, for both delimiters at once, so the text is scanned
+/// in a single forward pass: a byte is looked at a bounded number of times,
+/// and a 4 MiB line of `{}` pairs or lone `\` is cleaned in one go.
 fn clean_ass(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
-    loop {
-        // The next `{` or `\`, whichever comes first.
-        let brace = rest.find('{');
-        let backslash = rest.find('\\');
-        let hit = match (brace, backslash) {
-            (Some(b), Some(s)) if b < s => b,
-            (Some(b), _) => b,
-            (None, Some(s)) => s,
-            (None, None) => break,
-        };
+    while let Some(hit) = rest.find(['{', '\\']) {
         // Copy the run before the hit, whole.
         out.push_str(&rest[..hit]);
-        let is_brace = brace == Some(hit);
-        if is_brace {
+        if rest.as_bytes()[hit] == b'{' {
             match rest[hit + 1..].find('}') {
                 Some(close) => {
                     // Drop the override block.
@@ -639,6 +640,7 @@ fn clean_ass(text: &str) -> String {
             }
         }
     }
+    // No more delimiters: the run to the end of the text stays whole.
     out.push_str(rest);
     out
 }
