@@ -27,7 +27,9 @@
 use crate::capped::{CappedLen, ReadBudget};
 use crate::codec::{Codec, TrackKind};
 use crate::probe::{TrackInfo, matroska_audio_rate, matroska_error, matroska_kind, open_matroska};
-use crate::source::{Sample, SourceError, SourceResult, TrackConfig, TrackSource};
+use crate::source::{
+    FragmentStream, Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource,
+};
 use crate::{ELEMENT_CAP, MAX_SKIPPED_FRAMES, MediaError};
 use matroska_demuxer::{
     ContentCompAlgo, ContentEncAlgo, ContentEncoding, ContentEncodingValue, Frame, MatroskaFile,
@@ -49,17 +51,22 @@ const VIDEO_TIMESCALE: u32 = 90_000;
 /// passed over after the demuxer has already read it - the seeking that skips
 /// whole clusters happens in the seek, not in the walk.
 ///
+/// The reader type stays private on purpose: [`open_track`] boxes this into a
+/// [`FragmentStream`] and hands that out, because the point of a source is its
+/// samples, not its type.
+///
 /// `R` stays the caller's own reader inside [`CappedLen`]: a `Box<dyn Read +
 /// Seek>` would erase a torrent reader's timeouts into the reader trait's
 /// own `io::Error`, and those have to survive to the API as retryable.
-pub struct MkvSource<R: Read + Seek> {
+pub(crate) struct MkvSource<R: Read + Seek> {
     /// The demuxer, past its header and (when the start time asked for it)
     /// sought to its first cluster.
     file: MatroskaFile<CappedLen<R>>,
     /// What [`TrackSource::config`] answers.
     config: TrackConfig,
-    /// `Content-Type` for a stream of this source's fragments.
-    mime: &'static str,
+    /// `Content-Type` for a fragmented MP4 stream of this track: the container
+    /// for the track's kind plus its RFC 6381 codec string, see [`mp4_mime`].
+    mime: String,
     /// The container's own track number, compared against each frame's.
     track: u64,
     /// Nanoseconds of source time per container timestamp unit.
@@ -86,11 +93,19 @@ pub struct MkvSource<R: Read + Seek> {
     anchored: bool,
     /// Whether any sample has been emitted yet.
     emitted: bool,
-    /// The message of the first failure, repeated to every later request.
-    failed: Option<String>,
+    /// The first failure, repeated to every later request with its kind kept:
+    /// a read that timed out is still timed out the second time it is asked.
+    failed: Option<StoredError>,
     /// The track's `DefaultDuration` in nanoseconds, the duration a frame gets
-    /// when its block states none.
+    /// when its block states none - and the spacing between the frames of a
+    /// same-timestamp run, see [`MkvSource::sample_with_timestamp`].
     default_duration: Option<u64>,
+    /// Same-timestamp run state: the container timestamp the run started at,
+    /// and how many of this track's frames have carried it. Every frame of a
+    /// laced block carries the block's own timestamp, and the run length is
+    /// what turns that into one distinct PTS per frame.
+    run_timestamp: u64,
+    run_len: u64,
     /// A frame slot the demuxer fills in place, reused every read so each
     /// frame costs the buffer it needs, not one per call.
     frame: Frame,
@@ -125,11 +140,20 @@ struct PendingFrame {
 /// Ask the demuxer for one frame under a panic guard, `Ok(false)` being the
 /// end of the stream. The frame lands in `slot`, which is why callers read it
 /// back through the slot rather than getting it by value.
+///
+/// `slot.track` is zeroed before every call because `Ok(true)` does not
+/// guarantee a filled slot: the demuxer answers `Ok(true)` for a `BlockGroup`
+/// that holds no `Block` without touching the slot at all, so the stale track
+/// number of the previous frame would pass such a read off as "a frame of the
+/// right track, empty". Zero is the one value no real `TrackNumber` has, so
+/// "the slot still says track 0" is how callers tell a filled frame from a
+/// stale one.
 fn guarded_next<R: Read + Seek>(
     file: &mut MatroskaFile<CappedLen<R>>,
     slot: &mut Frame,
     what: &str,
 ) -> Result<bool, MediaError> {
+    slot.track = 0;
     match catch_unwind(AssertUnwindSafe(|| file.next_frame(slot))) {
         Ok(Ok(got)) => Ok(got),
         Ok(Err(error)) => Err(matroska_error(error)),
@@ -158,8 +182,10 @@ fn guarded_seek<R: Read + Seek>(
 /// the request.
 fn start_in_scale_units(start_ms: u64, scale: u64) -> Result<(u64, u128), MediaError> {
     let start_ns = u128::from(start_ms) * 1_000_000;
-    // Truncating: the seek lands at or before the requested time, and the
-    // sync-point clamp moves it further back, never forward.
+    // Truncating down: the target handed the demuxer is the whole scale unit
+    // at or below `start_ms`, and the demuxer's own walk then lands on the
+    // first frame at or after that unit - never earlier, which is what makes
+    // the emitted stream begin at or after the time that was asked for.
     let units = start_ns / u128::from(scale);
     let units = u64::try_from(units).map_err(|_| {
         MediaError::Malformed(format!(
@@ -170,16 +196,16 @@ fn start_in_scale_units(start_ms: u64, scale: u64) -> Result<(u64, u128), MediaE
 }
 
 impl<R: Read + Seek> MkvSource<R> {
-    /// The first error, if there is one, as the verdict every later call gives.
+    /// The first error, if there is one, as the verdict every later call gives,
+    /// its kind intact: an `Io` verdict replays as `Io`, not as a `Malformed`
+    /// retelling of it.
     fn poisoned(&self) -> Option<SourceError> {
-        self.failed
-            .as_deref()
-            .map(|reason| SourceError::Malformed(reason.to_string()))
+        self.failed.as_ref().map(StoredError::to_source_error)
     }
 
     fn poison(&mut self, error: &SourceError) {
-        let reason = error.to_string();
-        self.failed.get_or_insert(reason);
+        self.failed
+            .get_or_insert_with(|| StoredError::from_source(error));
     }
 
     /// Count one frame walked without emitting, and say whether the walk has
@@ -195,7 +221,8 @@ impl<R: Read + Seek> MkvSource<R> {
 
     /// One frame, in container terms: this track's, already filtered against
     /// the start time and the keyframe rule, with the container's timestamps
-    /// translated into output ticks. `Ok(None)` is the end of the stream, and
+    /// translated into output ticks - same-timestamp runs spaced by
+    /// `DefaultDuration` on the way. `Ok(None)` is the end of the stream, and
     /// `skipped` accounts for every frame passed over on the way.
     fn next_emittable(&mut self) -> Result<Option<Sample>, MediaError> {
         loop {
@@ -211,6 +238,11 @@ impl<R: Read + Seek> MkvSource<R> {
                     if !guarded_next(&mut self.file, &mut self.frame, "frames")? {
                         return Ok(None);
                     }
+                    // A slot that still claims track 0 was filled by nothing:
+                    // `guarded_next` zeroes it before the call, and an empty
+                    // `BlockGroup` leaves it that way. No frame, so it counts
+                    // against patience exactly like the frames of other tracks
+                    // this branch already passes over.
                     if self.frame.track != self.track {
                         if let Some(gave_up) = self.walk_beyond_patience() {
                             return Err(gave_up);
@@ -223,6 +255,11 @@ impl<R: Read + Seek> MkvSource<R> {
                     (timestamp, keyframe, data)
                 }
             };
+            // Every frame of this track advances the same-timestamp run,
+            // emitted or dropped: a frame dropped below still occupied its
+            // slot in its block's timeline, and the next one must not slide
+            // back into it.
+            let run_index = self.run_index_for(timestamp);
             let keyframe = match self.filter_frame(keyframe, timestamp) {
                 FrameAction::Drop => {
                     if let Some(gave_up) = self.walk_beyond_patience() {
@@ -239,11 +276,14 @@ impl<R: Read + Seek> MkvSource<R> {
                 self.frame.data = data;
                 return Ok(Some(self.sample_with_timestamp(
                     timestamp,
+                    run_index,
                     keyframe,
                     with_header,
                 )?));
             }
-            return Ok(Some(self.sample_with_timestamp(timestamp, keyframe, data)?));
+            return Ok(Some(
+                self.sample_with_timestamp(timestamp, run_index, keyframe, data)?,
+            ));
         }
     }
 
@@ -260,12 +300,14 @@ impl<R: Read + Seek> MkvSource<R> {
     /// writer understands, and inventing sync flags the file never claimed
     /// would let the player cut a fragment where no keyframe is.
     ///
-    /// Video ignores `start_ns` on purpose: the seek landed on a sync point at
-    /// or before the start time because the frames between it and the start
-    /// time are reference material the decoder needs, so the stream starts
-    /// where a decoder can, and the page trims the difference. Audio filters
-    /// by start time, because every audio frame is independently decodable and
-    /// one before the start time would play a sound the viewer asked to skip.
+    /// Video ignores `start_ns` on purpose: what a seek leaves is the stream
+    /// from its landing frame onward, and the frames after that keyframe are
+    /// the references and reorder partners that make it decodable - including
+    /// ones that present before the start time, which a start-time filter
+    /// would drop precisely to the decoder's loss. The keyframe rule above is
+    /// what decides where video starts. Audio filters by start time, because
+    /// every audio frame is independently decodable and one before the start
+    /// time would play a sound the viewer asked to skip.
     fn filter_frame(&mut self, keyframe: Option<bool>, timestamp: u64) -> FrameAction {
         if !self.is_video() {
             if (u128::from(timestamp) * u128::from(self.scale)) < self.start_ns {
@@ -286,9 +328,36 @@ impl<R: Read + Seek> MkvSource<R> {
         self.config.kind == TrackKind::Video
     }
 
-    /// A [`Sample`] from one container frame: PTS in output ticks, the
+    /// Which frame of a same-timestamp run this frame is: 0 for the first
+    /// frame to carry a timestamp, and one more for every later frame of this
+    /// track that carries it. Every frame of a laced block carries the block's
+    /// own timestamp; this index is the multiplier behind
+    /// [`sample_with_timestamp`](Self::sample_with_timestamp)'s spacing.
+    fn run_index_for(&mut self, timestamp: u64) -> u64 {
+        let index = if timestamp == self.run_timestamp {
+            self.run_len
+        } else {
+            self.run_timestamp = timestamp;
+            self.run_len = 0;
+            0
+        };
+        self.run_len = self.run_len.saturating_add(1);
+        index
+    }
+
+    /// A [`Sample`] from one frame of the track: PTS in output ticks, the
     /// container's stated duration (its own `BlockDuration`, or the track's
     /// `DefaultDuration`) as a stated duration in output ticks, and the bytes.
+    ///
+    /// `run_index` spaces the frames that share a timestamp: every frame of a
+    /// laced block carries its block's timestamp, and the i-th frame of such
+    /// a run plays `i * DefaultDuration` later. Without that spacing four
+    /// fixed-laced MP3 frames become four samples at one instant, which the
+    /// fragment writer can only endow with one-tick durations. A run of one
+    /// frame, or a track with no `DefaultDuration` to space by, keeps the
+    /// container's timestamp as it is - those frames share the instant, and
+    /// the writer then derives every duration from the gaps between decode
+    /// times, which is its documented fallback.
     ///
     /// A PTS or duration too wide for the timeline is `Malformed`: a frame at
     /// 2^63 ticks on a 90 kHz timeline is a claim about the file no MP4
@@ -296,14 +365,29 @@ impl<R: Read + Seek> MkvSource<R> {
     fn sample_with_timestamp(
         &mut self,
         timestamp: u64,
+        run_index: u64,
         keyframe: bool,
         data: Vec<u8>,
     ) -> Result<Sample, MediaError> {
-        let pts = self.to_ticks(timestamp)?;
+        let base_ns = u128::from(timestamp)
+            .checked_mul(u128::from(self.scale))
+            .ok_or_else(|| self.time_overflow())?;
+        let nanoseconds = match (run_index, self.default_duration) {
+            (0, _) | (_, None) => base_ns,
+            (index, Some(default_ns)) => {
+                let spacing = u128::from(index)
+                    .checked_mul(u128::from(default_ns))
+                    .ok_or_else(|| self.time_overflow())?;
+                base_ns
+                    .checked_add(spacing)
+                    .ok_or_else(|| self.time_overflow())?
+            }
+        };
+        let pts = self.to_ticks_from_ns(nanoseconds)?;
         let duration = self.frame_duration()?;
         if !self.emitted {
             self.emitted = true;
-            self.reported_start_ms = source_milliseconds(timestamp, self.scale);
+            self.reported_start_ms = source_milliseconds(nanoseconds);
         }
         self.skipped = 0;
         self.anchored |= keyframe;
@@ -316,13 +400,9 @@ impl<R: Read + Seek> MkvSource<R> {
         })
     }
 
-    /// Container timestamp units to output ticks: scale units to nanoseconds
-    /// to seconds to ticks, all in `u128` so a junk timestamp is refused
-    /// rather than wrapped.
-    fn to_ticks(&self, units: u64) -> Result<i64, MediaError> {
-        let nanoseconds = u128::from(units)
-            .checked_mul(u128::from(self.scale))
-            .ok_or_else(|| self.time_overflow())?;
+    /// Nanoseconds of source time to output ticks, all in `u128` so a junk
+    /// timestamp or spacing is refused rather than wrapped.
+    fn to_ticks_from_ns(&self, nanoseconds: u128) -> Result<i64, MediaError> {
         let ticks = nanoseconds
             .checked_mul(u128::from(self.timescale))
             .ok_or_else(|| self.time_overflow())?
@@ -374,12 +454,11 @@ impl<R: Read + Seek> MkvSource<R> {
     }
 }
 
-/// Milliseconds of source time from container units, saturating: only ever
+/// Milliseconds of source time from nanoseconds, saturating: only ever
 /// reported to a caller as "where this stream begins", where a start time
 /// beyond `u64` milliseconds of anything is a start time beyond the file.
-fn source_milliseconds(units: u64, scale: u64) -> u64 {
-    let ns = u128::from(units) * u128::from(scale);
-    let ms = ns / 1_000_000;
+fn source_milliseconds(nanoseconds: u128) -> u64 {
+    let ms = nanoseconds / 1_000_000;
     u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
@@ -393,13 +472,22 @@ enum FrameAction {
 
 /// Open one Matroska track for fragmented MP4.
 ///
-/// `track` is the container's own `TrackNumber`. `start_ms` is source time:
-/// the source seeks to the latest sync point at or before it - video seeks to
-/// a keyframe, and the samples start there even when that is before `start_ms`,
-/// because frames between the keyframe and `start_ms` are the decoder's
-/// reference material; audio states no keyframes, so every audio frame passes,
-/// and its samples start at or after `start_ms`. Zero opens from the track's
-/// first sample with no seek at all.
+/// `track` is the container's own `TrackNumber`; a track number above what a
+/// `u32` holds names a track this crate cannot open (`probe` refuses such a
+/// track the same way). `start_ms` is source time, and a seek lands forward,
+/// never back: the demuxer's walk gives the first frame at or after the
+/// target, and video's keyframe rule starts the stream at the first sync
+/// point at or after `start_ms` - the latest-at-or-before landing players
+/// sometimes describe is not what this does, and `start_ms()` reports where
+/// the samples really began. Audio needs no sync clamp: every audio frame is
+/// independently decodable, and the frames before `start_ms` are dropped one
+/// by one, so its samples start at or after it too. Zero opens from the
+/// track's first sample with no seek at all.
+///
+/// The stream's [`mime`](FragmentStream::mime) is the fragmented MP4
+/// `Content-Type` for this track - `video/mp4` or `audio/mp4` plus the
+/// track's RFC 6381 codec string - because the bytes it produces are
+/// fragmented MP4 whatever the source container was.
 ///
 /// The reader is wrapped in [`CappedLen`] with [`ELEMENT_CAP`], so the header
 /// parse and every frame read see a stream that refuses to claim more room
@@ -412,8 +500,9 @@ enum FrameAction {
 /// The header parse itself is `open_matroska`, the same guarded, budgeted
 /// walk [`probe`](crate::probe::probe) uses; every frame read and the seek are
 /// guarded the same way, because the demuxer's own arithmetic can panic on
-/// junk input (see [`MkvSource`]'s field docs) and the plan's rule is that
-/// hostile input changes the answer, never the control flow.
+/// junk input (see `MkvSource`'s module docs, this file's header) and the
+/// plan's rule is that hostile input changes the answer, never the control
+/// flow.
 ///
 /// # Errors
 ///
@@ -421,7 +510,7 @@ enum FrameAction {
 /// track type that holds no media (a logo track has no samples to remux), a
 /// codec or subtitle track [`sample_entry`](crate::sample_entry) cannot write,
 /// an AC-3 or E-AC-3 track whose first frame the walk cannot find, and content
-/// encodings this crate does not undo (see [`MkvSource`]'s module docs]).
+/// encodings this crate does not undo (see `MkvSource`'s module docs).
 /// [`MediaError::Malformed`] for a header that does not parse, a file that
 /// ends inside a header element, a demuxer panic, a `TimestampScale` or start
 /// time no timeline can hold, a frame timestamp or duration too wide for the
@@ -434,6 +523,21 @@ enum FrameAction {
 /// None. The demuxer's panics are caught, unwound, and reported.
 pub fn open_track<R: Read + Seek + Send + 'static>(
     reader: R,
+    track: u32,
+    start_ms: u64,
+) -> Result<FragmentStream, MediaError> {
+    let source = open_source(reader, u64::from(track), start_ms)?;
+    // Read the mime out of the source before the box eats the name.
+    let mime = source.mime.clone();
+    FragmentStream::new(Box::new(source), mime)
+}
+
+/// The same open as [`open_track`], unbuilt into a stream: the concrete
+/// source, for this module's tests and for the box `open_track` puts it in.
+/// `track` is the container's full `TrackNumber` here; the public wrapper
+/// narrows a `u32` to it.
+pub(crate) fn open_source<R: Read + Seek>(
+    reader: R,
     track: u64,
     start_ms: u64,
 ) -> Result<MkvSource<R>, MediaError> {
@@ -444,7 +548,6 @@ pub fn open_track<R: Read + Seek + Send + 'static>(
     let mut file = open_matroska(reader, budget.clone())?;
     let scale = file.info().timestamp_scale().get();
     let (start_units, start_ns) = start_in_scale_units(start_ms, scale)?;
-    let is_webm = matches!(file.ebml_header().doc_type(), "webm");
     let entry = file
         .tracks()
         .iter()
@@ -525,11 +628,7 @@ pub fn open_track<R: Read + Seek + Send + 'static>(
             width,
             height,
         },
-        mime: if is_webm {
-            "video/webm"
-        } else {
-            "video/x-matroska"
-        },
+        mime: mp4_mime(kind, &mime_codecs),
         track,
         scale,
         timescale,
@@ -542,8 +641,30 @@ pub fn open_track<R: Read + Seek + Send + 'static>(
         emitted: false,
         failed: None,
         default_duration,
+        run_timestamp: 0,
+        run_len: 0,
         frame: slot,
     })
+}
+
+/// The `Content-Type` a fragmented MP4 stream of this track is served under:
+/// the MP4 container for the track's kind, plus the track's RFC 6381 codec
+/// string - `video/mp4; codecs="avc1.64000A"`, `audio/mp4; codecs="opus"`.
+/// The codec string is not worked out twice: Task 1's `matroska_codec`
+/// already computed it when the track was identified, and this pastes that
+/// exact entry in. A codec the probe gave no RFC 6381 string gets the bare
+/// container type, which a `SourceBuffer` still accepts for the init segment
+/// it is about to parse.
+fn mp4_mime(kind: TrackKind, mime_codecs: &[String]) -> String {
+    let container = match kind {
+        TrackKind::Video => "video/mp4",
+        TrackKind::Audio => "audio/mp4",
+        TrackKind::Subtitle => unreachable!("subtitle tracks are refused before this"),
+    };
+    match mime_codecs.first() {
+        Some(codec) => format!("{container}; codecs=\"{codec}\""),
+        None => container.to_string(),
+    }
 }
 
 /// The bytes the container stripped off every block, in prepend order, or
@@ -625,6 +746,9 @@ fn hunt_first_frame_of_track<R: Read + Seek>(
         if !guarded_next(file, slot, "frames while looking for the first frame")? {
             return Ok(None);
         }
+        // A slot still claiming track 0 was filled by nothing - the demuxer
+        // reports an empty `BlockGroup` without touching it, see
+        // [`guarded_next`] - and no frame means this walk keeps walking.
         if slot.track != track {
             skipped += 1;
             if skipped > MAX_SKIPPED_FRAMES {
@@ -712,51 +836,167 @@ impl<R: Read + Seek + Send> TrackSource for MkvSource<R> {
         }
     }
 
-    /// Re-seek the source. `start_ms` means what it means in
-    /// [`open_track`], and a Dolby track's held first frame (its sample entry
-    /// needed it) is dropped and not hunted again: its sample entry is built,
-    /// and re-hunting it would walk frames the new seek just skipped all over
-    /// again.
-    ///
-    /// Seeking is the demuxer's cue-table walk (or a linear cluster scan),
-    /// under the same panic guard as the initial seek: a cue table built from
-    /// junk positions is hostile input too, and it gets the same answer.
-    fn seek(&mut self, start_ms: u64) -> SourceResult<()> {
-        if let Some(error) = self.poisoned() {
-            return Err(error);
-        }
-        let target = match start_in_scale_units(start_ms, self.scale) {
-            Ok((units, start_ns)) => {
-                self.start_ns = start_ns;
-                self.reported_start_ms = start_ms;
-                units
-            }
-            Err(error) => {
-                let error = SourceError::from_media(error);
-                self.poison(&error);
-                return Err(error);
-            }
-        };
-        match guarded_seek(&mut self.file, target) {
-            Ok(()) => {
-                self.skipped = 0;
-                self.anchored = false;
-                self.pending = None;
-                Ok(())
-            }
-            Err(error) => {
-                let error = SourceError::from_media(error);
-                self.poison(&error);
-                Err(error)
-            }
-        }
-    }
-
     fn start_ms(&self) -> u64 {
         self.reported_start_ms
     }
+}
 
-    fn mime(&self) -> &'static str {
-        self.mime
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal EBML assembly: the same rules as `tests/remux.rs`'s helpers
+    /// (a 1-byte or 5-byte size prefix ahead of the body, the body after the
+    /// ID), this file's share of its elements. The full files live in
+    /// `tests/remux.rs`; this one input is assembled here because this test is
+    /// a unit test only in order to see a `BlockDuration`.
+    fn vint(size: u64) -> Vec<u8> {
+        if size <= 126 {
+            return vec![0x80 | u8::try_from(size).expect("a size of 126 or less")];
+        }
+        let size = u32::try_from(size).expect("an element under 4 GiB");
+        let mut out = vec![0x08];
+        out.extend_from_slice(&size.to_be_bytes());
+        out
+    }
+
+    fn ebml(id: &[u8], body: &[u8]) -> Vec<u8> {
+        let declared = u64::try_from(body.len()).expect("an element under 4 GiB");
+        let mut out = Vec::with_capacity(id.len() + 5 + body.len());
+        out.extend_from_slice(id);
+        out.extend_from_slice(&vint(declared));
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// An unsigned-integer element in its shortest valid width: EBML allows
+    /// one to eight value bytes and the demuxer reads any of them.
+    fn uint(id: &[u8], value: u64) -> Vec<u8> {
+        let bytes = value.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len() - 1);
+        ebml(id, &bytes[first..])
+    }
+
+    fn ebml_header() -> Vec<u8> {
+        ebml(
+            &[0x1A, 0x45, 0xDF, 0xA3],
+            &[
+                ebml(&[0x42, 0x82], b"matroska"),
+                ebml(&[0x42, 0x87], &[1]),
+                ebml(&[0x42, 0x85], &[1]),
+            ]
+            .concat(),
+        )
+    }
+
+    /// An `AVCDecoderConfigurationRecord`: H.264 without a CodecPrivate is
+    /// `Unsupported`, so the track needs one.
+    fn avcc() -> Vec<u8> {
+        vec![
+            0x01, 0x64, 0x0C, 0x15, 0xFF, // version, profile, compat, level
+            0xE1, 0x00, 0x05, 0x67, 0x64, 0x0C, 0x15, 0xFF, // one 5-byte SPS
+            0x01, 0x00, 0x02, 0x68, 0xEB, // one 2-byte PPS
+        ]
+    }
+
+    #[test]
+    fn remux_blockgroup_first_frame_counts_as_sync() {
+        // A `BlockGroup` carries no keyframe flag (the demuxer reads no
+        // `ReferenceBlock`, so `is_keyframe` is None): the crate's documented
+        // reading is that the first frame of a video track with no flags is
+        // the sync point a stream starts from, and every later unflagged frame
+        // is non-sync. And the `BlockGroup`'s `BlockDuration` - counted in the
+        // file's `TimestampScale` units - becomes the sample's stated duration
+        // in track ticks.
+        //
+        // This is a unit test rather than a `tests/remux.rs` one because
+        // `BlockDuration` reaches a `Sample` and nothing public: on the wire,
+        // only a stream's last sample carries a stated duration (earlier
+        // samples' durations are the gaps to the next decode time), so a test
+        // through `open_track` could never ask a stated duration about all
+        // but the tail.
+        let tracks = ebml(
+            &[0x16, 0x54, 0xAE, 0x6B],
+            &[ebml(
+                &[0xAE],
+                &[
+                    uint(&[0xD7], 1),                  // TrackNumber
+                    uint(&[0x73, 0xC5], 11),           // TrackUID
+                    uint(&[0x83], 1),                  // TrackType: video
+                    uint(&[0x88], 1),                  // FlagDefault
+                    ebml(&[0x86], b"V_MPEG4/ISO/AVC"), // CodecID
+                    ebml(&[0x63, 0xA2], &avcc()),      // CodecPrivate
+                    ebml(
+                        &[0xE0], // Video
+                        &[uint(&[0xB0], 640), uint(&[0xBA], 360)].concat(),
+                    ),
+                ]
+                .concat(),
+            )]
+            .concat(),
+        );
+        let info = ebml(
+            &[0x15, 0x49, 0xA9, 0x66],
+            &[
+                ebml(&[0x4D, 0x80], b"fbtt"),         // MuxingApp
+                ebml(&[0x57, 0x41], b"fbtt"),         // WritingApp
+                uint(&[0x2A, 0xD7, 0xB1], 1_000_000), // TimestampScale: 1 ms
+            ]
+            .concat(),
+        );
+        let block_group = |offset: i16, duration: u64, payload: &[u8]| -> Vec<u8> {
+            let block = ebml(
+                &[0xA1], // Block: track 1 (one-byte VINT), timecode, no flags
+                &[
+                    vec![0x81],
+                    offset.to_be_bytes().to_vec(),
+                    vec![0x00],
+                    payload.to_vec(),
+                ]
+                .concat(),
+            );
+            ebml(&[0xA0], &[block, uint(&[0x9B], duration)].concat())
+        };
+        let cluster = ebml(
+            &[0x1F, 0x43, 0xB6, 0x75],
+            &[
+                uint(&[0xE7], 5_000),                     // 5 s timecode
+                block_group(0, 45, &[0x41, 0x01, 0x02]),  // 45 ms duration
+                block_group(20, 45, &[0x41, 0x01, 0x03]), // 20 ms later
+            ]
+            .concat(),
+        );
+        let file = [
+            ebml_header(),
+            ebml(
+                &[0x18, 0x53, 0x80, 0x67], // Segment: no SeekHead, no Cues
+                &[tracks, info, cluster].concat(),
+            ),
+        ]
+        .concat();
+
+        let mut source = open_source(Cursor::new(file), 1, 0).expect("opens");
+        let first = source.next_sample().expect("no error").expect("a sample");
+        assert!(
+            first.keyframe,
+            "the unflagged first frame is the sync point"
+        );
+        assert_eq!(
+            first.pts,
+            5_000 * 90,
+            "cluster timecode 5000 ms on the 90 kHz timeline"
+        );
+        assert_eq!(
+            first.duration,
+            Some(4_050),
+            "BlockDuration 45 ms of TimestampScale units is 4050 ticks at 90 kHz"
+        );
+        let second = source.next_sample().expect("no error").expect("a sample");
+        assert!(!second.keyframe, "a later unflagged frame is non-sync");
+        assert_eq!(second.pts, 5_020 * 90, "the second frame follows the first");
     }
 }

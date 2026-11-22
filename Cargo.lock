@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-media"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "matroska-demuxer",
  "mp4-atom",

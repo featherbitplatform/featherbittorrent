@@ -17,22 +17,23 @@
 pub mod capped;
 pub mod codec;
 pub mod fmp4;
-pub mod mkv;
+mod mkv;
 pub mod probe;
-pub mod source;
+mod source;
 
 pub use capped::{CappedLen, MAX_HEADER_OPS, ReadBudget};
 pub use codec::{Codec, TrackKind, sample_entry};
 pub use fmp4::{FragmentWriter, init_segment};
-pub use mkv::{MkvSource, open_track};
+pub use mkv::open_track;
 pub use probe::{MediaInfo, TrackInfo, probe};
-pub use source::{FragmentStream, Sample, SourceError, SourceResult, TrackConfig, TrackSource};
+pub use source::{FragmentStream, Sample, TrackConfig};
 
 /// Which container a file is.
 ///
 /// WebM is a Matroska file whose EBML `DocType` says `webm`: the same reader
-/// handles both, and the probe tells them apart because the player asks the
-/// browser for `video/webm` or `video/x-matroska` depending on it.
+/// handles both, and the probe tells them apart because the answer says where
+/// the bytes came from - a track of either streams as fragmented MP4 with
+/// [`open_track`], whichever container held it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Container {
     /// Matroska, `DocType` `matroska`.

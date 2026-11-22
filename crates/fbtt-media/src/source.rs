@@ -80,7 +80,7 @@ pub struct TrackConfig {
 /// caller can still tell a codec it does not speak from a file that does not
 /// hold together.
 #[derive(Debug, thiserror::Error)]
-pub enum SourceError {
+pub(crate) enum SourceError {
     /// The reader failed. A [`std::io::ErrorKind::TimedOut`] stays here: a piece
     /// of a torrent that has not arrived yet is not a verdict about the file.
     #[error("io: {0}")]
@@ -130,7 +130,58 @@ impl From<SourceError> for crate::MediaError {
 }
 
 /// A source's result: a sample, an end, or a verdict about why neither arrived.
-pub type SourceResult<T> = Result<T, SourceError>;
+pub(crate) type SourceResult<T> = Result<T, SourceError>;
+
+/// The first failure of a stream, kept so every later request gets the same
+/// verdict.
+///
+/// The verdicts themselves are not `Clone` - an `io::Error` carries OS state -
+/// so the kind is kept apart from the message and the error is rebuilt for
+/// every call. That is what makes a reader that timed out keep answering
+/// `Io` after its first timeout instead of inventing a `Malformed` verdict
+/// about a file it never got to finish reading.
+#[derive(Debug, Clone)]
+pub(crate) enum StoredError {
+    Io(std::io::ErrorKind, String),
+    Malformed(String),
+    Unsupported(String),
+    /// Kept as itself so a source that reported one is replayed verbatim;
+    /// the closest `MediaError` is the read failure
+    /// [`MediaError::from`] gives it.
+    Disconnected,
+}
+
+impl StoredError {
+    pub(crate) fn from_source(error: &SourceError) -> Self {
+        match error {
+            SourceError::Io(err) => Self::Io(err.kind(), err.to_string()),
+            SourceError::Malformed(message) => Self::Malformed(message.clone()),
+            SourceError::Unsupported(message) => Self::Unsupported(message.clone()),
+            SourceError::Disconnected => Self::Disconnected,
+        }
+    }
+
+    fn from_media(error: &crate::MediaError) -> Self {
+        match error {
+            crate::MediaError::Io(err) => Self::Io(err.kind(), err.to_string()),
+            crate::MediaError::Malformed(message) => Self::Malformed(message.clone()),
+            crate::MediaError::Unsupported(message) => Self::Unsupported(message.clone()),
+        }
+    }
+
+    pub(crate) fn to_source_error(&self) -> SourceError {
+        match self {
+            Self::Io(kind, message) => SourceError::Io(std::io::Error::new(*kind, message.clone())),
+            Self::Malformed(message) => SourceError::Malformed(message.clone()),
+            Self::Unsupported(message) => SourceError::Unsupported(message.clone()),
+            Self::Disconnected => SourceError::Disconnected,
+        }
+    }
+
+    fn to_media_error(&self) -> crate::MediaError {
+        crate::MediaError::from(self.to_source_error())
+    }
+}
 
 /// One track's samples, from whatever container they live in.
 ///
@@ -145,11 +196,11 @@ pub type SourceResult<T> = Result<T, SourceError>;
 /// `Send` is a supertrait because a stream of samples crosses threads on its way
 /// to an HTTP response: the source is boxed into a
 /// [`FragmentStream`] and moved to whichever task is writing the response.
-pub trait TrackSource: Send {
+pub(crate) trait TrackSource: Send {
     /// What the writer needs before the first sample: timescale, kind, codec,
     /// sample entry. Infallible because a source that could not decide these
-    /// was never opened: [`open_track`](crate::mkv::open_track) reports every
-    /// verdict this could need to make before it hands a source over.
+    /// was never opened: `open_track` reports every verdict this could need to
+    /// make before it hands a source over.
     fn config(&self) -> &TrackConfig;
 
     /// The next sample, or `None` at the end of the track. Errors are verdicts
@@ -159,36 +210,15 @@ pub trait TrackSource: Send {
     /// mid-track stays malformed.
     fn next_sample(&mut self) -> SourceResult<Option<Sample>>;
 
-    /// Re-position the source at or just before `start_ms` of source time, at a
-    /// sync point. A source overrides this only when it can actually seek; the
-    /// default reports `Unsupported` rather than silently doing nothing,
-    /// because a caller that asked to seek and got silence would serve samples
-    /// from the wrong place.
-    fn seek(&mut self, start_ms: u64) -> SourceResult<()> {
-        let _ = start_ms;
-        Err(SourceError::Unsupported(
-            "this source cannot seek".to_string(),
-        ))
-    }
-
     /// Where this source's samples actually begin, in milliseconds of source
     /// time, after any seeking it did. A source that does not seek can leave
     /// this at zero and mean it.
     fn start_ms(&self) -> u64 {
         0
     }
-
-    /// The MIME type of the byte stream a [`FragmentStream`] of this source
-    /// produces, so a response handler can set `Content-Type` without knowing
-    /// the container: Matroska sources say `video/x-matroska` or `video/webm`,
-    /// and the default says fragmented MP4, which is what a source that carries
-    /// MP4 samples remuxes to.
-    fn mime(&self) -> &'static str {
-        "video/mp4"
-    }
 }
 
-/// A [`TrackSource`]'s samples as fragmented MP4 bytes: one init segment, then
+/// One track source's samples as fragmented MP4 bytes: one init segment, then
 /// one `moof` + `mdat` fragment at a time, in `Vec`s sized exactly to their
 /// contents.
 ///
@@ -209,15 +239,24 @@ pub trait TrackSource: Send {
 pub struct FragmentStream {
     source: Box<dyn TrackSource>,
     writer: crate::FragmentWriter,
-    /// The init segment, until the first fragment has taken it. `Vec::new()`
-    /// afterwards frees nothing by itself, but it is dropped when the first
-    /// fragment is built, so a long stream holds no init segment.
+    /// The init segment. Kept for the whole life of the stream so
+    /// [`init_segment`](Self::init_segment) answers whenever a caller asks -
+    /// a few kilobytes, and the first fragment copies it rather than moving it
+    /// out.
     init: Vec<u8>,
-    mime: &'static str,
-    /// The message of the first failure, which every later call repeats: a
+    /// Whether the init segment has already been put in front of a fragment.
+    /// `init` stays readable for [`init_segment`](Self::init_segment) for the
+    /// stream's whole life, so "the prefix has been served" needs its own
+    /// memory; without it every fragment would arrive as init-plus-fragment.
+    prefixed: bool,
+    mime: String,
+    /// Whether the source has run out and the writer has been finished: after
+    /// this, every call answers `None` without touching either again.
+    ended: bool,
+    /// The first failure, which every later call repeats with the same kind: a
     /// failed write leaves the fragment writer half-moved, and a second attempt
     /// would invent bytes.
-    failed: Option<String>,
+    failed: Option<StoredError>,
 }
 
 impl std::fmt::Debug for FragmentStream {
@@ -228,13 +267,17 @@ impl std::fmt::Debug for FragmentStream {
         f.debug_struct("FragmentStream")
             .field("mime", &self.mime)
             .field("init_len", &self.init.len())
+            .field("ended", &self.ended)
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
 
 impl FragmentStream {
-    /// The fragmented MP4 stream for one track source.
+    /// The fragmented MP4 stream for one boxed track source.
+    ///
+    /// Crate-internal: the public way in is [`open_track`](crate::open_track),
+    /// which opens the container and knows the codec string `mime` reports.
     ///
     /// The init segment is built from the source's [`TrackConfig`] here, before
     /// any sample arrives, because a caller needs it for `Content-Type` and a
@@ -244,29 +287,41 @@ impl FragmentStream {
     /// A zero timescale in the config is not rejected here (it is rejected by
     /// [`init_segment`](crate::init_segment), which this calls, and by the
     /// fragment writer at its first use).
-    pub fn new<S: TrackSource + 'static>(source: S) -> Result<Self, SourceError> {
-        // Read everything the source has to say before boxing it: the config
-        // borrow and the mime answer need the source by name, and the box eats
-        // the name.
+    pub(crate) fn new(
+        source: Box<dyn TrackSource>,
+        mime: String,
+    ) -> Result<Self, crate::MediaError> {
+        // Read the config out of the box before the fields take it: the borrow
+        // needs the source by name, and `writer` moves the box away.
         let config = source.config().clone();
-        let mime = source.mime();
-        let init = crate::init_segment(&config).map_err(SourceError::from_media)?;
+        let init = crate::init_segment(&config)?;
         Ok(Self {
-            source: Box::new(source),
+            source,
             writer: crate::FragmentWriter::new(&config),
             init,
+            prefixed: false,
             mime,
+            ended: false,
             failed: None,
         })
     }
 
-    /// The MIME type to serve this stream under: what [`TrackSource::mime`]
-    /// answered when the stream was built - `video/webm` or `video/x-matroska`
-    /// for a Matroska source, per the plan's ruling that the player asks the
-    /// browser for the container the samples came from. A response handler sets
-    /// `Content-Type` from this.
-    pub fn mime(&self) -> &'static str {
-        self.mime
+    /// The MIME type to serve this stream under: fragmented MP4 for the
+    /// track's kind, carrying the track's RFC 6381 codec string - exactly what
+    /// a browser constructs a `SourceBuffer` with, e.g.
+    /// `video/mp4; codecs="avc1.64000A"` or `audio/mp4; codecs="opus"`. A
+    /// response handler sets `Content-Type` from this; the bytes it describes
+    /// are the init segment plus the fragments, never the source container.
+    pub fn mime(&self) -> String {
+        self.mime.clone()
+    }
+
+    /// The init segment: the bytes a player needs before any fragment, which
+    /// the first returned fragment also carries in front of itself. Kept for
+    /// the stream's whole life, so this answers the same bytes after the first
+    /// fragment has been handed out as before it.
+    pub fn init_segment(&self) -> &[u8] {
+        &self.init
     }
 
     /// Where the stream's samples begin, in milliseconds of source time, after
@@ -287,43 +342,43 @@ impl FragmentStream {
     /// A source that fails ends the stream with that failure, repeated
     /// verbatim to every later call; the writer is not retried past its first
     /// error.
-    pub fn next_fragment(&mut self) -> SourceResult<Option<Vec<u8>>> {
-        if let Some(reason) = &self.failed {
-            return Err(SourceError::Malformed(reason.clone()));
+    pub fn next_fragment(&mut self) -> Result<Option<Vec<u8>>, crate::MediaError> {
+        if let Some(failure) = &self.failed {
+            return Err(failure.to_media_error());
+        }
+        if self.ended {
+            return Ok(None);
         }
         let result = self.next_fragment_inner();
         if let Err(error) = &result {
-            // Keep the verdict's message, and repeat it: a source that failed
-            // once has already moved half a fragment's state.
-            let reason = match error {
-                SourceError::Io(_) | SourceError::Disconnected | SourceError::Unsupported(_) => {
-                    error.to_string()
-                }
-                SourceError::Malformed(message) => message.clone(),
-            };
-            self.failed.get_or_insert(reason);
+            // Keep the verdict's kind and its message, and repeat both: a
+            // source that failed once has already moved half a fragment's
+            // state, and a reader that timed out is still a reader that timed
+            // out on the next call, not a file that stopped making sense.
+            self.failed
+                .get_or_insert_with(|| StoredError::from_media(error));
         }
         result
     }
 
-    fn next_fragment_inner(&mut self) -> SourceResult<Option<Vec<u8>>> {
+    fn next_fragment_inner(&mut self) -> Result<Option<Vec<u8>>, crate::MediaError> {
         loop {
-            match self.source.next_sample()? {
+            match self.source.next_sample().map_err(crate::MediaError::from)? {
                 Some(sample) => {
-                    if let Some(fragment) =
-                        self.writer.push(sample).map_err(SourceError::from_media)?
-                    {
+                    if let Some(fragment) = self.writer.push(sample)? {
                         return Ok(Some(self.take_prefix(fragment)));
                     }
                 }
                 None => {
-                    // The source is over: seal whatever the writer still holds.
-                    // `finish` answers `None` when no sample was ever pushed or
-                    // held, and then this stream is done.
-                    let last = self.writer.finish().map_err(SourceError::from_media)?;
+                    // The source is over: seal whatever the writer still holds,
+                    // once. `finish` answers `None` when no sample was ever
+                    // pushed or held, and then the stream's answer is the init
+                    // segment alone - a complete if silent stream.
+                    let last = self.writer.finish()?;
+                    self.ended = true;
                     return Ok(match last {
                         Some(fragment) => Some(self.take_prefix(fragment)),
-                        None if !self.init.is_empty() => Some(std::mem::take(&mut self.init)),
+                        None if !self.init.is_empty() => Some(self.init.clone()),
                         None => None,
                     });
                 }
@@ -331,13 +386,16 @@ impl FragmentStream {
         }
     }
 
-    /// The init segment in front of `fragment` if it has not been handed out
-    /// yet, and `fragment` alone afterwards.
+    /// The init segment in front of `fragment` the first time this is called,
+    /// and `fragment` alone every time after: a `SourceBuffer` wants the init
+    /// segment exactly once, ahead of the first media bytes.
     fn take_prefix(&mut self, fragment: Vec<u8>) -> Vec<u8> {
-        if self.init.is_empty() {
+        if self.prefixed {
             return fragment;
         }
-        let mut out = std::mem::take(&mut self.init);
+        self.prefixed = true;
+        let mut out = Vec::with_capacity(self.init.len() + fragment.len());
+        out.extend_from_slice(&self.init);
         out.extend_from_slice(&fragment);
         out
     }

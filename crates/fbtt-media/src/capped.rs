@@ -30,14 +30,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Bytes bound what a header can make a reader hand out, but not how many times it can ask: a
 /// `SeekHead` that points at itself reads only a few dozen bytes a pass and would still cost
 /// hundreds of millions of calls on an [`ELEMENT_CAP`](crate::ELEMENT_CAP) byte budget, and in
-/// production every call
-/// goes through a blocking reader. A 2 hour MKV with a cue point every second costs about 200k
-/// calls opening and probing, and seeking to the last second walks the same cue table again, so
-/// a million is that file's worth with only about five times room to spare. `open_track` reads
-/// a whole film's cue table through one lifted budget, which is a real second walk, and a table
-/// with 60k entries costs over 2M calls on its own, so the bound sits at 4M: still small enough
-/// that a file whose element sizes are junk exhausts it rather than reading the whole file, and
-/// measured behaviour, not guesswork.
+/// production every call goes through a blocking reader. A 2 hour MKV with a cue point every
+/// second measured about 300k calls opening, probing, and seeking to the last second - about 38
+/// calls per cue table walk - where the doc comment this replaced guessed 200k. That is why the
+/// bound is not a million: a 7 hour recording on 1 s cues reaches its 2.6M calls on the strength
+/// of the cue table alone, and `open_track` reads the whole table through one lifted budget, so
+/// the 60k-entry table of `tests/remux.rs`'s 60000-cue-point test measured over 2M calls for one
+/// seek. The bound sits at `1 << 22`, just under 4.2M: more than 13 times a 2 hour file's
+/// measured worth, room for a 7 hour recording and its seeks, and still small enough that a file
+/// whose element sizes are junk exhausts the call budget rather than reading the whole file.
+/// Measured behaviour, not guesswork.
 pub const MAX_HEADER_OPS: u64 = 1 << 22;
 
 /// How many bytes a reader may hand out in total, shared by everything reading through it.
