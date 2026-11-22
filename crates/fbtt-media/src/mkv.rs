@@ -150,7 +150,7 @@ struct PendingFrame {
 /// right track, empty". Zero is the one value no real `TrackNumber` has, so
 /// "the slot still says track 0" is how callers tell a filled frame from a
 /// stale one.
-fn guarded_next<R: Read + Seek>(
+pub(crate) fn guarded_next<R: Read + Seek>(
     file: &mut MatroskaFile<CappedLen<R>>,
     slot: &mut Frame,
     what: &str,
@@ -166,7 +166,7 @@ fn guarded_next<R: Read + Seek>(
 }
 
 /// Seek the demuxer under a panic guard.
-fn guarded_seek<R: Read + Seek>(
+pub(crate) fn guarded_seek<R: Read + Seek>(
     file: &mut MatroskaFile<CappedLen<R>>,
     target: u64,
 ) -> Result<(), MediaError> {

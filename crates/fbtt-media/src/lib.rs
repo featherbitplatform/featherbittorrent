@@ -28,7 +28,7 @@ pub use fmp4::{FragmentWriter, init_segment};
 pub use mkv::open_track;
 pub use probe::{MediaInfo, TrackInfo, probe};
 pub use source::{FragmentStream, Sample, TrackConfig};
-pub use subtitle::{Cue, SubtitleFormat, file_cues, subtitle_format};
+pub use subtitle::{Cue, SubtitleFormat, embedded_cues, file_cues, subtitle_format};
 
 /// Which container a file is.
 ///

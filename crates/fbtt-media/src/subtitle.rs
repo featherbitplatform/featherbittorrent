@@ -10,8 +10,23 @@
 //! error: a caption file with one bad cue still has the rest of the
 //! conversation to show. The only whole-file error is the cue count, which is
 //! enforced the moment a kept cue would be number [`MAX_CUES`] + 1.
+//!
+//! Subtitles embedded in a Matroska or WebM file are read the same way:
+//! [`embedded_cues`] opens the file through the same guarded, budgeted
+//! Matroska open [`open_track`](crate::mkv::open_track) uses, walks the
+//! frames of one subtitle track, and keeps the cues that overlap the asked
+//! window. A frame is at most the file cap and a track is at most the cue
+//! cap, so a hostile file holds one decoded string and a bounded cue list.
 
-use crate::{MAX_CUES, MediaError, SUBTITLE_FILE_CAP};
+use crate::capped::ReadBudget;
+use crate::codec::Codec;
+use crate::mkv::{guarded_next, guarded_seek};
+use crate::probe::{matroska_kind, open_matroska};
+use crate::{
+    CUE_WINDOW_MAX_MS, ELEMENT_CAP, MAX_CUES, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP,
+};
+use matroska_demuxer::Frame;
+use std::io::{Read, Seek};
 
 /// One line of a subtitle, in source time.
 ///
@@ -658,6 +673,290 @@ fn clean_html_tags(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Subtitles embedded in a Matroska or WebM file: the cues of one track that
+/// overlap the window `[from_ms, to_ms)`, sorted by `start_ms`.
+///
+/// `reader` is any seekable source, the same reader the probe and the
+/// remuxer take. The window is checked before anything is read: `to_ms <=
+/// from_ms`, or a window wider than [`CUE_WINDOW_MAX_MS`], is
+/// [`MediaError::Unsupported`], because neither names a moment of the video.
+/// A file that is not Matroska or WebM is [`MediaError::Unsupported`] too; an
+/// MP4 (`ftyp`/`moov` at offset 4) is `Unsupported("embedded MP4 subtitles")`
+/// until the MP4 path lands.
+///
+/// The file is opened exactly the way
+/// [`open_track`](crate::mkv::open_track) opens it: through the crate's
+/// budgeted, capped Matroska open, and every frame read and seek wrapped in
+/// the same `catch_unwind` guard, so a hostile file answers with a
+/// [`MediaError`], never a panic.
+///
+/// `track` is the container's own `TrackNumber`. It must be a subtitle track
+/// with a text codec fbtt reads (`S_TEXT/UTF8`, `S_TEXT/ASS`, `S_TEXT/SSA`);
+/// any other track or codec - video, audio, a track the file does not carry,
+/// and bitmap subtitles like PGS or VobSub - is [`MediaError::Unsupported`].
+///
+/// When `from_ms > 10 000` the demuxer seeks to `from_ms - 10 000`, because a
+/// subtitle can start before the seek point; below that it reads from the
+/// start with no seek. In a file with cues the seek lands correctly, but in
+/// a file without them a seek into the last cluster ends the stream: if the
+/// seek gives no frame at all, the file is re-opened from the start and read
+/// forward instead.
+pub fn embedded_cues<R: Read + Seek>(
+    mut reader: R,
+    track: u32,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<Vec<Cue>, MediaError> {
+    // The window, checked before anything is read.
+    if to_ms <= from_ms || to_ms - from_ms > CUE_WINDOW_MAX_MS {
+        return Err(MediaError::Unsupported(format!(
+            "embedded subtitle window {from_ms}..{to_ms} is empty or wider than {CUE_WINDOW_MAX_MS} ms"
+        )));
+    }
+    // The container. Eight bytes decide: the EBML magic is Matroska or WebM,
+    // an `ftyp` or `moov` box is the MP4 path (Unsupported for now), anything
+    // else is not a container this function reads.
+    let mut magic = [0u8; 8];
+    match reader.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(MediaError::Unsupported(
+                "too short to hold a container header".to_string(),
+            ));
+        }
+        Err(err) => return Err(MediaError::Io(err)),
+    }
+    reader.rewind()?;
+    if magic[4..] == *b"ftyp" || magic[4..] == *b"moov" {
+        return Err(MediaError::Unsupported(
+            "embedded MP4 subtitles".to_string(),
+        ));
+    }
+    if magic[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
+        return Err(MediaError::Unsupported(format!(
+            "not a Matroska or WebM file: starts with {magic:02X?}"
+        )));
+    }
+    let cues = open_and_read(reader, u64::from(track), from_ms, to_ms)?;
+    Ok(cues)
+}
+
+/// The `embedded_cues` walk, over a reader already past its container check.
+///
+/// Opens the file the way the remuxer does, verifies the track, then reads
+/// frames of that track from the seek point to `to_ms` and keeps the cues
+/// that overlap the window. The re-open for a seek that gives no frame
+/// happens here, on the same reader.
+fn open_and_read<R: Read + Seek>(
+    mut reader: R,
+    track: u64,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<Vec<Cue>, MediaError> {
+    // The seek target, when there is one: 10 000 ms before the window, so a
+    // subtitle that starts before the seek point is not cut. The guard means
+    // the subtraction cannot underflow.
+    #[allow(clippy::implicit_saturating_sub)]
+    let seek_ms = if from_ms > 10_000 {
+        from_ms - 10_000
+    } else {
+        0
+    };
+    let mut cues = read_track(&mut reader, track, from_ms, to_ms, seek_ms)?;
+    // A seek that gives no frame at all: a file without cues, whose last
+    // cluster the seek ran into and ended the stream on. Re-open from the
+    // start and read forward - the reader sits after the failed open, so
+    // rewind it first.
+    if cues.is_empty() && seek_ms > 0 {
+        reader.rewind()?;
+        cues = read_track(&mut reader, track, from_ms, to_ms, 0)?;
+    }
+    cues.sort_by_key(|cue| cue.start_ms);
+    Ok(cues)
+}
+
+/// Open one Matroska file, confirm `track` is a readable text subtitle track,
+/// and read its frames from `seek_ms` to `to_ms` into cues overlapping
+/// `[from_ms, to_ms)`.
+fn read_track<R: Read + Seek>(
+    reader: R,
+    track: u64,
+    from_ms: u64,
+    to_ms: u64,
+    seek_ms: u64,
+) -> Result<Vec<Cue>, MediaError> {
+    // The same budgeted, capped open the remuxer and the probe use. The budget
+    // is cloned before `open_matroska` moves it in, and lifted once the header
+    // parse has succeeded: the frame reads are bounded by MAX_SKIPPED_FRAMES
+    // and the per-frame cap, not by the header budget.
+    let budget = ReadBudget::new(ELEMENT_CAP);
+    let mut file = open_matroska(reader, budget.clone())?;
+    let scale = file.info().timestamp_scale().get();
+    // The track, and what kind of text it holds.
+    let codec = file
+        .tracks()
+        .iter()
+        .find(|entry| entry.track_number().get() == track)
+        .ok_or_else(|| {
+            MediaError::Unsupported(format!("track {track} is not one of this file's tracks"))
+        })
+        .and_then(|entry| {
+            if matroska_kind(entry) != Some(crate::codec::TrackKind::Subtitle) {
+                return Err(MediaError::Unsupported(format!(
+                    "track {track} is not a subtitle track"
+                )));
+            }
+            let id = entry.codec_id().to_string();
+            let codec = match id.as_str() {
+                "S_TEXT/UTF8" => Codec::SubRip,
+                "S_TEXT/ASS" | "S_TEXT/SSA" => Codec::Ass,
+                other => {
+                    return Err(MediaError::Unsupported(format!(
+                        "track {track} has subtitle codec {other}, which fbtt does not read"
+                    )));
+                }
+            };
+            Ok(codec)
+        })?;
+    budget.lift();
+    let mut slot = Frame::default();
+    if seek_ms > 0 {
+        let units = scale_units(seek_ms, scale)?;
+        guarded_seek(&mut file, units)?;
+    }
+    let mut cues: Vec<(u64, Option<u64>, String)> = Vec::new();
+    // A frame that produced no cue, counted against MAX_SKIPPED_FRAMES: the
+    // bound on a track whose frames never make a cue.
+    let mut skipped = 0usize;
+    loop {
+        if !guarded_next(&mut file, &mut slot, "subtitle frames")? {
+            break;
+        }
+        // A slot still claiming track 0 was filled by nothing (an empty
+        // BlockGroup): no frame, so it counts against patience.
+        if slot.track != track {
+            skipped += 1;
+            if skipped > MAX_SKIPPED_FRAMES {
+                return Err(MediaError::Malformed(format!(
+                    "no subtitle within {MAX_SKIPPED_FRAMES} frames"
+                )));
+            }
+            continue;
+        }
+        // A timestamp too wide for the timeline is a malformed file.
+        let start_ms = frame_start_ms(slot.timestamp, scale)?;
+        // Past the window: the track's frames are in order, so nothing after
+        // this overlaps the window.
+        if start_ms >= to_ms {
+            break;
+        }
+        // The block's duration, in milliseconds of source time, when the
+        // frame states one.
+        let duration_ms = slot
+            .duration
+            .and_then(|duration| frame_duration_ms(duration, scale));
+        // The text, cleaned by the format's rules, or `None` for a frame with
+        // no cue (an ASS block with fewer than nine fields, or a frame over
+        // the per-frame cap).
+        let text = frame_text(&slot.data, &codec);
+        match text {
+            None => {
+                skipped += 1;
+                if skipped > MAX_SKIPPED_FRAMES {
+                    return Err(MediaError::Malformed(format!(
+                        "no cue within {MAX_SKIPPED_FRAMES} frames"
+                    )));
+                }
+                continue;
+            }
+            Some(text) => {
+                skipped = 0;
+                if cues.len() >= MAX_CUES {
+                    return Err(MediaError::Malformed(format!(
+                        "track {track} holds more than {MAX_CUES} cues"
+                    )));
+                }
+                cues.push((start_ms, duration_ms, text));
+            }
+        }
+    }
+    // The cues, with ends worked out: the block's duration when it states one,
+    // the next cue's start otherwise, or start + 5000 at the end of the track.
+    let mut out = Vec::with_capacity(cues.len());
+    for (index, (start_ms, duration_ms, text)) in cues.iter().enumerate() {
+        let end_ms = duration_ms
+            .and_then(|duration| (*start_ms).checked_add(duration))
+            .or_else(|| cues.get(index + 1).map(|(next, _, _)| *next))
+            .unwrap_or_else(|| start_ms.saturating_add(5000));
+        // Keep the cues that overlap the window; a cue with no room on screen
+        // (end_ms <= start_ms) is dropped.
+        if end_ms > from_ms && *start_ms < to_ms && end_ms > *start_ms {
+            if text.is_empty() {
+                continue;
+            }
+            out.push(Cue {
+                start_ms: *start_ms,
+                end_ms,
+                text: text.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Container timestamp units for a millisecond request, or `Malformed` when
+/// the file's `TimestampScale` cannot count it.
+fn scale_units(ms: u64, scale: u64) -> Result<u64, MediaError> {
+    let ns = u128::from(ms) * 1_000_000;
+    let units = ns / u128::from(scale);
+    u64::try_from(units).map_err(|_| {
+        MediaError::Malformed(format!(
+            "time {ms} ms is past what TimestampScale {scale} can count"
+        ))
+    })
+}
+
+/// A frame's start, in milliseconds: nanoseconds over a million, all checked
+/// in `u128`, `Malformed` on overflow.
+fn frame_start_ms(timestamp: u64, scale: u64) -> Result<u64, MediaError> {
+    let overflow =
+        || MediaError::Malformed("a subtitle timestamp overflows the timeline".to_string());
+    let ns = u128::from(timestamp)
+        .checked_mul(u128::from(scale))
+        .ok_or_else(overflow)?;
+    let ms = ns / 1_000_000;
+    u64::try_from(ms).map_err(|_| overflow())
+}
+
+/// A frame's stated duration, in milliseconds, when it fits the timeline.
+fn frame_duration_ms(duration: u64, scale: u64) -> Option<u64> {
+    let ns = u128::from(duration).checked_mul(u128::from(scale))?;
+    let ms = ns / 1_000_000;
+    u64::try_from(ms).ok()
+}
+
+/// A subtitle frame's text, cleaned by the format's rules.
+///
+/// `S_TEXT/UTF8` is plain text: the same tag rule as SRT. `S_TEXT/ASS` and
+/// `S_TEXT/SSA` are `Dialogue:` fields: the text is the ninth comma field
+/// onward (ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect,
+/// Text), and the ASS cleaner runs over it. A frame with fewer than nine
+/// fields is no cue, and a frame whose text is over the file cap is skipped.
+fn frame_text(data: &[u8], codec: &Codec) -> Option<String> {
+    if data.len() > SUBTITLE_FILE_CAP as usize {
+        return None;
+    }
+    let text = decode(data);
+    let cleaned = match codec {
+        Codec::Ass => {
+            let rest = text.splitn(9, ',').last()?.trim_start();
+            clean_ass(rest)
+        }
+        _ => clean_html_tags(&text),
+    };
+    Some(cleaned)
 }
 
 #[cfg(test)]
