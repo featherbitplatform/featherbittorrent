@@ -106,38 +106,23 @@ fn decode(bytes: &[u8]) -> String {
 /// line ending, not two, so a cue's number line and its timing line stay
 /// adjacent. The lines borrow from `text`, so a 4 MiB file holds one decoded
 /// `String` and a slice of its line starts, not a copy of every line.
-fn lines(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                out.push(&text[start..i]);
-                i += 1;
-                start = i;
-            }
-            b'\r' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    out.push(&text[start..i]);
-                    i += 2;
-                } else {
-                    out.push(&text[start..i]);
-                    i += 1;
-                }
-                start = i;
-            }
-            _ => i += 1,
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
         }
-    }
-    if start < bytes.len() || (start == 0 && bytes.is_empty()) || !text.is_empty() {
-        // A trailing line without a newline, or the empty string.
-        if start < text.len() {
-            out.push(&text[start..]);
+        match rest.find(['\n', '\r']) {
+            None => Some(std::mem::take(&mut rest)),
+            Some(i) => {
+                let line = &rest[..i];
+                let crlf =
+                    rest.as_bytes()[i] == b'\r' && rest.as_bytes().get(i + 1) == Some(&b'\n');
+                rest = &rest[i + if crlf { 2 } else { 1 }..];
+                Some(line)
+            }
         }
-    }
-    out
+    })
 }
 
 /// Add a cue to `cues`, dropping it when it has no text or `end_ms` does not
@@ -170,7 +155,7 @@ fn push_cue(
 /// skipped to its empty line, and the rest of the file still parses.
 fn srt_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     let mut cues = Vec::new();
-    let lines = lines(text);
+    let lines: Vec<&str> = lines(text).collect();
     let mut i = 0;
     while i < lines.len() {
         // Skip the blanks between blocks.
@@ -354,13 +339,10 @@ fn is_section_header(line: &str) -> bool {
 /// is the distance between its pointer and the text's, so the scan is one
 /// forward pass over the bytes.
 fn events_section(text: &str) -> Option<&str> {
-    let lines = split_lines(text);
-    let header = lines.iter().position(|line| is_events_header(line))?;
     let base = text.as_ptr() as usize;
-    let offset_of = |line: &&str| line.as_ptr() as usize - base;
-    let header_line = lines[header];
+    let header_line = lines(text).find(|line| is_events_header(line))?;
     // The body begins just past the header line's ending.
-    let after = offset_of(&header_line) + header_line.len();
+    let after = (header_line.as_ptr() as usize - base) + header_line.len();
     let nl = text[after..].find(['\n', '\r'])?;
     let advance = if text.as_bytes().get(after + nl) == Some(&b'\r')
         && text.as_bytes().get(after + nl + 1) == Some(&b'\n')
@@ -372,7 +354,7 @@ fn events_section(text: &str) -> Option<&str> {
     let body = &text[after + advance..];
     // The next section header ends the section.
     let mut offset = 0usize;
-    for line in split_lines(body) {
+    for line in lines(body) {
         if is_section_header(line) {
             return Some(&body[..offset]);
         }
@@ -397,8 +379,7 @@ fn standard_ass_columns() -> Vec<&'static str> {
 /// `[V4+ Styles]` `Format:` line never applies to `Dialogue:` lines. `None`
 /// when the section has no `Format:` line.
 fn events_format_fields(section: &str) -> Option<Vec<String>> {
-    split_lines(section)
-        .iter()
+    lines(section)
         .find_map(|line| {
             let fields = line.trim().strip_prefix("Format:")?;
             Some(
@@ -461,7 +442,7 @@ fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
         _ => return Ok(Vec::new()),
     };
     let mut cues = Vec::new();
-    for line in split_lines(scope) {
+    for line in lines(scope) {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("Dialogue:") else {
             continue;
@@ -484,19 +465,13 @@ fn ass_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     Ok(cues)
 }
 
-/// The lines of `text` for the ASS parser: the same three line endings as
-/// [`lines`], borrowed.
-fn split_lines(text: &str) -> Vec<&str> {
-    lines(text)
-}
-
 /// WebVTT: the `WEBVTT` header, `NOTE`/`STYLE`/`REGION` blocks and cue timing
 /// lines. A cue may open with an identifier line before its timing line, and
 /// the timing line may carry cue settings after the end time, which are
 /// ignored.
 fn vtt_cues(text: &str) -> Result<Vec<Cue>, MediaError> {
     let mut cues = Vec::new();
-    let lines = lines(text);
+    let lines: Vec<&str> = lines(text).collect();
     let mut i = 0;
     // The header block: WEBVTT and its metadata lines, to the first blank.
     while i < lines.len() {
