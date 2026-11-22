@@ -761,19 +761,30 @@ fn embedded_preroll_text_is_capped() {
     // after the walk finishes. The cues do not overlap the window, so a check
     // that ran only over the kept cues would never see them and would return
     // Ok(empty).
-    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    let tracks = common::tracks(&[
+        common::track_entry(1, 0x11, b"S_TEXT/UTF8"),
+        common::track_entry(2, 1, b"V_MPEG4/ISO/AVC"),
+    ]);
+    // The file has no Cues, so the seek to 19 000 is the demuxer's linear
+    // search: it returns the last cluster that starts at or before the seek
+    // point. A one-block video cluster at 10 s gives it a real cluster to land
+    // on (without it the first cluster, at 20 s, is already past 19 000 and the
+    // seek falls back to offset 0, so the blocks would be read only by the
+    // re-open from the start). The walk then starts at 10 s and reads the five
+    // blocks after the seek, which is the pre-roll path.
     // Five blocks, each 1 MiB of 'x', spaced 1 s apart from 20 s to 24 s. The
-    // window is 29 000 to 31 000, the seek is 19 000, so every block is read
-    // after the seek (real pre-roll) and none overlaps the window.
+    // window is 29 000 to 31 000, so none overlaps it.
     let payload = vec![b'x'; 1_024 * 1_024];
-    let clusters: Vec<Vec<u8>> = (0..5)
-        .map(|i| {
-            common::cluster(
-                20_000 + i * 1_000,
-                &[common::simple_block(1, 0, false, &payload)],
-            )
-        })
-        .collect();
+    let mut clusters: Vec<Vec<u8>> = vec![common::cluster(
+        10_000,
+        &[common::simple_block(2, 0, true, b"v")],
+    )];
+    clusters.extend((0..5).map(|i| {
+        common::cluster(
+            20_000 + i * 1_000,
+            &[common::simple_block(1, 0, false, &payload)],
+        )
+    }));
 
     let err = embedded_cues(
         Cursor::new(common::matroska_file(&common::indexed_segment(
