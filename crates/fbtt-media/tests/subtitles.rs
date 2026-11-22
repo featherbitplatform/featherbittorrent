@@ -3,8 +3,8 @@
 //! give its good cues back, or no cues, never a panic, never a hang.
 
 use fbtt_media::{
-    CUE_WINDOW_MAX_MS, Cue, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP, SubtitleFormat,
-    embedded_cues, file_cues, subtitle_format,
+    CUE_WINDOW_MAX_MS, Cue, MAX_CUE_SCAN_FRAMES, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP,
+    SubtitleFormat, embedded_cues, file_cues, subtitle_format,
 };
 use std::fs;
 use std::io::Cursor;
@@ -539,18 +539,52 @@ fn cluster_block_offset(cluster: &[u8]) -> u64 {
 
 #[test]
 fn embedded_hostile_frames_are_bounded() {
-    // One subtitle track whose one cue sits at 0 s, and a video track whose
-    // MAX_SKIPPED_FRAMES frames all sit at 0 s too: the walk must give up with
-    // Malformed after MAX_SKIPPED_FRAMES frames of no cue, not read on.
+    // One subtitle track that has no frame at all, and a video track whose
+    // MAX_CUE_SCAN_FRAMES + 1 frames all sit inside the window: the walk must
+    // give up with Malformed after reading that many frames, not read on.
     let tracks = common::tracks(&[
         common::track_entry(1, 0x11, b"S_TEXT/UTF8"),
         common::track_entry(2, 1, b"V_MPEG4/ISO/AVC"),
     ]);
-    // MAX_SKIPPED_FRAMES + 1 video frames, one per small cluster, none of them
-    // the subtitle track: the walk to a cue of track 1 never finds one, so it
-    // must give up after MAX_SKIPPED_FRAMES frames of no cue, not read on.
-    let clusters: Vec<Vec<u8>> = (0..MAX_SKIPPED_FRAMES as u64 + 1)
+    // MAX_CUE_SCAN_FRAMES + 1 video frames, one per small cluster, all at 0 s
+    // (inside the window), none of them the subtitle track: the read must give
+    // up after MAX_CUE_SCAN_FRAMES frames, not read on.
+    let clusters: Vec<Vec<u8>> = (0..MAX_CUE_SCAN_FRAMES + 1)
         .map(|_| common::cluster(0, &[common::simple_block(2, 0, true, &[0x41, 0x01])]))
+        .collect();
+
+    let start = Instant::now();
+    let err = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4000,
+    )
+    .expect_err("MAX_CUE_SCAN_FRAMES other-track frames is Malformed");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "MAX_CUE_SCAN_FRAMES other-track frames is Malformed, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "the bound must be reached quickly, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn embedded_empty_frames_are_bounded() {
+    // One subtitle track whose MAX_SKIPPED_FRAMES + 1 frames all give no cue
+    // (empty text): the walk must give up with Malformed after that many
+    // frames of the track itself, not read on.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    // MAX_SKIPPED_FRAMES + 1 frames, one per small cluster, all at 0 s, all
+    // with empty text: each gives no cue, so the skipped bound is what stops
+    // the read.
+    let clusters: Vec<Vec<u8>> = (0..MAX_SKIPPED_FRAMES as u64 + 1)
+        .map(|_| common::cluster(0, &[common::simple_block(1, 0, false, b"")]))
         .collect();
 
     let err = embedded_cues(
@@ -561,9 +595,107 @@ fn embedded_hostile_frames_are_bounded() {
         0,
         4000,
     )
-    .expect_err("a track with no cue in MAX_SKIPPED_FRAMES frames");
+    .expect_err("MAX_SKIPPED_FRAMES empty frames is Malformed");
     assert!(
         matches!(err, MediaError::Malformed(_)),
-        "MAX_SKIPPED_FRAMES other-track frames is Malformed, got {err:?}"
+        "MAX_SKIPPED_FRAMES empty frames is Malformed, got {err:?}"
+    );
+}
+
+#[test]
+fn embedded_ass_short_block_is_skipped() {
+    // An S_TEXT/ASS track with one block that has fewer than nine fields and
+    // one valid nine-field block: only the valid one comes back.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/ASS")]);
+    // The short block: three fields, not nine. The valid block: nine fields,
+    // the text in the ninth.
+    let short = common::cluster(0, &[common::simple_block(1, 0, false, b"0,0,Default")]);
+    let valid = common::cluster(
+        1_000,
+        &[common::simple_block(
+            1,
+            0,
+            false,
+            b"0,0,Default,,0,0,0,,Valid text",
+        )],
+    );
+    let clusters = [short, valid];
+
+    let cues = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4000,
+    )
+    .expect("the ass track");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 1_000,
+            // No BlockDuration: the end is the fallback, start plus 5000.
+            end_ms: 6_000,
+            text: "Valid text".into(),
+        }],
+        "the short block is skipped, only the valid one comes back"
+    );
+}
+
+#[test]
+fn embedded_last_cue_ends_at_next_cue() {
+    // Two cues at 3500 and 4100 with no BlockDuration and nothing else between
+    // them, window 0 to 4000: the first cue's end is the next cue's start
+    // (4100), not the 5000 ms fallback, because the walk records the first
+    // cue of the track at or past the window.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    let c0 = common::cluster(3_500, &[common::simple_block(1, 0, false, b"first")]);
+    let c1 = common::cluster(4_100, &[common::simple_block(1, 0, false, b"second")]);
+    let clusters = [c0, c1];
+
+    let cues = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        4_000,
+    )
+    .expect("the srt track");
+    assert_eq!(
+        cues,
+        vec![Cue {
+            start_ms: 3_500,
+            // The next cue's start, not the 5000 ms fallback.
+            end_ms: 4_100,
+            text: "first".into(),
+        }],
+        "the last cue in the window ends at the next cue's start"
+    );
+}
+
+#[test]
+fn embedded_total_text_is_capped() {
+    // About five blocks of 1 MiB of text each, inside the window: the total
+    // kept text passes SUBTITLE_FILE_CAP and the call is Malformed.
+    let tracks = common::tracks(&[common::track_entry(1, 0x11, b"S_TEXT/UTF8")]);
+    // Five blocks, each 1 MiB of 'x', spaced 1 s apart inside the window.
+    let payload = vec![b'x'; 1_024 * 1_024];
+    let clusters: Vec<Vec<u8>> = (0..5)
+        .map(|i| common::cluster(i * 1_000, &[common::simple_block(1, 0, false, &payload)]))
+        .collect();
+
+    let err = embedded_cues(
+        Cursor::new(common::matroska_file(&common::indexed_segment(
+            &tracks, 1_000_000, &clusters, None,
+        ))),
+        1,
+        0,
+        5_000,
+    )
+    .expect_err("the total kept text is over the cap");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "five 1 MiB blocks is Malformed, got {err:?}"
     );
 }

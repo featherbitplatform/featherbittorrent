@@ -23,7 +23,8 @@ use crate::codec::Codec;
 use crate::mkv::{guarded_next, guarded_seek};
 use crate::probe::{matroska_kind, open_matroska};
 use crate::{
-    CUE_WINDOW_MAX_MS, ELEMENT_CAP, MAX_CUES, MAX_SKIPPED_FRAMES, MediaError, SUBTITLE_FILE_CAP,
+    CUE_WINDOW_MAX_MS, ELEMENT_CAP, MAX_CUE_SCAN_FRAMES, MAX_CUES, MAX_SKIPPED_FRAMES, MediaError,
+    SUBTITLE_FILE_CAP,
 };
 use matroska_demuxer::Frame;
 use std::io::{Read, Seek};
@@ -746,8 +747,8 @@ pub fn embedded_cues<R: Read + Seek>(
 /// The `embedded_cues` walk, over a reader already past its container check.
 ///
 /// Opens the file the way the remuxer does, verifies the track, then reads
-/// frames of that track from the seek point to `to_ms` and keeps the cues
-/// that overlap the window. The re-open for a seek that gives no frame
+/// frames from the seek point to `to_ms` and keeps the track's cues that
+/// overlap the window. The re-open for a seek that gave no frame at all
 /// happens here, on the same reader.
 fn open_and_read<R: Read + Seek>(
     mut reader: R,
@@ -764,33 +765,41 @@ fn open_and_read<R: Read + Seek>(
     } else {
         0
     };
-    let mut cues = read_track(&mut reader, track, from_ms, to_ms, seek_ms)?;
-    // A seek that gives no frame at all: a file without cues, whose last
+    let (mut cues, saw_frame) = read_track(&mut reader, track, from_ms, to_ms, seek_ms)?;
+    // A seek that gave no frame at all: a file without cues, whose last
     // cluster the seek ran into and ended the stream on. Re-open from the
     // start and read forward - the reader sits after the failed open, so
-    // rewind it first.
-    if cues.is_empty() && seek_ms > 0 {
+    // rewind it first. An empty window is a normal answer, not a signal to
+    // re-read the file: only a seek that read nothing at all re-opens.
+    if seek_ms > 0 && !saw_frame {
         reader.rewind()?;
-        cues = read_track(&mut reader, track, from_ms, to_ms, 0)?;
+        let (rewound, _) = read_track(&mut reader, track, from_ms, to_ms, 0)?;
+        cues = rewound;
     }
     cues.sort_by_key(|cue| cue.start_ms);
     Ok(cues)
 }
 
 /// Open one Matroska file, confirm `track` is a readable text subtitle track,
-/// and read its frames from `seek_ms` to `to_ms` into cues overlapping
-/// `[from_ms, to_ms)`.
+/// and read frames from `seek_ms` to the first frame at or past `to_ms` into
+/// cues of that track overlapping `[from_ms, to_ms)`.
+///
+/// The second return value says whether the read after the seek returned at
+/// least one frame, of any track: the caller re-opens from the start only
+/// when a seek was made and no frame at all came back, and an empty window
+/// with frames around it is a normal answer.
 fn read_track<R: Read + Seek>(
     reader: R,
     track: u64,
     from_ms: u64,
     to_ms: u64,
     seek_ms: u64,
-) -> Result<Vec<Cue>, MediaError> {
+) -> Result<(Vec<Cue>, bool), MediaError> {
     // The same budgeted, capped open the remuxer and the probe use. The budget
     // is cloned before `open_matroska` moves it in, and lifted once the header
-    // parse has succeeded: the frame reads are bounded by MAX_SKIPPED_FRAMES
-    // and the per-frame cap, not by the header budget.
+    // parse has succeeded: the frame reads are bounded by
+    // MAX_CUE_SCAN_FRAMES, MAX_SKIPPED_FRAMES and the caps, not by the header
+    // budget.
     let budget = ReadBudget::new(ELEMENT_CAP);
     let mut file = open_matroska(reader, budget.clone())?;
     let scale = file.info().timestamp_scale().get();
@@ -826,31 +835,53 @@ fn read_track<R: Read + Seek>(
         let units = scale_units(seek_ms, scale)?;
         guarded_seek(&mut file, units)?;
     }
+    // The kept cues, with the start the next cue of the track takes when the
+    // block states no duration: the last kept cue's end is the start of the
+    // first cue of the track at or past the window, recorded when the walk
+    // stops on it.
     let mut cues: Vec<(u64, Option<u64>, String)> = Vec::new();
-    // A frame that produced no cue, counted against MAX_SKIPPED_FRAMES: the
-    // bound on a track whose frames never make a cue.
+    let mut next_start_after_window: Option<u64> = None;
+    // A frame of the requested track that gave no cue, counted against
+    // MAX_SKIPPED_FRAMES: the bound on a track whose frames never make a cue.
+    // Frames of other tracks are bounded by the total, `scanned`.
     let mut skipped = 0usize;
+    let mut scanned = 0u64;
+    let mut saw_frame = false;
     loop {
         if !guarded_next(&mut file, &mut slot, "subtitle frames")? {
             break;
         }
-        // A slot still claiming track 0 was filled by nothing (an empty
-        // BlockGroup): no frame, so it counts against patience.
-        if slot.track != track {
-            skipped += 1;
-            if skipped > MAX_SKIPPED_FRAMES {
-                return Err(MediaError::Malformed(format!(
-                    "no subtitle within {MAX_SKIPPED_FRAMES} frames"
-                )));
-            }
-            continue;
+        saw_frame = true;
+        scanned += 1;
+        if scanned > MAX_CUE_SCAN_FRAMES {
+            return Err(MediaError::Malformed(format!(
+                "no subtitle within {MAX_CUE_SCAN_FRAMES} frames"
+            )));
         }
-        // A timestamp too wide for the timeline is a malformed file.
+        // A slot still claiming track 0 was filled by nothing (an empty
+        // BlockGroup): no frame, so it counts against the total.
+        //
+        // The start time of every frame is computed, any track, with the same
+        // checked maths: the walk stops at the first frame, of any track,
+        // whose start is at or past the window, so a window after the last
+        // subtitle does not read to the end of the file.
         let start_ms = frame_start_ms(slot.timestamp, scale)?;
-        // Past the window: the track's frames are in order, so nothing after
-        // this overlaps the window.
         if start_ms >= to_ms {
+            // The stopping frame's start is the next cue's start when it
+            // belongs to the requested track and gives text; a frame of
+            // another track stops the read first, and then the next cue is
+            // unknown, so the 5000 ms rule applies to the last kept cue.
+            if slot.track == track
+                && next_start_after_window.is_none()
+                && frame_text(&slot.data, &codec).is_some_and(|text| !text.is_empty())
+            {
+                next_start_after_window = Some(start_ms);
+            }
             break;
+        }
+        // A frame of another track: it counts against the total only.
+        if slot.track != track {
+            continue;
         }
         // The block's duration, in milliseconds of source time, when the
         // frame states one.
@@ -883,18 +914,33 @@ fn read_track<R: Read + Seek>(
         }
     }
     // The cues, with ends worked out: the block's duration when it states one,
-    // the next cue's start otherwise, or start + 5000 at the end of the track.
+    // the next cue's start otherwise - the start of the first cue of the track
+    // at or past the window when the walk recorded it, or start + 5000 when
+    // the read ended or another track's frame stopped it first.
     let mut out = Vec::with_capacity(cues.len());
+    let mut text_bytes = 0u64;
     for (index, (start_ms, duration_ms, text)) in cues.iter().enumerate() {
         let end_ms = duration_ms
             .and_then(|duration| (*start_ms).checked_add(duration))
             .or_else(|| cues.get(index + 1).map(|(next, _, _)| *next))
+            .or_else(|| match (index, next_start_after_window) {
+                (last, Some(next)) if last == cues.len() - 1 => Some(next),
+                _ => None,
+            })
             .unwrap_or_else(|| start_ms.saturating_add(5000));
         // Keep the cues that overlap the window; a cue with no room on screen
         // (end_ms <= start_ms) is dropped.
         if end_ms > from_ms && *start_ms < to_ms && end_ms > *start_ms {
             if text.is_empty() {
                 continue;
+            }
+            // The total kept text is bounded: a hostile file with a million
+            // small cues would otherwise grow a list of megabytes.
+            text_bytes = text_bytes.saturating_add(text.len() as u64);
+            if text_bytes > SUBTITLE_FILE_CAP {
+                return Err(MediaError::Malformed(format!(
+                    "track {track} holds more than {SUBTITLE_FILE_CAP} bytes of subtitle text"
+                )));
             }
             out.push(Cue {
                 start_ms: *start_ms,
@@ -903,7 +949,7 @@ fn read_track<R: Read + Seek>(
             });
         }
     }
-    Ok(out)
+    Ok((out, saw_frame))
 }
 
 /// Container timestamp units for a millisecond request, or `Malformed` when
@@ -951,7 +997,10 @@ fn frame_text(data: &[u8], codec: &Codec) -> Option<String> {
     let text = decode(data);
     let cleaned = match codec {
         Codec::Ass => {
-            let rest = text.splitn(9, ',').last()?.trim_start();
+            // The ninth field (index 8) is the text; a block with fewer than
+            // nine fields is no cue. `.last()` would never be `None`, so a
+            // short block's final field would come back as its text.
+            let rest = text.splitn(9, ',').nth(8)?.trim_start();
             clean_ass(rest)
         }
         _ => clean_html_tags(&text),
