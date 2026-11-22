@@ -7,7 +7,7 @@ use fbtt_media::{
     SubtitleFormat, embedded_cues, file_cues, subtitle_format,
 };
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
 mod common;
@@ -698,4 +698,209 @@ fn embedded_total_text_is_capped() {
         matches!(err, MediaError::Malformed(_)),
         "five 1 MiB blocks is Malformed, got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Embedded subtitles: the same cues out of an MP4 file's own `tx3g` track.
+// The mov_text fixture's subtitle track carries no composition offsets, so
+// its samples present when they decode and the edit-list shift the video
+// track carries does not reach them: here the fixture's tables and
+// `expected.json` state the same cue times, and `embedded_expected()` is the
+// same three cues the sidecar fixtures hold.
+// ---------------------------------------------------------------------------
+
+const MP4: &str = "h264-aac2-movtext.mp4";
+
+#[test]
+fn embedded_movtext() {
+    let bytes = fixture(MP4);
+    // The whole window: the three cues `expected.json` records for the
+    // mov_text track (4) with non-empty text, and the zero-length gap
+    // samples between them no cues.
+    let cues = embedded_cues(Cursor::new(bytes.clone()), 4, 0, 4000).expect("the mov_text track");
+    assert_eq!(
+        cues,
+        embedded_expected(),
+        "a mov_text window shows the cues on it"
+    );
+    // A window inside the second cue: the read lands on that cue's sample -
+    // it opened before the window and is on screen when it opens - and stops
+    // before the third cue's sample.
+    let cues = embedded_cues(Cursor::new(bytes), 4, 2600, 2900).expect("the mov_text track");
+    assert_eq!(
+        cues,
+        window_cues(2600, 2900),
+        "a mov_text window shows only the cue on it"
+    );
+}
+
+#[test]
+fn embedded_movtext_bad_length_is_malformed() {
+    // The first text sample's 2-byte length patched past the bytes the sample
+    // holds: a sample claiming more text than it has is a lying table, not a
+    // stream that has not arrived. The sample is found by its own text - the
+    // length sits directly in front of it - so no new fixture file is added.
+    let mut bytes = fixture(MP4);
+    let needle: &[u8] = b"First subtitle line";
+    let hits = bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+    assert_eq!(hits, 1, "the first cue's text is in the file exactly once");
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("the first cue's text");
+    assert!(at >= 2, "the text has a length prefix in front of it");
+    // The patch must exceed any sample's size minus its prefix: the file
+    // minus two bytes is smaller than 65535, so a sample cannot hold text
+    // of the patched length whatever its own size is.
+    assert!(
+        bytes.len() - 2 < usize::from(u16::MAX),
+        "the patched length beats any sample in the file"
+    );
+    bytes[at - 2..at].copy_from_slice(&[0xff, 0xff]);
+    let err = embedded_cues(Cursor::new(bytes), 4, 0, 4000)
+        .expect_err("a length past the sample's bytes is Malformed");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "a lying length is Malformed, got {err:?}"
+    );
+}
+
+#[test]
+fn embedded_movtext_audio_track_is_unsupported() {
+    let bytes = fixture(MP4);
+    // Track 2 is one of the file's two AAC tracks. A cue request on it is the
+    // same refusal the Matroska path gives for a track that is not a text
+    // subtitle track.
+    let err = embedded_cues(Cursor::new(bytes), 2, 0, 4000)
+        .expect_err("an audio track is not a subtitle track");
+    assert!(
+        matches!(err, MediaError::Unsupported(_)),
+        "an audio track is Unsupported, got {err:?}"
+    );
+}
+
+/// A reader that fails the test instead of honouring a read of more than one
+/// megabyte in a single call. The oversized-sample verdict must come from the
+/// `stsz` entry before any buffer of that size is read, and this is what
+/// shows it: a source that asks this reader for 4 MiB at once ends the test
+/// right here, so a passing test is a run in which that read never happened.
+struct SmallReads(Cursor<Vec<u8>>);
+
+impl Read for SmallReads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            buf.len() <= 1024 * 1024,
+            "a read of {} bytes was asked for",
+            buf.len()
+        );
+        self.0.read(buf)
+    }
+}
+
+impl Seek for SmallReads {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+#[test]
+fn embedded_movtext_oversized_sample_is_malformed() {
+    // The first text sample's `stsz` entry patched to SUBTITLE_FILE_CAP + 1.
+    // The element cap (256 MiB) still trusts the number, so only the subtitle
+    // cap can refuse it, and it must refuse before the bytes are asked for:
+    // SmallReads turns a 4 MiB read into a failed test.
+    let bytes = fixture(MP4);
+    let entry_at = stsz_entry_at(&bytes, 4);
+    let mut patched = bytes.clone();
+    patched[entry_at..entry_at + 4].copy_from_slice(&(SUBTITLE_FILE_CAP as u32 + 1).to_be_bytes());
+    let err = embedded_cues(SmallReads(Cursor::new(patched)), 4, 0, 4000)
+        .expect_err("a sample over the subtitle cap is Malformed");
+    assert!(
+        matches!(err, MediaError::Malformed(_)),
+        "a sample over the subtitle cap is Malformed before it is read, got {err:?}"
+    );
+}
+
+/// Where a track's first sample that can hold text has its entry in the
+/// file's `stsz` box.
+///
+/// The tables are parsed with the same library the reader parses them with,
+/// as `remux.rs`'s `table_track_in` does, and the box itself is located by
+/// the shape only an `stsz` header has - its FourCC followed by a zero
+/// version and flags - inside the `moov`, checked by demanding that the
+/// whole entry array under the candidate equals the parsed sizes. The first
+/// sample big enough to hold a length prefix and a byte of text is the one
+/// the cue walk reads first after the leading gap sample, and its entry is
+/// the one a size patch has to hit.
+fn stsz_entry_at(bytes: &[u8], track_id: u32) -> usize {
+    use mp4_atom::{FourCC, Header, Moov, ReadAtom, ReadFrom};
+    let mut reader = Cursor::new(bytes);
+    let (moov_at, moov_body, moov) = loop {
+        let here = reader
+            .stream_position()
+            .expect("the position of a box header");
+        let header = <Option<Header> as ReadFrom>::read_from(&mut reader)
+            .expect("a top level box header")
+            .expect("a box before the moov");
+        if header.kind == FourCC::new(b"moov") {
+            let body = header.size.expect("a moov that declares its size");
+            let moov = Moov::read_atom(&header, &mut reader).expect("the fixture's moov");
+            break (
+                usize::try_from(here).expect("a moov near the file start"),
+                body,
+                moov,
+            );
+        }
+        let body = i64::try_from(header.size.expect("a sized box ahead of the moov"))
+            .expect("a box below 2^63");
+        reader.seek(SeekFrom::Current(body)).expect("the next box");
+    };
+    let trak = moov
+        .trak
+        .iter()
+        .find(|trak| trak.tkhd.track_id == track_id)
+        .expect("the mov_text track");
+    let sizes: &[u32] = match &trak.mdia.minf.stbl.stsz.samples {
+        mp4_atom::StszSamples::Different { sizes } => sizes,
+        mp4_atom::StszSamples::Identical { .. } => {
+            panic!("the fixture's tx3g track has per-sample sizes")
+        }
+    };
+    // An stsz box header: the FourCC and its zero version-and-flags. Every
+    // candidate is checked against the parsed table before one is trusted.
+    // `Header::size` excludes the box header, so the moov spans its header,
+    // this body, and nothing else; the search covers all of it.
+    let pattern = b"stsz\0\0\0\0";
+    let haystack = &bytes[moov_at..moov_at + 8 + moov_body];
+    let matching: Vec<usize> = haystack
+        .windows(pattern.len())
+        .enumerate()
+        .filter(|(_, window)| *window == pattern)
+        .map(|(at, _)| moov_at + at)
+        .filter(|at| {
+            let count = u32::from_be_bytes(bytes[at + 12..at + 16].try_into().expect("four bytes"));
+            count as usize == sizes.len()
+                && bytes[*at + 16..*at + 16 + 4 * sizes.len()]
+                    .chunks(4)
+                    .enumerate()
+                    .all(|(index, word)| {
+                        u32::from_be_bytes(word.try_into().expect("four bytes")) == sizes[index]
+                    })
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one stsz box in the moov holds the mov_text track's sizes"
+    );
+    // The first sample big enough to hold its prefix and one byte of text;
+    // the leading gap sample is its prefix alone.
+    let index = sizes
+        .iter()
+        .position(|size| *size > 2)
+        .expect("a sample with text");
+    matching[0] + 16 + 4 * index
 }
