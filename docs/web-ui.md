@@ -84,26 +84,43 @@ Streaming and playing video in the browser are provided by Playing video below.
 
 ## Playing video
 
-The web UI plays video and audio files in the browser:
+## Playing video
 
-- Supported **video containers** are Matroska, WebM and MP4; supported **video codecs** are H.264, HEVC and AV1.
-- Supported **audio codecs** are AAC, Opus, FLAC, MP3, AC-3 and E-AC-3.
+The web UI plays video and audio files in the browser.
 
-Browser support varies by browser and device. When a browser cannot play a video track, it shows `"This browser cannot play <codec> video."` and offers a "Download" button.
+- Supported **video containers** are Matroska, WebM and MP4; supported **video codecs** 
+are H.264, HEVC and AV1.
+- Supported **audio codecs** are AAC, Opus, FLAC, MP3, AC-3 and E-AC-3. Each audio 
+codec plays where the browser can decode it.
 
-Starting playback:
-A `Play` button appears on rows in the Files tab whose path ends in `.mkv`, `.mp4`, `.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player modal that shows video in a `<video>`, a seek bar, play controls and the menus below.
+### Starting playback
 
-The player:
-- `Audio`: change between playable audio tracks while video plays.
-- `Subtitles`: choose or turn off text tracks (embedded or as separate SRT/ASS/VTT files). Image-based subtitles like PGS or VobSub are shown disabled with the message `Image subtitles cannot be shown here.`
-
-Keys: `Space`, `k` play or pause; `Left`, `Right` move 5 seconds; `Up`, `Down` change volume by 0.1; `m` mutes; `a` selects the next playable audio track; `c` cycles through subtitles including Off; `f` enters fullscreen; `Escape` closes.
-
-Waiting state and partial download:
-When playback reaches a part of the file that has not arrived yet, the player shows `Waiting for data...` and keeps trying again, from the end of what it already has, until the data is there. Playback can start even while the torrent is still downloading.
+A `Play` button appears on rows in the Files tab whose path ends in `.mkv`, `.mp4`, 
+`.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player modal that 
+shows the video, a seek bar, play controls and the menus.
 
 VP8/VP9 video in a WebM container plays natively, without audio or subtitle choice.
 
-Fallback:
+### The player
+
+- `Audio`: change between playable audio tracks while video plays.
+- `Subtitles`: choose or turn off text tracks (embedded or as separate SRT/ASS/VTT 
+files). Image-based subtitles like PGS or VobSub are shown disabled with the message 
+`Image subtitles cannot be shown here.`
+
+### Keys
+
+`Space`, `k` play or pause; `Left`, `Right` move 5 seconds; `Up`, `Down` change 
+volume by 0.1; `m` mutes; `a` selects the next playable audio track; `c` cycles 
+through subtitles including Off; `f` enters fullscreen; `Escape` closes.
+
+### Waiting state and partial download
+
+When playback reaches a part of the file that has not arrived yet, the player shows 
+`Waiting for data...` and keeps trying again, from the end of what it already has, 
+until the data is there. Playback can start even while the torrent is still 
+downloading.
+
+### Fallback
+
 For a file in an unsupported format, Download saves the file to your computer.
