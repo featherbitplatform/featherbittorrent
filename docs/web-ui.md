@@ -85,26 +85,25 @@ Streaming and playing video in the browser are provided by Playing media below.
 ## Playing media
 
 Files that show a `Play` button in the Files tab are those whose path ends with `.mkv`, `.mp4`,
-`.m4v`, `.webm` or `.mov` (case-insensitive) and are not padding files, exactly as the code
-decides (components/detail/Files.tsx:113). Pressing the button opens the player modal and starts
-playback immediately; a torrent's pieces can still be downloading when playback begins.
+`.m4v`, `.webm` or `.mov` (case-insensitive); padding files have no `Play` button. Pressing the
+button opens the player modal and starts playback immediately; a torrent's pieces can still be
+downloading when playback begins.
 
 ### How a file is played
 
 The player tries one of three ways in the order listed below:
 
-1. **Native**: a WebM file whose video tracks are VP8 or VP9, or the browser reports it can play
-  the file's mime type (player/tracks.ts:56), and the player does not show its own menus or draw
-  its own controls; the browser's built‑in controls are on screen.
+1. **Native**: a WebM file whose video track is VP8 or VP9, when the browser also reports it can
+   play WebM video. The player does not show its own menus or draw its own controls; the browser's
+   built-in controls are on screen.
 
-2. **Remuxed**: every other playable file. The server repackages its tracks and the player's own
-  controls, menus, and keys are used; playback starts from where you last left off if the saved
-  position is before the file end.
+2. **Remuxed**: every other file whose video the browser can play. The server repackages its
+   tracks, and the player's own controls, menus and keys are used.
 
-3. **Unplayable**: when the file contains no playable track, the player draws the sentence
-  `This browser cannot play <codec> video.` and a `Download` button. The codec shown is the video
-  track's codec; if the file has no video track it is the first track's codec or `unknown`
-  (player/tracks.ts:76-84).
+3. **Unplayable**: when the file has no video track, or the browser cannot play any codec of the
+   video track, the player shows the sentence `This browser cannot play <codec> video.` and a
+   `Download` button. The codec shown is the video track's codec; if the file has no video track
+   it is the first track's codec or `unknown`.
 
 ### Controls
 
@@ -116,43 +115,38 @@ The remuxed player shows the following controls by their exact labels:
   forward.
 - `Mute` and `Unmute`: an icon button that toggles the audio on and off.
 - `Volume`: a slider that sets the volume from quietest to loudest.
-- `Audio`: a menu that lists the playable audio tracks; a track the browser will not play is
-  listed disabled with the suffix `: not playable here`.
-- `Subtitles`: a menu that lists the available subtitles; Off turns subtitles off and image-based
-  ones like PGS appear disabled with the text `<name>: Image subtitles cannot be shown here.`
+- `Audio`: a menu that lists the audio tracks; a track the browser will not play is listed
+  disabled with the suffix `: not playable here`.
+- `Subtitles`: a menu that lists the available subtitles; `Off` turns subtitles off, and image
+  subtitles appear disabled with the text `<name>: Image subtitles cannot be shown here.`
 - `Fullscreen`: an icon button that toggles fullscreen mode.
 - `Close player`: a button that closes the modal and stops playback.
 
-`Audio` and `Subtitles` appear only when the player has a choice to make (player/Player.tsx:842,
-851).
+`Audio` and `Subtitles` appear only when the player has a choice to make.
 
 ### Keys
 
-Keys that work for a remuxed file—and only for a remuxed file—are:
+`Space` or `k` toggles play and pause; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds
+back or forward; `ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` selects
+the next playable audio track; `c` cycles through subtitles including `Off`; `f` toggles
+fullscreen; `Escape` closes the player.
 
-`Space` or `k` toggles play or pause; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds;
-`ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` selects the next
-playable audio track; `c` cycles through subtitles including Off; `f` toggles fullscreen;
-`Escape` closes the player.
+Play and pause, the arrow-key seek and `a` work only for a remuxed file; the other keys also work
+for a native file.
 
-For a native file the remaining keys besides play/pause, seek, and audio (that is, volume, mute,
-subtitles, fullscreen keys) have no effect beyond what the browser handles on its own.
-
-If a range input or an open menu has focus, all keys in the list do nothing until focus leaves
-it (player/Player.tsx:654-662).
+Keys do nothing while an input, such as the `Seek` or `Volume` slider, or an open menu has focus,
+except `Escape`, which still closes the player.
 
 ### Remembered position
 
-Play positions are saved to storage every five seconds while playing and when the player closes,
-but not until the playhead is at least 10 seconds into the file (player/positions.ts:13-16).
-Positions within 30 seconds of the file end are cleared (player/positions.ts:54-58). When you
-reopen the file, playback starts at the saved position, provided it is before the file ends or the
-file length is unknown (player/Player.tsx:332-334).
+For a remuxed file, the position is saved every 5 seconds and when the player closes, once
+playback is at least 10 seconds into the file. It is cleared when the position is within 30
+seconds of the end of the file. When you reopen the file, playback starts at the saved position,
+provided it is before the end of the file or the file's length is unknown.
 
 ### Waiting and errors
 
-- `Waiting for data...`: the part of the file you are watching has not arrived or the server
-  is busy; the player retries automatically until the data can be played or the file ends.
+- `Waiting for data...`: the part of the file you are watching has not arrived or the server is
+  busy; the player retries by itself.
 
 - `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
-  The player does not recover from this state by itself.
