@@ -97,16 +97,35 @@ describe('the Devices section', () => {
   it('a private key is never sent', async () => {
     const { addDevice } = await open()
     await screen.findByText('phone')
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'laptop' } })
-    fireEvent.change(screen.getByLabelText('Public key'), {
-      target: { value: '-----BEGIN OPENSSH PRIVATE KEY-----' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
-    expect((await screen.findByRole('alert')).textContent).toBe(
-      'This is a private key. Paste the public key line instead.',
-    )
+    for (const secret of [
+      '-----BEGIN OPENSSH PRIVATE KEY-----',
+      'PuTTY-User-Key-File-3: ssh-ed25519',
+      'b3BlbnNzaC1rZXktdjEAAAAABG5vbmU',
+    ]) {
+      fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'laptop' } })
+      fireEvent.change(screen.getByLabelText('Public key'), { target: { value: secret } })
+      fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+      expect((await screen.findByRole('alert')).textContent).toBe(
+        'This is a private key. Paste the public key line instead.',
+      )
+      expect((screen.getByLabelText('Public key') as HTMLInputElement).value).toBe('')
+    }
     expect(addDevice, 'a private key was sent to the server').not.toHaveBeenCalled()
-    expect((screen.getByLabelText('Public key') as HTMLInputElement).value).toBe('')
+  })
+
+  it('editing the key clears its error', async () => {
+    const fake = fakeClient({
+      addDevice: () => Promise.reject(new ApiError(400, 'invalid_key', 'bad key')),
+    })
+    await open(fake)
+    await screen.findByText('phone')
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'laptop' } })
+    fireEvent.change(screen.getByLabelText('Public key'), { target: { value: 'junk' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await screen.findByRole('alert')
+    fireEvent.change(screen.getByLabelText('Public key'), { target: { value: 'junk2' } })
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByLabelText('Public key').getAttribute('aria-invalid')).toBe('false')
   })
 
   it('the key field refuses autofill and autocorrect', async () => {

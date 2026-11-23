@@ -21,6 +21,9 @@ import TextField from '../TextField'
 
 export const LOGINS_OFF_COPY = "Device logins need the server's logins on."
 export const PRIVATE_KEY_COPY = 'This is a private key. Paste the public key line instead.'
+/** Anything that looks like private key material: PEM headers, PuTTY files, or an OpenSSH body pasted without its header. */
+const PRIVATE_KEY_PATTERN = /-----BEGIN|PRIVATE[ -]?KEY|PuTTY-User-Key-File|Private-Lines|b3BlbnNzaC1rZXktdjE/i
+
 export const SAVED_ON_SERVER_COPY = "Changes are saved in the server's config.yaml."
 
 type Load = { phase: 'loading' } | { phase: 'off' } | { phase: 'failed'; text: string } | { phase: 'ready' }
@@ -104,6 +107,7 @@ export default function Devices({ client = api }: { client?: Api }) {
   const [rows, setRows] = useState<DeviceRow[]>([])
   const [name, setName] = useState('')
   const [key, setKey] = useState('')
+  const [keyEpoch, setKeyEpoch] = useState(0)
   const [addError, setAddError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const addingRef = useRef(false)
@@ -135,8 +139,10 @@ export default function Devices({ client = api }: { client?: Api }) {
   async function add(): Promise<void> {
     if (addingRef.current) return
     // A private key must never leave the page, least of all over plain HTTP.
-    if (/-----BEGIN|PRIVATE KEY/.test(key)) {
+    if (PRIVATE_KEY_PATTERN.test(key)) {
       setKey('')
+      // A fresh input, so the browser's undo history cannot bring the secret back.
+      setKeyEpoch((n) => n + 1)
       setAddError(PRIVATE_KEY_COPY)
       return
     }
@@ -200,7 +206,7 @@ export default function Devices({ client = api }: { client?: Api }) {
       >
         <TextField
           label="Name"
- autoComplete="off"
+          autoComplete="off"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
@@ -210,8 +216,9 @@ export default function Devices({ client = api }: { client?: Api }) {
           }}
         />
         <TextField
+          key={keyEpoch}
           label="Public key"
- autoComplete="off"
+          autoComplete="off"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
@@ -222,6 +229,7 @@ export default function Devices({ client = api }: { client?: Api }) {
           value={key}
           onChange={(event) => {
             setKey(event.target.value)
+            setAddError(null)
           }}
         />
         {addError !== null && (

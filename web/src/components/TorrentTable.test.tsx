@@ -507,4 +507,28 @@ describe('a table hidden and shown again', () => {
       else Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight')
     }
   })
+
+  it('a resize mid-scroll does not move the scroll position', () => {
+    let boxHeight = 300
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => boxHeight,
+    })
+    try {
+      const { container } = render(<TorrentTable rows={rowsOf(2_000)} selectedId={null} />)
+      const box = setScrollTop(container, 4_000)
+      fireEvent.scroll(box)
+      // The reader's finger is still moving: the box is somewhere else than the last scroll event said.
+      ;(box as unknown as { scrollTop: number }).scrollTop = 3_900
+      boxHeight = 350
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(box.scrollTop, 'a resize fought the reader mid-scroll').toBe(3_900)
+    } finally {
+      if (original !== undefined) Object.defineProperty(HTMLElement.prototype, 'clientHeight', original)
+      else Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight')
+    }
+  })
 })
