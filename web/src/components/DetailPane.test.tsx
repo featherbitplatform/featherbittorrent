@@ -451,11 +451,31 @@ describe('file priorities', () => {
     await flush()
     release()
     await flush()
-    rerender(<DetailPane id="a" client={client} tick={2} />)
-    await flush()
     expect(
       (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'high',
       'a refresh that was in flight snapped the new value back',
+    ).toBe(true)
+  })
+
+  it('after a change, the next refresh wins', async () => {
+    let current = [file(0), file(1)]
+    const client = {
+      files: vi.fn(async () => current),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async () => {}),
+    } as unknown as Api
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    current = [file(0), file(1, { priority: 'low' })]
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'low',
+      'a stale choice hid what the server now says',
     ).toBe(true)
   })
 

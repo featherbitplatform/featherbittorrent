@@ -21,7 +21,7 @@
  *
  * @module components/detail/Files
  */
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import type { Api, FileInfo } from "../../api/client";
@@ -66,17 +66,20 @@ export default function Files({
   // the state disables the selects while a change is in flight.
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
-  // What the user just chose, by file index. It is held until a files list arrives whose priority
-  // for that file equals the choice, so a poll that was already in flight cannot snap it back.
-  const [held, setHeld] = useState<Record<number, Choice>>({});
-  const settled = Object.entries(held).filter(
-    ([index, choice]) =>
-      files.find((entry) => entry.index === Number(index))?.priority === choice,
-  );
-  if (settled.length > 0) {
+  // What the user just chose, by file index. A choice is held from the moment its change completes
+  // until the first files list that arrives after that: that list is the server's own answer, even
+  // when someone else changed the file again. A list that landed while the change was in flight is
+  // the one current at completion (`base`), so it does not count.
+  const [held, setHeld] = useState<Record<number, { choice: Choice; base: FileInfo[] }>>({});
+  const latestFiles = useRef(files);
+  useEffect(() => {
+    latestFiles.current = files;
+  }, [files]);
+  const spent = Object.entries(held).filter(([, entry]) => entry.base !== files);
+  if (spent.length > 0) {
     // Dropping during render is React's own pattern for state derived from props.
     const next = { ...held };
-    for (const [index] of settled) delete next[Number(index)];
+    for (const [index] of spent) delete next[Number(index)];
     setHeld(next);
   }
   const chosen = held;
@@ -112,7 +115,10 @@ export default function Files({
             : entry.priority,
       );
       await client.setFilePriorities(id, priorities);
-      setHeld((now) => ({ ...now, [index]: priority }))
+      setHeld((now) => ({
+        ...now,
+        [index]: { choice: priority, base: latestFiles.current },
+      }))
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -200,7 +206,7 @@ export default function Files({
                       <select
                         aria-label={`Priority of ${path}`}
                         value={
-                          chosen[file.index] ??
+                          chosen[file.index]?.choice ??
                           (file.priority === "unknown"
                             ? "normal"
                             : file.priority)
