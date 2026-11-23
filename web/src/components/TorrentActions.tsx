@@ -37,6 +37,28 @@ export interface TorrentActionsProps {
 const ITEM =
   'flex min-h-11 w-full cursor-pointer items-center px-3 text-left text-[13px] text-body hover:bg-ink-700 hover:text-strong md:min-h-9'
 
+function MenuItem({
+  label,
+  onClick,
+  disabled = false,
+}: {
+  label: string
+  onClick(): void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      className={ITEM + ' disabled:cursor-default disabled:opacity-55'}
+      onClick={onClick}
+    >
+      {label}
+    </button>
+  )
+}
+
 function MoveDialog({
   client,
   onCancel,
@@ -83,13 +105,18 @@ function MoveDialog({
   )
 }
 
-export function TorrentActions({ torrent, client, onError, moving: movingProp, onMoving }: TorrentActionsProps) {
+export function TorrentActions({
+  torrent,
+  client,
+  onError,
+  moving: movingProp,
+  onMoving,
+}: TorrentActionsProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [moveOpen, setMoveOpen] = useState(false)
   const [localMoving, setMoving] = useState(false)
   const moving = movingProp ?? localMoving
-  const moreRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const dialogWasOpen = useRef(false)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -111,9 +138,15 @@ export function TorrentActions({ torrent, client, onError, moving: movingProp, o
     }
   }, [menuOpen])
 
+  /** The More button, found from the wrapper: the shared Button takes no ref. */
+  function moreButton(): HTMLElement | null {
+    return rootRef.current?.querySelector<HTMLElement>('[aria-haspopup="menu"]') ?? null
+  }
+
   // The first item takes the focus when the menu opens.
   useEffect(() => {
-    if (menuOpen) menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus()
+    if (menuOpen)
+      menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus()
   }, [menuOpen])
 
   // When a dialog opened from the menu goes away its opener (a menu item) is gone: the focus goes to More.
@@ -122,13 +155,13 @@ export function TorrentActions({ torrent, client, onError, moving: movingProp, o
       dialogWasOpen.current = true
     } else if (dialogWasOpen.current) {
       dialogWasOpen.current = false
-      moreRef.current?.focus()
+      moreButton()?.focus()
     }
   }, [limitsOpen, moveOpen])
 
   function closeMenu(): void {
     setMenuOpen(false)
-    moreRef.current?.focus()
+    moreButton()?.focus()
   }
 
   function onMenuKeyDown(event: KeyboardEvent<HTMLDivElement>): void {
@@ -169,19 +202,6 @@ export function TorrentActions({ torrent, client, onError, moving: movingProp, o
     }
   }
 
-  const item = (label: string, onClick: () => void, disabled = false) => (
-    <button
-      key={label}
-      type="button"
-      role="menuitem"
-      disabled={disabled}
-      className={ITEM + ' disabled:cursor-default disabled:opacity-55'}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  )
-
   return (
     <div
       ref={rootRef}
@@ -194,7 +214,6 @@ export function TorrentActions({ torrent, client, onError, moving: movingProp, o
       }}
     >
       <Button
-        ref={moreRef}
         size="sm"
         variant="secondary"
         aria-haspopup="menu"
@@ -216,23 +235,47 @@ export function TorrentActions({ torrent, client, onError, moving: movingProp, o
         >
           {queued && (
             <>
-              {item('Move up', () => void run(() => client.setQueuePosition(id, torrent.queue_position - 1)), atTop)}
-              {item('Move down', () => void run(() => client.setQueuePosition(id, torrent.queue_position + 1)))}
-              {item('Move to top', () => void run(() => client.setQueuePosition(id, 0)), atTop)}
-              {item('Move to bottom', () => void run(() => client.setQueuePosition(id, QUEUE_BOTTOM)))}
+              <MenuItem
+                label="Move up"
+                disabled={atTop}
+                onClick={() =>
+                  void run(() => client.setQueuePosition(id, torrent.queue_position - 1))
+                }
+              />
+              <MenuItem
+                label="Move down"
+                onClick={() =>
+                  void run(() => client.setQueuePosition(id, torrent.queue_position + 1))
+                }
+              />
+              <MenuItem
+                label="Move to top"
+                disabled={atTop}
+                onClick={() => void run(() => client.setQueuePosition(id, 0))}
+              />
+              <MenuItem
+                label="Move to bottom"
+                onClick={() => void run(() => client.setQueuePosition(id, QUEUE_BOTTOM))}
+              />
               <div role="separator" className="my-1 border-t border-ink-700" />
             </>
           )}
-          {item('Recheck', () => void run(() => client.recheck(id)))}
-          {item('Reannounce', () => void run(() => client.reannounce(id)))}
-          {item('Limits...', () => {
-            setMenuOpen(false)
-            setLimitsOpen(true)
-          })}
-          {item('Move files...', () => {
-            setMenuOpen(false)
-            setMoveOpen(true)
-          })}
+          <MenuItem label="Recheck" onClick={() => void run(() => client.recheck(id))} />
+          <MenuItem label="Reannounce" onClick={() => void run(() => client.reannounce(id))} />
+          <MenuItem
+            label="Limits..."
+            onClick={() => {
+              setMenuOpen(false)
+              setLimitsOpen(true)
+            }}
+          />
+          <MenuItem
+            label="Move files..."
+            onClick={() => {
+              setMenuOpen(false)
+              setMoveOpen(true)
+            }}
+          />
         </div>
       )}
       {limitsOpen && (
