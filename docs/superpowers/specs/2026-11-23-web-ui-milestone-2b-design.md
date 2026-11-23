@@ -65,6 +65,19 @@ Below a breakpoint of 640 px (the one the player uses), the torrent list is show
 - Above 640 px the desktop table is unchanged.
 - Colours follow the Graphite tokens already used.
 
+### 2.4b Create a folder in the folder picker
+The folder picker (Add torrent, and Move in section 2.2) gains `New folder`: it creates a folder inside the folder being shown, which then opens. **[owner, 2026-11-23: "yes, add create folder"]** This is the one server change in 2b, because no route for it exists.
+- **Route:** `POST /api/v1/fs/mkdir` with the parent folder and the new folder's name. It sits beside `/api/v1/fs/roots` and `/api/v1/fs/list`, behind the same login and CSRF check, and answers with the created folder's path. **[builder's call: name and shape]**
+- **Only inside the allowed folders.** The parent must be inside `server.allowed_roots` after the path is resolved, by the same check `/api/v1/fs/list` uses. The name is one path component:
+  - not empty, `.` or `..`;
+  - no `/` or `\`;
+  - no NUL or other control characters;
+  - at most 255 bytes.
+  It must not follow a symlink out of the allowed folders. **[builder's call]**
+- **Answers.** A folder that already exists is 409. A refused name or parent is 400 or 403 with the server's reason, shown in the picker. The server never creates intermediate folders (no `mkdir -p`). **[builder's call]**
+- **Review.** This is filesystem writing over the network: it gets the server auth tier of review (the most capable reviewer), and tests for traversal (`..`, an absolute name, a symlink pointing outside), a name with a separator, an existing folder, and a parent outside the roots. **[builder's call]**
+- The TUI's `Ctrl+O` picker does not gain it in 2b. **[builder's call]**
+
 ### 2.5 The torrent on a phone: full-screen detail
 Tapping a card opens that torrent full screen: its actions (pause or resume, remove, the section 2.2 actions) at the top, then the tabs (Files, Peers, Trackers, Pieces). Back returns to the list. Opening the view pushes a browser history entry, so the browser's back button and Android's back gesture return to the list; no routing library is added for this. **[builder's call; the mockup showed long-press for actions, dropped because long-press is hard to discover]**
 
@@ -73,7 +86,7 @@ Tapping a card opens that torrent full screen: its actions (pause or resume, rem
 - **The local TUI's "serve the web UI" action** (section 2a of the 2026-11-21 spec). The owner, 2026-11-23: "leave the serve web ui feature for now". **[owner]** It leaves milestone 2b's list; it is not dropped from the product.
 - **Changing keyboard shortcuts** in the web UI (desktop app, milestone 3). **[owner]**
 - **Anything a browser cannot do safely or at all:** reading key files or ssh-agent for device-key sign-in, launching mpv or VLC, switching between servers (the desktop app's job, milestone 3), the TUI's terminal-only keys and its minimal view. **[builder's call]**
-- **Server API changes.** 2b is front-end work over routes that exist. If one is missing, the feature is dropped from 2b and recorded, not built on the server. **[builder's call]**
+- **Server API changes, with one exception.** 2b is front-end work over routes that exist. If one is missing, the feature is dropped from 2b and recorded, not built on the server. **[builder's call]** The exception is creating a folder (section 2.4b), which the owner asked for. **[owner, 2026-11-23]**
 - **Search across torrent sites** stays parked (2026-11-21 spec, section 2b). **[owner, 2026-11-21]**
 
 ## 4. Constraints

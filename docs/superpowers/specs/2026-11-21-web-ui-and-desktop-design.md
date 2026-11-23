@@ -187,7 +187,8 @@ Direction 2 reverses the non-goal "search across indexing sites" (section 4). Ch
    - file priorities;
    - the per-torrent actions: queue moves, recheck, reannounce, per-torrent limits, move files;
    - a Settings screen: server settings, devices, and the keyboard shortcuts (read-only);
-   - the phone layout: torrent cards and a full-screen torrent view.
+   - the phone layout: torrent cards and a full-screen torrent view;
+   - `New folder` in the folder picker (one new server route).
    - The local TUI's "serve the web UI" action (section 2a) moved out of 2b, to a later milestone. **[owner, 2026-11-23]**
 3. **The desktop app:**
    - the Tauri crate, This computer and remote servers;
