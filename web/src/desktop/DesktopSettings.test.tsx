@@ -33,7 +33,7 @@ vi.mock('../components/settings/ServerSettings', () => ({ default: () => <div>se
 vi.mock('../components/settings/Devices', () => ({ default: () => <div>devices</div> }))
 
 import { Settings } from '../screens/Settings'
-import { DesktopSettings } from './DesktopSettings'
+import { DesktopSettings, PLAIN_HTTP_WARNING } from './DesktopSettings'
 
 const LIST = {
   default: 'local',
@@ -185,9 +185,51 @@ it('a_refused_serving_change_hands_the_line_to_the_page', async () => {
   const { onServingChanged } = renderSection()
   await screen.findByText('Off')
   fireEvent.click(screen.getByLabelText('Serve the web UI'))
+  fireEvent.change(screen.getByLabelText('User name'), { target: { value: 'alice' } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } })
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
   await waitFor(() => expect(onServingChanged).toHaveBeenCalledWith('Serving the web UI needs a password.'))
+  if (screen.queryByLabelText('Password') === null) fireEvent.click(screen.getByLabelText('Serve the web UI'))
+  expect((screen.getByLabelText('Password') as HTMLInputElement).value, 'cleared after a refusal too').toBe('')
   cleanup()
   renderSection({ servingProblem: 'Serving the web UI needs a password.' })
   await screen.findByText('Serving the web UI needs a password.')
+})
+
+it('an_apply_that_changes_nothing_asks_nothing', async () => {
+  const onServingApplying = vi.fn()
+  renderSection({ onServingApplying })
+  await screen.findByText('Off')
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(shell.setServing).not.toHaveBeenCalled()
+  expect(onServingApplying).not.toHaveBeenCalled()
+})
+
+it('the_page_is_told_before_this_computer_restarts', async () => {
+  const order: string[] = []
+  const onServingApplying = vi.fn(() => order.push('applying'))
+  shell.setServing.mockImplementation(() => {
+    order.push('set_serving')
+    return Promise.resolve(OFF)
+  })
+  renderSection({ onServingApplying })
+  await screen.findByText('Off')
+  fireEvent.click(screen.getByLabelText('Serve the web UI'))
+  fireEvent.change(screen.getByLabelText('User name'), { target: { value: 'alice' } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter2' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+  await waitFor(() => expect(order).toEqual(['applying', 'set_serving']))
+})
+
+it('the_plain_http_warning_shows_for_a_network_bind', async () => {
+  renderSection()
+  await screen.findByText('Off')
+  expect(screen.queryByText(PLAIN_HTTP_WARNING)).toBeNull()
+  fireEvent.click(screen.getByLabelText('Serve the web UI'))
+  expect(screen.getByText(PLAIN_HTTP_WARNING)).toBeTruthy()
+  fireEvent.change(screen.getByLabelText('Address to listen on'), { target: { value: '127.0.0.1:8090' } })
+  expect(screen.queryByText(PLAIN_HTTP_WARNING)).toBeNull()
+  fireEvent.change(screen.getByLabelText('Address to listen on'), { target: { value: '[::]:8090' } })
+  expect(screen.getByText(PLAIN_HTTP_WARNING)).toBeTruthy()
 })

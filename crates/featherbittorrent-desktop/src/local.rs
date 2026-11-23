@@ -54,6 +54,8 @@ pub fn paths_problem(problem: &ConfigError) -> String {
 pub struct ThisComputer {
     server: Server,
     secret: String,
+    /// Whether this engine was started serving other machines (Serve the web UI), not the window alone.
+    exposed: bool,
 }
 
 impl std::fmt::Debug for ThisComputer {
@@ -103,7 +105,11 @@ pub(crate) async fn start_with(
     let server = Server::start_desktop(settings(&config), config, &library, lock, access)
         .await
         .map_err(|problem| format!("This computer could not start: {problem}"))?;
-    Ok(ThisComputer { server, secret })
+    Ok(ThisComputer {
+        server,
+        secret,
+        exposed: serve,
+    })
 }
 
 /// The config This computer starts on: the library's file as read, this library's defaults written out
@@ -149,6 +155,11 @@ impl ThisComputer {
     /// interface. [`crate::serving`] turns that into the address other machines type.
     pub fn local_addr(&self) -> SocketAddr {
         self.server.local_addr()
+    }
+
+    /// Whether this engine serves other machines: started with Serve the web UI on.
+    pub fn exposed(&self) -> bool {
+        self.exposed
     }
 
     /// Stops the engine: the API closes, the last save runs, the library is released. A save that did not

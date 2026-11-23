@@ -14,6 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use fbtt_core::{Config, LibraryLock, LockError, ServerConfig, UserEntry};
 use fbtt_desktop_core::DesktopPaths;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::commands::DesktopState;
 use crate::lifecycle::Lifecycle;
@@ -94,8 +95,10 @@ impl Serving {
             .flatten()
     }
 
-    /// What the Serving section shows now. `running` is the address This computer listens on.
-    pub fn view(&self, running: Option<SocketAddr>) -> ServingView {
+    /// What the Serving section shows now. `serving` is the address This computer serves other machines
+    /// on ([`DesktopState::serving_addr`]: none for a window-only engine, whatever the switch says), and
+    /// `user` the login just applied (the config's first login when none was).
+    pub fn view(&self, serving: Option<SocketAddr>, user: Option<&str>) -> ServingView {
         let enabled = self
             .settings
             .read()
@@ -106,12 +109,14 @@ impl Serving {
             || DEFAULT_BIND.to_string(),
             |server| server.bind.to_string(),
         );
-        let user = server
-            .as_ref()
-            .and_then(|server| server.auth.users.first())
-            .map(|user| user.name.clone())
-            .unwrap_or_default();
-        let address = running.filter(|_| enabled).map(reachable_at);
+        let user = user.map(str::to_string).unwrap_or_else(|| {
+            server
+                .as_ref()
+                .and_then(|server| server.auth.users.first())
+                .map(|user| user.name.clone())
+                .unwrap_or_default()
+        });
+        let address = serving.filter(|_| enabled).map(reachable_at);
         ServingView {
             enabled,
             bind,
@@ -123,7 +128,7 @@ impl Serving {
     /// Checks `request` before anything is stopped: a bind that parses, a user name, and a password
     /// unless the config already has one for that user. The password is hashed here, on the blocking
     /// pool, so the engine is down for no longer than the restart itself.
-    async fn check(&self, request: ServingRequest) -> Result<Change, String> {
+    async fn check(&self, mut request: ServingRequest) -> Result<Change, String> {
         if !request.enabled {
             return Ok(Change {
                 enabled: false,
@@ -138,14 +143,20 @@ impl Serving {
         } else {
             bind_text
         };
-        let bind: SocketAddr = bind_text.parse().map_err(|_| {
-            format!(
-                "{} is not an address and port, like {DEFAULT_BIND}.",
-                fbt::display_safe(bind_text, fbt::MAX_DISPLAY_CHARS)
-            )
-        })?;
+        let bind: SocketAddr = match bind_text.parse() {
+            Ok(bind) => bind,
+            Err(_) => {
+                let line = format!(
+                    "{} is not an address and port, like {DEFAULT_BIND}.",
+                    fbt::display_safe(bind_text, fbt::MAX_DISPLAY_CHARS)
+                );
+                request.password.zeroize();
+                return Err(line);
+            }
+        };
         let user = request.user.trim().to_string();
         if let Some(problem) = name_problem(&user) {
+            request.password.zeroize();
             return Err(problem);
         }
         let password_hash = if request.password.is_empty() {
@@ -158,7 +169,8 @@ impl Serving {
             }
             None
         } else {
-            let password = request.password;
+            // Overwritten when dropped, once it is hashed (or the hashing failed).
+            let password = Zeroizing::new(request.password);
             let hashed =
                 tokio::task::spawn_blocking(move || fbtt_server::auth::password::hash(&password))
                     .await
@@ -231,10 +243,42 @@ impl Serving {
         S: Fn(&Config) -> fbt::Settings + Clone,
     {
         let change = self.check(request).await?;
+        let user = change.enabled.then(|| change.user.clone());
+        if self.unchanged(&change, state.serving_addr().is_some()) {
+            return Ok(self.view(state.serving_addr(), user.as_deref()));
+        }
         lifecycle
             .restart_this_computer(state, || self.restart(change, settings))
             .await?;
-        Ok(self.view(state.local_addr()))
+        Ok(self.view(state.serving_addr(), user.as_deref()))
+    }
+
+    /// Whether applying `change` would leave everything as it is: off while the switch is off and the
+    /// engine serves nobody, or on with the bind the config has, logins on, the same user and no new
+    /// password while the engine already serves. Nothing is restarted for that.
+    fn unchanged(&self, change: &Change, engine_serves: bool) -> bool {
+        let saved = self
+            .settings
+            .read()
+            .map(|settings| settings.serve.enabled)
+            .unwrap_or(false);
+        if !change.enabled {
+            return !saved && !engine_serves;
+        }
+        if !saved || !engine_serves || change.password_hash.is_some() {
+            return false;
+        }
+        self.config()
+            .and_then(|config| config.server)
+            .is_some_and(|server| {
+                server.bind == change.bind
+                    && server.auth.enabled == Some(true)
+                    && server
+                        .auth
+                        .users
+                        .iter()
+                        .any(|user| user.name == change.user)
+            })
     }
 
     /// The part of [`apply`](Self::apply) that runs with the old engine stopped.
@@ -249,7 +293,9 @@ impl Serving {
         if change.enabled
             && let Err(problem) = self.write_config(&change)
         {
+            // Back to the window's own engine, and the switch saved off to match it.
             let back = local::start_with(&self.paths, false, settings).await.ok();
+            let _ = self.save_switch(false);
             return (back, Err(problem));
         }
         match local::start_with(&self.paths, change.enabled, settings.clone()).await {
@@ -320,7 +366,7 @@ pub fn serving_status(
     serving: tauri::State<'_, Serving>,
     state: tauri::State<'_, DesktopState>,
 ) -> ServingView {
-    serving.view(state.local_addr())
+    serving.view(state.serving_addr(), None)
 }
 
 /// Turns Serve the web UI on or off (or changes its address and login), restarting This computer. The
@@ -461,7 +507,7 @@ mod tests {
         );
 
         assert_eq!(app.endpoint().1, secret, "nothing was restarted");
-        assert!(!app.serving.view(None).enabled, "nothing was saved");
+        assert!(!app.serving.view(None, None).enabled, "nothing was saved");
         assert_eq!(
             std::fs::read_to_string(&config_file).expect("the config reads"),
             before,
@@ -576,10 +622,19 @@ mod tests {
         ));
         assert!(!alice.password_hash.contains("hunter2"));
 
-        // The same user again with no password keeps the saved one.
+        // The same bind and user with no password changes nothing: no restart, the same secret.
+        let (_, secret) = app.endpoint();
         app.apply(on(&bind.to_string(), "alice", ""))
             .await
             .expect("a known user needs no new password");
+        assert_eq!(app.endpoint().1, secret, "nothing was restarted");
+
+        // A second login applied is the user the section shows, not the config's first.
+        let view = app
+            .apply(on(&bind.to_string(), "bob", "correct horse"))
+            .await
+            .expect("a second login");
+        assert_eq!(view.user, "bob");
 
         app.apply(off()).await.expect("serving turns off");
         assert!(
@@ -589,15 +644,100 @@ mod tests {
         app.stop().await;
     }
 
-    /// A quit that begins while serving is being applied gets the engine the restart left, so its final
-    /// stop still runs; and a restart asked for once the quit began starts nothing.
+    /// A restart asked for once a quit began starts nothing, and the quit's own stop still runs.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_after_a_quit_began_starts_nothing() {
         let app = running("desktop-serving-quit").await;
         assert!(app.lifecycle.begin_quit());
-        let refused = app.apply(off()).await;
+        let refused = app.apply(on("127.0.0.1:0", "alice", "hunter2")).await;
         assert_eq!(refused.err().as_deref(), Some(crate::lifecycle::QUITTING));
         app.lifecycle.stop_for_quit(&app.state).await;
         assert!(app.state.local_addr().is_none(), "the quit stopped it");
+    }
+
+    /// Off while already off restarts nothing: the launch secret is the same afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_apply_that_changes_nothing_does_not_restart() {
+        let app = running("desktop-serving-unchanged").await;
+        let (_, secret) = app.endpoint();
+        let view = app.apply(off()).await.expect("off while off");
+        assert!(!view.enabled);
+        assert_eq!(app.endpoint().1, secret, "nothing was restarted");
+        app.stop().await;
+    }
+
+    /// The config cannot be written (here: it no longer parses): the engine comes back for the window
+    /// alone, the switch is saved off, and no address is shown, though serving was on before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_config_write_saves_serving_off_and_shows_no_address() {
+        let app = running("desktop-serving-write-fails").await;
+        app.apply(on("127.0.0.1:0", "alice", "hunter2"))
+            .await
+            .expect("serving turns on");
+        assert!(app.state.serving_addr().is_some());
+
+        let config_file = app.serving.paths.library().config_file();
+        std::fs::write(&config_file, "server: [not, a, section").expect("the config is broken");
+        let refused = app
+            .apply(on("127.0.0.1:0", "alice", "other password"))
+            .await;
+        assert!(refused.is_err(), "the write was refused");
+
+        assert!(
+            app.state.local_addr().is_some(),
+            "the window still has its engine"
+        );
+        assert_eq!(app.state.serving_addr(), None, "it serves nobody");
+        let view = app.serving.view(app.state.serving_addr(), None);
+        assert!(!view.enabled, "the switch was saved off");
+        assert_eq!(
+            view.address, None,
+            "no loopback address is shown as reachable"
+        );
+        app.stop().await;
+    }
+
+    /// A quit that arrives while a serving restart holds the engine lock waits for it, then stops the
+    /// engine the restart started: nothing is left running and the library is free again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quit_during_a_serving_restart_stops_the_engine() {
+        let app = running("desktop-serving-quit-during").await;
+        let paths = app.serving.paths.clone();
+        let inside = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+
+        let restart = app.lifecycle.restart_this_computer(&app.state, || async {
+            inside.notify_one();
+            release.notified().await;
+            match crate::local::start_with(&paths, true, offline).await {
+                Ok(running) => (Some(running), Ok(())),
+                Err(problem) => (None, Err(problem)),
+            }
+        });
+        let quit = async {
+            inside.notified().await;
+            assert!(
+                app.lifecycle.begin_quit(),
+                "the quit starts during the restart"
+            );
+            let mut stopping = std::pin::pin!(app.lifecycle.stop_for_quit(&app.state));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut stopping)
+                    .await
+                    .is_err(),
+                "the quit's stop waits for the restart"
+            );
+            release.notify_one();
+            stopping.await;
+        };
+        let (restarted, ()) = tokio::time::timeout(DEADLINE, async { tokio::join!(restart, quit) })
+            .await
+            .expect("both finish in time");
+        restarted.expect("the restart started its engine");
+        assert!(app.state.local_addr().is_none(), "nothing is left running");
+        let again = start_offline(&paths)
+            .await
+            .expect("the library was released");
+        again.stop().await;
     }
 }

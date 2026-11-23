@@ -45,12 +45,24 @@ impl DesktopState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(this_computer);
     }
 
-    /// The address This computer listens on, while it runs.
+    /// The address This computer listens on, while it runs (served to others or not). The tests' view.
+    #[cfg(test)]
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.this_computer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
+            .map(ThisComputer::local_addr)
+    }
+
+    /// The address This computer serves other machines on: only while it runs and was started with Serve
+    /// the web UI on. A window-only engine (loopback, launch secret only) is never an address to give out.
+    pub fn serving_addr(&self) -> Option<std::net::SocketAddr> {
+        self.this_computer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|this| this.exposed())
             .map(ThisComputer::local_addr)
     }
 

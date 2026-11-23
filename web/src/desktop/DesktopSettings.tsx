@@ -29,7 +29,14 @@ import {
   systemTitleBar,
   trayAvailable,
 } from './bridge'
-import type { CloseAction, DesktopInfo, DesktopPreferences, InstancesList, ServingState } from './bridge'
+import type {
+  CloseAction,
+  DesktopInfo,
+  DesktopPreferences,
+  InstancesList,
+  ServingRequest,
+  ServingState,
+} from './bridge'
 import { Instances } from './Instances'
 
 /** The address serving listens on until the person picks another: every interface, port 8090. */
@@ -53,6 +60,8 @@ export interface DesktopSettingsProps {
    * `servingProblem`.
    */
   onServingChanged(problem: string | null): Promise<void>
+  /** An apply is about to restart This computer: requests to it may fail until `onServingChanged`. */
+  onServingApplying?(): void
   /** The line the last apply was refused with, kept across a reconnect. */
   servingProblem?: string | null
 }
@@ -62,6 +71,23 @@ function line(cause: unknown, fallback: string): string {
   if (typeof cause === 'string' && cause !== '') return cause
   if (cause instanceof Error && cause.message !== '') return cause.message
   return fallback
+}
+
+/** Said under the switch when serving is on and other machines can reach it. */
+export const PLAIN_HTTP_WARNING =
+  'Passwords travel unencrypted over http. For access from outside your home network, put the web UI behind https.'
+
+/** Whether `bind` (an address and port as typed) listens on this machine only. */
+function loopback(bind: string): boolean {
+  const text = bind.trim()
+  const host = text.startsWith('[') ? text.slice(1, text.indexOf(']')) : text.slice(0, text.lastIndexOf(':'))
+  return host === 'localhost' || host === '::1' || /^127\./.test(host)
+}
+
+/** Whether applying `asked` over `now` would change nothing, so the shell is not asked to restart. */
+function unchanged(now: ServingState, asked: ServingRequest): boolean {
+  if (!asked.enabled) return !now.enabled
+  return now.enabled && asked.password === '' && asked.bind.trim() === now.bind && asked.user.trim() === now.user
 }
 
 const CHECKBOX = 'h-4 w-4 accent-accent'
@@ -78,9 +104,11 @@ function Part({ id, title, children }: { id?: string; title: string; children: R
 
 /** Serve the web UI: the switch, where to listen and the login, applied together. */
 function Serving({
+  onServingApplying,
   onServingChanged,
   problem,
 }: {
+  onServingApplying?(): void
   onServingChanged(problem: string | null): Promise<void>
   problem: string | null
 }) {
@@ -112,11 +140,13 @@ function Serving({
 
   async function apply(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
+    // Nothing would change: off while off, or the same address and login with no new password.
+    if (state !== null && unchanged(state, { enabled, bind, user, password })) return
     setBusy(true)
     let refused: string | null = null
+    onServingApplying?.()
     try {
       const now = await setServing({ enabled, bind, user, password })
-      setPassword('')
       show(now)
     } catch (cause) {
       refused = line(cause, 'Serving could not be changed.')
@@ -124,6 +154,8 @@ function Serving({
         .then(show)
         .catch(() => {})
     } finally {
+      // Never kept in the page longer than the apply, answered or refused.
+      setPassword('')
       setBusy(false)
     }
     // A refused start still restarted This computer (back on the window's own engine), so the page asks
@@ -151,6 +183,9 @@ function Serving({
         />
         Serve the web UI
       </label>
+      {enabled && !loopback(bind) && (
+        <Banner tone="warning">{PLAIN_HTTP_WARNING}</Banner>
+      )}
       {enabled && (
         <>
           <TextField
@@ -189,6 +224,7 @@ export function DesktopSettings({
   list,
   current,
   onInstancesChanged,
+  onServingApplying,
   onServingChanged,
   servingProblem = null,
 }: DesktopSettingsProps) {
@@ -313,7 +349,11 @@ export function DesktopSettings({
       </div>
 
       <Part id={SERVING_SECTION} title="Serve the web UI">
-        <Serving onServingChanged={onServingChanged} problem={servingProblem} />
+        <Serving
+          onServingApplying={onServingApplying}
+          onServingChanged={onServingChanged}
+          problem={servingProblem}
+        />
       </Part>
 
       <Part title="Keyboard shortcuts">

@@ -192,6 +192,10 @@ function DesktopScreens() {
   // The newest connect; an answer for an older one arrives too late to matter.
   const latest = useRef(0)
   const probing = useRef(false)
+  // Serve the web UI is being applied: This computer is down or has a new secret until the shell
+  // answers, so a failed request or a refused token for `local` in that window is the restart, not a
+  // fault, and {@link onServingChanged} reconnects once it is over.
+  const applying = useRef(false)
   // Settings opened at a section by the shell's side of the page, and the last one asked.
   const [settingsRequest, setSettingsRequest] = useState<SettingsRequest | null>(null)
   const requests = useRef(0)
@@ -229,6 +233,7 @@ function DesktopScreens() {
   /** A request to remote instance `id` failed before any HTTP status: down, or refusing this origin? */
   const lost = useCallback(async (id: string, seq: number): Promise<void> => {
     if (probing.current || seq !== latest.current) return
+    if (applying.current && id === LOCAL_ID) return
     probing.current = true
     let probe: Probe | null = null
     try {
@@ -305,7 +310,13 @@ function DesktopScreens() {
   }, [reload, open])
 
   const current = phase.id
-  const onTokenRefused = useCallback((token: string) => void open(current, token), [open, current])
+  const onTokenRefused = useCallback(
+    (token: string) => {
+      if (applying.current && current === LOCAL_ID) return
+      void open(current, token)
+    },
+    [open, current],
+  )
 
   const onSwitch = useCallback(
     (id: string) => {
@@ -327,21 +338,34 @@ function DesktopScreens() {
   }, [askSettings])
 
   /** Serving was applied (or refused): if This computer is on screen with an old secret, connect again now. */
+  const onServingApplying = useCallback(() => {
+    applying.current = true
+    setServingProblem(null)
+  }, [])
+
   const onServingChanged = useCallback(
     async (problem: string | null): Promise<void> => {
+      applying.current = false
       setServingProblem(problem)
       const now = phaseNow.current
-      if (now.id !== LOCAL_ID || now.phase !== 'ready') return
-      let endpoint
-      try {
-        endpoint = await connect(LOCAL_ID)
-      } catch {
-        void open(LOCAL_ID, null)
-        return
+      if (now.id !== LOCAL_ID) return
+      if (now.phase === 'ready') {
+        let endpoint
+        try {
+          endpoint = await connect(LOCAL_ID)
+        } catch {
+          await open(LOCAL_ID, null)
+          askSettings(SERVING_SECTION)
+          return
+        }
+        if (endpoint.kind === 'bearer' && endpoint.token === launchToken(now.connection, LOCAL_ID)) return
+        latest.current += 1
+        setPhase({ phase: 'ready', connection: createConnection(endpoint), id: LOCAL_ID })
+      } else {
+        // Unreachable or still connecting: connect again from the start.
+        await open(LOCAL_ID, null)
       }
-      if (endpoint.kind === 'bearer' && endpoint.token === launchToken(now.connection, LOCAL_ID)) return
-      latest.current += 1
-      setPhase({ phase: 'ready', connection: createConnection(endpoint), id: LOCAL_ID })
+      // Back on Settings at the serving part, where the answer (or the refusal) is shown.
       askSettings(SERVING_SECTION)
     },
     [open, askSettings],
@@ -385,6 +409,7 @@ function DesktopScreens() {
           list={list}
           current={current}
           onInstancesChanged={onChanged}
+          onServingApplying={onServingApplying}
           onServingChanged={onServingChanged}
           servingProblem={servingProblem}
         />
@@ -392,7 +417,7 @@ function DesktopScreens() {
       request: settingsRequest,
       onOpened: (seq) => setSettingsRequest((was) => (was?.seq === seq ? null : was)),
     }),
-    [list, current, onChanged, onServingChanged, servingProblem, settingsRequest],
+    [list, current, onChanged, onServingApplying, onServingChanged, servingProblem, settingsRequest],
   )
 
   let body
