@@ -349,3 +349,126 @@ describe('the dialogs the screen opens', () => {
     expect(screen.queryByText('Moving...') === null, 'the indicator outlived the request').toBe(true)
   })
 })
+
+/** Make `matchMedia('(max-width: 640px)')` answer `matches`, and hand back a way to flip it. */
+function phoneWidth(matches: boolean): (next: boolean) => void {
+  const listeners = new Set<() => void>()
+  const state = { matches }
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    get matches() {
+      return state.matches
+    },
+    media: query,
+    addEventListener: (_: string, fn: () => void) => listeners.add(fn),
+    removeEventListener: (_: string, fn: () => void) => listeners.delete(fn),
+  }))
+  return (next) => {
+    state.matches = next
+    listeners.forEach((fn) => {
+      fn()
+    })
+  }
+}
+
+describe('the phone layout', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  const cards = (container: HTMLElement): NodeListOf<Element> =>
+    container.querySelectorAll('[data-card]')
+
+  it('the phone shows cards and the desktop the table', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+    })
+    phoneWidth(true)
+    const phone = openScreen(client)
+    await flush()
+    expect(cards(phone.container).length, 'the phone did not show cards').toBe(2)
+    expect(phone.container.querySelector('table'), 'the phone still drew the table').toBeNull()
+    cleanup()
+
+    phoneWidth(false)
+    const desktop = openScreen(client)
+    await flush()
+    expect(cards(desktop.container).length, 'the desktop drew cards').toBe(0)
+    expect(desktop.container.querySelector('table'), 'the desktop lost its table').not.toBeNull()
+  })
+
+  it('tapping a card opens the full view and pushes history', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const push = vi.spyOn(window.history, 'pushState')
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    expect(push, 'opening the full view must push history exactly once').toHaveBeenCalledTimes(1)
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(view.textContent).toContain('Pause')
+    expect(view.textContent).toContain('Remove')
+    for (const tab of ['Files', 'Peers', 'Trackers', 'Pieces']) {
+      expect(
+        screen.getByRole('tab', { name: tab }),
+        `the full view lost its ${tab} tab`,
+      ).toBeTruthy()
+    }
+  })
+
+  it('back returns to the list', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    let signedOut = 0
+    const { container } = render(
+      <Torrents
+        signedIn
+        signOutError={null}
+        onSignOut={() => {
+          signedOut += 1
+        }}
+        client={client}
+      />,
+    )
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).not.toBeNull()
+
+    // The browser's back: a popstate closes the view.
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'popstate did not close the view',
+    ).toBeNull()
+    expect(cards(container).length).toBe(1)
+    expect(signedOut, 'back signed the person out').toBe(0)
+
+    // The on-screen Back button goes through history.back, so the history stays balanced.
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(back, 'the Back button must call history.back once').toHaveBeenCalledTimes(1)
+  })
+
+  it('filters become chips', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b', { state: 'paused', download_rate: 0 })],
+    })
+    phoneWidth(true)
+    openScreen(client)
+    await flush()
+    const paused = screen.getByRole('button', { name: /Paused/ })
+    expect(paused.textContent, 'a chip lost its count').toContain('1')
+    expect(screen.getByRole('button', { name: /^All/ }).textContent).toContain('2')
+    fireEvent.click(paused)
+    expect(
+      document.querySelectorAll('[data-card]').length,
+      'choosing a chip did not narrow the cards',
+    ).toBe(1)
+  })
+})

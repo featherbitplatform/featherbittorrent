@@ -44,6 +44,8 @@ import ConfirmDelete from '../components/ConfirmDelete'
 import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
 import StateFilters from '../components/StateFilters'
+import TorrentCards from '../components/TorrentCards'
+import TorrentFullView from '../components/TorrentFullView'
 import TorrentTable from '../components/TorrentTable'
 import { api, errorMessage } from '../api/client'
 import type { Api, SessionInfo } from '../api/client'
@@ -67,6 +69,28 @@ const EVENTS_URL = '/api/v1/events?categories=status'
 
 /** How often the session row is re-read for the header's version and DHT count. It is decoration, not the live table; the refresh model puts the once-a-second cadence on the list. */
 const SESSION_POLL_MS = 30_000
+
+/** Whether the viewport is a phone: `matchMedia('(max-width: 640px)')`, followed through its `change` event. An environment without `matchMedia` (a test jsdom) is the desktop. */
+const PHONE_QUERY = '(max-width: 640px)'
+
+function usePhone(): boolean {
+  const [phone, setPhone] = useState(
+    () => typeof window.matchMedia === 'function' && window.matchMedia(PHONE_QUERY).matches,
+  )
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const query = window.matchMedia(PHONE_QUERY)
+    const onChange = (): void => {
+      setPhone(query.matches)
+    }
+    onChange()
+    query.addEventListener('change', onChange)
+    return () => {
+      query.removeEventListener('change', onChange)
+    }
+  }, [])
+  return phone
+}
 
 export default function Torrents({
   signedIn,
@@ -94,6 +118,47 @@ export default function Torrents({
   // The torrents whose files are being moved: kept here, not in the menu, so the indicator survives choosing another row.
   const [movingIds, setMovingIds] = useState<ReadonlySet<string>>(new Set())
   const liveRef = useRef<LiveHandle | null>(null)
+  const phone = usePhone()
+  // Whether the full-screen torrent owns a history entry: opened once with `pushState`, closed by
+  // the browser's back (a `popstate`) or by `history.back()`, so the history stays balanced and
+  // neither path ever leaves the page.
+  const pushedRef = useRef(false)
+
+  useEffect(() => {
+    const onPop = (): void => {
+      if (!pushedRef.current) return
+      pushedRef.current = false
+      setSelectedId(null)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => {
+      window.removeEventListener('popstate', onPop)
+    }
+  }, [])
+
+  /** Pick a card: select it and open it full screen on its own history entry. */
+  function openFull(id: string): void {
+    if (!pushedRef.current) {
+      window.history.pushState({ torrent: id }, '')
+      pushedRef.current = true
+    }
+    setSelectedId(id)
+  }
+
+  /** Close the full view: through the history when it owns an entry, so the entry is consumed. */
+  function closeFull(): void {
+    if (pushedRef.current) window.history.back()
+    else setSelectedId(null)
+  }
+
+  /** The torrent went away while open: clear the selection and give the history entry back. */
+  function goneFull(goneId: string): void {
+    setSelectedId((current) => (current === goneId ? null : current))
+    if (pushedRef.current) {
+      pushedRef.current = false
+      window.history.back()
+    }
+  }
 
   useEffect(() => {
     const live = startLive(
@@ -198,6 +263,15 @@ export default function Torrents({
     }
   }
 
+  const setMoving = (moverId: string, on: boolean): void => {
+    setMovingIds((current) => {
+      const next = new Set(current)
+      if (on) next.add(moverId)
+      else next.delete(moverId)
+      return next
+    })
+  }
+
   const toolbar = (
     <>
       <Button
@@ -237,13 +311,7 @@ export default function Torrents({
           client={client}
           moving={movingIds.has(selectedRow.id)}
           onMoving={(on) => {
-            const moverId = selectedRow.id
-            setMovingIds((current) => {
-              const next = new Set(current)
-              if (on) next.add(moverId)
-              else next.delete(moverId)
-              return next
-            })
+            setMoving(selectedRow.id, on)
           }}
           onError={(why) => {
             setActionError(why)
@@ -277,30 +345,60 @@ export default function Torrents({
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <StateFilters counts={counts} active={filter} onChange={setFilter} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <TorrentTable
-            rows={shown}
-            selectedId={selectedId}
-            onPick={setSelectedId}
-            actions={toolbar}
-          />
-          <DetailPane
-            id={selectedId}
-            client={client}
-            tick={tick}
-            name={selectedName}
-            onDismiss={() => {
-              setSelectedId(null)
-            }}
-            onRemoved={(goneId) => {
-              // The pane closes itself; the selection goes with it, but only when this is still
-              // the selected torrent - a late 404 about one nobody chose must not close a pane
-              // that is busy describing another.
-              setSelectedId((current) => (current === goneId ? null : current))
-            }}
-          />
+          {phone ? (
+            <TorrentCards rows={shown} onPick={openFull} />
+          ) : (
+            <>
+              <TorrentTable
+                rows={shown}
+                selectedId={selectedId}
+                onPick={setSelectedId}
+                actions={toolbar}
+              />
+              <DetailPane
+                id={selectedId}
+                client={client}
+                tick={tick}
+                name={selectedName}
+                onDismiss={() => {
+                  setSelectedId(null)
+                }}
+                onRemoved={(goneId) => {
+                  // The pane closes itself; the selection goes with it, but only when this is still
+                  // the selected torrent - a late 404 about one nobody chose must not close a pane
+                  // that is busy describing another.
+                  setSelectedId((current) => (current === goneId ? null : current))
+                }}
+              />
+            </>
+          )}
         </main>
       </div>
 
+      {phone && selectedRow !== null && (
+        <TorrentFullView
+          torrent={selectedRow}
+          client={client}
+          tick={tick}
+          busy={busy}
+          onBack={closeFull}
+          onAct={(kind) => {
+            void act(kind)
+          }}
+          onRemove={() => {
+            setConfirming({ id: selectedRow.id, name: selectedRow.name })
+          }}
+          moving={movingIds.has(selectedRow.id)}
+          onMoving={(on) => {
+            setMoving(selectedRow.id, on)
+          }}
+          onError={(why) => {
+            setActionError(why)
+            announcePolite(why)
+          }}
+          onRemoved={goneFull}
+        />
+      )}
       {addOpen && (
         <AddTorrent
           client={client}
@@ -324,7 +422,7 @@ export default function Torrents({
             setConfirming(null)
           }}
           onRemoved={(goneId) => {
-            setSelectedId((current) => (current === goneId ? null : current))
+            goneFull(goneId)
             wake()
           }}
         />
