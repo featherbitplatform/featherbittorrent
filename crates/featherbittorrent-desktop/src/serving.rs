@@ -123,7 +123,9 @@ impl Serving {
         };
         eprintln!("{problem}");
         let running = local::start_with(&self.paths, false, settings).await?;
-        let _ = self.save_switch(false);
+        if let Err(saving) = self.save_switch(false) {
+            eprintln!("Serving is off, but the switch could not be saved: {saving}");
+        }
         self.set_problem(Some(problem));
         Ok(running)
     }
@@ -353,7 +355,9 @@ impl Serving {
         {
             // Back to the window's own engine, and the switch saved off to match it.
             let back = local::start_with(&self.paths, false, settings).await.ok();
-            let _ = self.save_switch(false);
+            if let Err(saving) = self.save_switch(false) {
+                eprintln!("Serving is off, but the switch could not be saved: {saving}");
+            }
             return (back, Err(problem));
         }
         match local::start_with(&self.paths, change.enabled, settings.clone()).await {
@@ -364,7 +368,9 @@ impl Serving {
             Err(problem) if change.enabled => {
                 // Back to the window's own engine, and the switch saved off: the line says why.
                 let back = local::start_with(&self.paths, false, settings).await.ok();
-                let _ = self.save_switch(false);
+                if let Err(saving) = self.save_switch(false) {
+                    eprintln!("Serving is off, but the switch could not be saved: {saving}");
+                }
                 (back, Err(problem))
             }
             Err(problem) => (None, Err(problem)),

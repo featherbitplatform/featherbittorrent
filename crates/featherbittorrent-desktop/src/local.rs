@@ -284,23 +284,53 @@ pub(crate) mod tests {
         }
     }
 
-    /// A first run on a fresh library (no config.yaml, so no `server:` section) can add a magnet into the
-    /// default download folder: the engine's allowed folders are that folder, as `serve` would have them,
-    /// and the config written for the library still names no server.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_magnet_add_on_a_fresh_library_succeeds() {
-        let dir = ScratchDir::new("desktop-local-fresh-add");
+    /// The first run on a library with no config.yaml: the config it writes names no server, and the
+    /// engine's copy has the download folder as its one allowed root, as `serve` would have it. Nothing
+    /// starts and nothing is created but the scratch config file (the download folder may be the host's,
+    /// so it is only named, never made).
+    #[test]
+    fn a_fresh_library_gets_the_download_folder_as_its_root() {
+        let dir = ScratchDir::new("desktop-local-fresh-roots-unit");
         let paths = fresh_paths(&dir);
         let library = paths.library();
         assert!(!library.config_file().exists(), "a fresh library");
-        let this = start_offline(&paths).await.expect("This computer starts");
-        let (base, secret) = this.endpoint();
 
+        let config = super::library_config(&library).expect("the defaults");
         let written = Config::load_for_edit(&library.config_file())
             .expect("the config reads")
             .expect("the first run wrote one");
         assert!(written.server.is_none(), "no server section was written");
+
+        let download_dir = config.download_dir.clone();
+        let engine = super::with_allowed_roots(config, &library);
+        assert_eq!(
+            engine.server.expect("a section in memory").allowed_roots,
+            vec![download_dir]
+        );
+        let after = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("still there");
+        assert!(after.server.is_none(), "still no server section on disk");
+    }
+
+    /// A library whose config.yaml names no `server:` section (the desktop's default) can add a magnet
+    /// into its download folder: the engine's allowed folders are that folder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnet_add_on_a_fresh_library_succeeds() {
+        let dir = ScratchDir::new("desktop-local-fresh-add");
+        let paths = scratch_paths(&dir);
+        let library = paths.library();
+        let written = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("written by the scratch library");
+        assert!(written.server.is_none(), "no server section");
         let downloads = written.resolve(&library).download_dir;
+        assert!(
+            downloads.starts_with(dir.path()),
+            "a scratch download folder"
+        );
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let (base, secret) = this.endpoint();
 
         let body = serde_json::json!({
             "magnet": format!("magnet:?xt=urn:btih:{}", "cd".repeat(20)),
@@ -327,11 +357,16 @@ pub(crate) mod tests {
         this.stop().await;
     }
 
-    /// The folder picker on a fresh library has somewhere to start: its roots list is not empty.
+    /// The folder picker on a library with no `server:` section has somewhere to start: its roots list
+    /// is not empty.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_folder_roots_are_not_empty_on_a_fresh_library() {
         let dir = ScratchDir::new("desktop-local-fresh-roots");
-        let paths = fresh_paths(&dir);
+        let paths = scratch_paths(&dir);
+        let no_section = Config::load_for_edit(&paths.library().config_file())
+            .expect("the config reads")
+            .expect("written by the scratch library");
+        assert!(no_section.server.is_none(), "no server section");
         let this = start_offline(&paths).await.expect("This computer starts");
         let (base, secret) = this.endpoint();
         let answer = tokio::time::timeout(
