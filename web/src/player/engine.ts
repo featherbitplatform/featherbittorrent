@@ -1022,7 +1022,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     }
   }
 
+  // `sourceopen` fires again whenever an append or a remove reopens an ended source (a seek back
+  // after the end, an audio switch after it): the setup is the first open's alone, and a second
+  // `addSourceBuffer` after media data is the browser's `QuotaExceededError`.
+  let setUp = false
   function onOpen(): void {
+    if (setUp) return
+    setUp = true
     if (probe.durationMs !== null) source.duration = mapTimes.toMedia(probe.durationMs)
     openBuffers()
     // The start is where the player asked to begin, when it did before the source opened; that is

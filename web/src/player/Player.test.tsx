@@ -1802,4 +1802,46 @@ describe('the player', () => {
     expect(t.engine.state(), 'the held re-append ended in an error').not.toBe('error')
     t.close()
   })
+
+  it('a seek back after the end keeps one buffer per track', async () => {
+    // Both bodies reach the end and the source is ended. A seek back into data the buffer does
+    // not hold restarts the streams, and their first appends reopen the source, which fires
+    // `sourceopen` again. The engine must not set itself up a second time.
+    const errors: unknown[] = []
+    const onError = (event: ErrorEvent): void => {
+      errors.push(event.error ?? event.message)
+    }
+    window.addEventListener('error', onError)
+    try {
+      const t = await openEngine({}, 1_000)
+      for (let i = 0; i < 6; i += 1) {
+        t.body(1).push(new Uint8Array([1]))
+        t.body(2).push(new Uint8Array([1]))
+        await settle()
+      }
+      t.body(1).end()
+      t.body(2).end()
+      await settle()
+      expect(t.source.readyState, 'the source did not end').toBe('ended')
+      // The front of the file is evicted: the seek to media 2 lands in no buffered range.
+      setRanges(t.videoBuffer, [[4, 6]])
+      setRanges(t.audioBuffer, [[4, 6]])
+      const appendsBefore = t.videoBuffer.log.appends.length
+      t.video.currentTime = 2
+      await settle()
+      expect(t.recorder.callsFor('/tracks/1/stream').length, 'the seek did not restart').toBe(2)
+      t.body(1).push(new Uint8Array([1]))
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+      await settle()
+      expect(t.source.readyState, 'the append did not reopen the source').toBe('open')
+      expect(t.source.activeSourceBuffers.length, 'the reopen added buffers').toBe(2)
+      expect(t.videoBuffer.log.appends.length, 'the restart did not append').toBe(appendsBefore + 1)
+      expect(errors, 'the second sourceopen threw').toEqual([])
+      expect(t.engine.state(), 'the restart after the end is an error').not.toBe('error')
+      t.close()
+    } finally {
+      window.removeEventListener('error', onError)
+    }
+  })
 })

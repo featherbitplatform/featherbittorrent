@@ -60,6 +60,7 @@ export class FakeSourceBuffer extends EventTarget {
   private _buffered: [number, number][] = []
   private _updating = false
   private _updateTimer: ReturnType<typeof setTimeout> | null = null
+  private _updateKind: 'append' | 'remove' | 'changeType' | null = null
   private appendBufferOriginal: (data: ArrayBuffer | ArrayBufferView) => void
   /** The owning source, for the `InvalidStateError` a buffer in a closed source throws. */
   owner: FakeMediaSource | null = null
@@ -95,6 +96,7 @@ export class FakeSourceBuffer extends EventTarget {
 
   appendBuffer(data: ArrayBuffer | ArrayBufferView): void {
     this._refuseWhileBusy()
+    this.owner?.reopenIfEnded()
     this.log.appends.push(data as ArrayBuffer)
     this.log.ops.push('append')
     // The fake buffer grows by a whole second per chunk: a test can reason about how far ahead
@@ -102,18 +104,31 @@ export class FakeSourceBuffer extends EventTarget {
     const last = this._buffered.at(-1)
     if (last !== undefined) last[1] += 1
     else this._buffered.push([0, 1])
-    this._beginUpdate()
+    this._beginUpdate('append')
   }
 
   remove(start: number, end: number): void {
     this._refuseWhileBusy()
+    const duration = this.owner?.duration ?? Number.POSITIVE_INFINITY
+    if (!(start >= 0) || start > duration || !(end > start)) {
+      throw new TypeError(`remove(${start}, ${end}) is out of range`)
+    }
+    this.owner?.reopenIfEnded()
     this.log.removes.push([start, end])
     this.log.ops.push('remove')
     this._buffered = this._buffered.filter(([s, e]) => e <= start || s >= end)
-    this._beginUpdate()
+    this._beginUpdate('remove')
   }
 
   abort(): void {
+    // The spec refuses an abort on a source that is not open, and during a range removal (the
+    // removal runs to its own `updateend`).
+    if (this.owner !== null && this.owner.readyState !== 'open') {
+      throw new DOMException('the media source is not open', 'InvalidStateError')
+    }
+    if (this._updating && this._updateKind === 'remove') {
+      throw new DOMException('the buffer is removing a range', 'InvalidStateError')
+    }
     this.log.aborts += 1
     this.log.ops.push('abort')
     // A real `abort()` only stops the current update: the buffered ranges stay. On an idle buffer
@@ -123,6 +138,7 @@ export class FakeSourceBuffer extends EventTarget {
     if (this._updateTimer !== null) clearTimeout(this._updateTimer)
     this._updating = false
     this._updateTimer = null
+    this._updateKind = null
     setTimeout(() => {
       this.dispatchEvent(new Event('abort'))
       this.dispatchEvent(new Event('updateend'))
@@ -134,17 +150,19 @@ export class FakeSourceBuffer extends EventTarget {
     this.log.changeTypes.push(mime)
     this.log.ops.push('changeType')
     this.currentMimeType = mime
-    this._beginUpdate()
+    this._beginUpdate('changeType')
   }
 
-  private _beginUpdate(): void {
+  private _beginUpdate(kind: 'append' | 'remove' | 'changeType'): void {
     this._updating = true
+    this._updateKind = kind
     // A browser's `updateend` is a macrotask: the buffer is busy for a whole task, and a test
     // that appends and then appends again in the same task sees the `InvalidStateError` a browser
     // would throw, the way a missing wait for `updateend` shows up.
     this._updateTimer = setTimeout(() => {
       this._updateTimer = null
       this._updating = false
+      this._updateKind = null
       this.dispatchEvent(new Event('updateend'))
     }, 0)
   }
@@ -182,7 +200,7 @@ export class FakeMediaSource extends EventTarget {
   readonly activeSourceBuffers: FakeSourceBuffer[] = []
   readonly createdUrls: string[] = []
   private _duration = 0
-  private _open = false
+  private _state: 'closed' | 'open' | 'ended' = 'closed'
   endOfStreamCalls: string[] = []
 
   get duration(): number {
@@ -194,7 +212,18 @@ export class FakeMediaSource extends EventTarget {
   }
 
   get readyState(): string {
-    return this._open ? 'open' : 'closed'
+    return this._state
+  }
+
+  /**
+   * The MSE spec's step for an append or a remove on an ended source: the source is `open`
+   * again at once, and `sourceopen` is queued as a task, so a page that set itself up in
+   * `sourceopen` sees that event a second time.
+   */
+  reopenIfEnded(): void {
+    if (this._state !== 'ended') return
+    this._state = 'open'
+    setTimeout(() => this.dispatchEvent(new Event('sourceopen')), 0)
   }
 
   private _anyAppend(): boolean {
@@ -220,17 +249,25 @@ export class FakeMediaSource extends EventTarget {
   }
 
   endOfStream(mode?: string): void {
+    // The spec refuses an end on a source that is not open or a buffer that is updating.
+    if (this._state !== 'open') {
+      throw new DOMException('the media source is not open', 'InvalidStateError')
+    }
+    if (this.activeSourceBuffers.some((buffer) => buffer.updating)) {
+      throw new DOMException('a source buffer is updating', 'InvalidStateError')
+    }
     this.endOfStreamCalls.push(mode ?? 'none')
+    this._state = 'ended'
   }
 
   /** The test's side of the element's `load`: the source says it is open. */
   open(): void {
-    if (this._open) return
+    if (this._state !== 'closed') return
     // A browser stays `closed` until the async `sourceopen`: the `readyState` flips in the same
     // task that fires the event, not before it, so an `addSourceBuffer` in between is the
     // `InvalidStateError` a real element would throw.
     queueMicrotask(() => {
-      this._open = true
+      this._state = 'open'
       this.dispatchEvent(new Event('sourceopen'))
     })
   }
