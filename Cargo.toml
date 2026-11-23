@@ -209,3 +209,11 @@ tauri-build = "=2.7.6"
 # `tauri-plugin-dialog` 2.8 uses: it links the same `gtk-sys` 0.18 as Tauri, and two copies of a crate
 # that links `gtk-3` cannot be in one build.
 rfd = { version = "=0.17.2", default-features = false }
+# Start at login (plan 2026-11-23-desktop-app, Task 8): the app writes and removes its own login item at
+# runtime (a LaunchAgent on macOS, the Run key on Windows, an XDG autostart entry on Linux), launched with
+# `--background`. Pinned to the spike's version, which needs tauri ^2.12 like the rest.
+tauri-plugin-autostart = "=2.7.0"
+# The Linux tray check (Task 8): whether a StatusNotifier host owns `org.kde.StatusNotifierWatcher` on the
+# session bus, since the tray builder succeeds without one. Already in the tree through keyring's Linux
+# store, at its default features (async-io and the blocking API), so this adds no crates.
+zbus = "5.19"

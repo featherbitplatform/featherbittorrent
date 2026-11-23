@@ -92,6 +92,11 @@ impl ChromeState {
         }
     }
 
+    /// The setting as this run knows it.
+    pub fn saved(&self) -> bool {
+        self.get()
+    }
+
     fn get(&self) -> bool {
         *self
             .system_title_bar

@@ -18,6 +18,9 @@ import type { Endpoint } from '../endpoint'
 /** The shell's id for This computer, the app's own engine, and the instance the page opens on until saved instances arrive. */
 export const LOCAL_ID = 'local'
 
+/** This computer's name, wherever the app shows it. */
+export const THIS_COMPUTER = 'This computer'
+
 /** What the shell's `connect` answers: an absolute base address and the bearer token to present there, or null when the page has to sign in. */
 interface EndpointAnswer {
   kind: 'bearer'
@@ -128,4 +131,40 @@ export async function forgetPassword(id: string): Promise<void> {
 /** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */
 export async function probeInstance(id: string): Promise<Probe> {
   return invoke<Probe>('probe_instance', { id })
+}
+
+/** What closing the window does once the first-close question is answered. */
+export type CloseAction = 'quit' | 'tray'
+
+/** The shell's event when closing the window needs the page's answer first. */
+export const CLOSE_REQUESTED_EVENT = 'close-requested'
+
+/** Saves what closing the window does from now on. */
+export async function setCloseAction(action: CloseAction): Promise<void> {
+  await invoke('set_close_action', { action })
+}
+
+/** Closes the window the way the saved choice says: quit, or hide in the tray. */
+export async function closeWindow(): Promise<void> {
+  await invoke('close_window_now')
+}
+
+/** Whether this system gave the app a tray to keep running in. */
+export async function trayAvailable(): Promise<boolean> {
+  return invoke<boolean>('tray_available')
+}
+
+/** Turns Start at login on or off; rejects with the shell's line when the login item cannot change. */
+export async function setStartAtLogin(on: boolean): Promise<void> {
+  await invoke('set_start_at_login', { on })
+}
+
+/** Names the connected instance in the tray menu. */
+export async function setTrayInstance(name: string): Promise<void> {
+  await invoke('set_tray_instance', { name })
+}
+
+/** Calls `handler` each time closing the window asks the page first; resolves to the function that stops listening. */
+export async function onCloseRequested(handler: () => void): Promise<() => void> {
+  return listen(CLOSE_REQUESTED_EVENT, () => handler())
 }

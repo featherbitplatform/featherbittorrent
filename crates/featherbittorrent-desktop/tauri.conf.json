@@ -9,6 +9,7 @@
     "windows": [
       {
         "label": "main",
+        "visible": false,
         "title": "featherbittorrent",
         "width": 1200,
         "height": 800,

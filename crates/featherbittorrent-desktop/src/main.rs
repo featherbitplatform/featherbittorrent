@@ -11,11 +11,13 @@
 mod commands;
 mod instances;
 mod keychain;
+mod lifecycle;
 mod local;
+mod tray;
 mod window;
 
 use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, WindowEvent};
 
 use crate::commands::{DesktopState, Platform};
 
@@ -53,6 +55,10 @@ fn main() {
             });
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![lifecycle::BACKGROUND_FLAG]),
+        ))
         .manage(DesktopState::new(this_computer))
         .manage(window::ChromeState::new(
             paths.settings_file(),
@@ -63,6 +69,16 @@ fn main() {
             std::sync::Arc::new(keychain::SystemKeychain::probe()),
             local::desktop_origin(),
         ))
+        .manage(lifecycle::Lifecycle::new(paths.settings_file()))
+        // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
+        // be added anywhere: a new step goes into `setup` below, in its place in the order.
+        .setup(setup)
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                lifecycle::close_window(window.app_handle());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
             commands::connect,
@@ -74,7 +90,12 @@ fn main() {
             instances::set_default_instance,
             instances::save_password,
             instances::forget_password,
-            instances::probe_instance
+            instances::probe_instance,
+            lifecycle::set_close_action,
+            lifecycle::close_window_now,
+            lifecycle::tray_available,
+            lifecycle::set_start_at_login,
+            tray::set_tray_instance
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -84,23 +105,39 @@ fn main() {
             )
         });
 
-    let system_title_bar = settings.system_title_bar;
-    app.run(move |handle, event| {
-        // The config's windows exist from `Ready` on. The title bar's decorations must go on before the
-        // window is first shown: when the app gets its single setup function, this is its first step,
-        // ahead of any `show()` (`Builder::setup` replaces, never chains, so it cannot be a second one).
-        if let RunEvent::Ready = event {
-            match handle.get_webview_window("main") {
-                Some(main) => window::apply_chrome(&main, Platform::current(), system_title_bar),
-                None => eprintln!("The main window was not there to put its title bar on."),
-            }
-        }
-        if let RunEvent::Exit = event
-            && let Some(this_computer) = handle.state::<DesktopState>().take()
-        {
-            tauri::async_runtime::block_on(this_computer.stop());
-        }
-    });
+    // Exit requests, the last event (where Cmd+Q, logging out and shutting down arrive on macOS) and the
+    // Dock icon: every way out waits for This computer's final save.
+    app.run(lifecycle::handle_run_event);
+}
+
+/// Everything that needs the app built and its window made, in a fixed order: the window's chrome, then
+/// the tray, then how the window starts (which depends on whether there is a tray), then the quit signals.
+/// This is the only setup function; `Builder::setup` keeps one.
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = app.handle();
+    let system_title_bar = app.state::<window::ChromeState>().saved();
+    // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
+    //    them before it calls the setup); a missing one is said once and the app goes on without it.
+    match handle.get_webview_window(lifecycle::MAIN_WINDOW) {
+        Some(main) => window::apply_chrome(
+            &main,
+            Platform::current(),
+            system_title_bar,
+        ),
+        None => eprintln!("The main window was not there to put its title bar on."),
+    }
+    // 2. The tray, and whether this system shows one.
+    let tray_available = tray::install(handle);
+    app.state::<lifecycle::Lifecycle>()
+        .set_tray_available(tray_available);
+    // 3. Show, hide or minimize the window (it starts invisible, `tauri.conf.json`).
+    lifecycle::apply_initial_state(
+        handle,
+        lifecycle::initial_window_state(std::env::args(), tray_available),
+    );
+    // 4. A quit by signal runs the final save too.
+    lifecycle::quit_on_signals(handle);
+    Ok(())
 }
 
 /// Says `message` in a native message box (and on stderr, for a run from a terminal), then exits with

@@ -19,6 +19,7 @@ const shell = vi.hoisted(() => ({
   listInstances: vi.fn(),
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
+  setTrayInstance: vi.fn(() => Promise.resolve()),
   seen: [] as Connection[],
   mounts: 0,
 }))
@@ -32,7 +33,10 @@ vi.mock('./bridge', () => ({
   setDefaultInstance: vi.fn(),
   forgetPassword: vi.fn(),
   LOCAL_ID: 'local',
+  THIS_COMPUTER: 'This computer',
+  setTrayInstance: shell.setTrayInstance,
 }))
+vi.mock('./CloseChoice', () => ({ CloseChoiceHost: () => null }))
 vi.mock('../App', () => ({
   default: function FakeApp() {
     const connection = useConnection()
@@ -97,6 +101,13 @@ it('connects_to_this_computer_and_renders_the_app_on_its_endpoint', async () => 
   render(<DesktopRoot />)
   await screen.findByText(`workspace ${BASE} first`)
   expect(shell.connect).toHaveBeenCalledWith('local')
+})
+
+it('the_tray_names_this_computer_once_connected', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  render(<DesktopRoot />)
+  await screen.findByText(`workspace ${BASE} first`)
+  await waitFor(() => expect(shell.setTrayInstance).toHaveBeenCalledWith('This computer'))
 })
 
 it('a_rejected_launch_token_reconnects_without_signing_in', async () => {

@@ -35,8 +35,9 @@ import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
 import { SavePasswordContext } from '../savePassword'
 import type { SavePasswordOffer } from '../savePassword'
-import { connect, listInstances, LOCAL_ID, probeInstance, savePassword } from './bridge'
+import { connect, listInstances, LOCAL_ID, probeInstance, savePassword, setTrayInstance, THIS_COMPUTER } from './bridge'
 import type { InstancesList, Probe } from './bridge'
+import { CloseChoiceHost } from './CloseChoice'
 import { InstanceSwitcher } from './InstanceSwitcher'
 import { Instances } from './Instances'
 
@@ -134,7 +135,17 @@ function Connected({
   )
 }
 
+/** The screens below, with the first-close question ready whatever phase they are in. */
 export function DesktopRoot() {
+  return (
+    <>
+      <DesktopScreens />
+      <CloseChoiceHost />
+    </>
+  )
+}
+
+function DesktopScreens() {
   const [phase, setPhase] = useState<Phase>({ phase: 'connecting', id: LOCAL_ID })
   const [list, setList] = useState<InstancesList>(LOCAL_ONLY)
   const [managing, setManaging] = useState(false)
@@ -253,6 +264,15 @@ export function DesktopRoot() {
     // The instance on screen was removed: back to the one that is never gone.
     if (fresh !== null && !fresh.items.some((item) => item.id === current)) void open(LOCAL_ID, null)
   }, [reload, open, current])
+
+  // The tray names the instance the page is connected to.
+  const connectedId = phase.phase === 'ready' ? phase.id : null
+  useEffect(() => {
+    if (connectedId === null) return
+    setTrayInstance(connectedId === LOCAL_ID ? THIS_COMPUTER : connectedId).catch((cause: unknown) => {
+      console.warn('The tray could not name the connected instance:', cause)
+    })
+  }, [connectedId])
 
   const offer: SavePasswordOffer | null =
     current === LOCAL_ID
