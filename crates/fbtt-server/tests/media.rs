@@ -1448,12 +1448,16 @@ async fn media_routes_refuse_a_stream_token_as_bearer() {
     let stream_token = token_of(&address);
     let probe = served.url(&format!("/api/v1/media/{id}/0"));
 
-    let (status, code) = error_of(get(&http(), &probe, Some(&stream_token)).await).await;
+    let response = get(&http(), &probe, Some(&stream_token)).await;
+    // The status is asserted before anything is read out of the body: if the token opens the route, the
+    // body is a probe answer rather than an error, and the failure worth having is the one that says a
+    // stream token signed in.
     assert_eq!(
-        status,
+        response.status(),
         StatusCode::UNAUTHORIZED,
         "a stream token opened a media route as a bearer header"
     );
+    let (_, code) = error_of(response).await;
     assert_eq!(code, "unauthorized");
 
     // The stream address the token was issued for, which is the one place it is a credential.
