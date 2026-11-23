@@ -25,7 +25,11 @@ and the keyboard shortcuts, and a phone layout, with the off switch in `server.w
 ([docs/web-ui.md](docs/web-ui.md)). Every release now ships two builds: the full build, `featherbittorrent`,
 which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and
 changes nothing for the TUI. Every artifact is built and smoke tested in a clean container or runner before
-anything is published, and the release workflow publishes them all on a `v*` tag.
+anything is published, and the release workflow publishes them all on a `v*` tag. The desktop app,
+`featherbittorrent-desktop`, is in development now: the same web UI in its own window, with an engine of its
+own on this machine (`This computer`), instances to switch between, a tray, start at login, `magnet:` links
+and `.torrent` files, and changeable keyboard shortcuts, shipped as a `.dmg`, an `.msi`, `.deb`, `.rpm` and
+`.tar.gz` beside the CLI builds ([docs/desktop.md](docs/desktop.md)).
 
 ## Install
 
@@ -37,7 +41,9 @@ installing puts its files. Installing never starts anything: no package installs
 creates an account, and nothing runs after the install. To have `serve` start at boot under systemd, launchd
 or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a time, all of it
 opt-in. The web UI's sign-in, the off switch and where to serve it are in
-[docs/web-ui.md](docs/web-ui.md).
+[docs/web-ui.md](docs/web-ui.md). The desktop app is a package of its own in the same releases: its files,
+its install steps and everything you can turn on after them are in [docs/desktop.md](docs/desktop.md), and
+the last section of [docs/install.md](docs/install.md) covers its files beside these.
 
 ## Build and run
 
