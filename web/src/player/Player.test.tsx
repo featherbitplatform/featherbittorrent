@@ -964,6 +964,72 @@ describe('the player', () => {
     expect(playCalls, 'a later canplay asked for playback again').toBe(1)
   })
 
+  it('a pause before the first data is kept', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    let playCalls = 0
+    video.play = (): Promise<void> => {
+      playCalls += 1
+      return Promise.resolve()
+    }
+
+    // The viewer pauses before any data arrives: that is their word for what they want, and it
+    // must be kept.
+    video.dispatchEvent(new Event('pause'))
+    await settle()
+
+    // Data arrives and the element can play: the autoplay must not override the viewer's pause.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    await settle()
+    expect(playCalls, 'the autoplay overrode the viewer\'s pause').toBe(0)
+  })
+
+  it('a refused autoplay leaves the player paused', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { status: 500 })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // The browser refuses the autoplay: `play()` rejects, the way an autoplay policy does.
+    video.play = (): Promise<void> => Promise.reject(new Error('NotAllowedError'))
+
+    // Data arrives and the element can play: the autoplay is refused.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    await settle()
+    // The refusal is not an error: the Play control shows, so the person can play when they
+    // choose. The autoplay's own error state is not one a person sees (the element's `play`
+    // promise is caught), so no unhandled rejection leaks into the test either.
+    expect(
+      video.paused === true,
+      'a refused autoplay did not leave the player paused',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Play' }) !== null,
+      'the Play control did not show after a refused autoplay',
+    ).toBe(true)
+  })
+
   it('reading pauses at the gate', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()

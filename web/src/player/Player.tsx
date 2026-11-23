@@ -361,7 +361,8 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   // The native path's transport: the open asks the element to play once its data can play, the
   // way the remux path does, and a refused autoplay leaves the Play control (the element's own
-  // `controls`) showing.
+  // `controls`) showing. The viewer's own play or pause (the element's `controls`) wins: once they
+  // have said what they want, the autoplay never overrides it.
   useEffect(() => {
     if (choice?.kind !== 'native' || nativeSrc === null) return
     const video = videoRef.current
@@ -373,9 +374,21 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         // An autoplay the browser refuses is not an error: the element's own Play control stays.
       })
     }
+    // A play or pause the viewer makes through the element's controls is their word for what they
+    // want: mark the open handled so the autoplay does not override it.
+    const onPlay = (): void => {
+      autoPlayedRef.current = true
+    }
+    const onPause = (): void => {
+      autoPlayedRef.current = true
+    }
     video.addEventListener('canplay', onCanPlay)
+    video.addEventListener('play', onPlay)
+    video.addEventListener('pause', onPause)
     return () => {
       video.removeEventListener('canplay', onCanPlay)
+      video.removeEventListener('play', onPlay)
+      video.removeEventListener('pause', onPause)
     }
   }, [choice, nativeSrc])
 
@@ -412,8 +425,16 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     engine.onState(setState)
     engine.seek(startMs)
 
-    const onPlay = (): void => setPaused(false)
-    const onPause = (): void => setPaused(true)
+    // A play or pause the viewer makes (Space or `k`, or the Play control) is their word for what
+    // they want: mark the open handled so the autoplay on the first `canplay` does not override it.
+    const onPlay = (): void => {
+      autoPlayedRef.current = true
+      setPaused(false)
+    }
+    const onPause = (): void => {
+      autoPlayedRef.current = true
+      setPaused(true)
+    }
     // The display is in source time, the clock the probe answers and the person thinks in: the
     // element's media time mapped back through the offset.
     const onTime = (): void => setTime(toSource(video.currentTime, probe.time_offset_ms))
@@ -751,7 +772,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         onDialogKey(event)
         onKeyDown(event)
       }}
-      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0"
+      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0"
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-4 py-2.5">
         <span className="min-w-0 truncate text-[13px] text-strong">{displaySafe(name)}</span>
