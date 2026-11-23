@@ -11,13 +11,15 @@
  *
  * @module components/Button
  */
-import type { ButtonHTMLAttributes } from 'react'
+import type { ButtonHTMLAttributes, Ref } from 'react'
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   /** The violet fill for the thing to do, the raised outline for everything else, the same outline wearing `error` for the one that cannot be undone. */
   variant?: 'primary' | 'secondary' | 'danger'
   /** `md` is the plan's 40px control. `sm` is the 36px the Torrents prototype draws its toolbar buttons at, beside a filter field of the same height. */
   size?: 'md' | 'sm'
+  /** Handed to the button, for a caller that has to move the focus to it. */
+  ref?: Ref<HTMLButtonElement>
 }
 
 const VARIANTS: Record<'primary' | 'secondary' | 'danger', string> = {

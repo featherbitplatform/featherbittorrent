@@ -371,7 +371,7 @@ describe('a new folder in the picker', () => {
     expect(rowPaths(container), 'the new folder was not listed').toContain('/downloads/Season 2')
   })
 
-  it.each([400, 403, 404, 409])('a refused name stays in the form with the reason (%i)', async (status) => {
+  it.each([400, 403, 404, 409])('a refused name stays in the form with the reason for status %i', async (status) => {
     const { client } = server({
       roots: ['/downloads'],
       mkdirAnswer: () =>
