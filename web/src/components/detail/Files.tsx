@@ -21,7 +21,7 @@
  *
  * @module components/detail/Files
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import type { Api, FileInfo } from "../../api/client";
@@ -67,10 +67,12 @@ export default function Files({
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   // What the user just chose, held until the next files refresh brings the server's own answer.
-  const [chosen, setChosen] = useState<Record<number, Choice>>({});
-  useEffect(() => {
-    setChosen({});
-  }, [files]);
+  const [held, setHeld] = useState<{ of: FileInfo[]; map: Record<number, Choice> }>({
+    of: files,
+    map: {},
+  })
+  // A choice only counts for the list it was made against: a refresh is a new list.
+  const chosen = held.of === files ? held.map : {};
 
   /**
    * The server wants one entry per file, pads included, so the list is read back first, the one
@@ -103,7 +105,7 @@ export default function Files({
             : entry.priority,
       );
       await client.setFilePriorities(id, priorities);
-      setChosen((held) => ({ ...held, [index]: priority }));
+      setHeld({ of: files, map: { ...chosen, [index]: priority } })
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
