@@ -56,11 +56,13 @@ use std::io::{Read, Seek};
 ///
 /// [`MediaError::Malformed`] for a header that does not parse, a file that ends inside a header
 /// element, a demuxer panic, a `TimestampScale` or start time no timeline can hold, a frame
-/// timestamp or duration too wide for the track's timeline, and a Matroska walk of
+/// timestamp or duration too wide for the track's timeline, one frame or sample over
+/// [`MAX_SAMPLE_BYTES`](crate::MAX_SAMPLE_BYTES), and a Matroska walk of
 /// [`MAX_SKIPPED_FRAMES`](crate::MAX_SKIPPED_FRAMES) frames that produced nothing; for an MP4
 /// `moov` declaring more than [`MOOV_CAP`](crate::MOOV_CAP) bytes, an `mdhd` timescale of 0,
 /// sample tables that contradict each other, a track with no samples or with more than
-/// [`MAX_MP4_SAMPLES`](crate::MAX_MP4_SAMPLES) of them, and a sample whose byte offset or timeline
+/// [`MAX_MP4_SAMPLES`](crate::MAX_MP4_SAMPLES) of them, a sample declaring more than
+/// [`MAX_SAMPLE_BYTES`](crate::MAX_SAMPLE_BYTES) bytes, and a sample whose byte offset or timeline
 /// does not fit.
 ///
 /// A reader that fails stays [`MediaError::Io`] - a torrent piece that has not arrived is not a
