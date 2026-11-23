@@ -517,7 +517,23 @@ mod tests {
             .buffered_across_seeks(64 * 1024);
             let cues = fbtt_media::embedded_cues(reader, 4, 0, 10_000).expect("the embedded cues");
             assert!(!cues.is_empty(), "the fixture's SubRip track has cues");
-            assert_moves_only_to_reads("cue scan", &told.lock().unwrap(), len);
+            let told = told.lock().unwrap();
+            assert_moves_only_to_reads("cue scan", &told, len);
+            // The whole file fits in one of the route's buffers, so one fill's worth of reads covers
+            // every byte the scan asks for, and the reader under the buffer should hear about no more.
+            // `+ 2` is slack: a second fill at the far end of the file is still not one per frame.
+            // Measured over this fixture: one.
+            let reads = told
+                .iter()
+                .filter(|t| matches!(t, Told::Read { .. }))
+                .count();
+            let buffer = 64 * 1024;
+            let bound = usize::try_from(len).unwrap_or(usize::MAX) / buffer + 2;
+            assert!(
+                reads <= bound,
+                "the cue scan read the engine {reads} times over a {len} byte file with a {buffer} \
+                 byte buffer; one buffer covers the file, so {bound} is the most it should take"
+            );
         })
         .await
         .expect("the blocking job");
