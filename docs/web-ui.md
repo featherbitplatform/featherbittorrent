@@ -82,7 +82,7 @@ where it is served, in setups 1 and 3, it signs in at the server.
 
 Streaming and playing video in the browser are provided by Playing video below.
 
-## Playing video
+## Playing media
 
 The web UI plays video and audio files in the browser.
 
@@ -94,8 +94,8 @@ codec plays where the browser can decode it.
 ### Starting playback
 
 A `Play` button appears on rows in the Files tab whose path ends in `.mkv`, `.mp4`,
-`.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player modal that
-shows the video, a seek bar, play controls and the menus.
+`.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player with an
+`aria-label` of `Play <file name>` and a `Close player` button.
 
 VP8/VP9 video in a WebM container plays natively, without audio or subtitle choice.
 
@@ -108,19 +108,23 @@ files). Image-based subtitles like PGS or VobSub are shown disabled with the mes
 
 ### Keys
 
-`Space`, `k` play or pause; `Left`, `Right` move 5 seconds; `Up`, `Down` change
-volume by 0.1; `m` mutes; `a` selects the next playable audio track; `c` cycles
-through subtitles including Off; `f` enters fullscreen; `Escape` closes.
+`Space` or `k` toggles play or pause; `ArrowLeft` or `ArrowRight` moves 5 seconds;
+`ArrowUp` or `ArrowDown` changes volume by 0.1; `m` toggles mute; `a` selects the next
+playable audio track; `c` cycles through subtitles including Off; `f` enters fullscreen;
+`Escape` closes the player.
 
-### Waiting state and partial download
+### Engine states
 
-When playback reaches a part of the file that has not arrived yet, the player shows
-`Waiting for data...` and keeps trying again, from the end of what it already has,
-until the data is there. Playback can start even while the torrent is still
-downloading.
+- `loading`: the player is starting up.
+- `waiting`: playback reaches a part of the file that has not arrived yet. The player shows
+`Waiting for data...`, keeps trying again from the end of what it already has, until the data is
+there. Playback can start even while the torrent is still downloading.
+- `playing`: the media is playing.
+- `error`: the engine has reached a fatal state; the player shows the message
+`Playback failed.` and the file can be downloaded.
 
 ### Unplayable message
 
-When the browser cannot play a video track, the player shows `This browser cannot
-play <codec> video.` and a `Download` button. Download saves the file to your
-computer.
+When the browser cannot play a video track, the player shows
+`This browser cannot play <codec> video.` and a button with an `aria-label` of `Download` that,
+when clicked, saves the file to your computer. The codec is filled in from the media.
