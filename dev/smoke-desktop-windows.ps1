@@ -68,7 +68,9 @@ $hadConfig = Test-Path -LiteralPath $settings
 if ($hadConfig -and -not $env:CI) {
     throw "$settings exists; run this on a CI runner or a clean machine"
 }
-if (Test-Path $magnetKey) { throw "$magnetKey exists before the install; run on a clean machine" }
+if (Test-Path $magnetKey) {
+    throw "$magnetKey exists before the install: this machine (or runner image) already has a magnet: handler, so the check could not tell whether this .msi registered one. Run the smoke on a clean machine or a runner image without a magnet: handler."
+}
 New-Item -ItemType Directory -Force $Logs | Out-Null
 
 # msiexec, quiet, with a verbose log; stops on any result but success.

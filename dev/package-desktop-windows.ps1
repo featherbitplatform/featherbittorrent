@@ -31,9 +31,27 @@
 
 .EXAMPLE
     ./dev/package-desktop-windows.ps1 -Version 0.3.0
+
+.DESCRIPTION
+    An .msi carries a numeric version (major.minor.patch.build), and the bundler refuses a prerelease
+    identifier that is not a plain number, so a release tag like v0.4.0-rc.1 would fail here and, through
+    the publish job's needs, hold back every other artifact. A version with a prerelease is therefore given
+    to the bundler as X.Y.Z.N through bundle.windows.wix.version (a --config file made for this build, so
+    tauri.conf.json is never edited): N is the last numeric identifier of the prerelease (rc.1 is 1, beta
+    is 0), and build metadata after + is dropped. A plain X.Y.Z passes through unchanged. Only the
+    installer's internal version changes: the .msi's file name keeps the real version, and the installed
+    exe still prints the workspace version. Windows Installer compares the first three fields only, and the
+    bundler's MajorUpgrade allows same-version upgrades, so 0.4.0 still replaces 0.4.0-rc.1.
+
+.EXAMPLE
+    ./dev/package-desktop-windows.ps1 -Version 0.4.0-rc.1 -PrintWixVersion
+
+    Prints 0.4.0.1, the version the .msi would carry, and exits: the mapping on its own, before any
+    platform or tool question, which is what dev/test-packaging.sh checks.
 #>
 param(
-    [string] $Version
+    [string] $Version,
+    [switch] $PrintWixVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +80,23 @@ function Write-Failure {
 if (-not $Version) { Write-Refusal 'usage: ./dev/package-desktop-windows.ps1 -Version <X.Y.Z>' }
 if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?\z') {
     Write-Refusal "invalid version '$Version' (expected X.Y.Z or X.Y.Z-pre)"
+}
+
+function ConvertTo-WixVersion {
+    # X.Y.Z stays X.Y.Z; X.Y.Z-pre becomes X.Y.Z.N with N the last numeric identifier of pre, or 0.
+    param([string] $SemVer)
+    $core, $rest = ($SemVer -split '\+', 2)[0] -split '-', 2
+    if (-not $rest) { return $core }
+    $numbers = @($rest -split '\.' | Where-Object { $_ -cmatch '^[0-9]+\z' })
+    $build = if ($numbers.Count -gt 0) { [long] $numbers[-1] } else { 0 }
+    if ($build -gt 65535) { Write-Refusal "the prerelease number $build in '$SemVer' is over 65535, the most an .msi version field holds" }
+    return "$core.$build"
+}
+
+$wixVersion = ConvertTo-WixVersion $Version
+if ($PrintWixVersion) {
+    Write-Output $wixVersion
+    exit 0
 }
 
 if (-not $IsWindows) { Write-Failure 'package-desktop-windows.ps1 runs on Windows only' }
@@ -97,12 +132,19 @@ $hashPath = "$out.sha256"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $msiDir, $out, $hashPath
 New-Item -ItemType Directory -Force $dist | Out-Null
 
+# The .msi's numeric version, for this build only (see the description).
+$wixConfig = Join-Path $dist 'desktop-wix-version.json'
+$wixJson = @{ bundle = @{ windows = @{ wix = @{ version = $wixVersion } } } } | ConvertTo-Json -Depth 5 -Compress
+[System.IO.File]::WriteAllText($wixConfig, $wixJson, [System.Text.UTF8Encoding]::new($false))
+Write-Output "the .msi carries version $wixVersion"
+
 Push-Location $crate
 try {
-    & cargo tauri build --bundles msi --target $Target --ci -- --locked
+    & cargo tauri build --bundles msi --target $Target --ci --config $wixConfig -- --locked
     if ($LASTEXITCODE -ne 0) { Write-Failure "cargo tauri build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
+    Remove-Item -Force -ErrorAction SilentlyContinue $wixConfig
 }
 
 $msis = @(Get-ChildItem -LiteralPath $msiDir -Filter '*.msi' -File -ErrorAction SilentlyContinue)
