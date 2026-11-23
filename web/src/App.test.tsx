@@ -135,3 +135,18 @@ describe('the page as a whole', () => {
     world.behavior = null
   })
 })
+
+describe('the Settings screen in the page', () => {
+  it('settings_replaces_the_torrents_and_back_returns', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(screen.getByRole('heading', { name: 'Server' }) !== null, 'Settings did not open').toBe(true)
+    expect(screen.queryByRole('button', { name: 'Add torrent' }), 'the table stayed under Settings').toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    expect(screen.queryByRole('heading', { name: 'Server' }), 'Settings stayed after Back').toBeNull()
+    world.behavior = null
+  })
+})

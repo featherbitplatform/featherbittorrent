@@ -20,7 +20,7 @@
  * @module components/Header
  */
 import { useEffect, useState } from 'react'
-import { LogOut, Plus } from 'lucide-react'
+import { LogOut, Plus, Settings } from 'lucide-react'
 import { formatRate } from '../format'
 import type { LinkState } from '../live'
 import Button from './Button'
@@ -38,6 +38,8 @@ export interface HeaderProps {
   /** Whether there is a session to end. */
   signedIn: boolean
   onSignOut(): void
+  /** Opens the Settings screen. */
+  onSettings(): void
   /** Opens the Add torrent dialog. */
   onAdd(): void
 }
@@ -65,6 +67,7 @@ export default function Header({
   dhtNodes,
   signedIn,
   onSignOut,
+  onSettings,
   onAdd,
 }: HeaderProps) {
   const lost = link.phase === 'lost'
@@ -104,6 +107,10 @@ export default function Header({
         <Button onClick={onAdd}>
           <Plus className="h-4 w-4" aria-hidden="true" />
           Add torrent
+        </Button>
+        <Button variant="secondary" onClick={onSettings}>
+          <Settings className="h-4 w-4" aria-hidden="true" />
+          Settings
         </Button>
         {signedIn && (
           <Button variant="secondary" onClick={onSignOut}>

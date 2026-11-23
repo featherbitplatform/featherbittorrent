@@ -30,6 +30,7 @@ import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
 import { session, useSession } from './session'
+import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
@@ -39,6 +40,7 @@ export default function App() {
   const assertiveRef = useRef<HTMLDivElement>(null)
   const live = useRef<LiveAnnouncer | null>(null)
   const [trying, setTrying] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   // The announcer writes into the two nodes above and follows the store. The regions are React's;
   // this only ever sets their text, and React never gives them children to fight over.
@@ -87,8 +89,17 @@ export default function App() {
           <img className="h-16 w-auto" src="/favicon.png" alt="" />
           <h1 className="mt-4 text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
         </main>
+      ) : settingsOpen ? (
+        <Settings
+          onBack={() => {
+            setSettingsOpen(false)
+          }}
+        />
       ) : (
         <Torrents
+          onSettings={() => {
+            setSettingsOpen(true)
+          }}
           signedIn={state.phase === 'signedIn'}
           signOutError={signOutError}
           onSignOut={() => void signOut()}

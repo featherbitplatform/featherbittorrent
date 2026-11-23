@@ -57,6 +57,8 @@ export interface TorrentsProps {
   /** Why the last sign-out attempt did not take, or null. The session is still live in that case, and the table keeps running under the notice. */
   signOutError: string | null
   onSignOut(): void
+  /** Opens the Settings screen, which replaces this one. */
+  onSettings(): void
   /** The client to read through. Defaults to the page's one so tests can hand in a fake. */
   client?: Api
 }
@@ -71,6 +73,7 @@ export default function Torrents({
   signedIn,
   signOutError,
   onSignOut,
+  onSettings,
   client = api,
 }: TorrentsProps) {
   const [rows, setRows] = useState<TorrentRow[]>([])
@@ -240,6 +243,7 @@ export default function Torrents({
         dhtNodes={sessionInfo?.dht_nodes ?? null}
         signedIn={signedIn}
         onSignOut={onSignOut}
+        onSettings={onSettings}
         onAdd={() => {
           setAddOpen(true)
         }}

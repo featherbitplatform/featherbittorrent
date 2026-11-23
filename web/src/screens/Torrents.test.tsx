@@ -124,7 +124,7 @@ function openScreen(client: Api): { container: HTMLElement; polite: HTMLElement 
   const { container } = render(
     <>
       <div role="status" aria-live="polite" />
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />
     </>,
   )
   return {
