@@ -24,6 +24,8 @@ export interface BufferLog {
   removes: Array<[number, number]>
   aborts: number
   changeTypes: string[]
+  /** The appends a one-shot `QuotaExceededError` refused, so a test can read the refusal back. */
+  quotas: number
 }
 
 /** A `TimeRanges` over a list of ranges, the shape the engine reads. */
@@ -43,11 +45,12 @@ function rangesOf(ranges: [number, number][]): TimeRanges {
  */
 export class FakeSourceBuffer extends EventTarget {
   readonly mimeType: string
-  readonly log: BufferLog = { appends: [], removes: [], aborts: 0, changeTypes: [] }
+  readonly log: BufferLog = { appends: [], removes: [], aborts: 0, changeTypes: [], quotas: 0 }
   /** The mime a successful `changeType` moves the buffer to, so a test can read the switch back. */
   currentMimeType: string
   private _buffered: [number, number][] = []
   private _updating = false
+  private appendBufferOriginal: (data: ArrayBuffer | ArrayBufferView) => void
   /** The owning source, for the `InvalidStateError` a buffer in a closed source throws. */
   owner: FakeMediaSource | null = null
   readyState: 'open' | 'ended' = 'open'
@@ -56,6 +59,9 @@ export class FakeSourceBuffer extends EventTarget {
     super()
     this.mimeType = mimeType
     this.currentMimeType = mimeType
+    this.appendBufferOriginal = (data: ArrayBuffer | ArrayBufferView): void => {
+      this.appendBuffer(data)
+    }
   }
 
   get buffered(): TimeRanges {
@@ -120,14 +126,17 @@ export class FakeSourceBuffer extends EventTarget {
    * refuse, once, the way a full buffer would.
    */
   makeNextAppendThrowQuota(): void {
-    const original = this.appendBuffer.bind(this)
+    // The next append refuses, once, the way a full buffer would. The refusal is recorded and
+    // the chunk is not appended; the following append goes through, and the buffer is not
+    // left busy: in a browser the refused append never started an update.
     let once = true
     this.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
       if (once) {
         once = false
+        this.log.quotas += 1
         throw new DOMException('quota', 'QuotaExceededError')
       }
-      original(data)
+      this.appendBufferOriginal(data)
     }
   }
 }

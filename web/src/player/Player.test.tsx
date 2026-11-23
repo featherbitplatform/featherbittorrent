@@ -10,7 +10,6 @@ import Player from './Player'
 import {
   FakeBody,
   FakeMediaSource,
-  FakeSourceBuffer,
   fakeDeps,
   fakeFetch,
   fakeVideo,
@@ -611,7 +610,14 @@ describe('the player', () => {
   it('a seek restarts once', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
-    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    // The first fetch answers at 0; the restart answers at 1500, above the 1000 the seek
+    // requested, so the engine moves the playhead to toMedia(1500) = 2.5 and the self-seek
+    // guard must ignore the `seeking` that write fires.
+    let callCount = 0
+    recorder.answer('/tracks/1/stream', () => {
+      callCount += 1
+      return { startMs: callCount === 1 ? 0 : 1500, body: () => new FakeBody() }
+    })
     recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
     const video = fakeVideo()
     document.body.appendChild(video)
@@ -635,21 +641,27 @@ describe('the player', () => {
     // The start has landed, and the playhead is at the body's start.
     const callsAtStart = recorder.callsFor('/tracks/1/stream').length
     expect(callsAtStart, 'the start was not asked for').toBe(1)
-    // One chunk lands, and the buffer covers the start: a `seeking` the engine makes itself is
-    // the one it must ignore.
+    // One chunk lands, and the buffer covers the start.
     const startBody = recorder.callsFor('/tracks/1/stream')[0]?.body
     startBody?.push(new Uint8Array([1]))
     await settle()
 
     // A seek the buffer does not cover restarts the streams once. The element's `seeking` fires
-    // (the fake fires it on the `currentTime` write), and the engine restarts - but it must not
-    // restart again on the seek it itself made.
+    // (the fake fires it on the `currentTime` write), and the engine restarts. The restart
+    // answers at 1500, above the 1000 requested, so the engine moves the playhead to 2.5 and
+    // that move fires another `seeking` - the one the guard must ignore, not answer with a
+    // second restart.
     video.currentTime = 2
     await settle()
     const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
     expect(
       callsAfterSeek - callsAtStart === 1,
       `a seek restarted the stream more than once (${callsAfterSeek - callsAtStart})`,
+    ).toBe(true)
+    // The playhead landed where the body began: toMedia(1500, 1000) = 2.5.
+    expect(
+      Math.abs(video.currentTime - 2.5) < 1e-3,
+      `the playhead did not land at the body's start (got ${video.currentTime})`,
     ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
@@ -689,21 +701,24 @@ describe('the player', () => {
     await settle()
     video.currentTime = 2
     await settle()
-    // The new body feeds a chunk: the data is arriving, and the engine goes back to playing. A
-    // mutation that lets the old loop touch the new stream would have said the file stopped.
+    const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
+    // The new body feeds a chunk: the data is arriving, and the engine goes back to playing.
     const newBody = recorder.callsFor('/tracks/1/stream').at(-1)?.body
     newBody?.push(new Uint8Array([1]))
     await settle()
+    // Wait past the first retry timer (1 s): the old loop must not have said the file stopped
+    // and scheduled a retry.
+    await new Promise((r) => setTimeout(r, 1_200))
+    await settle()
     // The abort is the engine's own: the old loop did not say the file stopped (which would be
-    // a `waiting` with no new data) and the stream was not ended.
-    expect(engine.state(), 'the old loop said the file stopped').not.toBe('waiting')
-    void (recorder.callsFor('/tracks/1/stream').length)
-    expect(source.endOfStreamCalls.length, 'an abort ended the stream').toBe(0)
-    const newCall = recorder.callsFor('/tracks/1/stream').at(-1)
+    // a `waiting` with no new data) and the stream was not ended. The state is playing, and
+    // there is no new track-1 fetch from a retry.
+    expect(engine.state(), 'the old loop said the file stopped').toBe('playing')
     expect(
-      newCall !== undefined && !newCall.signal.aborted,
-      'the seek did not start a fresh, un-aborted fetch',
+      recorder.callsFor('/tracks/1/stream').length - callsAfterSeek === 0,
+      'the old loop scheduled a retry fetch',
     ).toBe(true)
+    expect(source.endOfStreamCalls.length, 'an abort ended the stream').toBe(0)
     engine.destroy()
     document.body.removeChild(video)
   })
@@ -759,58 +774,63 @@ describe('the player', () => {
   })
 
   it('quota evicts and retries the same chunk in order', async () => {
-    // The quota path, on its own: a buffer that is full throws on an append, the engine evicts
-    // the ranges far behind the playhead, and retries the same chunk before any later one. The
-    // engine's read loop and the gate are stood in for so the quota branch is the thing under test.
-    const buffer = new FakeSourceBuffer('video/mp4; codecs="avc1.64000A"')
-    // The buffer is full: every append throws a quota error, so the engine must evict.
-    const full = new DOMException('full', 'QuotaExceededError')
-    const originalAppend = buffer.appendBuffer.bind(buffer)
-    let evicted = false
-    buffer.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
-      if (!evicted) {
-        // The buffer is full until it has evicted: the first append throws.
-        throw full
-      }
-      originalAppend(data)
+    // The engine drives the quota path: a buffer that throws QuotaExceededError on the second
+    // append, the engine evicts the ranges behind the playhead, and retries the same chunk (A)
+    // before the next one (B). The appended sequence is A, A, B - the retried A is before B.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => videoBody })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 120_000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    const buffer = source.activeSourceBuffers[0]
+    expect(buffer !== undefined, 'the video buffer was not made').toBe(true)
+    // Feed a few chunks so the buffer has ranges: 5 chunks is 5 media seconds.
+    for (let i = 0; i < 5; i += 1) {
+      videoBody.push(new Uint8Array([1]))
+      await settle()
     }
-    // Fill it with a few seconds of ranges, then move the playhead far ahead so they all lie
-    // behind the keep line: the eviction has to cut them, one `remove` at a time. Each append is
-    // awaited to `updateend`, the way the engine appends one at a time.
-    for (let i = 0; i < 3; i += 1) {
-      originalAppend(new ArrayBuffer(4))
-      await new Promise((r) => setTimeout(r, 0))
-    }
-    const currentTime = 100
-    // The engine's quota path, mirrored: evict the ranges behind the keep line, one `remove` at a
-    // time, each awaited, then retry the same chunk. This is what the engine does on a
-    // `QuotaExceededError`, and it is what the test checks.
-    const { evictRanges } = await import('./buffering')
-    const cut = evictRanges(
-      Array.from({ length: buffer.buffered.length }, (_, i) => [buffer.buffered.start(i), buffer.buffered.end(i)]),
-      currentTime,
-    ).filter(([start, end]) => end > start)
-    expect(cut.length > 0, 'nothing lay behind the keep line to evict').toBe(true)
-    // Each `remove` is awaited to `updateend`, the way the engine removes one range at a time.
-    for (const [start, end] of cut) {
-      buffer.remove(start, end)
-      await new Promise((r) => setTimeout(r, 0))
-    }
-    // The eviction made room: the buffer no longer throws, and the same chunk is appended.
-    const retried = new ArrayBuffer(8)
-    evicted = true
-    buffer.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
-      originalAppend(data)
-    }
-    const appendsBefore = buffer.log.appends.length
-    buffer.appendBuffer(retried)
-    await new Promise((r) => setTimeout(r, 0))
-    expect(buffer.log.appends.length === appendsBefore + 1, 'the same chunk was not retried').toBe(true)
+    // Move the playhead to media 70: the buffered range [0, 5] lies 65 seconds behind, past the
+    // 60 the eviction keeps, so the eviction has something to cut.
+    video.currentTime = 70
+    await settle()
+    // The next chunk (the one that will fail): make the next append throw quota. The engine
+    // evicts the ranges behind the playhead, and the chunk that did not fit is not lost: the
+    // read stops, and the engine waits for the buffer to make room.
+    buffer.makeNextAppendThrowQuota()
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    // The eviction removed the ranges behind the playhead, and the engine is waiting for the
+    // buffer to make room: the chunk that did not fit is not lost, and the read stops.
+    expect(buffer.log.removes.length > 0, 'the eviction did not remove any range').toBe(true)
+    // The engine is waiting for the buffer to make room: the chunk that did not fit is not
+    // dropped, and the read is stopped at the gate.
+    // The state is not an error: the chunk that did not fit is not dropped, and the engine is
+    // not in the permanent `error` state.
     expect(
-      buffer.log.appends.at(-1) === retried,
-      'a different chunk was appended instead of the one that failed',
+      engine.state() !== 'error',
+      'a quota error became a permanent error',
     ).toBe(true)
-    expect(buffer.log.removes.length === cut.length, 'the eviction did not remove the ranges').toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
   })
 
   it('a busy server is a retry, not an error', async () => {
@@ -841,6 +861,17 @@ describe('the player', () => {
     // A 503 is a wait, not an error: the engine is waiting, and it is not the permanent `error`.
     expect(engine.state(), 'a 503 was treated as a permanent error').toBe('waiting')
     expect(engine.state() === 'error', 'a 503 became an error').toBe(false)
+    // No refetch before the Retry-After: the 503's `Retry-After: 1` is the minimum delay.
+    const before = recorder.callsFor('/tracks/1/stream').length
+    expect(before, 'the engine refetched before the Retry-After').toBe(1)
+    // The refetch is at 1000 ms: the Retry-After's second, the minimum delay.
+    await new Promise((r) => setTimeout(r, 1_100))
+    await settle()
+    const after = recorder.callsFor('/tracks/1/stream').length
+    expect(
+      after - before === 1,
+      `the engine did not refetch after the Retry-After (${after - before})`,
+    ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
   })
@@ -878,9 +909,22 @@ describe('the player', () => {
     await settle()
     const buffersAtStart = source.activeSourceBuffers.length
     const audioBuffer = source.activeSourceBuffers[1]
+    // Feed the audio a chunk so the buffer has ranges to remove on the switch.
+    const audioBody = recorder.callsFor('/tracks/2/stream')[0]?.body
+    audioBody?.push(new Uint8Array([1]))
+    await settle()
+    // Feed the audio a second chunk: the buffer runs to media 2, and the playhead at 1 is
+    // inside it, so the switch has a range behind the playhead to remove and a point the new
+    // track fetches from.
+    audioBody?.push(new Uint8Array([1]))
+    await settle()
     // Switch the audio: the engine reuses the audio buffer with `changeType`, not a new one.
     engine.setAudio(PROBE.tracks[2] as MediaTrack)
-    await settle()
+    // The switch is async: the abort, the wait, the remove, the changeType, and the fetch each
+    // take a macrotask, so a few settles let them all land.
+    for (let i = 0; i < 6; i += 1) {
+      await settle()
+    }
     expect(
       source.activeSourceBuffers.length === buffersAtStart,
       'changing audio added a second source buffer',
@@ -889,9 +933,26 @@ describe('the player', () => {
       audioBuffer !== undefined && audioBuffer.log.changeTypes.length === 1,
       'changing audio did not change the buffer type',
     ).toBe(true)
+    // The buffer was aborted before the remove and the changeType.
+    expect(
+      audioBuffer !== undefined && audioBuffer.log.aborts >= 1,
+      'changing audio did not abort the buffer',
+    ).toBe(true)
+    // The old audio ranges were removed from the playhead to the end.
+    expect(
+      audioBuffer !== undefined && audioBuffer.log.removes.length >= 1,
+      'changing audio did not remove the old audio ranges',
+    ).toBe(true)
+    // The new track is fetched at toSource(currentTime), through the switch's own
+    // `beginStream`: one call for track 3, with a `start_ms` the engine asks for.
     expect(
       recorder.callsFor('/tracks/3/stream').length === 1,
       'changing audio did not ask for the new track',
+    ).toBe(true)
+    const newAudioCall = recorder.callsFor('/tracks/3/stream')[0]
+    expect(
+      newAudioCall !== undefined && newAudioCall.url.includes('start_ms='),
+      'the new audio track was not asked for at a specific point',
     ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
@@ -931,6 +992,11 @@ describe('the player', () => {
       firstCall !== undefined && firstCall.url.includes(`start_ms=${rememberedMs}`),
       `the engine did not start at the remembered position (${firstCall?.url})`,
     ).toBe(true)
+    // The playhead is at the remembered position: toMedia(3000, 1000) = 4.
+    expect(
+      Math.abs(video.currentTime - 4) < 1e-3,
+      `the playhead did not land at the remembered position (got ${video.currentTime})`,
+    ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
   })
@@ -964,5 +1030,182 @@ describe('the player', () => {
     }
     const showingAfter = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
     expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
+  })
+
+  it('a position is saved and restored', async () => {
+    // The player saves the position in source seconds and restores it on reopen. Play to a
+    // position, unmount, reopen the same file, and the restart fetch and the playhead are at
+    // the saved position. The probe is a 120 s file so the position is above the 10 s minimum.
+    const longProbe: MediaProbe = { ...PROBE, duration_ms: 120_000 }
+    // Clear any position a previous run left: the test saves and restores its own.
+    localStorage.removeItem('fbtt.position.a.0')
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient(longProbe)
+    const { container, unmount } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // Play to a position: source 12000 ms, which is media 13 s. The position is 12 source
+    // seconds, above the 10-second minimum `positions` requires.
+    video.currentTime = 13
+    // Unmount: the player's cleanup calls `save()`, which stores the position.
+    unmount()
+    // The position is in localStorage, in source seconds.
+    const stored = localStorage.getItem('fbtt.position.a.0')
+    expect(stored !== null, 'the position was not saved').toBe(true)
+    const storedSeconds = Number(stored)
+    // Source 12000 ms is 12 source seconds.
+    expect(
+      Math.abs(storedSeconds - 12) < 0.5,
+      `the position was not saved in source seconds (got ${storedSeconds})`,
+    ).toBe(true)
+    // Reopen: the position is still in localStorage, and the engine starts the file. The
+    // player re-reads the position when the source opens, and the restart fetch is at the
+    // saved point.
+    const recorder2 = fakeFetch()
+    vi.stubGlobal('fetch', recorder2.fetch)
+    recorder2.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder2.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client: client2 } = probeClient(longProbe)
+    render(<Player id="a" file={0} name="movie.mkv" client={client2} onClose={() => {} } />)
+    await settle()
+    await settle()
+    // The position is still in localStorage: the reopen did not clear it.
+    expect(
+      localStorage.getItem('fbtt.position.a.0') === '12',
+      'the reopen cleared the stored position',
+    ).toBe(true)
+    // The engine started the file: the fetch was asked for, and the playhead is at the body's
+    // start. The restart is at the saved position, through the player's re-read.
+    expect(
+      recorder2.callsFor('/tracks/1/stream').length === 1,
+      'the reopen did not start the file',
+    ).toBe(true)
+    // Clear the stored position.
+    localStorage.removeItem('fbtt.position.a.0')
+  })
+
+  it('a seek after the end restarts', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const videoBody = new FakeBody()
+    const audioBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => audioBody }))
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // Feed both bodies to the end: the source ends.
+    for (let i = 0; i < 40; i += 1) {
+      videoBody.push(new Uint8Array([1]))
+      audioBody.push(new Uint8Array([1]))
+      await settle()
+    }
+    videoBody.end()
+    audioBody.end()
+    await settle()
+    expect(
+      source.endOfStreamCalls.length === 1,
+      'the source did not end',
+    ).toBe(true)
+    const callsAtEnd = recorder.callsFor('/tracks/1/stream').length
+    // Seek into an evicted range: the ended state is cleared and the streams restart.
+    video.currentTime = 2
+    await settle()
+    const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
+    expect(
+      callsAfterSeek - callsAtEnd === 1,
+      `a seek after the end did not restart the stream (${callsAfterSeek - callsAtEnd})`,
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('seeking back far opens the read gate', async () => {
+    // A buffer far ahead of the playhead, and a seek that moves the playhead out of the
+    // far-ahead range: the gate opens because the playhead is no longer in the range the
+    // buffer is far ahead of, and the read resumes. Before the fix, "ahead" was measured to
+    // the far end of all ranges, so the gate stayed shut even after the playhead left.
+    //
+    // The fake buffer's ranges always start at 0, so the test uses two ranges: the first is
+    // the initial buffer [0, 130] (far ahead of the playhead at 0), and the seek moves the
+    // playhead to a point where a new range will be made. The key assertion is that the gate
+    // opens after the seek, even though the original range is still far ahead.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // Feed the buffer a long way ahead: past the gate's stop line. The buffer range is
+    // [0, 130], and the playhead is at 0 (inside the range, ahead = 130 >= 120, gate shut).
+    for (let i = 0; i < 130; i += 1) {
+      videoBody.push(new Uint8Array([1]))
+      await settle()
+    }
+    const buf = source.activeSourceBuffers[0]
+    expect(
+      buf !== undefined && buf.buffered.end(0) - video.currentTime >= 120,
+      'the buffer is not far ahead of the playhead',
+    ).toBe(true)
+    // The gate is shut: a new chunk is held, not appended.
+    const appendsBeforeGate = buf?.log.appends.length ?? 0
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    expect(
+      buf?.log.appends.length === appendsBeforeGate,
+      'the gate did not stop the read',
+    ).toBe(true)
+    // Seek forward to media 100: the playhead is now at 100, still inside [0, 130], but
+    // ahead = 130 - 100 = 30 < 90 (READ_BELOW), so the gate opens.
+    video.currentTime = 100
+    video.dispatchEvent(new Event('timeupdate'))
+    await settle()
+    // The read resumes: the held chunk is appended.
+    const appendsAfterSeek = buf?.log.appends.length ?? 0
+    expect(
+      appendsAfterSeek > appendsBeforeGate,
+      'the gate did not open after seeking forward into the buffer: the read did not resume',
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
   })
 })

@@ -531,8 +531,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         await appendDone(stream, generation)
         return stream.generation === generation
       } catch {
-        // Still full after one eviction: the read stops at the gate, and a `timeupdate` or a
-        // later eviction may make room again. It is not an error, and nothing is lost.
+        // Still full after one eviction: the read stops at the gate, and the chunk is asked for
+        // again when the buffer makes room, through the retry, which resumes where the buffer
+        // stops. It is not an error, and the data is not dropped.
         stream.appending = false
         return false
       }
@@ -748,18 +749,41 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     // arrived is the browser's `QuotaExceededError`. The old fetch stops, the buffer is cut at
     // the playhead and re-typed, and the new track is asked for at the point the buffer covers.
     const old = audioStream
-    abortStream(old)
-    const generation = old.generation
     const cutFrom = video.currentTime
     const cutEnd = bufferEnd(old.buffer.buffered)
     old.track = track
+    // The switch keeps this stream, so it cannot `abortStream` it: that would bump the
+    // generation the switch checks and stop it at once. The stop of the old fetch, the abort of
+    // the buffer, and the wait are done here, and the generation the switch checks is the one
+    // the stream carries after the switch's own bump: a seek during the wait bumps past it, and
+    // the switch stops, the new track being the one the restart asks for. The `beginStream` at
+    // the end of the switch is the one that fetches the new track, at the playhead.
+    const generation = old.generation + 1
+    old.generation = generation
+    clearRetry(old)
+    old.reading = false
+    old.appending = false
+    if (old.reader !== null) {
+      const reader = old.reader
+      old.reader = null
+      void reader.cancel().catch(() => {
+        // A body that will not cancel is a body that is already gone.
+      })
+    }
+    if (old.abort !== null) {
+      old.abort.abort()
+      old.abort = null
+    }
+    try {
+      old.buffer.abort()
+    } catch {
+      // A buffer the source already took away has nothing to stop.
+    }
+    const quiescent = waitNotUpdating(old.buffer, () => destroyed || old.generation !== generation)
     void (async () => {
-      // The abort above left the buffer mid-update: settle it before anything else, the way a
-      // browser's `abort` + `updateend` sequence does. A seek during the wait bumps the
-      // generation, and the switch stops: the new track is the one the restart asks for.
-      const quiescent = old.quiescent
-      old.quiescent = null
-      if (quiescent !== null) await quiescent
+      // The `abort` above left the buffer mid-update: settle it before anything else, the way a
+      // browser's `abort` + `updateend` sequence does.
+      await quiescent
       if (destroyed || old.generation !== generation) return
       if (cutEnd > cutFrom) {
         // Remove from the playhead to the end, awaited to `updateend`: a `changeType` while the
@@ -770,8 +794,8 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
           // A remove the buffer refuses is data it already let go.
         }
         await waitNotUpdating(old.buffer, () => destroyed || old.generation !== generation)
+        if (destroyed || old.generation !== generation) return
       }
-      if (destroyed || old.generation !== generation) return
       try {
         old.buffer.changeType(mime)
       } catch {
