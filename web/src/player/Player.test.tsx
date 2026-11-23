@@ -1308,13 +1308,14 @@ describe('the player', () => {
     // the gate's stop line, and a held chunk is waiting.
     ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[1, 131]]
     videoBody.push(new Uint8Array([1]))
-    video.dispatchEvent(new Event('timeupdate'))
-    await settle()
-    // The gate is open over a playhead that sits in no range: the held chunk is read and
-    // appended.
     const appendsBefore = buf?.log.appends.length ?? 0
-    videoBody.push(new Uint8Array([1]))
-    await settle()
+    // The `timeupdate` is the element's word for the move, and it is what wakes the read: the
+    // loop, blocked at the gate, re-measures on its next read and takes the held chunk.
+    video.dispatchEvent(new Event('timeupdate'))
+    for (let i = 0; i < 4; i += 1) {
+      videoBody.push(new Uint8Array([1]))
+      await settle()
+    }
     const appendsAfter = buf?.log.appends.length ?? 0
     expect(
       appendsAfter > appendsBefore,
