@@ -792,19 +792,14 @@ fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
     let base = files
         .iter()
         .find(|row| row.index == video)
-        .map(display_name)
-        .map(|name| match name.rsplit_once('.') {
-            Some((stem, _)) if !stem.is_empty() => stem.to_ascii_lowercase(),
-            _ => name.to_ascii_lowercase(),
-        });
+        .map(display_name);
     let mut rows: Vec<(bool, usize, SubtitleRow)> = files
         .iter()
         .filter(|row| !row.pad && row.index != video)
         .filter_map(|row| {
             let name = display_name(row);
             let format = media::subtitle_format(&name)?;
-            let mine = name.to_ascii_lowercase();
-            let beside = base.as_deref().is_some_and(|base| sidecar_of(base, &mine));
+            let beside = base.as_deref().is_some_and(|base| sidecar_of(base, &name));
             Some((
                 // A row that did not match the video's name sorts after one that did.
                 !beside,
@@ -821,19 +816,28 @@ fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
     rows.into_iter().map(|(_, _, row)| row).collect()
 }
 
-/// Whether `name` is the sidecar of a video whose lower-case stem is `video_stem`: the stem exactly, or the
-/// stem with a dot and something after it.
+/// Whether `name` is the sidecar of the video named `video`: that video's stem, exactly, or the stem
+/// with a dot and something after it.
 ///
-/// Both arguments are already lower-case - [`external_subtitles`] lower-cases both before asking, so the
-/// comparison is not thrown off by a `Movie.SRT` beside a `movie.mkv`. `movie.srt`, `movie.en.srt` and
-/// `movie.ita.srt` belong to the video named `movie`; `about.srt` does not belong to a video named `a`
-/// however much its first letters agree, and neither does `movies.vtt` to a video named `movie`. A bare
-/// prefix test says all of those are sidecars, and then a folder's stray `about.srt` ranks as `a.mkv`'s
-/// own. The stem, and after it either nothing or a dot, is the whole rule.
-fn sidecar_of(video_stem: &str, name: &str) -> bool {
-    name == video_stem
+/// Neither name is trusted to have arrived in the other one's case: `ÄRGER.srt` beside `ärger.mkv` is
+/// one film's captions, and the two only meet once both are put in lower case. That folding is the
+/// whole Unicode one rather than the ASCII one, because the ASCII form leaves an `Ä` standing as it
+/// was and then holds it against the `ä` the other name carries, which misses the sidecar of every
+/// film whose name is not plain ASCII. `movie.srt`, `movie.en.srt` and `movie.ita.srt` belong to the
+/// video named `movie.mkv`; `about.srt` does not belong to a video named `a.mkv` however much its
+/// first letters agree, and neither does `movies.vtt` to a video named `movie`. A bare prefix test
+/// says all of those are sidecars, and then a folder's stray `about.srt` ranks as `a.mkv`'s own. The
+/// stem, and after it either nothing or a dot, is the whole rule.
+fn sidecar_of(video: &str, name: &str) -> bool {
+    let video = video.to_lowercase();
+    let name = name.to_lowercase();
+    let stem = match video.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => video.as_str(),
+    };
+    name == stem
         || name
-            .strip_prefix(video_stem)
+            .strip_prefix(stem)
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
@@ -1072,6 +1076,40 @@ mod tests {
             assert!(
                 !sidecar_of(stem, name),
                 "{name} wrongly ranks as {stem}'s own sidecar"
+            );
+        }
+    }
+
+    /// The dot rule carries over to names that are not plain ASCII, and neither side of the
+    /// comparison is trusted to have arrived in the other one's case.
+    ///
+    /// `ÄRGER.srt` and `Ärger.en.SRT` are the sidecars of the film named `ärger.mkv`, and
+    /// `Ärgerlich.srt` is not, however much it agrees with them at the front. Both spellings of the
+    /// pair are run through: an ASCII-only folding lower-cases neither `Ä` nor `ä`, so the side that
+    /// is left with it standing misses the side that does not have it, whichever one that is. An
+    /// `a` with no umlaut is a different name and stays a different name: this folds case, not the
+    /// letters themselves.
+    #[test]
+    fn sidecar_names_match_in_any_case() {
+        for (video, name) in [
+            ("ärger.mkv", "ÄRGER.srt"),
+            ("ärger.mkv", "Ärger.en.SRT"),
+            ("Ärger.mkv", "ärger.srt"),
+            ("Ärger.mkv", "ÄRGER.EN.SRT"),
+        ] {
+            assert!(
+                sidecar_of(video, name),
+                "{name} should rank as {video}'s own sidecar"
+            );
+        }
+        for (video, name) in [
+            ("ärger.mkv", "Ärgerlich.srt"),
+            ("Ärger.mkv", "arger.srt"),
+            ("ärger.mkv", "arger.en.srt"),
+        ] {
+            assert!(
+                !sidecar_of(video, name),
+                "{name} wrongly ranks as {video}'s own sidecar"
             );
         }
     }
