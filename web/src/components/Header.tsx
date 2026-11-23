@@ -17,13 +17,19 @@
  * engine version and the DHT count, both from this server's own `/session` route; the pill's words
  * are this file's, built around a number.
  *
+ * Inside the desktop app the header draws no strip of its own: it puts the mark and the pill, then the
+ * rates and the buttons, into the app's title bar through the slots in `titleBarSlots`, with the
+ * buttons at the toolbar's 36px so they fit the bar.
+ *
  * @module components/Header
  */
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { LogOut, Plus, Settings } from 'lucide-react'
 import { formatRate } from '../format'
 import type { LinkState } from '../live'
 import Button from './Button'
+import { useTitleBarSlots } from './titleBarSlots'
 
 export interface HeaderProps {
   /** The engine library's version from `GET /api/v1/session`, or null until that answer has come. It is tooltip decoration only: the version the header displays is `__APP_VERSION__`, featherbittorrent's own, injected at build time. */
@@ -74,54 +80,93 @@ export default function Header({
   inert = false,
 }: HeaderProps) {
   const lost = link.phase === 'lost'
+  const slots = useTitleBarSlots()
+  const desktop = slots !== null
+  const brand = (
+    <div className="flex items-center gap-2.5">
+      <img className={`${desktop ? 'h-5' : 'h-6.5'} w-auto object-contain`} src="/favicon.png" alt="" />
+      <span
+        className={`text-[15px] font-semibold tracking-[-0.01em] text-strong ${desktop ? 'max-lg:hidden' : ''}`}
+      >
+        featherbittorrent
+      </span>
+      <span
+        className="font-mono text-xs text-muted"
+        title={engineVersion === null ? undefined : `engine ${engineVersion}`}
+      >
+        v{__APP_VERSION__}
+      </span>
+    </div>
+  )
+  const pill = (
+    <div className="flex items-center gap-2 rounded-control border border-rule bg-surface px-2.5 py-1">
+      <span aria-hidden="true" className={`h-2 w-2 rounded-full ${lost ? 'bg-error' : 'bg-connection'}`} />
+      <span className={`text-[13px] font-medium ${lost ? 'text-error' : 'text-strong'}`}>
+        {lost ? <PauseCountdown key={link.attempt} retryIn={link.retryIn} /> : 'Connected'}
+      </span>
+    </div>
+  )
+  const rates = (
+    <div className={`flex items-center gap-4 font-mono text-[13px] ${desktop ? '' : 'ml-auto flex-wrap'}`}>
+      <span className="text-muted">
+        ↓ <span className="text-strong">{formatRate(totalDown)}</span>
+      </span>
+      <span className="text-muted">
+        ↑ <span className="text-strong">{formatRate(totalUp)}</span>
+      </span>
+      <span className={`text-muted ${desktop ? 'max-xl:hidden' : 'max-md:hidden'}`}>DHT {dhtNodes ?? 0}</span>
+    </div>
+  )
+  const size = desktop ? 'sm' : 'md'
+  const buttons = (
+    <div className="flex items-center gap-2">
+      <Button size={size} onClick={onAdd}>
+        <Plus className="h-4 w-4" aria-hidden="true" />
+        Add torrent
+      </Button>
+      <Button size={size} variant="secondary" data-settings-opener onClick={onSettings}>
+        <Settings className="h-4 w-4" aria-hidden="true" />
+        Settings
+      </Button>
+      {signedIn && (
+        <Button size={size} variant="secondary" onClick={onSignOut}>
+          <LogOut className="h-4 w-4" aria-hidden="true" />
+          Sign out
+        </Button>
+      )}
+    </div>
+  )
+
+  // Inside the desktop app the header has no strip of its own: its parts go into the app's title bar.
+  if (desktop) {
+    return (
+      <>
+        {slots.lead !== null &&
+          createPortal(
+            <div inert={inert} className="flex min-w-0 items-center gap-4">
+              {brand}
+              {pill}
+            </div>,
+            slots.lead,
+          )}
+        {slots.actions !== null &&
+          createPortal(
+            <div inert={inert} className="flex items-center gap-4">
+              {rates}
+              {buttons}
+            </div>,
+            slots.actions,
+          )}
+      </>
+    )
+  }
+
   return (
     <header inert={inert} className="flex flex-wrap items-center gap-4 border-b border-rule bg-sunken px-5 py-3">
-      <div className="flex items-center gap-2.5">
-        <img className="h-6.5 w-auto object-contain" src="/favicon.png" alt="" />
-        <span className="text-[15px] font-semibold tracking-[-0.01em] text-strong">
-          featherbittorrent
-        </span>
-        <span
-          className="font-mono text-xs text-muted"
-          title={engineVersion === null ? undefined : `engine ${engineVersion}`}
-        >
-          v{__APP_VERSION__}
-        </span>
-      </div>
-
-      <div className="flex items-center gap-2 rounded-control border border-rule bg-surface px-2.5 py-1">
-        <span aria-hidden="true" className={`h-2 w-2 rounded-full ${lost ? 'bg-error' : 'bg-connection'}`} />
-        <span className={`text-[13px] font-medium ${lost ? 'text-error' : 'text-strong'}`}>
-          {lost ? <PauseCountdown key={link.attempt} retryIn={link.retryIn} /> : 'Connected'}
-        </span>
-      </div>
-
-      <div className="ml-auto flex flex-wrap items-center gap-4 font-mono text-[13px]">
-        <span className="text-muted">
-          ↓ <span className="text-strong">{formatRate(totalDown)}</span>
-        </span>
-        <span className="text-muted">
-          ↑ <span className="text-strong">{formatRate(totalUp)}</span>
-        </span>
-        <span className="text-muted max-md:hidden">DHT {dhtNodes ?? 0}</span>
-      </div>
-
-      <div className="flex items-center gap-2">
-        <Button onClick={onAdd}>
-          <Plus className="h-4 w-4" aria-hidden="true" />
-          Add torrent
-        </Button>
-        <Button variant="secondary" data-settings-opener onClick={onSettings}>
-          <Settings className="h-4 w-4" aria-hidden="true" />
-          Settings
-        </Button>
-        {signedIn && (
-          <Button variant="secondary" onClick={onSignOut}>
-            <LogOut className="h-4 w-4" aria-hidden="true" />
-            Sign out
-          </Button>
-        )}
-      </div>
+      {brand}
+      {pill}
+      {rates}
+      {buttons}
     </header>
   )
 }

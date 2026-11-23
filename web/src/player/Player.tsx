@@ -32,7 +32,7 @@ import { useConnection } from '../connection'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe } from '../format'
 import { matches } from '../keys'
-import { useModalDialog } from '../modal'
+import { MODAL_CENTRED, useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
 import { createEngine } from './engine'
 import type { Engine, EngineState } from './engine'
@@ -888,7 +888,7 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
         onDialogKey(event)
         onKeyDown(event)
       }}
-      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0"
+      className={`${MODAL_CENTRED} flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0`}
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-4 py-2.5">
         <span className="min-w-0 truncate text-[13px] text-strong">{displaySafe(name)}</span>

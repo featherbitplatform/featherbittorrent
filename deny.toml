@@ -28,6 +28,8 @@ allow = [
     "CC0-1.0",
     # webpki-roots (Mozilla's root certificates as data, for HTTPS over rustls)
     "CDLA-Permissive-2.0",
+    # target-lexicon (a Linux-only build dependency of the desktop app's GTK crates, via system-deps)
+    "Apache-2.0 WITH LLVM-exception",
 ]
 
 [advisories]

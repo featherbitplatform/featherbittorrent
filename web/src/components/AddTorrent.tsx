@@ -22,16 +22,23 @@
  * and the element end together - and while its request is on the wire the dialog cannot be closed at
  * all, by Escape, by the close button or by Cancel, because the answer is still owed.
  *
+ * In the desktop app the same dialog takes a link or a file the app was opened with (`initial`), a
+ * picker for the instance to add it to (`instancePicker`, drawn above the folder tree), and, when that
+ * instance needs a sign-in first, the sign-in form in place of the folder tree (`signIn`). The browser
+ * passes none of them and gets the dialog it always had. The folder tree belongs to one client: a
+ * different client is a different server, so the tree starts over and a folder picked on the last one
+ * is never sent to this one.
+ *
  * @module components/AddTorrent
  */
 import { useCallback, useRef, useState } from 'react'
-import type { ChangeEvent, DragEvent, FormEvent } from 'react'
+import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from 'react'
 import { Upload, X } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
 import { displaySafe, formatBytes } from '../format'
 import { announcePolite } from '../live'
-import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
+import { MODAL_DIALOG, useModalDialog } from '../modal'
 import Banner from './Banner'
 import Button from './Button'
 import FolderPicker from './FolderPicker'
@@ -85,8 +92,32 @@ const SOURCES = [
 
 type Source = (typeof SOURCES)[number]['key']
 
+/** What the dialog opens with: a link to put in the field, or a file already picked. */
+export type InitialSource = { kind: 'magnet'; uri: string } | { kind: 'file'; file: File }
+
+/** A number per client, so the folder tree of one server is never kept for another. */
+const clientKeys = new WeakMap<Api, number>()
+let nextClientKey = 1
+
+function clientKey(client: Api): number {
+  let key = clientKeys.get(client)
+  if (key === undefined) {
+    key = nextClientKey
+    nextClientKey += 1
+    clientKeys.set(client, key)
+  }
+  return key
+}
+
 export interface AddTorrentProps {
-  client: Api
+  /** The server to add to; null while the desktop app has no connection to the picked instance (then `signIn` says why). */
+  client: Api | null
+  /** The magnet link or the `.torrent` the dialog starts with (the desktop app's opened links and files). */
+  initial?: InitialSource
+  /** The desktop app's instance picker, drawn above the folder tree. */
+  instancePicker?: ReactNode
+  /** Drawn in place of the folder tree while the instance needs a sign-in first; Add stays shut. */
+  signIn?: ReactNode
   /** Says what was added, after the announcement and before the dialog closes. */
   onAdded(name: string): void
   onClose(): void
@@ -98,12 +129,22 @@ export interface AddTorrentProps {
  * The magnet field is uncontrolled on purpose. What a person pasted stays theirs until the server
  * says yes, and a refusal has to leave it in the field to be fixed or resent.
  */
-export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps) {
-  const [source, setSource] = useState<Source>('magnet')
-  const [path, setPath] = useState('')
-  const [file, setFile] = useState<File | null>(null)
+export default function AddTorrent({
+  client,
+  initial,
+  instancePicker,
+  signIn,
+  onAdded,
+  onClose,
+}: AddTorrentProps) {
+  const initialFile = initial?.kind === 'file' ? initial.file : null
+  const [source, setSource] = useState<Source>(initialFile === null ? 'magnet' : 'file')
+  // The folder belongs to the client it was picked on: a folder another server named is no folder here.
+  const [picked, setPicked] = useState<{ client: Api | null; path: string }>({ client, path: '' })
+  const path = signIn === undefined && picked.client === client ? picked.path : ''
+  const [file, setFile] = useState<File | null>(initialFile)
   const [startPaused, setStartPaused] = useState(false)
-  const [refusal, setRefusal] = useState<string | null>(null)
+  const [refusal, setRefusal] = useState<string | null>(() => fileProblem(initialFile))
   const [busy, setBusy] = useState(false)
   const magnetRef = useRef<HTMLInputElement>(null)
   // The submit guard, on a ref rather than on `busy`: a second press in the same tick reads state the
@@ -121,9 +162,12 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
   }
 
   const { ref, onKeyDown } = useModalDialog(requestClose, '#add-magnet')
-  const onPathChange = useCallback((next: string) => {
-    setPath(next)
-  }, [])
+  const onPathChange = useCallback(
+    (next: string) => {
+      setPicked({ client, path: next })
+    },
+    [client],
+  )
 
   const problem = source === 'file' ? fileProblem(file) : null
   // On the magnet tab a refusal is said when Add is pressed, because the field is what it is and
@@ -163,6 +207,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
   async function add(): Promise<void> {
     if (submittingRef.current || busy || path === '') return
     const magnet = (magnetRef.current?.value ?? '').trim()
+    if (client === null) return
     const picked = source === 'file' ? file : null
     if (source === 'magnet' && !looksLikeMagnet(magnet)) {
       setRefusal(NOT_A_MAGNET_COPY)
@@ -202,7 +247,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="add-torrent-title"
-      className={`w-[min(720px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
+      className={`w-[min(720px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${MODAL_DIALOG}`}
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="add-torrent-title" className="text-[16px] font-semibold text-strong">
@@ -271,6 +316,7 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
               <input
                 ref={magnetRef}
                 id="add-magnet"
+                defaultValue={initial?.kind === 'magnet' ? initial.uri : undefined}
                 type="text"
                 spellCheck={false}
                 autoComplete="off"
@@ -315,7 +361,12 @@ export default function AddTorrent({ client, onAdded, onClose }: AddTorrentProps
           )}
         </div>
 
-        <FolderPicker client={client} value={path} onPathChange={onPathChange} />
+        {instancePicker}
+
+        {signIn ??
+          (client !== null && (
+            <FolderPicker key={clientKey(client)} client={client} value={path} onPathChange={onPathChange} />
+          ))}
 
         {refusal !== null && <Banner tone="danger">{refusal}</Banner>}
 
