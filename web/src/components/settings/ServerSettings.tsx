@@ -11,7 +11,7 @@
  *
  * @module components/settings/ServerSettings
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, errorMessage } from '../../api/client'
 import type { Api } from '../../api/client'
 import Banner from '../Banner'
@@ -32,6 +32,16 @@ type Key = (typeof FIELDS)[number]['key']
 type Values = Record<Key, string>
 
 /** Nothing typed is 0 (unlimited); otherwise digits only, and a safe integer so no precision is lost on the wire. */
+interface Base {
+  down: number
+  up: number
+  shownDown: string
+  shownUp: string
+}
+
+/** KiB/s for display, rounded up so a limit that is not zero never reads as 0 (which means unlimited). */
+const kib = (bytes: number): string => String(Math.ceil(bytes / 1024))
+
 function parse(text: string): number | null {
   const trimmed = text.trim()
   if (trimmed === '') return 0
@@ -46,6 +56,12 @@ export default function ServerSettings({ client = api }: { client?: Api }) {
   const [problem, setProblem] = useState<{ key: Key | null; text: string } | null>(null)
   const [saved, setSaved] = useState(false)
   const [busy, setBusy] = useState(false)
+  // The rates as the server last held them: bytes per second, and the KiB/s text shown for them. A
+  // rate whose field is still showing that text is sent back as the exact bytes, never as the
+  // rounded KiB/s, so saving the queue never rewrites a limit the person did not touch.
+  const [base, setBase] = useState<Base | null>(null)
+  // Set synchronously: a second Enter or click in the same tick must not send a second save.
+  const savingRef = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -53,9 +69,12 @@ export default function ServerSettings({ client = api }: { client?: Api }) {
       ([session, loaded]) => {
         if (cancelled) return
         setQueue(loaded)
+        const shownDown = kib(session.download_limit)
+        const shownUp = kib(session.upload_limit)
+        setBase({ down: session.download_limit, up: session.upload_limit, shownDown, shownUp })
         setValues({
-          down: String(Math.round(session.download_limit / 1024)),
-          up: String(Math.round(session.upload_limit / 1024)),
+          down: shownDown,
+          up: shownUp,
           downloads: String(loaded.active_downloads ?? 0),
           seeds: String(loaded.active_seeds ?? 0),
           total: String(loaded.active_limit ?? 0),
@@ -71,7 +90,7 @@ export default function ServerSettings({ client = api }: { client?: Api }) {
   }, [client])
 
   async function save(): Promise<void> {
-    if (values === null || queue === null) return
+    if (values === null || queue === null || base === null || savingRef.current) return
     setSaved(false)
     const parsed: Partial<Record<Key, number>> = {}
     for (const { key, label } of FIELDS) {
@@ -85,21 +104,39 @@ export default function ServerSettings({ client = api }: { client?: Api }) {
     }
     setProblem(null)
     // 0 is unlimited, which the API spells null for a rate and for a queue count alike.
-    const rate = (kib: number | undefined): number | null => (kib ? kib * 1024 : null)
+    const rate = (kibs: number | undefined, text: string, shown: string, original: number): number | null => {
+      if (text === shown) return original > 0 ? original : null
+      return kibs ? kibs * 1024 : null
+    }
     const count = (n: number | undefined): number | null => (n ? n : null)
+    const down = rate(parsed.down, values.down, base.shownDown, base.down)
+    const up = rate(parsed.up, values.up, base.shownUp, base.up)
+    const nextQueue = {
+      ...queue,
+      active_downloads: count(parsed.downloads),
+      active_seeds: count(parsed.seeds),
+      active_limit: count(parsed.total),
+    }
+    savingRef.current = true
     setBusy(true)
+    let limitsApplied = false
     try {
-      await client.setSessionLimits(rate(parsed.down), rate(parsed.up))
-      await client.setQueueSettings({
-        ...queue,
-        active_downloads: count(parsed.downloads),
-        active_seeds: count(parsed.seeds),
-        active_limit: count(parsed.total),
-      })
+      await client.setSessionLimits(down, up)
+      limitsApplied = true
+      setBase({ down: down ?? 0, up: up ?? 0, shownDown: values.down, shownUp: values.up })
+      await client.setQueueSettings(nextQueue)
+      setQueue(nextQueue)
       setSaved(true)
     } catch (cause) {
-      setProblem({ key: null, text: errorMessage(cause) })
+      const reason = errorMessage(cause)
+      setProblem({
+        key: null,
+        text: limitsApplied
+          ? `The speed limits were applied; the queue counts were not: ${reason}`
+          : reason,
+      })
     } finally {
+      savingRef.current = false
       setBusy(false)
     }
   }

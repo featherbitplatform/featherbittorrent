@@ -149,4 +149,19 @@ describe('the Settings screen in the page', () => {
     expect(screen.queryByRole('heading', { name: 'Server' }), 'Settings stayed after Back').toBeNull()
     world.behavior = null
   })
+
+  it('the filter survives a trip to Settings', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: /^Paused/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^Paused/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => screen.getByRole('button', { name: /^Paused/ }))
+    expect(
+      screen.getByRole('button', { name: /^Paused/ }).getAttribute('aria-pressed'),
+      'the filter was reset by the trip',
+    ).toBe('true')
+    world.behavior = null
+  })
 })

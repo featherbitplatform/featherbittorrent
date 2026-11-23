@@ -36,11 +36,11 @@ const QUEUE = {
   interval: 11,
 }
 
-function fakeClient() {
+function fakeClient(session: SessionInfo = SESSION, queueFails = false) {
   const setSessionLimits = vi.fn(() => Promise.resolve())
-  const setQueueSettings = vi.fn(() => Promise.resolve())
+  const setQueueSettings = vi.fn(() => (queueFails ? Promise.reject(new Error('queue refused')) : Promise.resolve()))
   const client = {
-    session: () => Promise.resolve(SESSION),
+    session: () => Promise.resolve(session),
     queueSettings: () => Promise.resolve({ ...QUEUE }),
     setSessionLimits,
     setQueueSettings,
@@ -48,10 +48,10 @@ function fakeClient() {
   return { client, setSessionLimits, setQueueSettings }
 }
 
-async function open() {
-  const fake = fakeClient()
+async function open(session: SessionInfo = SESSION, queueFails = false) {
+  const fake = fakeClient(session, queueFails)
   render(<ServerSettings client={fake.client} />)
-  await screen.findByDisplayValue('1024')
+  await screen.findByDisplayValue('3')
   return fake
 }
 
@@ -106,5 +106,38 @@ describe('the Server section', () => {
     })
     expect(setSessionLimits).toHaveBeenCalledWith(null, null)
     expect(setQueueSettings).toHaveBeenCalledWith({ ...QUEUE, active_downloads: null })
+  })
+
+  it('an untouched rate is sent back exactly', async () => {
+    const { setSessionLimits, setQueueSettings } = await open({
+      ...SESSION,
+      download_limit: 1_500_000,
+      upload_limit: 100,
+    })
+    expect((field('Upload limit KiB/s') as HTMLInputElement).value, 'a nonzero limit read as 0').toBe('1')
+    type('Active seeds', '8')
+    save()
+    await waitFor(() => {
+      expect(setQueueSettings).toHaveBeenCalledTimes(1)
+    })
+    expect(setSessionLimits).toHaveBeenCalledWith(1_500_000, 100)
+  })
+
+  it('saving twice quickly sends once', async () => {
+    const { setSessionLimits, setQueueSettings } = await open()
+    save()
+    save()
+    await waitFor(() => {
+      expect(setQueueSettings).toHaveBeenCalledTimes(1)
+    })
+    expect(setSessionLimits).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed queue save says the limits were applied', async () => {
+    const { setSessionLimits } = await open(SESSION, true)
+    save()
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('The speed limits were applied; the queue counts were not')
+    expect(setSessionLimits).toHaveBeenCalledTimes(1)
   })
 })

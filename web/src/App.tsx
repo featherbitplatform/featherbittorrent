@@ -56,6 +56,12 @@ export default function App() {
     }
   }, [])
 
+  // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
+  const workspace = state.phase === 'signedIn' || state.phase === 'open'
+  useEffect(() => {
+    if (!workspace) setSettingsOpen(false)
+  }, [workspace])
+
   async function retry(): Promise<void> {
     setTrying(true)
     try {
@@ -89,21 +95,27 @@ export default function App() {
           <img className="h-16 w-auto" src="/favicon.png" alt="" />
           <h1 className="mt-4 text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
         </main>
-      ) : settingsOpen ? (
-        <Settings
-          onBack={() => {
-            setSettingsOpen(false)
-          }}
-        />
       ) : (
-        <Torrents
-          onSettings={() => {
-            setSettingsOpen(true)
-          }}
-          signedIn={state.phase === 'signedIn'}
-          signOutError={signOutError}
-          onSignOut={() => void signOut()}
-        />
+        <>
+          {settingsOpen && (
+            <Settings
+              onBack={() => {
+                setSettingsOpen(false)
+              }}
+            />
+          )}
+          {/* Hidden, not unmounted: the filter, the selection and the scroll position are still there on the way back. */}
+          <div hidden={settingsOpen}>
+            <Torrents
+              onSettings={() => {
+                setSettingsOpen(true)
+              }}
+              signedIn={state.phase === 'signedIn'}
+              signOutError={signOutError}
+              onSignOut={() => void signOut()}
+            />
+          </div>
+        </>
       )}
     </>
   )
