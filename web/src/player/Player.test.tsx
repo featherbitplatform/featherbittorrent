@@ -838,6 +838,81 @@ describe('the player', () => {
     document.body.removeChild(video)
   })
 
+  it('the default fetch is called on the window', async () => {
+    // The engine's default deps take `window.fetch` itself. The browser's `fetch` refuses a call
+    // it is not invoked as `window.fetch` (an `Illegal invocation`), so the recorder below stands
+    // in for `window.fetch` the way the browser is strict: it throws when its `this` is not the
+    // `window`. The engine makes no deps at all - the default path - and the stream request must
+    // still get out, and the state must not sit in the `waiting` the unbound call would have left.
+    const source = new FakeMediaSource()
+    const calls: string[] = []
+    // The recorder answers like the rest of the fakes: a 200 with the stream's start header and
+    // a fresh body for each call, the way the rest of the fakes build one. It is strict where
+    // the browser is strict: it throws when its `this` is not the `window`, which is what an
+    // unbound `window.fetch` call gets.
+    const strictWindowFetch = function (this: unknown, input: RequestInfo | URL): Promise<unknown> {
+      if (this !== window) throw new TypeError('Illegal invocation')
+      calls.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      const body = new FakeBody()
+      const headers = new Headers({ 'x-fbtt-start-ms': '0' })
+      const reader = body.getReader()
+      const response = {
+        ok: true,
+        status: 200,
+        headers,
+        body: { getReader: () => reader },
+      }
+      return Promise.resolve(response)
+    } as unknown as typeof fetch
+    const originalFetch = window.fetch
+    window.fetch = strictWindowFetch
+    try {
+      const video = fakeVideo()
+      document.body.appendChild(video)
+      const engine = createEngine(
+        video,
+        { id: 'a', file: 0 },
+        {
+          offsetMs: 1000,
+          durationMs: 4000,
+          video: PROBE.tracks[0] as MediaTrack,
+          videoMime: 'video/mp4; codecs="avc1.64000A"',
+          audio: null,
+          audioMime: null,
+          mimeFor: () => null,
+        },
+        // No `fetch` in the deps: the default path, which reads `window.fetch`. The `MediaSource`
+        // and `managed` are given only to keep the fake source in reach; the `fetch` stays the
+        // browser's.
+        {
+          MediaSource: fakeDeps(source, fakeFetch()).MediaSource,
+          managed: false,
+        },
+      )
+      source.open()
+      await settle()
+      await settle()
+      // One more for the append's `updateend`: the engine reads the body's end after it has put
+      // the chunk in, and that end is what settles the engine's state.
+      await settle()
+      expect(
+        calls.some((url) => url.includes('/tracks/1/stream')),
+        'the default path never asked for a stream (an unbound fetch throws instead)',
+      ).toBe(true)
+      // The data has landed, and a data-arrived state is the one the person sees: `loading`
+      // before the first byte, `playing` with data, and never the `waiting` the unbound call
+      // would have left.
+      expect(
+        engine.state() !== 'waiting',
+        `the unbound fetch was taken for a network wait (state ${engine.state()})`,
+      ).toBe(true)
+      engine.destroy()
+      document.body.removeChild(video)
+    } finally {
+      window.fetch = originalFetch
+    }
+  })
+
   it('reading pauses at the gate', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
