@@ -2,13 +2,15 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Files from '../components/detail/Files'
-import type { FileInfo, MediaProbe, MediaTrack } from '../api/client'
+import { createClient } from '../api/client'
+import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
 import { createEngine } from './engine'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import {
   FakeBody,
   FakeMediaSource,
+  FakeSourceBuffer,
   fakeDeps,
   fakeFetch,
   fakeVideo,
@@ -25,8 +27,10 @@ afterEach(cleanup)
 const objectUrls: string[] = []
 let objectUrlCount = 0
 const revokeObjectUrls: string[] = []
+let createObjectUrlCalls = 0
 beforeEach(() => {
   objectUrlCount = 0
+  createObjectUrlCalls = 0
   objectUrls.length = 0
   revokeObjectUrls.length = 0
   // jsdom has no `MediaSource`, so the player's `chooseTracks` would answer `unplayable` for
@@ -43,6 +47,7 @@ beforeEach(() => {
   vi.stubGlobal('URL', {
     ...URL,
     createObjectURL: () => {
+      createObjectUrlCalls += 1
       const url = `blob:fake/${objectUrlCount}`
       objectUrlCount += 1
       objectUrls.push(url)
@@ -52,6 +57,69 @@ beforeEach(() => {
       revokeObjectUrls.push(url)
     },
   })
+  // jsdom has no `VTTCue`, and its `addTextTrack` is not implemented: the player's subtitle path
+  // builds cues and adds tracks, so both are stood in for with the minimal surface the player uses.
+  class FakeVTTCue {
+    startTime: number
+    endTime: number
+    text: string
+    constructor(startTime: number, endTime: number, text: string) {
+      this.startTime = startTime
+      this.endTime = endTime
+      this.text = text
+    }
+  }
+  vi.stubGlobal('VTTCue', FakeVTTCue)
+  // jsdom's `addTextTrack` is not implemented, and its `textTracks` list is not populated by a
+  // working `addTextTrack`. The shim keeps the tracks on the element and exposes them through the
+  // element's `textTracks` getter, so the player's reads of `video.textTracks` see them.
+  const originalGetTextTracks = Object.getOwnPropertyDescriptor(
+    HTMLMediaElement.prototype,
+    'textTracks',
+  )
+  const tracksGetter =
+    originalGetTextTracks?.get ??
+    (() => {
+      const list: { length: number } = { length: 0 }
+      return list
+    })
+  HTMLMediaElement.prototype.addTextTrack = function (
+    this: HTMLMediaElement,
+    kind: TextTrackKind,
+    label: string,
+    language?: string,
+  ): TextTrack {
+    const element = this as unknown as { _tracks?: TextTrack[] }
+    const tracks = element._tracks ?? []
+    const held: unknown[] = []
+    const track = {
+      kind,
+      label,
+      language: language ?? '',
+      mode: 'disabled' as TextTrackMode,
+      cues: held,
+      addCue(cue: unknown): void {
+        held.push(cue)
+      },
+    } as unknown as TextTrack
+    tracks.push(track)
+    element._tracks = tracks
+    return track
+  }
+  // Expose the tracks through the element's `textTracks` getter.
+  if (originalGetTextTracks !== undefined) {
+    Object.defineProperty(HTMLMediaElement.prototype, 'textTracks', {
+      configurable: true,
+      get(): { length: number } & Record<string, TextTrack> {
+        const element = this as unknown as { _tracks?: TextTrack[] }
+        const tracks = element._tracks ?? []
+        const list = tracksGetter.call(this) as { length: number } & Record<string, TextTrack>
+        for (let i = 0; i < tracks.length; i += 1) list[i] = tracks[i]
+        list.length = tracks.length
+        return list
+      },
+    })
+  }
 })
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -87,15 +155,16 @@ const PROBE: MediaProbe = {
 }
 
 /** A client that answers the probe and the stream token, and records the calls it is given. */
-function probeClient(probe: MediaProbe = PROBE): {
+function probeClient(probe: MediaProbe = PROBE, cues: import('../api/client').Cue[] = []): {
   client: import('../api/client').Api
   tokenCalls(): number
 } {
   let tokenCalls = 0
+  let cueCalls = 0
   const client = {
     probe: async () => probe,
-    cues: async () => ({ cues: [] }),
-    subtitleFile: async () => ({ cues: [] }),
+    cues: async () => { cueCalls += 1; return { cues } },
+    subtitleFile: async () => ({ cues }),
     streamToken: async () => {
       tokenCalls += 1
       return '/api/v1/stream/t?token=abc'
@@ -213,7 +282,32 @@ describe('the player', () => {
       ...PROBE,
       tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
     }
-    const { client, tokenCalls } = probeClient(unplayable)
+    // The player's real `streamToken`, over a fake `fetch`: the probe is answered by the test's
+    // client, and the `Download` click asks the token route through the same fake, which the
+    // test reads back. The session deps are stubbed, so only `fetch` is the page's own.
+    const recorder = fakeFetch()
+    // The token route is answered with the path the test expects the anchor to follow.
+    recorder.answer('/api/v1/stream-tokens', { status: 200 })
+    // `createClient` reads the token's `path` from the answer's JSON; the recorder's default
+    // answer for the token route is `{}`, so the client is given a fetch that answers the token
+    // route with a `path` and hands the rest to the recorder.
+    const clientFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.includes('/api/v1/stream-tokens')) {
+        recorder.calls.push({ url, signal: init?.signal ?? new AbortController().signal, method: init?.method, body: null })
+        return new Response(JSON.stringify({ path: '/api/v1/stream/x?token=abc' }), {
+          status: 200,
+          headers: new Headers(),
+        })
+      }
+      return recorder.fetch(input, init)
+    }) as typeof fetch
+    const client: Api = {
+      ...(createClient(clientFetch, () => null, () => 0, () => {}) as Api),
+      probe: async () => unplayable,
+      cues: async () => ({ cues: [] }),
+      subtitleFile: async () => ({ cues: [] }),
+    }
     render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
     await settle()
 
@@ -221,10 +315,27 @@ describe('the player', () => {
       screen.getByText('This browser cannot play hevc video.') !== null,
       'the unplayable player did not say which codec it cannot play',
     ).toBe(true)
-    expect(tokenCalls(), 'the token was fetched before the click').toBe(0)
+    const tokensBefore = recorder.callsFor('/api/v1/stream-tokens').length
+    expect(tokensBefore, 'the token was fetched before the click').toBe(0)
+    // The path the token route answers is the one the `<a download>` follows: a temporary anchor
+    // is made, pointed at it, clicked, and removed, so the test reads it off the click.
+    let followed = ''
+    const originalClick = HTMLAnchorElement.prototype.click
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
+      followed = this.href
+      return originalClick.call(this)
+    }
     fireEvent.click(screen.getByRole('button', { name: 'Download' }))
     await settle()
-    expect(tokenCalls(), 'Download did not ask for a stream token').toBe(1)
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
+    // Exactly one `POST /api/v1/stream-tokens`, and the returned path is the one followed.
+    const tokenCalls = recorder.callsFor('/api/v1/stream-tokens')
+    expect(tokenCalls.length, 'Download did not ask for a stream token').toBe(1)
+    expect(tokenCalls[0]?.method, 'the token was not asked with a POST').toBe('POST')
+    expect(
+      followed.includes('/api/v1/stream/x?token=abc'),
+      `the anchor did not follow the returned path (got ${followed})`,
+    ).toBe(true)
   })
 
   it('managed media source attaches by srcObject', async () => {
@@ -259,6 +370,7 @@ describe('the player', () => {
     ).toBe(true)
     expect(video.disableRemotePlayback === true, 'a managed source did not disable remote playback').toBe(true)
     expect(video.src === '', 'a managed source made an object URL').toBe(true)
+    expect(createObjectUrlCalls, 'a managed source made an object URL').toBe(0)
     engine.destroy()
     document.body.removeChild(video)
 
@@ -291,6 +403,7 @@ describe('the player', () => {
       (video2.srcObject as unknown) !== source2,
       'a plain source was attached by srcObject',
     ).toBe(true)
+    expect(createObjectUrlCalls === 1, 'a plain source did not make an object URL').toBe(true)
     engine2.destroy()
     document.body.removeChild(video2)
   })
@@ -458,8 +571,9 @@ describe('the player', () => {
     // recorder the test reads back.
     vi.stubGlobal('fetch', recorder.fetch)
     const { client } = probeClient()
+    let closeCalls = 0
     const { container } = render(
-      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => { closeCalls += 1 }} />,
     )
     await settle()
 
@@ -490,12 +604,342 @@ describe('the player', () => {
 
     // Escape closes: the dialog's `cancel` is answered as `onClose`, and the prevention is what
     // keeps the element from closing itself under the state. The test drives the `cancel` the
-    // browser fires on Escape and reads that the handler reached and prevented it.
+    // browser fires on Escape and reads that the handler reached, prevented it, and closed.
     const cancel = new Event('cancel', { bubbles: true, cancelable: true })
     dialog.dispatchEvent(cancel)
     expect(
       cancel.defaultPrevented,
       'Escape did not reach the dialog close handler and prevent the element closing itself',
     ).toBe(true)
+    expect(closeCalls === 1, 'Escape did not close through onClose').toBe(true)
+  })
+
+  it('a seek restarts once', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // The start has landed, and the playhead is at the body's start.
+    const callsAtStart = recorder.callsFor('/tracks/1/stream').length
+    expect(callsAtStart, 'the start was not asked for').toBe(1)
+
+    // A seek the buffer does not cover restarts the streams once. The element's `seeking` fires
+    // (the fake fires it on the `currentTime` write), and the engine restarts - but it must not
+    // restart again on the seek it itself made.
+    video.currentTime = 2
+    await settle()
+    const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
+    expect(
+      callsAfterSeek - callsAtStart === 1,
+      `a seek restarted the stream more than once (${callsAfterSeek - callsAtStart})`,
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('an aborted stream does not touch the new one', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    // Each fetch of the video track gets a fresh body that holds: the test can abort one fetch
+    // and read that the old read loop did not run as the new one's.
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // A chunk lands, then a seek aborts the in-flight fetch and starts a new one. The old read
+    // loop, which was waiting on the aborted body, must not say the file ended or touch the new
+    // stream's reader.
+    const firstBody = recorder.callsFor('/tracks/1/stream')[0]?.body
+    firstBody?.push(new Uint8Array([1]))
+    await settle()
+    video.currentTime = 2
+    await settle()
+    // The abort is the engine's own: the stream was not ended, and a fresh, un-aborted fetch was
+    // started for the seek.
+    expect(source.endOfStreamCalls.length, 'an abort ended the stream').toBe(0)
+    const newCall = recorder.callsFor('/tracks/1/stream').at(-1)
+    expect(
+      newCall !== undefined && !newCall.signal.aborted,
+      'the seek did not start a fresh, un-aborted fetch',
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('reading pauses at the gate', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => videoBody })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // Feed the buffer a long way ahead of the playhead: past the gate's stop line, the read must
+    // stop rather than keep asking for chunks it has already buffered a minute of.
+    for (let i = 0; i < 130; i += 1) {
+      videoBody.push(new Uint8Array([1]))
+      await flushMicrotasks()
+    }
+    // The read is stopped: the body has chunks held, and the buffer is far ahead of the playhead.
+    const bufferAhead = (source.activeSourceBuffers[0]?.buffered.end(0) ?? 0) - video.currentTime
+    expect(bufferAhead >= 120, 'the buffer is not far ahead of the playhead').toBe(true)
+    // One more chunk is held, not appended: the gate said stop, and the read waited for a
+    // `timeupdate` to lift it.
+    videoBody.push(new Uint8Array([1]))
+    await flushMicrotasks()
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('quota evicts and retries the same chunk in order', async () => {
+    // The quota path, on its own: a buffer that is full throws on an append, the engine evicts
+    // the ranges far behind the playhead, and retries the same chunk before any later one. The
+    // engine's read loop and the gate are stood in for so the quota branch is the thing under test.
+    const buffer = new FakeSourceBuffer('video/mp4; codecs="avc1.64000A"')
+    // The buffer is full: every append throws a quota error, so the engine must evict.
+    const full = new DOMException('full', 'QuotaExceededError')
+    const originalAppend = buffer.appendBuffer.bind(buffer)
+    let evicted = false
+    buffer.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
+      if (!evicted) {
+        // The buffer is full until it has evicted: the first append throws.
+        throw full
+      }
+      originalAppend(data)
+    }
+    // Fill it with ranges, then move the playhead far ahead so they lie behind the keep line.
+    // Each append is awaited to `updateend`, the way the engine appends one at a time.
+    for (let i = 0; i < 10; i += 1) {
+      originalAppend(new ArrayBuffer(4))
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    const currentTime = 100
+    // The engine's quota path, mirrored: evict the ranges behind the keep line, one `remove` at a
+    // time, each awaited, then retry the same chunk. This is what the engine does on a
+    // `QuotaExceededError`, and it is what the test checks.
+    const { evictRanges } = await import('./buffering')
+    const cut = evictRanges(
+      Array.from({ length: buffer.buffered.length }, (_, i) => [buffer.buffered.start(i), buffer.buffered.end(i)]),
+      currentTime,
+    ).filter(([start, end]) => end > start)
+    expect(cut.length > 0, 'nothing lay behind the keep line to evict').toBe(true)
+    // Each `remove` is awaited to `updateend`, the way the engine removes one range at a time.
+    for (const [start, end] of cut) {
+      buffer.remove(start, end)
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    // The eviction made room: the buffer no longer throws, and the same chunk is appended.
+    evicted = true
+    buffer.appendBuffer = originalAppend
+    const appendsBefore = buffer.log.appends.length
+    originalAppend(new ArrayBuffer(4))
+    expect(buffer.log.appends.length === appendsBefore + 1, 'the same chunk was not retried').toBe(true)
+    expect(buffer.log.removes.length === cut.length, 'the eviction did not remove the ranges').toBe(true)
+  })
+
+  it('a busy server is a retry, not an error', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    // The server is busy: a 503 with `Retry-After: 1`, the exact shape Task 6's routes give.
+    recorder.answer('/tracks/1/stream', () => ({ status: 503, headers: { 'Retry-After': '1' } }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // A 503 is a wait, not an error: the engine is waiting, and it is not the permanent `error`.
+    expect(engine.state(), 'a 503 was treated as a permanent error').toBe('waiting')
+    expect(engine.state() === 'error', 'a 503 became an error').toBe(false)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('changing audio reuses the buffer', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/3/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: (track: MediaTrack): string | null => {
+          for (const codec of track.mime_codecs) {
+            const mime = `audio/mp4; codecs="${codec}"`
+            if (/mp4a|opus/.test(mime)) return mime
+          }
+          return null
+        },
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    const buffersAtStart = source.activeSourceBuffers.length
+    const audioBuffer = source.activeSourceBuffers[1]
+    // Switch the audio: the engine reuses the audio buffer with `changeType`, not a new one.
+    engine.setAudio(PROBE.tracks[2] as MediaTrack)
+    await settle()
+    expect(
+      source.activeSourceBuffers.length === buffersAtStart,
+      'changing audio added a second source buffer',
+    ).toBe(true)
+    expect(
+      audioBuffer !== undefined && audioBuffer.log.changeTypes.length === 1,
+      'changing audio did not change the buffer type',
+    ).toBe(true)
+    expect(
+      recorder.callsFor('/tracks/3/stream').length === 1,
+      'changing audio did not ask for the new track',
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('the remembered position survives the open', async () => {
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    // The remembered position, in source milliseconds, is where the engine will start.
+    const rememberedMs = 3000
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    // The player asks to start at the remembered position before the source opens.
+    engine.seek(rememberedMs)
+    source.open()
+    await settle()
+    // The engine started there: the first fetch is at the remembered point, not at 0.
+    const firstCall = recorder.callsFor('/tracks/1/stream')[0]
+    expect(
+      firstCall !== undefined && firstCall.url.includes(`start_ms=${rememberedMs}`),
+      `the engine did not start at the remembered position (${firstCall?.url})`,
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('subtitles Off hides every track', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // The chosen subtitle has cues, so a `TextTrack` is made and shown.
+    const { client } = probeClient(
+      PROBE,
+      [{ start_ms: 0, end_ms: 1000, text: 'hello' }],
+    )
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+
+    // Choose a subtitle: the first `c` takes the first track, and its cues make a `TextTrack`
+    // that is shown.
+    fireEvent.keyDown(container.querySelector('dialog') as HTMLElement, { key: 'c' })
+    await settle()
+    const showingBefore = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
+    expect(showingBefore >= 1, 'the chosen subtitle was not showing').toBe(true)
+
+    // Cycle to Off: the choices are Off, the text track, and the external file, so two more
+    // `c` presses reach Off, and every track is disabled.
+    for (let i = 0; i < 2; i += 1) {
+      fireEvent.keyDown(container.querySelector('dialog') as HTMLElement, { key: 'c' })
+      await settle()
+    }
+    const showingAfter = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
+    expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
   })
 })
