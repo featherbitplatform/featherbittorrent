@@ -109,12 +109,24 @@ if (-not (Test-Path $magnetKey)) { throw "no $magnetKey after the install" }
 $protocol = Get-ItemProperty $magnetKey
 if ($null -eq $protocol.PSObject.Properties['URL Protocol']) { throw "$magnetKey has no 'URL Protocol' value" }
 $command = (Get-ItemProperty "$magnetKey\shell\open\command").'(default)'
-if ($command -notmatch '^"([^"]+\\featherbittorrent-desktop\.exe)"') {
-    throw "the magnet open command is '$command', expected it to start featherbittorrent-desktop.exe"
+if ($command -notmatch '^"([^"]+)"') {
+    throw "the magnet open command is '$command', expected it to start with a quoted exe path"
 }
-$exe = $Matches[1]
+$raw = $Matches[1]
+if (-not (Test-Path -LiteralPath $raw)) { throw "the magnet open command is '$command', which names $raw, which is not there" }
+# The installer may write the 8.3 short path (C:\PROGRA~1\FEATHE~1\FEATHE~1.EXE). Get-Item and
+# GetFullPath do not expand short names, so ask Win32 GetLongPathName directly.
+Add-Type -Namespace Fbt -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathName(string shortPath, System.Text.StringBuilder longPath, uint bufferSize);
+'@
+$buf = New-Object System.Text.StringBuilder 4096
+if ([Fbt.Native]::GetLongPathName($raw, $buf, $buf.Capacity) -eq 0) { throw "could not expand $raw to its long path" }
+$exe = $buf.ToString()
+if ((Split-Path -Leaf $exe) -ne 'featherbittorrent-desktop.exe') {
+    throw "the magnet open command is '$command'; expanded to '$exe', expected it to be featherbittorrent-desktop.exe"
+}
 $installDir = Split-Path -Parent $exe
-if (-not (Test-Path -LiteralPath $exe)) { throw "the magnet open command names $exe, which is not there" }
 Write-Output "ok: magnet opens $exe"
 
 # 3. --version, through a pipe: the release exe has no console of its own.
