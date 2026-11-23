@@ -425,6 +425,7 @@ describe('the phone layout', () => {
       <Torrents
         signedIn
         signOutError={null}
+        onSettings={() => {}}
         onSignOut={() => {
           signedOut += 1
         }}
@@ -601,7 +602,7 @@ describe('the phone layout', () => {
     const { client } = fakeClient({ rows: [torrentInfo('a')] })
     phoneWidth(true)
     const { container, unmount } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
     )
     await flush()
     fireEvent.click(cards(container)[0])

@@ -1,10 +1,9 @@
 /**
  * The Settings screen: what the server and this page can be told, in three sections.
  *
- * Server (the speed limits and queue counts) is built here. Devices and Keyboard shortcuts are
- * named slots with a heading and no content yet: the device logins and the shortcut list are
- * mounted into them by their own pieces of work. The screen replaces the Torrents screen while it
- * is open, and `Back to torrents` returns.
+ * Server (the speed limits and queue counts), Devices (the device logins) and Keyboard shortcuts
+ * (the read-only key list). The screen replaces the Torrents screen while it is open, and
+ * `Back to torrents` returns.
  *
  * @module screens/Settings
  */
@@ -15,6 +14,7 @@ import type { Api } from '../api/client'
 import Button from '../components/Button'
 import Devices from '../components/settings/Devices'
 import ServerSettings from '../components/settings/ServerSettings'
+import { Shortcuts } from '../components/settings/Shortcuts'
 
 export interface SettingsProps {
   client?: Api
@@ -52,7 +52,7 @@ export function Settings({ client = api, onBack }: SettingsProps) {
         <h2 id="settings-shortcuts" className="text-base font-medium text-strong">
           Keyboard shortcuts
         </h2>
-        {/* SHORTCUTS SLOT: the read-only key list is mounted here. */}
+        <Shortcuts />
       </section>
     </main>
   )
