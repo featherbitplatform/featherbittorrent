@@ -91,7 +91,8 @@ describe('TorrentActions', () => {
     const up = screen.getByLabelText(/upload/i) as HTMLInputElement
     expect(down.value).toBe('')
     expect(up.value).toBe('')
-    expect(screen.getByText('Sets a new limit. 0 removes it.')).toBeTruthy()
+    expect(screen.getByText('Both limits are set together. 0 means unlimited.')).toBeTruthy()
+    expect(screen.getByText('Both limits are set together. 0 means unlimited.')).toBeTruthy()
     fireEvent.change(down, { target: { value: '500' } })
     fireEvent.change(up, { target: { value: '0' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -142,5 +143,88 @@ describe('TorrentActions', () => {
     await waitFor(() => {
       expect(onError).toHaveBeenCalledWith('that folder already holds this torrent')
     })
+  })
+  it('save waits for both limits', () => {
+    const client = fake()
+    open(client)
+    fireEvent.click(screen.getByRole('menuitem', { name: /limits/i }))
+    const save = screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/download/i), { target: { value: '500' } })
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/upload/i), { target: { value: 'abc' } })
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/upload/i), { target: { value: '9007199254740993' } })
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/upload/i), { target: { value: '10' } })
+    expect(save.disabled).toBe(false)
+  })
+
+  it('the top torrent cannot move up', () => {
+    open(fake(), torrent({ queue_position: 0 }))
+    expect((screen.getByRole('menuitem', { name: 'Move up' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('menuitem', { name: 'Move to top' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('menuitem', { name: 'Move down' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('the menu works from the keyboard', () => {
+    open(fake())
+    const more = screen.getByRole('button', { name: 'More' })
+    const items = screen.getAllByRole('menuitem')
+    expect(document.activeElement).toBe(items[0])
+    fireEvent.keyDown(items[0] as HTMLElement, { key: 'ArrowDown' })
+    expect(document.activeElement).toBe(items[1])
+    fireEvent.keyDown(items[1] as HTMLElement, { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(items[0])
+    fireEvent.keyDown(items[0] as HTMLElement, { key: 'End' })
+    expect(document.activeElement).toBe(items[items.length - 1])
+    fireEvent.keyDown(items[items.length - 1] as HTMLElement, { key: 'Home' })
+    expect(document.activeElement).toBe(items[0])
+    fireEvent.keyDown(items[0] as HTMLElement, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(more)
+    fireEvent.click(more)
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole('menu')).toBeNull()
+    fireEvent.click(more)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Recheck' }))
+    expect(document.activeElement).toBe(more)
+    fireEvent.click(more)
+    fireEvent.click(screen.getByRole('menuitem', { name: /limits/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(document.activeElement).toBe(more)
+  })
+
+  it('recheck and reannounce errors reach onError', async () => {
+    const client = fake({
+      recheck: vi.fn(async () => {
+        throw new ApiError(409, 'busy', 'a check is already running')
+      }),
+      reannounce: vi.fn(async () => {
+        throw new ApiError(409, 'busy', 'announce refused')
+      }),
+    })
+    const onError = open(client)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Recheck' }))
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledWith('a check is already running')
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'More' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Reannounce' }))
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledWith('announce refused')
+    })
+  })
+
+  it('cancelling the move picker sends nothing', async () => {
+    const client = fake()
+    open(client)
+    fireEvent.click(screen.getByRole('menuitem', { name: /move files/i }))
+    await waitFor(() => {
+      expect(document.querySelector('[data-folder="/downloads"]')).not.toBeNull()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(client.moveStorage).not.toHaveBeenCalled()
+    expect(screen.queryByText('Moving...')).toBeNull()
   })
 })

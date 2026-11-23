@@ -1,10 +1,9 @@
 /**
  * The dialog that sets one torrent's speed limits.
  *
- * The fields are in KiB/s, the unit a person thinks in, and leave as bytes per second, the unit the
- * server counts in. Both start empty: this page does not know what limit the torrent has now, so the
- * dialog never pretends to show it. A blank or `0` field sends `null`, which the server reads as
- * unlimited. A server refusal stays inside the dialog, in the same banner the removal dialog uses.
+ * Both fields are required and the Save button waits for them. The fields are in KiB/s, the unit a person thinks in, and leave as bytes per second, the unit the
+ * server counts in. Both start empty: this page does not know what limit the torrent has now. `0` sends `null`, which the server reads as
+ * unlimited, and a blank field never leaves the page. A server refusal stays inside the dialog, in the same banner the removal dialog uses.
  *
  * @module components/TorrentLimits
  */
@@ -23,13 +22,16 @@ export interface TorrentLimitsProps {
   onClose(): void
 }
 
-/** `''` and `0` mean no limit; a whole number of KiB/s is that many times 1024 bytes; anything else is not a limit. */
-function toBps(text: string): number | null | undefined {
+type Parsed = { kind: 'empty' } | { kind: 'bad' } | { kind: 'big' } | { kind: 'ok'; bps: number | null }
+
+/** A whole number of KiB/s is that many times 1024 bytes; 0 is unlimited and leaves as null; blank, non-numbers and anything past 2^53 bytes are not limits. */
+function parse(text: string): Parsed {
   const trimmed = text.trim()
-  if (trimmed === '') return null
-  if (!/^\d{1,9}$/.test(trimmed)) return undefined
-  const kib = Number(trimmed)
-  return kib === 0 ? null : kib * 1024
+  if (trimmed === '') return { kind: 'empty' }
+  if (!/^\d+$/.test(trimmed)) return { kind: 'bad' }
+  const bytes = Number(trimmed) * 1024
+  if (!Number.isSafeInteger(bytes)) return { kind: 'big' }
+  return { kind: 'ok', bps: bytes === 0 ? null : bytes }
 }
 
 export default function TorrentLimits({ id, client, onClose }: TorrentLimitsProps) {
@@ -39,6 +41,16 @@ export default function TorrentLimits({ id, client, onClose }: TorrentLimitsProp
   const [busy, setBusy] = useState(false)
   const submittingRef = useRef(false)
 
+  const downParsed = parse(down)
+  const upParsed = parse(up)
+  const ready = downParsed.kind === 'ok' && upParsed.kind === 'ok'
+  const invalid =
+    downParsed.kind === 'bad' || upParsed.kind === 'bad'
+      ? 'A limit is a whole number of KiB/s.'
+      : downParsed.kind === 'big' || upParsed.kind === 'big'
+        ? 'That limit is too large.'
+        : null
+
   function requestClose(): void {
     if (submittingRef.current) return
     onClose()
@@ -47,12 +59,9 @@ export default function TorrentLimits({ id, client, onClose }: TorrentLimitsProp
 
   async function save(): Promise<void> {
     if (submittingRef.current) return
-    const downBps = toBps(down)
-    const upBps = toBps(up)
-    if (downBps === undefined || upBps === undefined) {
-      setError('A limit is a whole number of KiB/s.')
-      return
-    }
+    if (downParsed.kind !== 'ok' || upParsed.kind !== 'ok') return
+    const downBps = downParsed.bps
+    const upBps = upParsed.bps
     submittingRef.current = true
     setBusy(true)
     setError(null)
@@ -105,15 +114,15 @@ export default function TorrentLimits({ id, client, onClose }: TorrentLimitsProp
             setUp(event.target.value)
           }}
         />
-        <p className="text-[12px] text-muted">Sets a new limit. 0 removes it.</p>
-        {error !== null && <Banner tone="danger">{error}</Banner>}
+        <p className="text-[12px] text-muted">Both limits are set together. 0 means unlimited.</p>
+        {(invalid ?? error) !== null && <Banner tone="danger">{invalid ?? error}</Banner>}
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-ink-700 px-5.5 py-4">
         <Button data-cancel variant="secondary" onClick={requestClose} disabled={busy}>
           Cancel
         </Button>
         <Button
-          disabled={busy}
+          disabled={busy || !ready}
           onClick={() => {
             void save()
           }}

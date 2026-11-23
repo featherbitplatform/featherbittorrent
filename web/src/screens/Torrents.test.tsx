@@ -85,6 +85,7 @@ function fakeClient(options: {
   pause?: (id: string) => Promise<void>
   resume?: (id: string) => Promise<void>
   remove?: (id: string, deleteFiles: boolean) => Promise<void>
+  moveStorage?: (id: string, path: string) => Promise<void>
 }): { client: Api; calls: Calls } {
   const rows = options.rows ?? []
   const calls: Calls = { torrents: 0, pause: [], resume: [], remove: [] }
@@ -112,6 +113,8 @@ function fakeClient(options: {
       calls.remove.push(`${id}:${String(deleteFiles)}`)
       return options.remove?.(id, deleteFiles) ?? Promise.resolve()
     },
+    moveStorage: (id: string, path: string): Promise<void> =>
+      options.moveStorage?.(id, path) ?? Promise.resolve(),
     addMagnet: async () => torrentInfo('added'),
     addFile: async () => torrentInfo('added'),
     roots: async (): Promise<string[]> => options.roots ?? ['/downloads'],
@@ -311,5 +314,38 @@ describe('the dialogs the screen opens', () => {
       !enabled('Pause') && !enabled('Resume') && !enabled('Remove'),
       'the toolbar still acted on a torrent that was removed',
     ).toBe(true)
+  })
+
+  it('moving survives selecting another torrent', async () => {
+    let finish: () => void = () => {}
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+      moveStorage: () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        }),
+    })
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(row(container, 'a'))
+    await flush()
+    fireEvent.click(button('More'))
+    fireEvent.click(screen.getByRole('menuitem', { name: /move files/i }))
+    await flush()
+    fireEvent.click(button('Move'))
+    await flush()
+    expect(screen.queryByText('Moving...') !== null, 'the move showed no indicator').toBe(true)
+    fireEvent.click(row(container, 'b'))
+    await flush()
+    expect(screen.queryByText('Moving...') === null, 'another torrent showed the indicator').toBe(true)
+    fireEvent.click(row(container, 'a'))
+    await flush()
+    expect(screen.queryByText('Moving...') !== null, 'the indicator was lost on reselecting').toBe(true)
+    await act(async () => {
+      finish()
+      await Promise.resolve()
+    })
+    await flush()
+    expect(screen.queryByText('Moving...') === null, 'the indicator outlived the request').toBe(true)
   })
 })

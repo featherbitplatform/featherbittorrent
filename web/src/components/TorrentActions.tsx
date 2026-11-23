@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MoreHorizontal } from 'lucide-react'
 import { errorMessage } from '../api/client'
+import type { KeyboardEvent } from 'react'
 import type { Api, TorrentInfo } from '../api/client'
 import { useModalDialog } from '../modal'
 import Button from './Button'
@@ -27,6 +28,10 @@ export interface TorrentActionsProps {
   torrent: TorrentInfo
   client: Api
   onError(message: string): void
+  /** Whether a move of this torrent's files is on the wire, when the screen keeps that across selections; absent, the component tracks its own. */
+  moving?: boolean
+  /** Told when a move starts and when it settles, so the screen can keep the indicator while another torrent is selected. */
+  onMoving?(moving: boolean): void
 }
 
 const ITEM =
@@ -78,14 +83,20 @@ function MoveDialog({
   )
 }
 
-export function TorrentActions({ torrent, client, onError }: TorrentActionsProps) {
+export function TorrentActions({ torrent, client, onError, moving: movingProp, onMoving }: TorrentActionsProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [moveOpen, setMoveOpen] = useState(false)
-  const [moving, setMoving] = useState(false)
+  const [localMoving, setMoving] = useState(false)
+  const moving = movingProp ?? localMoving
+  const moreRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const dialogWasOpen = useRef(false)
   const rootRef = useRef<HTMLDivElement>(null)
   const id = torrent.id
+  // -1 would mean "not in the queue" (libtorrent's convention); the server sends a place from 0, so this only guards the odd one out.
   const queued = torrent.auto_managed && torrent.queue_position >= 0
+  const atTop = torrent.queue_position === 0
 
   useEffect(() => {
     if (!menuOpen) return
@@ -94,14 +105,49 @@ export function TorrentActions({ torrent, client, onError }: TorrentActionsProps
         setMenuOpen(false)
       }
     }
-    document.addEventListener('mousedown', away)
+    document.addEventListener('pointerdown', away)
     return () => {
-      document.removeEventListener('mousedown', away)
+      document.removeEventListener('pointerdown', away)
     }
   }, [menuOpen])
 
-  async function run(call: () => Promise<void>): Promise<void> {
+  // The first item takes the focus when the menu opens.
+  useEffect(() => {
+    if (menuOpen) menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus()
+  }, [menuOpen])
+
+  // When a dialog opened from the menu goes away its opener (a menu item) is gone: the focus goes to More.
+  useEffect(() => {
+    if (limitsOpen || moveOpen) {
+      dialogWasOpen.current = true
+    } else if (dialogWasOpen.current) {
+      dialogWasOpen.current = false
+      moreRef.current?.focus()
+    }
+  }, [limitsOpen, moveOpen])
+
+  function closeMenu(): void {
     setMenuOpen(false)
+    moreRef.current?.focus()
+  }
+
+  function onMenuKeyDown(event: KeyboardEvent<HTMLDivElement>): void {
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)') ?? [],
+    )
+    const at = items.indexOf(document.activeElement as HTMLElement)
+    let next: number | null = null
+    if (event.key === 'ArrowDown') next = (at + 1) % items.length
+    else if (event.key === 'ArrowUp') next = (at <= 0 ? items.length : at) - 1
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = items.length - 1
+    if (next === null) return
+    event.preventDefault()
+    items[next]?.focus()
+  }
+
+  async function run(call: () => Promise<void>): Promise<void> {
+    closeMenu()
     try {
       await call()
     } catch (cause) {
@@ -112,17 +158,26 @@ export function TorrentActions({ torrent, client, onError }: TorrentActionsProps
   async function move(path: string): Promise<void> {
     setMoveOpen(false)
     setMoving(true)
+    onMoving?.(true)
     try {
       await client.moveStorage(id, path)
     } catch (cause) {
       onError(errorMessage(cause))
     } finally {
       setMoving(false)
+      onMoving?.(false)
     }
   }
 
-  const item = (label: string, onClick: () => void) => (
-    <button key={label} type="button" role="menuitem" className={ITEM} onClick={onClick}>
+  const item = (label: string, onClick: () => void, disabled = false) => (
+    <button
+      key={label}
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      className={ITEM + ' disabled:cursor-default disabled:opacity-55'}
+      onClick={onClick}
+    >
       {label}
     </button>
   )
@@ -132,10 +187,14 @@ export function TorrentActions({ torrent, client, onError }: TorrentActionsProps
       ref={rootRef}
       className="relative"
       onKeyDown={(event) => {
-        if (event.key === 'Escape' && menuOpen) setMenuOpen(false)
+        if (event.key === 'Escape' && menuOpen) {
+          event.stopPropagation()
+          closeMenu()
+        }
       }}
     >
       <Button
+        ref={moreRef}
         size="sm"
         variant="secondary"
         aria-haspopup="menu"
@@ -150,14 +209,16 @@ export function TorrentActions({ torrent, client, onError }: TorrentActionsProps
       {moving && <span className="ml-2 text-[12px] text-muted">Moving...</span>}
       {menuOpen && (
         <div
+          ref={menuRef}
           role="menu"
+          onKeyDown={onMenuKeyDown}
           className="absolute right-0 z-20 mt-1 flex min-w-44 flex-col rounded-card border border-rule bg-raised py-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]"
         >
           {queued && (
             <>
-              {item('Move up', () => void run(() => client.setQueuePosition(id, torrent.queue_position - 1)))}
+              {item('Move up', () => void run(() => client.setQueuePosition(id, torrent.queue_position - 1)), atTop)}
               {item('Move down', () => void run(() => client.setQueuePosition(id, torrent.queue_position + 1)))}
-              {item('Move to top', () => void run(() => client.setQueuePosition(id, 0)))}
+              {item('Move to top', () => void run(() => client.setQueuePosition(id, 0)), atTop)}
               {item('Move to bottom', () => void run(() => client.setQueuePosition(id, QUEUE_BOTTOM)))}
               <div role="separator" className="my-1 border-t border-ink-700" />
             </>

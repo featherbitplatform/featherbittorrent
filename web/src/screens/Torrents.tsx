@@ -91,6 +91,8 @@ export default function Torrents({
   // True while an action is on the wire: a toolbar that stayed live during a pause is a toolbar that
   // lets the person press it four more times.
   const [busy, setBusy] = useState(false)
+  // The torrents whose files are being moved: kept here, not in the menu, so the indicator survives choosing another row.
+  const [movingIds, setMovingIds] = useState<ReadonlySet<string>>(new Set())
   const liveRef = useRef<LiveHandle | null>(null)
 
   useEffect(() => {
@@ -233,6 +235,16 @@ export default function Torrents({
           key={selectedRow.id}
           torrent={selectedRow}
           client={client}
+          moving={movingIds.has(selectedRow.id)}
+          onMoving={(on) => {
+            const moverId = selectedRow.id
+            setMovingIds((current) => {
+              const next = new Set(current)
+              if (on) next.add(moverId)
+              else next.delete(moverId)
+              return next
+            })
+          }}
           onError={(why) => {
             setActionError(why)
             announcePolite(why)
