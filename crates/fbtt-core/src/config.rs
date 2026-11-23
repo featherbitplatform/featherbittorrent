@@ -575,8 +575,7 @@ impl Config {
         {
             create_private_dir(parent).map_err(cannot_write)?;
         }
-        write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, text.as_bytes())
-            .map_err(cannot_write)
+        replace_file(path, text.as_bytes()).map_err(cannot_write)
     }
 
     /// This config as it belongs in a file: the roots unnamed when they are the one directory
@@ -777,10 +776,14 @@ fn player_problem_line(path: &Path, problem: &str) -> String {
 }
 
 /// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
-/// file beside the target, readable only by the owner on Unix, synced, then renamed over
-/// it. The session state save shares this so both files are replaced by the same rules
-/// ([`crate::LocalBackend`]).
-pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// file beside the target (`<file>.tmp`), readable only by the owner on Unix, synced, then
+/// renamed over it, so a reader sees either the old file or the new one and never half of
+/// each. This is the product's one rule for writing a file atomically with private
+/// permissions: the config save, the session state save ([`crate::LocalBackend`]) and the
+/// desktop app's settings save all go through it. A leftover temp file from a failed write is
+/// taken out of the way first, so its mode is never the mode the file ends up with. The
+/// directory must already exist; [`create_private_dir`] makes it the same way.
+pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, bytes)
 }
 
@@ -836,9 +839,10 @@ fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
 /// Makes `dir` and every missing directory above it, owner-only on Unix for the same reason the
 /// file inside it is: 0700 keeps another local user out of the folder holding the hashes. Only what
 /// this call creates gets that mode; a directory that was already there keeps whatever its owner
-/// chose for it.
+/// chose for it. The directory half of the rule [`replace_file`] is the file half of: every
+/// featherbittorrent save that may have to make its directory makes it here.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     let mut builder = std::fs::DirBuilder::new();
@@ -849,7 +853,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Makes `dir` and every missing parent, as it always has on a platform where the mode a new
 /// directory gets is not something this call decides.
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 

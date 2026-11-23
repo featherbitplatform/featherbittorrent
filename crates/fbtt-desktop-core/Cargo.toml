@@ -1,0 +1,33 @@
+[package]
+name = "fbtt-desktop-core"
+description = "featherbittorrent desktop core: paths, the desktop settings file, instances, the launch secret and handed-over links and files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The launch secret and instance ids, spelled base64url without padding.
+base64.workspace = true
+# The app's own config and data directories, beside (never shared with) the CLI's.
+directories.workspace = true
+# The library path type This computer runs its engine on, and `ConfigError` for the
+# host with no home directory.
+fbtt-core.workspace = true
+# The bytes the secret and instance ids are made of.
+getrandom.workspace = true
+serde.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+# The address an instance is added by: the same WHATWG parser `reqwest` dials with, so
+# what is accepted here is what a connection can actually reach.
+url.workspace = true
+
+[dev-dependencies]
+# `fbtt_core::scratch`: the settings tests need a directory of their own to read and write in.
+fbtt-core = { workspace = true, features = ["test-support"] }
