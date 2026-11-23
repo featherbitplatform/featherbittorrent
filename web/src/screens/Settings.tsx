@@ -12,6 +12,7 @@ import { ArrowLeft } from 'lucide-react'
 import { api } from '../api/client'
 import type { Api } from '../api/client'
 import Button from '../components/Button'
+import Devices from '../components/settings/Devices'
 import ServerSettings from '../components/settings/ServerSettings'
 
 export interface SettingsProps {
@@ -39,7 +40,7 @@ export function Settings({ client = api, onBack }: SettingsProps) {
         <h2 id="settings-devices" className="text-base font-medium text-strong">
           Devices
         </h2>
-        {/* DEVICES SLOT: the device logins are mounted here. */}
+        <Devices client={client} />
       </section>
       <section aria-labelledby="settings-shortcuts" className="flex flex-col gap-3">
         <h2 id="settings-shortcuts" className="text-base font-medium text-strong">
