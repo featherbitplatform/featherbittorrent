@@ -16,8 +16,11 @@ import {
   fakeDeps,
   fakeFetch,
   fakeVideo,
+  fakeVideoBeforeMetadata,
   makeVideoPlayable,
+  makeVideoSeekable,
 } from './testing'
+import { FOCUSABLE_SELECTOR } from '../modal'
 
 
 installDialogShim()
@@ -300,9 +303,11 @@ describe('the Files tab', () => {
     )
     const mkvRow = screen.getByText('movie.mkv').closest('tr')
     const txtRow = screen.getByText('notes.txt').closest('tr')
-    const mkvButton = mkvRow?.querySelector('button[aria-label="Play"]')
-    expect(mkvButton !== null, 'a .mkv row has no Play button').toBe(true)
-    expect(txtRow?.querySelector('button[aria-label="Play"]') === null, 'a .txt row has a Play button').toBe(true)
+    // Each row's button is named after the file the row shows, so a screen reader's list of
+    // buttons tells the rows apart.
+    const mkvButton = mkvRow?.querySelector('button[aria-label="Play movie.mkv"]')
+    expect(mkvButton !== null && mkvButton !== undefined, 'a .mkv row has no Play button named after its file').toBe(true)
+    expect(txtRow?.querySelector('button') === null, 'a .txt row has a Play button').toBe(true)
     fireEvent.click(mkvButton as HTMLElement)
     expect(played === 0, 'clicking Play did not open the player on the right file').toBe(true)
   })
@@ -700,31 +705,30 @@ describe('the player', () => {
     expect(audioButton !== undefined, 'the audio menu was not found').toBe(true)
     expect(subtitleButton !== undefined, 'the subtitle menu was not found').toBe(true)
 
-    // Open both menus: each keeps its own flag, so both are open at once.
+    const video = dialog.querySelector('video') as HTMLVideoElement
+    // Open the audio menu, then the subtitle menu: the focus moves into the subtitle choices, and
+    // the audio menu closes as the focus leaves it. Each menu keeps its own flag, so the audio
+    // menu's close, reported after the subtitle menu's open, must not clear the subtitle menu's.
     fireEvent.click(audioButton)
     await settle()
+    expect(audioButton.getAttribute('aria-expanded'), 'the audio menu was not open').toBe('true')
     fireEvent.click(subtitleButton)
     await settle()
     expect(
-      audioButton.getAttribute('aria-expanded') === 'true',
-      'the audio menu was not open',
+      audioButton.getAttribute('aria-expanded') === 'false',
+      'the audio menu stayed open when the focus moved into the subtitle menu',
     ).toBe(true)
     expect(
       subtitleButton.getAttribute('aria-expanded') === 'true',
       'the subtitle menu was not open',
     ).toBe(true)
-
-    // Close the audio menu: the subtitle menu stays open, because each menu keeps its own flag.
-    fireEvent.click(audioButton)
+    // The player's keys stay off while the subtitle menu is open: `m` does not mute.
+    fireEvent.keyDown(dialog, { key: 'm' })
     await settle()
     expect(
-      audioButton.getAttribute('aria-expanded') === 'false',
-      'the audio menu was not closed',
-    ).toBe(true)
-    expect(
-      subtitleButton.getAttribute('aria-expanded') === 'true',
-      'closing the audio menu closed the subtitle menu too: the menus share one flag',
-    ).toBe(true)
+      video.muted,
+      'closing the audio menu cleared the subtitle menu too: the menus share one flag',
+    ).toBe(false)
   })
 
   it('a seek restarts once', async () => {
@@ -2177,5 +2181,396 @@ describe('the player', () => {
       chosen.some((text) => text.startsWith('ita')),
       `a refused switch showed the new track as chosen (${JSON.stringify(chosen)})`,
     ).toBe(false)
+  })
+})
+
+/** A WebM the browser plays on its own: the native path, the element's own controls. */
+const NATIVE_PROBE: MediaProbe = {
+  container: 'webm',
+  duration_ms: 4000,
+  time_offset_ms: 0,
+  tracks: [
+    track({ id: 1, kind: 'video', codec: 'vp9', mime_codecs: ['vp09.00.10.08'], default: true }),
+    track({ id: 2, kind: 'audio', codec: 'opus', mime_codecs: ['opus'], default: true }),
+  ],
+  external_subtitles: [],
+}
+
+/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. */
+async function renderNative(): Promise<{ container: HTMLElement; restore(): void }> {
+  const spy = vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockImplementation((mime: string) =>
+    mime.startsWith('video/webm') ? 'maybe' : '',
+  )
+  const { client } = probeClient(NATIVE_PROBE)
+  const { container } = render(<Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />)
+  await settle()
+  return { container, restore: () => spy.mockRestore() }
+}
+
+/** Render the remuxed player over a fake `fetch` the engine reads as `window.fetch`. */
+async function renderRemux(probe: MediaProbe = PROBE): Promise<{
+  container: HTMLElement
+  recorder: ReturnType<typeof fakeFetch>
+  video: HTMLVideoElement
+  dialog: HTMLDialogElement
+}> {
+  const recorder = fakeFetch()
+  let videoCalls = 0
+  recorder.answer('/tracks/1/stream', () => {
+    videoCalls += 1
+    return { startMs: videoCalls === 1 ? 0 : 3000, body: () => new FakeBody() }
+  })
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  vi.stubGlobal('fetch', recorder.fetch)
+  const { client } = probeClient(probe)
+  const { container } = render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+  await settle()
+  const video = container.querySelector('video') as HTMLVideoElement
+  const dialog = container.querySelector('dialog') as HTMLDialogElement
+  return { container, recorder, video, dialog }
+}
+
+describe('the final review fixes', () => {
+  it('a failed resume keeps the playhead', async () => {
+    // The video body stops early; its resume gets a 504, the normal answer of a slow torrent.
+    // The next try must only ask again from where the buffer ends: a restart of the whole start
+    // would move the playhead to the far end of the buffered range and skip what lies between.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 2; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    expect(t.video.currentTime, 'the start did not land at media 1').toBe(1)
+    let busy = true
+    t.recorder.answer('/tracks/1/stream', () =>
+      busy ? { status: 504 } : { startMs: 1000, body: () => new FakeBody() },
+    )
+    vi.useFakeTimers()
+    try {
+      t.body(1).end()
+      await vi.advanceTimersByTimeAsync(1_100)
+      expect(t.recorder.callsFor('/tracks/1/stream').length, 'the early end was not retried').toBe(2)
+      busy = false
+      await vi.advanceTimersByTimeAsync(2_100)
+      const calls = t.recorder.callsFor('/tracks/1/stream')
+      expect(calls.length, 'the failed resume was not asked again').toBe(3)
+      expect(calls[2]?.url, 'the resume did not ask from the buffered end').toContain('start_ms=1000')
+      expect(t.video.currentTime, 'the failed resume moved the playhead').toBe(1)
+      expect(t.recorder.callsFor('/tracks/2/stream').length, 'the failed resume restarted the audio').toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+    t.close()
+  })
+
+  it('a busy answer after a seek fetches the new position', async () => {
+    // The seek's audio follow-up gets a 503. Its retry must ask for the new position, not resume
+    // the range the old body fed at the old position.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 2; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    let busy = true
+    t.recorder.answer('/tracks/2/stream', () =>
+      busy ? { status: 503 } : { startMs: 19_000, body: () => new FakeBody() },
+    )
+    t.video.currentTime = 20
+    await settle()
+    const asked = t.recorder.callsFor('/tracks/2/stream')
+    expect(asked.length, 'the seek did not ask for the audio').toBe(2)
+    expect(asked[1]?.url, 'the seek did not ask for the audio at the seek').toContain('start_ms=19000')
+    busy = false
+    await sleep(1_100)
+    await settle()
+    const calls = t.recorder.callsFor('/tracks/2/stream')
+    expect(calls.length, 'the busy answer was not retried').toBe(3)
+    expect(calls[2]?.url, 'the retry went back to the old position').toContain('start_ms=19000')
+    t.close()
+  })
+
+  it('a busy answer during an audio switch starts at the playhead', async () => {
+    // The new audio track's first body gets a 503. The buffer still holds the old track to media
+    // 3; the retry must ask for the new track at the playhead, not at the old track's range end,
+    // which would leave the old language playing up to it.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 3; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    let busy = true
+    t.recorder.answer('/tracks/3/stream', () =>
+      busy ? { status: 503 } : { startMs: 0, body: () => new FakeBody() },
+    )
+    expect(t.engine.setAudio(PROBE.tracks[2] as MediaTrack), 'the switch was refused').toBe(true)
+    await settle()
+    expect(t.recorder.callsFor('/tracks/3/stream').length, 'the switch did not ask for the new track').toBe(1)
+    busy = false
+    await sleep(1_100)
+    await settle()
+    await settle()
+    const calls = t.recorder.callsFor('/tracks/3/stream')
+    expect(calls.length, 'the busy answer was not retried').toBe(2)
+    expect(calls[1]?.url, 'the retry of the switch did not start at the playhead').toContain('start_ms=0')
+    expect(t.audioBuffer.log.removes, 'the old track was not cut at the playhead').toEqual([[1, 3]])
+    t.close()
+  })
+
+  it('a seek back to the start point restarts', async () => {
+    // The first start writes the playhead before the element has metadata, so no `seeking`
+    // comes for it. A later seek back to that same point, outside the buffer, is the person's
+    // and must restart the streams like any other.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    const { video, loadMetadata } = fakeVideoBeforeMetadata()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(video.currentTime, 'the start did not land at media 1').toBe(1)
+    loadMetadata()
+    recorder.callsFor('/tracks/1/stream')[0]?.body?.push(new Uint8Array([1]))
+    await settle()
+    video.currentTime = 1
+    await settle()
+    await settle()
+    expect(
+      recorder.callsFor('/tracks/1/stream').length,
+      'a seek back to the start point was taken for the engine\'s own move',
+    ).toBe(2)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('the video plays inline', async () => {
+    // Without `playsinline`, iPhone Safari takes the video into its own fullscreen player on
+    // `play()`, past the controls, the menus and the subtitles.
+    const remux = await renderRemux()
+    expect(remux.video.hasAttribute('playsinline'), 'the remuxed video does not play inline').toBe(true)
+    cleanup()
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.hasAttribute('controls'), 'the native path did not render').toBe(true)
+      expect(video.hasAttribute('playsinline'), 'the native video does not play inline').toBe(true)
+    } finally {
+      native.restore()
+    }
+  })
+
+  it('fullscreen falls back to the video on iPhone', async () => {
+    // iPhone Safari has no `requestFullscreen` on elements and no `document.fullscreenElement`;
+    // the video's own `webkitEnterFullscreen` is the fullscreen there is.
+    const { video, dialog } = await renderRemux()
+    Object.defineProperty(dialog, 'requestFullscreen', { value: undefined, configurable: true })
+    Object.defineProperty(document, 'fullscreenElement', { value: undefined, configurable: true })
+    let entered = 0
+    ;(video as HTMLVideoElement & { webkitEnterFullscreen(): void }).webkitEnterFullscreen = () => {
+      entered += 1
+    }
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
+      await settle()
+      expect(entered, 'the Fullscreen button did not use the video fullscreen').toBe(1)
+    } finally {
+      delete (document as unknown as { fullscreenElement?: unknown }).fullscreenElement
+    }
+  })
+
+  it('dragging the seek bar restarts once', async () => {
+    const { recorder, video } = await renderRemux()
+    makeVideoSeekable(video)
+    const seek = screen.getByRole('slider', { name: 'Seek' }) as HTMLInputElement
+    const before = recorder.callsFor('/tracks/1/stream').length
+    fireEvent.pointerDown(seek)
+    for (const value of ['1', '2', '3']) {
+      fireEvent.input(seek, { target: { value } })
+      await settle()
+    }
+    expect(recorder.callsFor('/tracks/1/stream').length - before, 'the drag sought before the release').toBe(0)
+    expect(seek.value, 'the drag did not show where it is').toBe('3')
+    fireEvent.pointerUp(seek)
+    await settle()
+    await settle()
+    const calls = recorder.callsFor('/tracks/1/stream')
+    expect(calls.length - before, 'the release did not seek exactly once').toBe(1)
+    expect(calls.at(-1)?.url, 'the release did not seek to where the drag stopped').toContain('start_ms=3000')
+  })
+
+  it('the audio menu marks the playing track', async () => {
+    await renderRemux()
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const chosen = screen
+      .getAllByRole('option')
+      .filter((option) => option.getAttribute('aria-selected') === 'true')
+      .map((option) => option.textContent ?? '')
+    expect(chosen, 'the Audio menu did not mark the track that is playing').toEqual(['eng'])
+  })
+
+  it('opening a menu focuses its choices', async () => {
+    await renderRemux()
+    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }))
+    await settle()
+    const active = document.activeElement
+    expect(
+      active?.getAttribute('role') === 'option' && active.textContent === 'Off',
+      `the open menu did not take the focus to its chosen option (focus on ${active?.outerHTML.slice(0, 60)})`,
+    ).toBe(true)
+  })
+
+  it('arrows that open a menu leave the volume', async () => {
+    const { video } = await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    audio.focus()
+    fireEvent.keyDown(audio, { key: 'ArrowDown' })
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'ArrowDown did not open the menu').toBe('true')
+    expect(video.volume, 'the ArrowDown that opened the menu moved the volume').toBe(1)
+    fireEvent.keyDown(audio, { key: 'ArrowUp' })
+    await settle()
+    fireEvent.keyDown(audio, { key: 'ArrowDown' })
+    await settle()
+    expect(video.volume, 'an arrow with the menu open moved the volume').toBe(1)
+  })
+
+  it('a press outside a menu closes it', async () => {
+    await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    fireEvent.click(audio)
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'the menu did not open').toBe('true')
+    fireEvent.pointerDown(screen.getByRole('option', { name: 'eng' }))
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'a press inside the menu closed it').toBe('true')
+    fireEvent.pointerDown(screen.getByRole('slider', { name: 'Seek' }))
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'a press outside the menu left it open').toBe('false')
+  })
+
+  it('the seek bar reads its time', async () => {
+    await renderRemux()
+    const seek = screen.getByRole('slider', { name: 'Seek' })
+    expect(seek.getAttribute('aria-valuetext'), 'the Seek bar does not read its time').toBe('0:00 of 0:04')
+  })
+
+  it('an unplayable codec name is display-safe', async () => {
+    const hostile: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'he‮vc\u0007', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const { client } = probeClient(hostile)
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(
+      screen.queryByText('This browser cannot play hevc video.') !== null,
+      'the codec name was drawn without displaySafe',
+    ).toBe(true)
+  })
+
+  it('a file with no video says so', async () => {
+    const audioOnly: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'audio', codec: 'flac', mime_codecs: ['flac'] })],
+    }
+    const { client } = probeClient(audioOnly)
+    render(<Player id="a" file={0} name="song.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(
+      screen.queryByText('This file has no video track to play.') !== null,
+      'a file with no video was described as an unplayable video codec',
+    ).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Download' }) !== null, 'the file was not offered for download').toBe(true)
+  })
+
+  it('keys on the native video stay with its controls', async () => {
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      for (const key of [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) {
+        expect(fireEvent.keyDown(video, { key }), `the player took ${JSON.stringify(key)} from the native controls`).toBe(true)
+      }
+    } finally {
+      native.restore()
+    }
+  })
+
+  it('the native video is in the tab trap', async () => {
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.matches(FOCUSABLE_SELECTOR), 'the native video is not one of the dialog\'s stops').toBe(true)
+      // Tab from Close goes on to the video, the way a browser walks into its controls, rather
+      // than wrapping back to Close as if Close were the dialog's last stop.
+      const close = screen.getByRole('button', { name: 'Close player' })
+      close.focus()
+      expect(fireEvent.keyDown(close, { key: 'Tab' }), 'Tab from Close wrapped past the native video').toBe(true)
+    } finally {
+      native.restore()
+    }
+  })
+
+  it('a remembered position starts with one fetch per track', async () => {
+    // The start at the remembered point is written before the element has metadata, so it
+    // becomes the element's default start position, and the element seeks there when the
+    // metadata arrives: by then the video has fed data. That seek is the start itself, not a
+    // person's, and must not restart a body that is working.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 3000, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 3000, body: () => new FakeBody() }))
+    const { video, loadMetadata } = fakeVideoBeforeMetadata()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    engine.seek(3000)
+    source.open()
+    await settle()
+    expect(video.currentTime, 'the start did not land at the remembered position').toBe(4)
+    recorder.callsFor('/tracks/1/stream')[0]?.body?.push(new Uint8Array([1]))
+    await settle()
+    loadMetadata()
+    await settle()
+    await settle()
+    expect(recorder.callsFor('/tracks/1/stream').length, 'the metadata seek restarted the video').toBe(1)
+    expect(recorder.callsFor('/tracks/2/stream').length, 'the metadata seek restarted the audio').toBe(1)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('tabbing out of a menu closes it', async () => {
+    const { video } = await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    fireEvent.click(audio)
+    await settle()
+    const option = screen.getByRole('option', { name: 'eng' })
+    expect(document.activeElement, 'the open menu did not take the focus').toBe(option)
+    // Tab past the last choice: the focus goes on to the next control, outside the menu.
+    const next = screen.getByRole('button', { name: 'Subtitles' })
+    fireEvent.blur(option, { relatedTarget: next })
+    next.focus()
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'the menu stayed open with the focus outside it').toBe('false')
+    expect(document.activeElement, 'closing the menu took the focus back').toBe(next)
+    // The player's keys work again: `m` mutes.
+    fireEvent.keyDown(next, { key: 'm' })
+    await settle()
+    expect(video.muted, 'the keys stayed off after the menu lost the focus').toBe(true)
+  })
+
+  it('the seek bar stays where it was released', async () => {
+    // The release seeks outside the buffer, and no `timeupdate` comes until the data does: the
+    // bar must stay where it was let go, not jump back to the old time.
+    const { video } = await renderRemux()
+    makeVideoSeekable(video)
+    const seek = screen.getByRole('slider', { name: 'Seek' }) as HTMLInputElement
+    fireEvent.pointerDown(seek)
+    fireEvent.input(seek, { target: { value: '3' } })
+    await settle()
+    fireEvent.pointerUp(seek)
+    expect(seek.value, 'the bar jumped back on release').toBe('3')
+    await settle()
+    expect(seek.value, 'the bar jumped back while waiting for data').toBe('3')
   })
 })

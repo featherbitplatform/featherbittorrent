@@ -10,7 +10,8 @@
  * zero-length file counts as whole, as `share` does in `fbtt-tui/src/view/detail.rs`. Paths are
  * remote text and go through `displaySafe` before they are drawn.
  *
- * A row whose path ends in one of the playable video extensions gets a `Play` button, the way
+ * A row whose path ends in one of the playable video extensions gets a `Play <path>` button (the
+ * path the row shows, so each row's button has a name of its own), the way
  * milestone 2 can act on it: the button opens the player, and the player decides what the browser
  * will do with the file. The extensions are matched case-insensitively, and a pad file never gets
  * one, because a pad file is padding and not a file.
@@ -113,7 +114,7 @@ export default function Files({ files, viewportHeight, id, onPlay }: FilesProps)
                   {id !== undefined && onPlay !== undefined && !file.pad && isPlayablePath(file.path) && (
                     <button
                       type="button"
-                      aria-label="Play"
+                      aria-label={`Play ${path}`}
                       onClick={() => {
                         onPlay(file.index)
                       }}

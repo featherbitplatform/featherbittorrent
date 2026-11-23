@@ -154,6 +154,8 @@ interface VideoLike extends EventTarget {
   srcObject?: unknown
   disableRemotePlayback?: boolean
   currentTime: number
+  /** `HAVE_NOTHING` (0) until the element has its metadata; a write then fires no `seeking`. */
+  readyState: number
   buffered: { length: number; start(i: number): number; end(i: number): number }
 }
 
@@ -317,6 +319,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   // The point the engine itself put the playhead at, so the `seeking` that write fires is not
   // answered with a restart of the streams it was just asking for.
   let engineSeekTo: number | null = null
+  // The video stream's generation when the engine made that write, or null when the element had
+  // no metadata yet. A write before metadata fires no `seeking`: it becomes the element's default
+  // start position, and the element seeks there (firing `seeking` at that point) once its
+  // metadata arrives, however much data the body has fed by then. So a point written before
+  // metadata is kept until that seek; one written after it names the engine's own move only while
+  // the body that made it is still the live one.
+  let engineSeekGeneration: number | null = null
   let videoStream: Stream
   let audioStream: Stream | null
 
@@ -417,8 +426,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       const startMsLanded = Math.max(requestedMs, bodyStartMs)
       if (stream.role !== 'video' || !stream.isStart) return
       stream.isStart = false
-      engineSeekTo = mapTimes.toMedia(startMsLanded)
-      video.currentTime = engineSeekTo
+      const landed = mapTimes.toMedia(startMsLanded)
+      const beforeMetadata = video.readyState === 0
+      // A start at 0 before metadata is the element's own default: no seek ever comes for it, so
+      // there is nothing to arm.
+      engineSeekTo = beforeMetadata && landed === 0 ? null : landed
+      engineSeekGeneration = beforeMetadata ? null : stream.generation
+      video.currentTime = landed
       // The follow is asked for at the same point the primary landed on.
       if (follow !== null) beginStream(follow, bodyStartMs)
       if (state === 'loading') setState('playing')
@@ -440,6 +454,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     stream.atEnd = false
     stream.isStart = true
     stream.fedTo = null
+    // The body this call opens begins here until its answer says otherwise: a body that fails
+    // before it answers (a 503, a 504, the network) must not leave the last body's start in
+    // place, or its retry resumes from where the old body was, not from where this one was asked.
+    stream.bodyStartMs = Math.max(0, startMs)
 
     const abort = new AbortController()
     stream.abort = abort
@@ -459,11 +477,16 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         // The engine's own abort is not a failure: the stream is being replaced, and the old
         // fetch is the way the engine said so.
         if (destroyed || abort.signal.aborted || isAbort(cause)) return
-        // A network error is a wait, not an end: the state, and its retries. A first fetch of
-        // the video that fails re-runs the whole start, so the audio is asked for too.
+        // A network error is a wait, not an end: the state, and its retries. A start of the
+        // video that fails re-runs the whole start, so the audio is asked for too. A resume (a
+        // retry, which has no `onStarted`) only asks again: a restart would move the playhead to
+        // the far end of what is buffered and skip everything in between.
         setState('waiting')
-        if (stream.role === 'video') scheduleRetry(stream, () => restartAll(startMs))
-        else scheduleRetry(stream)
+        if (stream.role === 'video' && onStarted !== undefined) {
+          scheduleRetry(stream, () => restartAll(startMs))
+        } else {
+          scheduleRetry(stream)
+        }
         return
       }
       if (destroyed || abort.signal.aborted) return
@@ -473,7 +496,8 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         if (response.status === 504 || response.status === 503) {
           const retryAfterMs = parseRetryAfterMs(response)
           setState('waiting')
-          if (stream.role === 'video') {
+          // The same rule as the network error: only a start is re-run whole.
+          if (stream.role === 'video' && onStarted !== undefined) {
             scheduleRetry(stream, () => restartAll(startMs), retryAfterMs ?? undefined)
           } else {
             scheduleRetry(stream, undefined, retryAfterMs ?? undefined)
@@ -875,6 +899,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       // range an hour ahead is not this body's, and the retry must not start past it; the range
       // the playhead sits in may be one the body already left, and refetching it is waste. A
       // body with no data in the buffer resumes from its own start.
+      //
+      // An audio switch that has not reached its `changeType` is the exception: the buffer still
+      // holds the old track, and its range is not the new track's data. Resuming from its end
+      // would leave the old language playing up to it, so the new track is asked for at the
+      // playhead, or at the body's own start when that is later.
+      if (stream.pendingType !== null) {
+        beginStream(stream, Math.max(stream.bodyStartMs, mapTimes.toSource(video.currentTime)))
+        return
+      }
       const rangeEnd = fedRangeEnd(stream)
       const fromMs = rangeEnd > 0 ? mapTimes.toSource(rangeEnd) : stream.bodyStartMs
       beginStream(stream, fromMs)
@@ -976,7 +1009,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (engineSeekTo !== null) {
       const target = engineSeekTo
       engineSeekTo = null
-      if (Math.abs(time - target) < 1e-3) return
+      // A point written before metadata is the element's own seek at metadata, whatever the body
+      // has fed since; one written after it is the engine's own move while that body is live.
+      // Otherwise a person seeking to the same point gets the coverage check like any seek.
+      const own =
+        engineSeekGeneration === null ||
+        (videoStream !== undefined && videoStream.generation === engineSeekGeneration)
+      if (own && Math.abs(time - target) < 1e-3) return
     }
     const covered = video.buffered.length > 0 &&
       [...Array(video.buffered.length).keys()].some(

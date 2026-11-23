@@ -67,6 +67,11 @@ const ERROR_COPY = 'Playback failed.'
 function unplayableCopy(codec: string): string {
   return `This browser cannot play ${codec} video.`
 }
+/**
+ * The sentence for a file with no video track at all (an audio file, or a file the probe found no
+ * tracks in): there is no video codec to name, and this player plays video files only.
+ */
+const NO_VIDEO_COPY = 'This file has no video track to play.'
 
 /** The words a track is listed under: its name when it has one, its language when it does not. The name is remote text, so it goes through `displaySafe` on the way out. */
 function trackLabel(track: MediaTrack): string {
@@ -139,11 +144,40 @@ function ChoiceMenu({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const wrapperRef = useRef<HTMLDivElement>(null)
+  // The latest report, for the listener below: it is added once per open, not once per render.
+  const onMenuChangeRef = useRef(onMenuChange)
+  useEffect(() => {
+    onMenuChangeRef.current = onMenuChange
+  }, [onMenuChange])
 
   function setOpenAndReport(next: boolean): void {
     setOpen(next)
     onMenuChange(next)
   }
+
+  // An open menu takes the focus into its choices, the chosen one first, so the arrows move
+  // through the list from where the person is; and a press anywhere outside the menu closes it,
+  // the way a menu closes when a person moves on, without taking the focus back to the button.
+  useEffect(() => {
+    if (!open) return
+    const list = listRef.current
+    const target =
+      list?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]:not([disabled])') ??
+      list?.querySelector<HTMLElement>('[role="option"]:not([disabled])') ??
+      null
+    target?.focus()
+    const onPointerDown = (event: Event): void => {
+      const wrapper = wrapperRef.current
+      if (wrapper !== null && event.target instanceof Node && wrapper.contains(event.target)) return
+      setOpen(false)
+      onMenuChangeRef.current(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+    }
+  }, [open])
 
   function close(): void {
     setOpenAndReport(false)
@@ -158,6 +192,12 @@ function ChoiceMenu({
       }
       return
     }
+    // Escape closes the menu even when it has no choice that can be taken.
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      close()
+      return
+    }
     const items = Array.from(
       listRef.current?.querySelectorAll<HTMLElement>('[role="option"]:not([disabled])') ?? [],
     )
@@ -166,11 +206,6 @@ function ChoiceMenu({
     // focus, and Enter takes the focused option, so a person can move and then choose.
     const focused = items.findIndex((item) => item === listRef.current?.querySelector<HTMLElement>(':focus'))
     const current = focused !== -1 ? focused : items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      close()
-      return
-    }
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
       const key = items[current === -1 ? 0 : current]?.getAttribute('data-key')
@@ -189,7 +224,18 @@ function ChoiceMenu({
   }
 
   return (
-    <div className="relative" onKeyDown={onKeyDown}>
+    <div
+      ref={wrapperRef}
+      className="relative"
+      onKeyDown={onKeyDown}
+      onBlur={(event) => {
+        // Focus that leaves the menu (Tab past its last choice) closes it, and leaves the focus
+        // where it went: an open menu nobody is in would keep the player's keys off.
+        const next = event.relatedTarget
+        if (!open || (next instanceof Node && wrapperRef.current?.contains(next) === true)) return
+        setOpenAndReport(false)
+      }}
+    >
       <button
         ref={buttonRef}
         type="button"
@@ -274,6 +320,11 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
+  // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
+  // the buffer restarts the streams, and a drag writes dozens of values.
+  const [scrub, setScrub] = useState<number | null>(null)
+  const draggingRef = useRef(false)
   // True while a menu is open: the dialog's key handler ignores keys from inside it, so an
   // `ArrowUp` in the Audio listbox does not move the volume. Each menu keeps its own flag:
   // closing one while the other is open is the way a person works, and the handler has to
@@ -455,6 +506,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('timeupdate', onTime)
+    // A seek (a key, a nudge, the engine's own landing) moves the shown time at once, not when
+    // the data for it arrives.
+    video.addEventListener('seeking', onTime)
     video.addEventListener('volumechange', onVolume)
     video.addEventListener('canplay', onCanPlay)
 
@@ -470,6 +524,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('timeupdate', onTime)
+      video.removeEventListener('seeking', onTime)
       video.removeEventListener('volumechange', onVolume)
       video.removeEventListener('canplay', onCanPlay)
       save()
@@ -640,8 +695,57 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   function toggleFullscreen(): void {
     const root = dialogRef.current
     if (root === null) return
-    if (document.fullscreenElement !== null) void document.exitFullscreen()
-    else root.requestFullscreen?.()
+    // `!= null`, not `!== null`: a browser without the Fullscreen API (iPhone Safari) has no
+    // `fullscreenElement` at all, and reads it as `undefined`.
+    if (document.fullscreenElement != null) {
+      if (typeof document.exitFullscreen === 'function') void document.exitFullscreen().catch(() => {})
+      return
+    }
+    if (typeof root.requestFullscreen === 'function') {
+      void root.requestFullscreen().catch(() => {
+        // A refused fullscreen leaves the player as it was.
+      })
+      return
+    }
+    // iPhone Safari has no `requestFullscreen` on elements: the video's own fullscreen player is
+    // the one fullscreen there is.
+    const video = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null
+    if (typeof video?.webkitEnterFullscreen === 'function') {
+      try {
+        video.webkitEnterFullscreen()
+      } catch {
+        // Before the video has its metadata, Safari refuses with `InvalidStateError`.
+      }
+    }
+  }
+
+  /** Move the playhead to a point of the Seek bar, in source seconds. */
+  function commitSeek(sourceSeconds: number): void {
+    const video = videoRef.current
+    if (video === null) return
+    // The bar is in source time: the value is source seconds, mapped to the element.
+    video.currentTime = toMedia(sourceSeconds * 1000, probe?.time_offset_ms ?? 0)
+    // The bar stays where it was put: a seek outside the buffer fires no `timeupdate` until the
+    // data arrives, and the old time would pull it back meanwhile.
+    setTime(Math.round(sourceSeconds * 1000))
+  }
+
+  /**
+   * A pointer went down on the Seek bar: the values it writes are shown, not sought, until it
+   * comes up (or the browser takes it away), and the release seeks once to where it stopped.
+   */
+  function startDrag(input: HTMLInputElement): void {
+    draggingRef.current = true
+    const finish = (): void => {
+      window.removeEventListener('pointerup', finish)
+      window.removeEventListener('pointercancel', finish)
+      if (!draggingRef.current) return
+      draggingRef.current = false
+      commitSeek(Number(input.value))
+      setScrub(null)
+    }
+    window.addEventListener('pointerup', finish)
+    window.addEventListener('pointercancel', finish)
   }
 
   function nextAudio(): void {
@@ -696,6 +800,19 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   function onDialogKey(event: KeyboardEvent): void {
     const target = event.target
+    // A key a menu already answered (the ArrowDown that opens it, the arrows that move in it) is
+    // the menu's; and while a menu is open, every key is the menu's, so an `ArrowUp` there never
+    // also moves the volume.
+    if (event.defaultPrevented || menuOpen) return
+    // The native video's own controls take Space and the arrows when they have the focus: the
+    // player must not take the keys away from them.
+    if (
+      target instanceof HTMLVideoElement &&
+      target.controls &&
+      [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)
+    ) {
+      return
+    }
     // A key from inside a range input or an open menu is the menu's, not the player's: an
     // `ArrowUp` on a listbox option moves the cursor, and the same key here would move the
     // volume. The menu's `role` on its items and its listbox names it either way.
@@ -760,6 +877,8 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         }))
       : []
   const subtitleChoices = subtitleOptions()
+  // The Seek bar's position: where a drag is, or where the playhead is.
+  const shownSec = scrub ?? time / 1000
 
   return (
     <dialog
@@ -798,7 +917,11 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
       {probe !== null && choice?.kind === 'unplayable' && (
         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
-          <p className="max-w-sm text-[14px] text-strong">{unplayableCopy(choice.codec)}</p>
+          <p className="max-w-sm text-[14px] text-strong">
+            {probe.tracks.some((entry) => entry.kind === 'video')
+              ? unplayableCopy(displaySafe(choice.codec))
+              : NO_VIDEO_COPY}
+          </p>
           <button
             type="button"
             aria-label="Download"
@@ -816,14 +939,18 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
       {probe !== null && choice?.kind === 'native' && (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
-          <video ref={videoRef} src={nativeSrc ?? undefined} controls className="max-h-full max-w-full" />
+          {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
+              player on `play()`. */}
+          <video ref={videoRef} src={nativeSrc ?? undefined} controls playsInline className="max-h-full max-w-full" />
         </div>
       )}
 
       {probe !== null && choice?.kind === 'remux' && (
         <>
           <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
-            <video ref={videoRef} className="h-full w-full max-h-full max-w-full object-contain" />
+            {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
+                player on `play()`, past the controls, the menus and the subtitles drawn here. */}
+            <video ref={videoRef} playsInline className="h-full w-full max-h-full max-w-full object-contain" />
             {waiting && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>
@@ -845,17 +972,19 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               min={0}
               max={durationSourceSec}
               step={0.1}
-              value={time / 1000}
+              value={shownSec}
+              aria-valuetext={`${clock(shownSec)} of ${clock(durationSourceSec)}`}
+              onPointerDown={(event) => startDrag(event.currentTarget)}
               onChange={(event) => {
-                const video = videoRef.current
-                if (video === null) return
-                // The bar is in source time: the value is source seconds, mapped to the element.
-                video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
+                const value = Number(event.target.value)
+                // A drag shows the value and seeks on release; a key step seeks at once.
+                if (draggingRef.current) setScrub(value)
+                else commitSeek(value)
               }}
               className="h-1.5 w-full shrink-0 min-[641px]:w-auto min-[641px]:min-w-0 min-[641px]:shrink flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent max-[640px]:order-first max-[640px]:flex-none"
             />
             <span className="font-mono text-[12px] text-strong">
-              {clock(time / 1000)} / {clock(durationSourceSec)}
+              {clock(shownSec)} / {clock(durationSourceSec)}
             </span>
             <IconButton label={paused ? 'Play' : 'Pause'} onClick={togglePlay}>
               {paused ? <Play className="h-4 w-4" aria-hidden="true" /> : <Pause className="h-4 w-4" aria-hidden="true" />}
@@ -894,7 +1023,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               <ChoiceMenu
                 label="Audio"
                 options={audioOptions}
-                selected={audioKey ?? ''}
+                selected={audioKey ?? (choice.audio === null ? '' : String(choice.audio.id))}
                 onChoose={chooseAudio}
                 onMenuChange={setAudioMenuOpen}
               />

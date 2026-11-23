@@ -606,26 +606,62 @@ export function makeVideoPlayable(video: HTMLVideoElement): void {
 }
 
 /**
- * A video element's side of the engine's contract, as a test builds it.
- *
- * It behaves the way a browser's element does for the one field the engine writes: setting
- * `currentTime` fires `seeking` asynchronously, once the element has loaded its metadata. jsdom's
- * `currentTime` is a plain field, so it is stood in for with a setter that fires the event.
+ * Give an element the browser's `currentTime` and `readyState`: a write fires `seeking`
+ * asynchronously once the element has loaded its metadata (`readyState` 1, `HAVE_METADATA`), and
+ * fires nothing before that (`readyState` 0): the spec only records the write as the default
+ * playback start position then, and seeks there, firing `seeking`, when the metadata arrives if
+ * that point is above 0. jsdom's `currentTime` is a plain field and its `readyState` is always 0,
+ * so both are stood in for. `metadata: false` starts the element before its metadata, and the
+ * handle's `loadMetadata` is the moment it arrives.
  */
-export function fakeVideo(): HTMLVideoElement {
-  const video = document.createElement('video')
-  makeVideoPlayable(video)
+export function makeVideoSeekable(
+  video: HTMLVideoElement,
+  options: { metadata?: boolean } = {},
+): { loadMetadata(): void } {
   let current = 0
+  let metadata = options.metadata ?? true
+  const fireSeeking = (): void => queueMicrotask(() => video.dispatchEvent(new Event('seeking')))
   Object.defineProperty(video, 'currentTime', {
     get: (): number => current,
     set: (value: number): void => {
       current = value
-      // A browser fires `seeking` asynchronously once metadata is loaded; the element here has no
-      // metadata to wait for, so the event goes out on the next microtask, the way the browser's
-      // does relative to the write.
-      queueMicrotask(() => video.dispatchEvent(new Event('seeking')))
+      // A browser fires `seeking` asynchronously once metadata is loaded; the event goes out on
+      // the next microtask, the way the browser's does relative to the write.
+      if (metadata) fireSeeking()
     },
     configurable: true,
   })
+  Object.defineProperty(video, 'readyState', {
+    get: (): number => (metadata ? 1 : 0),
+    configurable: true,
+  })
+  return {
+    loadMetadata(): void {
+      if (metadata) return
+      metadata = true
+      // The default playback start position: a point above 0 is sought to now.
+      if (current > 0) fireSeeking()
+    },
+  }
+}
+
+/**
+ * A video element's side of the engine's contract, as a test builds it.
+ *
+ * It behaves the way a browser's element does for the one field the engine writes: setting
+ * `currentTime` fires `seeking` asynchronously, once the element has loaded its metadata.
+ */
+export function fakeVideo(): HTMLVideoElement {
+  const video = document.createElement('video')
+  makeVideoPlayable(video)
+  makeVideoSeekable(video)
   return video
+}
+
+/** A fake video whose metadata has not loaded yet: its writes fire no `seeking` until `loadMetadata`. */
+export function fakeVideoBeforeMetadata(): { video: HTMLVideoElement; loadMetadata(): void } {
+  const video = document.createElement('video')
+  makeVideoPlayable(video)
+  const handle = makeVideoSeekable(video, { metadata: false })
+  return { video, loadMetadata: handle.loadMetadata }
 }
