@@ -308,6 +308,7 @@ export default function DetailPane({
             files={live.data as FileInfo[]}
             viewportHeight={viewportHeight}
             id={id}
+            client={client}
             onPlay={(index) => {
               const file = (live.data as FileInfo[]).find((entry) => entry.index === index)
               if (file !== undefined) setPlaying({ file: index, name: file.path })

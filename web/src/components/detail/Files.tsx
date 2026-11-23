@@ -2,8 +2,8 @@
  * The Files tab: what the selected torrent is made of and how much of it is on disk.
  *
  * The columns are the prototype's - path, size, done and priority - with no "Play in browser" in
- * this milestone: priorities are edited in milestone 2, so this list is read-only and carries no
- * buttons at all. BEP 47 pad files (`pad === true`, length is padding, never written to disk) are
+ * this milestone: a row's priority is a native select that rewrites the whole priority list (see
+ * `change`), and the only button a row may carry is Play. BEP 47 pad files (`pad === true`, length is padding, never written to disk) are
  * hidden the way the TUI hides them, so a row count here counts real files. `downloaded` counts
  * bytes that live inside verified pieces, which is why the TUI treats a file at or past its length
  * as finished and draws it in the seeding colour even while the torrent still wants the rest; a
@@ -21,9 +21,11 @@
  *
  * @module components/detail/Files
  */
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Play } from 'lucide-react'
-import type { FileInfo } from '../../api/client'
+import { errorMessage } from '../../api/client'
+import type { Api, FileInfo } from '../../api/client'
+import Banner from '../Banner'
 import { displaySafe, formatBytes, formatPercent } from '../../format'
 import { DETAIL_ROW_HEIGHT, DETAIL_ROW_RULE, useRowWindow } from './window'
 
@@ -35,7 +37,13 @@ export interface FilesProps {
   id?: string
   /** Open the player on a file. Only called for a file the player can open. */
   onPlay?: (index: number) => void
+  /** The client a priority change goes through. Without it the priority is only a word. */
+  client?: Api
 }
+
+/** The priorities a file can be given. `unknown` is only ever reported, never requested. */
+const CHOICES = ['skip', 'low', 'normal', 'high'] as const
+type Choice = (typeof CHOICES)[number]
 
 /** The path endings the player offers to play, matched case-insensitively. */
 const PLAYABLE_SUFFIXES = ['.mkv', '.mp4', '.m4v', '.webm', '.mov']
@@ -46,7 +54,32 @@ function isPlayablePath(path: string): boolean {
   return PLAYABLE_SUFFIXES.some((suffix) => lower.endsWith(suffix))
 }
 
-export default function Files({ files, viewportHeight, id, onPlay }: FilesProps) {
+export default function Files({ files, viewportHeight, id, onPlay, client }: FilesProps) {
+  const [error, setError] = useState<string | null>(null)
+
+  /**
+   * The server wants one entry per file, pads included, so the list is read back first, the one
+   * entry changed and the whole list sent (the TUI's rule), and a stale pane cannot undo another
+   * client's change to a file it did not touch.
+   */
+  async function change(index: number, priority: Choice): Promise<void> {
+    if (client === undefined || id === undefined) return
+    setError(null)
+    try {
+      const fresh = [...(await client.files(id))].sort((a, b) => a.index - b.index)
+      if (!fresh.some((entry) => entry.index === index)) {
+        setError(`no file with index ${index}`)
+        return
+      }
+      const priorities = fresh.map((entry): Choice =>
+        entry.index === index ? priority : entry.priority === 'unknown' ? 'normal' : entry.priority,
+      )
+      await client.setFilePriorities(id, priorities)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    }
+  }
+
   const shown = useMemo(() => files.filter((file) => !file.pad), [files])
   const { boxRef, onScroll, start, end, padTop, padBottom } = useRowWindow(
     shown.length,
@@ -55,6 +88,7 @@ export default function Files({ files, viewportHeight, id, onPlay }: FilesProps)
 
   return (
     <div ref={boxRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
+      {error !== null && <Banner tone="danger">{error}</Banner>}
       <table className="w-full min-w-[560px] border-separate border-spacing-0">
         <caption className="sr-only">Files of the selected torrent</caption>
         <thead>
@@ -108,7 +142,24 @@ export default function Files({ files, viewportHeight, id, onPlay }: FilesProps)
                 <td
                   className={`box-border h-7 truncate px-3 text-[12px] leading-4 text-body ${DETAIL_ROW_RULE}`}
                 >
-                  {file.priority}
+                  {client !== undefined && id !== undefined ? (
+                    <select
+                      aria-label={`Priority of ${path}`}
+                      value={file.priority === 'unknown' ? 'normal' : file.priority}
+                      onChange={(event) => {
+                        void change(file.index, event.target.value as Choice)
+                      }}
+                      className="h-6 cursor-pointer rounded-control border border-rule bg-transparent px-1 text-[12px] text-body"
+                    >
+                      {CHOICES.map((choice) => (
+                        <option key={choice} value={choice}>
+                          {choice}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    file.priority
+                  )}
                 </td>
                 <td className={`box-border h-7 px-3 text-right ${DETAIL_ROW_RULE}`}>
                   {id !== undefined && onPlay !== undefined && !file.pad && isPlayablePath(file.path) && (

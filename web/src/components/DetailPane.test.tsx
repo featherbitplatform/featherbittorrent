@@ -342,6 +342,97 @@ describe('what the pane reads', () => {
   })
 })
 
+describe('file priorities', () => {
+  type Prio = FileInfo['priority']
+  function prioClient(initial: FileInfo[], fail?: ApiError) {
+    let current = initial
+    const sent: Array<{ id: string; priorities: string[] }> = []
+    const client = {
+      files: vi.fn(async () => current),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async (id: string, priorities: string[]) => {
+        if (fail !== undefined) throw fail
+        sent.push({ id, priorities })
+        current = current.map((f, i) => ({ ...f, priority: priorities[i] as Prio }))
+      }),
+    } as unknown as Api
+    return { client, sent }
+  }
+  const choose = (name: string, value: string): void => {
+    fireEvent.change(screen.getByLabelText(`Priority of ${name}`), { target: { value } })
+  }
+
+  it("a file's priority can be changed", async () => {
+    const { client, sent } = prioClient([
+      file(0, { priority: 'high' }),
+      file(1),
+      file(2, { priority: 'low' }),
+    ])
+    const { container, rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'skip')
+    await flush()
+    expect(
+      JSON.stringify(sent) === JSON.stringify([{ id: 'a', priorities: ['high', 'skip', 'low'] }]),
+      'the change did not send the whole list with only that file changed',
+    ).toBe(true)
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'skip',
+      'the cell does not show the new priority after a refresh',
+    ).toBe(true)
+    expect(container.querySelectorAll('tbody select').length === 3, 'a row has no select').toBe(true)
+  })
+
+  it('pad files keep their priority', async () => {
+    const { client, sent } = prioClient([
+      file(0),
+      file(1, { pad: true, priority: 'skip' }),
+      file(2),
+    ])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-2.bin', 'high')
+    await flush()
+    expect(
+      sent.length === 1 && JSON.stringify(sent[0]?.priorities) === JSON.stringify(['normal', 'skip', 'high']),
+      'the pad file lost its place or its priority in the sent list',
+    ).toBe(true)
+  })
+
+  it('an unknown priority is sent as normal', async () => {
+    const { client, sent } = prioClient([file(0, { priority: 'unknown' }), file(1)])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'low')
+    await flush()
+    expect(
+      sent.length === 1 && JSON.stringify(sent[0]?.priorities) === JSON.stringify(['normal', 'low']),
+      'unknown was sent as it is',
+    ).toBe(true)
+  })
+
+  it("a refused change shows the server's reason", async () => {
+    const { client } = prioClient(
+      [file(0), file(1)],
+      new ApiError(409, 'no_metadata', 'metadata\u202e is not known\u0007 yet'),
+    )
+    const { container } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'skip')
+    await flush()
+    const text = pane(container)?.textContent ?? ''
+    expect(text.includes('metadata is not known yet'), 'the refusal was not shown, or not cleaned').toBe(true)
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'normal',
+      'the cell moved although the server refused',
+    ).toBe(true)
+  })
+})
+
 describe('the files tab', () => {
   const files = [
     file(0, { path: 'ubuntu.iso', len: 5_800_000_000, downloaded: 3_596_000_000 }),
