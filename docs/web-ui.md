@@ -84,104 +84,75 @@ Streaming and playing video in the browser are provided by Playing media below.
 
 ## Playing media
 
-The web UI plays video and audio files in the browser.
+Files that show a `Play` button in the Files tab are those whose path ends with `.mkv`, `.mp4`,
+`.m4v`, `.webm` or `.mov` (case-insensitive) and are not padding files, exactly as the code
+decides (components/detail/Files.tsx:113). Pressing the button opens the player modal and starts
+playback immediately; a torrent's pieces can still be downloading when playback begins.
 
-- Supported **video containers** are Matroska, WebM and MP4; supported **video codecs**
-are H.264, HEVC and AV1.
-- Supported **audio codecs** are AAC, Opus, FLAC, MP3, AC-3 and E-AC-3. Each audio
-codec plays where the browser can decode it.
+### How a file is played
 
-### Starting playback
+The player tries one of three ways in the order listed below:
 
-A `Play` button appears on rows in the Files tab whose path ends in `.mkv`, `.mp4`,
-`.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player with an
-`aria-label` of `Play <file name>` and a `Close player` button.
+1. **Native**: a WebM file whose video tracks are VP8 or VP9, or the browser reports it can play
+  the file's mime type (player/tracks.ts:56), and the player does not show its own menus or draw
+  its own controls; the browser's built‑in controls are on screen.
 
-VP8/VP9 video in a WebM container plays natively, without audio or subtitle choice.
+2. **Remuxed**: every other playable file. The server repackages its tracks and the player's own
+  controls, menus, and keys are used; playback starts from where you last left off if the saved
+  position is before the file end.
 
-### The player
-
-- `Audio`: change between playable audio tracks while video plays.
-- `Subtitles`: choose or turn off text tracks (embedded or as separate SRT/ASS/VTT
-files). Image-based subtitles like PGS or VobSub are shown disabled with the message
-`Image subtitles cannot be shown here.`
-
-### Keys
-
-`Space` or `k` toggles play or pause; `ArrowLeft` or `ArrowRight` moves 5 seconds;
-`ArrowUp` or `ArrowDown` changes volume by 0.1; `m` toggles mute; `a` selects the next
-playable audio track; `c` cycles through subtitles including Off; `f` enters fullscreen;
-`Escape` closes the player.
-
-### Player modes
-
-The player can open a file in one of three ways, each with its own HTML element and controls:
-
-- **Native path**: the browser plays the file on its own. The file appears in a `<video>
-  element with its `src` set to a 60-second token signed by the server (player/Player.tsx:769-773). The
-  browser's own controls are on screen, or none when the element is `controls`-less, and the keys do
-  nothing. The browser must report it can play the file's mime (player/tracks.ts:100); otherwise the
-  browser shifts to the unplayable mode.
-
-- **Remux path**: the player remuxes the file into a single MP4 stream the browser's `ManagedMediaSource`
-  (or `MediaSource`) understands (player/tracks.ts:81-97), and the `SourceBuffer`s it fills from the
-  server feed the video element. The player draws its own controls around it, and the keys work.
-
-- **Unplayable**: when neither path can play the file, the player shows the sentence
-  `This browser cannot play <codec> video.` and offers a `Download` button to save the file.
-  The codec shown is the first track's codec if any, else `unknown` (player/tracks.ts:76-80).
+3. **Unplayable**: when the file contains no playable track, the player draws the sentence
+  `This browser cannot play <codec> video.` and a `Download` button. The codec shown is the video
+  track's codec; if the file has no video track it is the first track's codec or `unknown`
+  (player/tracks.ts:76-84).
 
 ### Controls
 
-The remux path's own controls are:
+The remuxed player shows the following controls by their exact labels:
 
-- `Seek`: a range input with the `aria-label` of `Seek` that jumps to a point in the file.
-- `Play` / `Pause`: an icon button whose `aria-label` changes between `Play` and `Pause` that starts and
-  stops playback.
-- `Back 5 seconds`: an icon button with the `aria-label` `Back 5 seconds` that moves the playhead 5
-  seconds back.
-- `Forward 5 seconds`: an icon button with the `aria-label` `Forward 5 seconds` that moves the playhead
-  5 seconds forward.
-- `Mute` / `Unmute`: an icon button whose `aria-label` toggles between `Mute` and `Unmute` and sets
-  audio volume to 0.
-- `Volume`: a range input with the `aria-label` `Volume` that sets volume from 0 to 1 in steps of 0.05.
-- `Fullscreen`: an icon button with the `aria-label` `Fullscreen` that toggles fullscreen mode.
-- `Audio`: a menu labeled `Audio` listing playable audio tracks; a track the browser cannot play is
-  labeled with `: not playable here`.
-- `Subtitles`: a menu labeled `Subtitles` listing the subtitle tracks; image-based subtitles like PGS
-  appear disabled with the text `<name>: Image subtitles cannot be shown here.`
+- `Seek`: a range input that moves the playhead to any point in the file.
+- `Play` and `Pause`: a toggle that starts and stops playback.
+- `Back 5 seconds` and `Forward 5 seconds`: icon buttons that move the playhead 5 seconds back and
+  forward.
+- `Mute` and `Unmute`: an icon button that toggles the audio on and off.
+- `Volume`: a slider that sets the volume from quietest to loudest.
+- `Audio`: a menu that lists the playable audio tracks; a track the browser will not play is
+  listed disabled with the suffix `: not playable here`.
+- `Subtitles`: a menu that lists the available subtitles; Off turns subtitles off and image-based
+  ones like PGS appear disabled with the text `<name>: Image subtitles cannot be shown here.`
+- `Fullscreen`: an icon button that toggles fullscreen mode.
+- `Close player`: a button that closes the modal and stops playback.
 
-Keys affect the remux path only. When focus is in a range input or an open menu, the keys do nothing
-(player/Player.tsx:654-662). A keypress of `f` toggles fullscreen (player/Player.tsx:592-597) in any
-mode.
+`Audio` and `Subtitles` appear only when the player has a choice to make (player/Player.tsx:842,
+851).
 
 ### Keys
 
-While the remux path has focus, the keys are:
+Keys that work for a remuxed file—and only for a remuxed file—are:
 
-`Space` or `k` toggles the player; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds;
-`ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` switches to the next
-playable audio track; `c` cycles through subtitles including Off; `f` toggles fullscreen.
+`Space` or `k` toggles play or pause; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds;
+`ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` selects the next
+playable audio track; `c` cycles through subtitles including Off; `f` toggles fullscreen;
+`Escape` closes the player.
 
-### Position and state
+For a native file the remaining keys besides play/pause, seek, and audio (that is, volume, mute,
+subtitles, fullscreen keys) have no effect beyond what the browser handles on its own.
 
-Play positions are saved every 5 seconds and on close, first after 10 seconds have elapsed, cleared
-within 30 seconds of the file end, and are restored only when shorter than the file's duration
-(player/positions.ts, player/Player.tsx:333-334).
+If a range input or an open menu has focus, all keys in the list do nothing until focus leaves
+it (player/Player.tsx:654-662).
 
-### Engine states
+### Remembered position
 
-- `loading`: the player is starting up.
-- `waiting`: playback reaches a part of the file that has not arrived yet. The player shows
-`Waiting for data...`, keeps trying again from the end of what it already has, until the data is
-there. The engine could not continue.
-- `playing`: the media is playing.
-- `error`: the engine ran into a state it cannot recover from; the player shows only
-`Playback failed.` with no way to recover.
+Play positions are saved to storage every five seconds while playing and when the player closes,
+but not until the playhead is at least 10 seconds into the file (player/positions.ts:13-16).
+Positions within 30 seconds of the file end are cleared (player/positions.ts:54-58). When you
+reopen the file, playback starts at the saved position, provided it is before the file ends or the
+file length is unknown (player/Player.tsx:332-334).
 
-### Unplayable message
+### Waiting and errors
 
-When the browser cannot play a file, the player shows
-`This browser cannot play <codec> video.` and a button with an `aria-label` of `Download` that,
-when clicked, saves the file to your computer. The codec is the first track's codec if any, else
-`unknown`.
+- `Waiting for data...`: the part of the file you are watching has not arrived or the server
+  is busy; the player retries automatically until the data can be played or the file ends.
+
+- `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
+  The player does not recover from this state by itself.
