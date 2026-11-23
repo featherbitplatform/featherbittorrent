@@ -36,7 +36,7 @@ export interface TorrentCardsProps {
   viewportHeight?: number
 }
 
-/** Every card's slot: an 80 px card and the 8 px gap under it. The window maths counts in this. */
+/** Every card's slot: an 80 px card and the 8 px gap under it, both in px (the card is the slot's full content height), so a larger root font cannot make a card overflow its slot. The window maths counts in this. */
 const CARD_HEIGHT = 88
 
 const FIELD =
@@ -111,6 +111,7 @@ export default function TorrentCards({
         </label>
         <input
           id={filterId}
+          data-torrent-filter
           type="search"
           placeholder="Filter by name"
           value={query}
@@ -170,7 +171,7 @@ export default function TorrentCards({
                   onClick={() => {
                     onPick(row.id)
                   }}
-                  className="box-border flex h-20 w-full cursor-pointer flex-col justify-center gap-1.5 overflow-hidden rounded-xl border border-rule bg-ink-800 p-3 text-left"
+                  className="box-border flex h-full w-full cursor-pointer flex-col justify-center gap-1.5 overflow-hidden rounded-xl border border-rule bg-ink-800 p-3 text-left"
                 >
                   <span className="truncate text-[13px] text-strong">{name}</span>
                   <span

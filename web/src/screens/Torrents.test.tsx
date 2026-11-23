@@ -728,4 +728,79 @@ describe('the phone layout', () => {
       'Sorted by name (reverse)',
     )
   })
+
+  it('opening another torrent clears the last action error', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+      pause: () => Promise.reject(new ApiError(400, 'bad_request', 'that torrent cannot be paused')),
+    })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(container.querySelector('[data-card="a"]') as HTMLElement)
+    await flush()
+    fireEvent.click(button('Pause'))
+    await flush()
+    expect(screen.getByRole('dialog', { name: 'Torrent' }).textContent).toContain(
+      'that torrent cannot be paused',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    fireEvent.click(container.querySelector('[data-card="b"]') as HTMLElement)
+    await flush()
+    expect(
+      screen.getByRole('dialog', { name: 'Torrent' }).textContent,
+      "torrent a's refusal showed in torrent b's full view",
+    ).not.toContain('that torrent cannot be paused')
+  })
+
+  it('focus has somewhere to go when the opening card is gone', async () => {
+    const rows = [torrentInfo('a'), torrentInfo('b')]
+    const { client } = fakeClient({ rows })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    // The torrent goes away while its full view is open: its card goes with it.
+    fireEvent.click(container.querySelector('[data-card="b"]') as HTMLElement)
+    await flush()
+    rows.splice(1, 1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+    })
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+    expect(
+      document.activeElement,
+      'with its card gone the focus fell to the page body instead of the filter',
+    ).toBe(screen.getByRole('searchbox', { name: 'Filter torrents' }))
+
+    // The window grows into the table while the view is open: the selected row takes the focus.
+    fireEvent.click(container.querySelector('[data-card="a"]') as HTMLElement)
+    await flush()
+    act(() => {
+      flip(false)
+    })
+    await flush()
+    expect(document.activeElement, 'after a resize the focus did not land on the selected row').toBe(
+      row(container, 'a'),
+    )
+  })
+
+  it('a stale settings popstate does not close a new full view', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    // The late answer to Settings' own `history.back()` lands on the Settings entry.
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate', { state: { fbttSettings: 1 } }))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'a stale Settings popstate closed the full view that was just opened',
+    ).not.toBeNull()
+  })
 })

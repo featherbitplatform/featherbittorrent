@@ -152,8 +152,9 @@ export default function Torrents({
   useEffect(() => {
     const onPop = (event: PopStateEvent): void => {
       if (!pushedRef.current) return
-      const landed = event.state as { fbttFull?: number } | null
-      if (landed?.fbttFull !== undefined) return
+      // A stale answer to either screen's earlier `history.back()` (the full view's or Settings').
+      const landed = event.state as { fbttFull?: number; fbttSettings?: number } | null
+      if (landed?.fbttFull !== undefined || landed?.fbttSettings !== undefined) return
       pushedRef.current = false
       setSelectedId(null)
     }
@@ -185,6 +186,8 @@ export default function Torrents({
       pushedRef.current = true
     }
     openerRef.current = id
+    // The last refusal belongs to the torrent it was about, not to the one being opened now.
+    setActionError(null)
     setSelectedId(id)
   }
 
@@ -307,15 +310,24 @@ export default function Torrents({
   }, [hidden, wake])
 
   const fullOpen = phone && selectedRow !== null
-  // Closing the full view hands the focus back to the card it was opened from.
+  // Closing the full view hands the focus back to the card it was opened from. When that card is
+  // gone (removed, or the window grew into the table) the focus still needs somewhere to land: the
+  // selected row on the desktop, else the name filter, never `body`.
   const wasFull = useRef(false)
   useEffect(() => {
     if (wasFull.current && !fullOpen && openerRef.current !== null) {
-      document.querySelector<HTMLElement>(`[data-card="${CSS.escape(openerRef.current)}"]`)?.focus()
+      const card = document.querySelector<HTMLElement>(
+        `[data-card="${CSS.escape(openerRef.current)}"]`,
+      )
+      const row =
+        !phone && selectedId !== null
+          ? document.querySelector<HTMLElement>(`[data-row="${CSS.escape(selectedId)}"]`)
+          : null
+      ;(card ?? row ?? document.querySelector<HTMLElement>('[data-torrent-filter]'))?.focus()
       openerRef.current = null
     }
     wasFull.current = fullOpen
-  }, [fullOpen])
+  }, [fullOpen, phone, selectedId])
 
   /** An action the server accepted: an older refusal is no longer the news. */
   const clearError = useCallback((): void => {

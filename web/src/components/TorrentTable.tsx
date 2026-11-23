@@ -307,6 +307,7 @@ export default function TorrentTable({
         </label>
         <input
           id={filterId}
+          data-torrent-filter
           type="search"
           placeholder="Filter by name"
           value={query}

@@ -55,8 +55,9 @@ export default function App() {
   useEffect(() => {
     const onPop = (event: PopStateEvent): void => {
       if (!settingsPushed.current) return
-      const landed = event.state as { fbttSettings?: number } | null
-      if (landed?.fbttSettings !== undefined) return
+      // A stale answer to either screen's earlier `history.back()` (Settings' or the full view's).
+      const landed = event.state as { fbttSettings?: number; fbttFull?: number } | null
+      if (landed?.fbttSettings !== undefined || landed?.fbttFull !== undefined) return
       settingsPushed.current = false
       setSettingsOpen(false)
     }
