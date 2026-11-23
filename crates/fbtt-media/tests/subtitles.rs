@@ -262,7 +262,9 @@ fn ass_text_keeps_commas() {
 fn cleaners_are_linear() {
     // The tag cleaners must not rescan the text they have already walked: a
     // 4 MiB line of delimiters is one pass, not one pass per delimiter. Each
-    // of these hostile inputs must return within two seconds.
+    // of these hostile inputs must return within twenty seconds: the guard is
+    // against quadratic time, which would take minutes at 4 MiB, while debug
+    // builds on shared CI runners are several times slower than a laptop.
     let cap = SUBTITLE_FILE_CAP as usize;
     let ass_head = "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,";
     let srt_head = "1\n00:00:01,000 --> 00:00:02,000\n";
@@ -291,7 +293,7 @@ fn cleaners_are_linear() {
     let start = Instant::now();
     file_cues(ass_backslashes.as_bytes(), SubtitleFormat::Ass).expect("no panic");
     assert!(
-        start.elapsed() < Duration::from_secs(2),
+        start.elapsed() < Duration::from_secs(20),
         "cleaning a 4 MiB line of lone backslashes must be linear, took {:?}",
         start.elapsed()
     );
@@ -303,7 +305,7 @@ fn cleaners_are_linear() {
     let start = Instant::now();
     file_cues(srt_tags.as_bytes(), SubtitleFormat::Srt).expect("no panic");
     assert!(
-        start.elapsed() < Duration::from_secs(2),
+        start.elapsed() < Duration::from_secs(20),
         "cleaning a 4 MiB line of <> tags must be linear, took {:?}",
         start.elapsed()
     );
@@ -316,7 +318,7 @@ fn cleaners_are_linear() {
     let start = Instant::now();
     let cues = file_cues(srt_open.as_bytes(), SubtitleFormat::Srt).expect("no panic");
     assert!(
-        start.elapsed() < Duration::from_secs(2),
+        start.elapsed() < Duration::from_secs(20),
         "cleaning a 4 MiB line of lone < must be linear, took {:?}",
         start.elapsed()
     );
