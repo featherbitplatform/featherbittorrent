@@ -197,15 +197,7 @@ async function settle(): Promise<void> {
   })
 }
 
-/** Flush the microtask queue without a timer: for the fake-timer test, where a `setTimeout`
- * would sit faked and never resolve. */
-async function flushMicrotasks(): Promise<void> {
-  await act(async () => {
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
-  })
-}
+
 
 function fileInfo(index: number, path: string): FileInfo {
   return { index, path, len: 1_048_576, downloaded: 524_288, priority: 'normal', pad: false }
@@ -491,76 +483,79 @@ describe('the player', () => {
   })
 
   it('a stream that ends early shows Waiting for data and retries', async () => {
-    vi.useFakeTimers()
-    try {
-      const source = new FakeMediaSource()
-      const recorder = fakeFetch()
-      const firstBody = new FakeBody()
-      // The first body answers, then ends after its init segment: one chunk, then done.
-      recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => firstBody }))
-      recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
-      const video = fakeVideo()
-      document.body.appendChild(video)
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const firstBody = new FakeBody()
+    // The first body answers, then ends after its init segment: one chunk, then done.
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => firstBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
 
-      const engine = createEngine(
-        video,
-        { id: 'a', file: 0 },
-        {
-          offsetMs: 1000,
-          durationMs: 4000,
-          video: PROBE.tracks[0] as MediaTrack,
-          videoMime: 'video/mp4; codecs="avc1.64000A"',
-          audio: PROBE.tracks[1] as MediaTrack,
-          audioMime: 'audio/mp4; codecs="mp4a.40.2"',
-          mimeFor: () => null,
-        },
-        fakeDeps(source, recorder),
-      )
-      source.open()
-      await flushMicrotasks()
-      // The init segment lands, then the body ends.
-      firstBody.push(new Uint8Array([1, 2, 3]))
-      firstBody.end()
-      await flushMicrotasks()
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    // The init segment lands, then the body ends.
+    firstBody.push(new Uint8Array([1, 2, 3]))
+    firstBody.end()
+    await settle()
 
-      // The engine is waiting, and it will be asked again in a second.
-      expect(engine.state(), 'an early end did not move the engine to waiting').toBe('waiting')
-      const before = recorder.callsFor('/tracks/1/stream').length
-      // The first retry is one second out: the cadence is one, two, four, then five each.
-      await vi.advanceTimersByTimeAsync(1_000)
-      await flushMicrotasks()
-      let after = recorder.callsFor('/tracks/1/stream').length
-      expect(after - before === 1, 'the early end was not retried after a second').toBe(true)
-      // The retry goes from the end of what the buffer has, not from the start. The buffer has
-      // one media second, and with the 1000 ms offset that is source time 0: the offset's room
-      // at the front has no source time, so the retry asks for the start of the file.
-      const retry = recorder.callsFor('/tracks/1/stream')[after - 1]
-      expect(retry.url.includes('start_ms=0'), `the retry did not start at the buffered end (${retry.url})`).toBe(true)
+    // The engine is waiting, and it will be asked again in a second.
+    expect(engine.state(), 'an early end did not move the engine to waiting').toBe('waiting')
+    const before = recorder.callsFor('/tracks/1/stream').length
+    // No fetch before the first retry: the engine is waiting on its timer.
+    expect(
+      recorder.callsFor('/tracks/1/stream').length === before,
+      'the engine fetched before the first retry',
+    ).toBe(true)
+    // The first retry is one second out: the cadence is one, two, four, then five each.
+    await new Promise((r) => setTimeout(r, 1_100))
+    await settle()
+    let after = recorder.callsFor('/tracks/1/stream').length
+    expect(after - before === 1, 'the early end was not retried after a second').toBe(true)
+    // The retry goes from the end of what the buffer has, not from the start. The buffer has
+    // one media second, and with the 1000 ms offset that is source time 0: the offset's room
+    // at the front has no source time, so the retry asks for the start of the file.
+    const retry = recorder.callsFor('/tracks/1/stream')[after - 1]
+    expect(retry.url.includes('start_ms=0'), `the retry did not start at the buffered end (${retry.url})`).toBe(true)
 
-      // The first retry's body ends the same way, and the count persists, so the second retry
-      // is two seconds out, not one.
-      const firstRetryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
-      firstRetryBody?.end()
-      await flushMicrotasks()
-      const beforeSecond = recorder.callsFor('/tracks/1/stream').length
-      await vi.advanceTimersByTimeAsync(2_000)
-      await flushMicrotasks()
-      after = recorder.callsFor('/tracks/1/stream').length
-      expect(after - beforeSecond === 1, 'the second retry was not two seconds out').toBe(true)
+    // The first retry's body ends the same way, and the count persists, so the second retry
+    // is two seconds out, not one.
+    const firstRetryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
+    firstRetryBody?.end()
+    await settle()
+    const beforeSecond = recorder.callsFor('/tracks/1/stream').length
+    expect(
+      recorder.callsFor('/tracks/1/stream').length === beforeSecond,
+      'the engine fetched before the second retry',
+    ).toBe(true)
+    await new Promise((r) => setTimeout(r, 2_100))
+    await settle()
+    after = recorder.callsFor('/tracks/1/stream').length
+    expect(after - beforeSecond === 1, 'the second retry was not two seconds out').toBe(true)
 
-      // The second retry's first append lands: the data is arriving, and the count is reset, so
-      // the next stop would wait one second again. The state is the engine's own, and the append
-      // is what the next `waiting` to `playing` turn would come from.
-      const retryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
-      retryBody?.push(new Uint8Array([9]))
-      await flushMicrotasks()
-      expect(engine.state(), 'the engine kept running after the retry appended').not.toBe('error')
+    // The second retry's first append lands: the data is arriving, and the state is the
+    // engine's own, and the append is what the next `waiting` to `playing` turn would come from.
+    const retryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
+    retryBody?.push(new Uint8Array([9]))
+    await settle()
+    expect(engine.state(), 'the engine kept running after the retry appended').toBe('playing')
 
-      engine.destroy()
-      document.body.removeChild(video)
-    } finally {
-      vi.useRealTimers()
-    }
+    engine.destroy()
+    document.body.removeChild(video)
   })
 
   it('keyboard', async () => {
@@ -739,10 +734,12 @@ describe('the player', () => {
     source.open()
     await settle()
     // Feed the buffer a long way ahead of the playhead: past the gate's stop line, the read must
-    // stop rather than keep asking for chunks it has already buffered a minute of.
+    // stop rather than keep asking for chunks it has already buffered a minute of. The buffer is
+    // one media second per chunk, so 130 chunks is 130 seconds ahead. Each settle lets the
+    // append's `updateend` land the way a browser's does: a macrotask, not a microtask.
     for (let i = 0; i < 130; i += 1) {
       videoBody.push(new Uint8Array([1]))
-      await flushMicrotasks()
+      await settle()
     }
     // The read is stopped: the body has chunks held, and the buffer is far ahead of the playhead.
     const bufferAhead = (source.activeSourceBuffers[0]?.buffered.end(0) ?? 0) - video.currentTime
@@ -751,7 +748,7 @@ describe('the player', () => {
     // `timeupdate` to lift it.
     const appendsBeforeGate = source.activeSourceBuffers[0]?.log.appends.length ?? 0
     videoBody.push(new Uint8Array([1]))
-    await flushMicrotasks()
+    await settle()
     const appendsAfterGate = source.activeSourceBuffers[0]?.log.appends.length ?? 0
     expect(
       appendsAfterGate === appendsBeforeGate,

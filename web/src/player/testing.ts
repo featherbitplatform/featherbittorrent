@@ -105,10 +105,30 @@ export class FakeSourceBuffer extends EventTarget {
 
   private _beginUpdate(): void {
     this._updating = true
-    queueMicrotask(() => {
+    // A browser's `updateend` is a macrotask: the buffer is busy for a whole task, and a test
+    // that appends and then appends again in the same task sees the `InvalidStateError` a browser
+    // would throw, the way a missing wait for `updateend` shows up.
+    setTimeout(() => {
       this._updating = false
       this.dispatchEvent(new Event('updateend'))
-    })
+    }, 0)
+  }
+
+  /**
+   * A one-shot `QuotaExceededError` on the next append: the browser's quota is a property of the
+   * buffer's contents, and a test drives the engine's quota branch by making the next append
+   * refuse, once, the way a full buffer would.
+   */
+  makeNextAppendThrowQuota(): void {
+    const original = this.appendBuffer.bind(this)
+    let once = true
+    this.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
+      if (once) {
+        once = false
+        throw new DOMException('quota', 'QuotaExceededError')
+      }
+      original(data)
+    }
   }
 }
 
@@ -218,9 +238,11 @@ export class FakeBody {
   /** Set once the body's `AbortSignal` has fired; a `read` after that rejects with the `AbortError`. */
   private aborted = false
 
-  /** A fresh fetch of the same body clears an earlier fetch's abort. */
+  /** A fresh fetch of the same body clears an earlier fetch's abort and its end: the body is read
+   * again, the way a browser's fetch gives a fresh body for the same stream. */
   resetAbort(): void {
     this.aborted = false
+    this.ended = false
   }
 
   getReader(): ReadableStreamDefaultReader<Uint8Array> {
@@ -232,6 +254,9 @@ export class FakeBody {
         // A `read` that has not been answered yet, after the signal fired, rejects with the
         // `AbortError`, the way a browser's body read does, rather than returning the next chunk.
         if (this.aborted) throw abortError()
+        // A chunk that was fed before the reader asked for it is the next read, even if the body
+        // was once cancelled: the `cancel` is the old reader's end, and a fresh fetch of the same
+        // body clears the abort, so the chunk is the new read's.
         if (this.pending.length > 0) return { done: false, value: this.pending.shift() as Uint8Array }
         if (this.ended) return { done: true, value: undefined }
         // A body that has neither a chunk nor an end is one the test is still deciding on; the
@@ -242,7 +267,13 @@ export class FakeBody {
         })
       },
       cancel: async (): Promise<void> => {
-        this.ended = true
+        // A browser's `reader.cancel()` settles the pending `read` with `{done: true}`: the body
+        // is closed, not failed. The pending reads get the end, the way the browser's do. The
+        // `ended` is not set: a fresh fetch of the same body clears the abort and reads on, and
+        // the `cancel` is the old reader's end, not the body's.
+        while (this.waiters.length > 0) {
+          this.waiters.shift()?.({ done: true, value: undefined })
+        }
       },
       releaseLock: (): void => {
         this.reader = null

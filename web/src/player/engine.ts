@@ -100,6 +100,8 @@ interface Stream {
   generation: number
   /** The read pump: set on the stream once the function that closes over it is defined. */
   pump?: () => void
+  /** Settled when the buffer stops updating after an `abort`; the next `beginStream` waits for it. */
+  quiescent: Promise<void> | null
 }
 
 /** The shape the fake and the real `SourceBuffer` both give the engine. */
@@ -185,6 +187,24 @@ function bufferEnd(
   let end = 0
   for (let i = 0; i < buffered.length; i += 1) end = Math.max(end, buffered.end(i))
   return end
+}
+
+/**
+ * How far the buffer runs ahead of the playhead, measured on the range the playhead sits in, or
+ * 0 when it sits in none: a range an hour ahead is not one the person is watching, and the gate
+ * must not keep it shut over a range the playhead has moved out of.
+ */
+function aheadOfPlayhead(
+  buffered: { length: number; start(i: number): number; end(i: number): number },
+  currentTime: number,
+): number {
+  let ahead = 0
+  for (let i = 0; i < buffered.length; i += 1) {
+    const start = buffered.start(i)
+    const end = buffered.end(i)
+    if (start <= currentTime && currentTime <= end) ahead = Math.max(ahead, end - currentTime)
+  }
+  return ahead
 }
 
 /** A `SourceBuffer`'s ranges as pairs, the shape `evictRanges` reads. */
@@ -277,6 +297,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       retryTimer: null,
       role,
       generation: 0,
+      quiescent: null,
     }
     // One `updateend` ends the append the buffer was busy with, and it is also where a stopped
     // read finds out there is room to go again.
@@ -317,14 +338,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   function openAt(primary: Stream, follow: Stream | null, startMs: number): void {
     if (destroyed) return
     beginStream(primary, startMs, (bodyStartMs, requestedMs) => {
-      // The playhead follows the server's own word for where this body began, but only when that
-      // point is past where the person asked for: a start at or before the request, inside what
-      // the body will buffer, is the request itself, and moving the element would fire a `seeking`
-      // the streams do not need.
-      if (bodyStartMs > requestedMs) {
-        engineSeekTo = bodyStartMs
-        video.currentTime = mapTimes.toMedia(bodyStartMs)
-      }
+      // The playhead lands where the later of the two points is: the person asked for one, the
+      // server's body began at the other, and the body's data covers from its own start, so the
+      // playhead must not sit before the data. The move is the engine's own, and the `seeking` it
+      // fires is the one the guard below answers with no restart: `engineSeekTo` names the media
+      // point the engine put the playhead at, in the element's clock, and the event that matches
+      // it is ignored and cleared.
+      const startMsLanded = Math.max(requestedMs, bodyStartMs)
+      engineSeekTo = mapTimes.toMedia(startMsLanded)
+      video.currentTime = engineSeekTo
       // The follow is asked for at the same point the primary landed on.
       if (follow !== null) beginStream(follow, bodyStartMs)
       if (state === 'loading') setState('playing')
@@ -344,8 +366,14 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     const abort = new AbortController()
     stream.abort = abort
     const url = streamUrl(stream.track.id, startMs)
+    // The abort above may have left the buffer mid-update: settle it before the first append,
+    // the way a browser's `abort` + `updateend` sequence does.
+    const quiescent = stream.quiescent
+    stream.quiescent = null
 
     void (async () => {
+      if (quiescent !== null) await quiescent
+      if (destroyed || abort.signal.aborted) return
       let response: Response
       try {
         response = await full.fetch(url, { signal: abort.signal, credentials: 'same-origin' })
@@ -404,7 +432,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       const generation = stream.generation
       // The gate answers before each read: a buffer a minute ahead of the playhead is not one
       // the person is watching, and its fetch stops until a `timeupdate` says the playhead moved.
-      const ahead = bufferEnd(stream.buffer.buffered) - video.currentTime
+      // The measure is the range the playhead sits in, not the far end of everything buffered:
+      // a range far ahead that the playhead has left behind does not keep the gate shut.
+      const ahead = aheadOfPlayhead(stream.buffer.buffered, video.currentTime)
       if (!stream.gate(ahead)) {
         stream.reading = false
         return
@@ -464,13 +494,23 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     } catch (cause) {
       if (stream.generation !== generation) return false
       stream.appending = false
-      if (!isQuotaError(cause)) return false
+      // A quota error is a buffer that is full, and the eviction below makes room. Any other
+      // error is the buffer saying no for a reason the engine cannot answer, and it is the
+      // player's `error`, not a silent drop of the chunk.
+      if (!isQuotaError(cause)) {
+        setState('error')
+        return false
+      }
       // The buffer is full: cut what lies far behind the playhead, one range at a time, each
       // `remove` awaited to its `updateend`, and a `remove` of nothing is skipped.
       const cut = evictRanges(ranges(stream.buffer.buffered), video.currentTime).filter(
         ([start, end]) => end > start,
       )
       for (const [start, end] of cut) {
+        if (stream.generation !== generation) return false
+        // The buffer may still be finishing the update that ended in the quota error: a `remove`
+        // while it is updating is the browser's `InvalidStateError`, so the wait comes first.
+        await waitNotUpdating(stream.buffer, () => stream.generation !== generation)
         if (stream.generation !== generation) return false
         try {
           stream.buffer.remove(start, end)
@@ -482,6 +522,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       // The same chunk, again, before any later one: the eviction made room for it, and the
       // order of the buffer is the order the decoder wants it in.
       try {
+        if (stream.generation !== generation) return false
+        await waitNotUpdating(stream.buffer, () => stream.generation !== generation)
+        if (stream.generation !== generation) return false
         stream.appending = true
         stream.buffer.appendBuffer(data)
         if (stream.generation !== generation) return false
@@ -499,25 +542,36 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   /** A read loop that is stopped by its gate, woken by a `timeupdate` moving the playhead. */
   function pump(stream: Stream): void {
     if (destroyed || stream.reading || stream.appending || stream.reader === null) return
-    const ahead = bufferEnd(stream.buffer.buffered) - video.currentTime
+    // The same measure the read loop uses: the range the playhead sits in, or none.
+    const ahead = aheadOfPlayhead(stream.buffer.buffered, video.currentTime)
     if (!stream.gate(ahead)) return
     stream.reading = true
     void readStream(stream)
   }
 
-  /** Wait for the buffer to stop updating: one `updateend` per append, and none the stream no longer is. */
-  function appendDone(stream: Stream, generation: number): Promise<void> {
+  /**
+   * Wait until the buffer is not updating: the browser's word that an append, remove or type
+   * change has landed, after which the next one is legal. A stream that goes away while the wait
+   * runs (a seek, a switch, a destroy) ends it: the caller is the old stream and has no buffer to
+   * keep working.
+   */
+  function waitNotUpdating(buffer: Stream['buffer'], isGone: () => boolean): Promise<void> {
     return new Promise((resolve) => {
       const check = (): void => {
-        if (stream.generation !== generation) {
+        if (isGone()) {
           resolve()
           return
         }
-        if (!stream.appending) resolve()
-        else stream.buffer.addEventListener('updateend', check, { once: true })
+        if (!buffer.updating) resolve()
+        else buffer.addEventListener('updateend', check, { once: true })
       }
       check()
     })
+  }
+
+  /** Wait for the buffer to stop updating after an append, and none the stream no longer is. */
+  function appendDone(stream: Stream, generation: number): Promise<void> {
+    return waitNotUpdating(stream.buffer, () => stream.generation !== generation)
   }
 
   /** A body that has been read to its end: is the file over, or does the stream wait to be asked again? */
@@ -571,7 +625,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       }
       // The retry goes from the end of what the buffer already has, not from where the fetch
       // began: the data that made it in is kept, and the server resumes where the buffer stops.
-      const fromMs = mapTimes.toSource(bufferEnd(stream.buffer.buffered))
+      // A buffer that holds nothing has no end to resume from, and the body's own start is where
+      // its data is, so the retry asks for that.
+      const bufferedEnd = bufferEnd(stream.buffer.buffered)
+      const fromMs = bufferedEnd > 0 ? mapTimes.toSource(bufferedEnd) : stream.bodyStartMs
       beginStream(stream, fromMs)
     }, delay)
   }
@@ -592,7 +649,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     stream.retrying = false
   }
 
-  /** Bump the stream's generation and stop it: the old loops and timers find it gone. */
+  /**
+   * Bump the stream's generation and stop it: the old loops and timers find it gone. The buffer
+   * is `abort()`ed, the way a browser's `SourceBuffer.abort` stops an in-flight update, and the
+   * wait for it to stop updating is what makes the new body's first append legal: an append while
+   * the old update is still running is the browser's `InvalidStateError`. The wait is handed to
+   * the stream, and the next `beginStream` settles it before it reads.
+   */
   function abortStream(stream: Stream): void {
     stream.generation += 1
     clearRetry(stream)
@@ -610,6 +673,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       stream.abort.abort()
       stream.abort = null
     }
+    // An `abort` is legal while the buffer is updating, and it keeps the buffered ranges: it
+    // stops the current update.
+    const gone = stream.generation
+    try {
+      stream.buffer.abort()
+    } catch {
+      // A buffer the source already took away has nothing to stop.
+    }
+    stream.quiescent = waitNotUpdating(stream.buffer, () => destroyed || stream.generation !== gone)
   }
 
   function restartAll(fromMs: number): void {
@@ -632,9 +704,19 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   // `engineSeekTo` names that point, and the event that matches it is the engine's, so it is
   // ignored and cleared.
   function onSeeking(): void {
-    if (destroyed || endedFired) return
+    if (destroyed) return
     const time = video.currentTime
     if (time < 0) return
+    // The file ended, and the person asked to go back: the ended state is the file's word for
+    // "nothing more to fetch", and a seek past it is the person's word for "there is". The
+    // streams restart at the point the element moved to, and the end is un-fired: the next time
+    // the playhead reaches the true end, `settleEnd` fires it again.
+    if (endedFired) {
+      endedFired = false
+      for (const stream of streams) stream.atEnd = false
+      restartAll(mapTimes.toSource(time))
+      return
+    }
     if (engineSeekTo !== null) {
       const target = engineSeekTo
       engineSeekTo = null
@@ -667,29 +749,36 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     // the playhead and re-typed, and the new track is asked for at the point the buffer covers.
     const old = audioStream
     abortStream(old)
+    const generation = old.generation
     const cutFrom = video.currentTime
     const cutEnd = bufferEnd(old.buffer.buffered)
     old.track = track
-    const finish = (): void => {
-      if (destroyed) return
+    void (async () => {
+      // The abort above left the buffer mid-update: settle it before anything else, the way a
+      // browser's `abort` + `updateend` sequence does. A seek during the wait bumps the
+      // generation, and the switch stops: the new track is the one the restart asks for.
+      const quiescent = old.quiescent
+      old.quiescent = null
+      if (quiescent !== null) await quiescent
+      if (destroyed || old.generation !== generation) return
+      if (cutEnd > cutFrom) {
+        // Remove from the playhead to the end, awaited to `updateend`: a `changeType` while the
+        // remove is still updating is the browser's `InvalidStateError`, so the wait comes after.
+        try {
+          old.buffer.remove(Math.max(cutFrom, 0), cutEnd)
+        } catch {
+          // A remove the buffer refuses is data it already let go.
+        }
+        await waitNotUpdating(old.buffer, () => destroyed || old.generation !== generation)
+      }
+      if (destroyed || old.generation !== generation) return
       try {
         old.buffer.changeType(mime)
       } catch {
         // A buffer that will not change its type is one that is already gone.
       }
       beginStream(old, mapTimes.toSource(cutFrom))
-    }
-    if (cutEnd > cutFrom) {
-      // Remove from the playhead to the end, awaited to `updateend`, then switch the type.
-      try {
-        old.buffer.remove(Math.max(cutFrom, 0), cutEnd)
-      } catch {
-        // A remove the buffer refuses is data it already let go.
-      }
-      appendDone(old, old.generation).then(finish)
-      return
-    }
-    finish()
+    })()
   }
 
   function destroy(): void {
@@ -731,12 +820,14 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
   return {
     seek(sourceMs: number): void {
-      if (destroyed || endedFired) return
+      if (destroyed) return
       // Before the source opens there is no stream to restart: the start is held for `onOpen`.
       if (source.readyState !== 'open') {
         pendingStartMs = sourceMs
         return
       }
+      // The file ended, and the person asked to go back: the seek is the restart, and the
+      // `seeking` it fires is the one `onSeeking` answers with it.
       video.currentTime = mapTimes.toMedia(sourceMs)
     },
     setAudio,

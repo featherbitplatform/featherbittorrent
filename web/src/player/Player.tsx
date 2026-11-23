@@ -71,7 +71,9 @@ function unplayableCopy(codec: string): string {
 /** The words a track is listed under: its name when it has one, its language when it does not. The name is remote text, so it goes through `displaySafe` on the way out. */
 function trackLabel(track: MediaTrack): string {
   if (track.name !== null && track.name !== '') return displaySafe(track.name)
-  return track.language ?? 'Audio'
+  // The language is remote text too: a track with no name is listed under its language, and the
+  // same run of `displaySafe` the name gets is the one it gets.
+  return track.language !== null && track.language !== '' ? displaySafe(track.language) : 'Audio'
 }
 
 /**
@@ -273,8 +275,12 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
   // True while a menu is open: the dialog's key handler ignores keys from inside it, so an
-  // `ArrowUp` in the Audio listbox does not move the volume.
-  const [menuOpen, setMenuOpen] = useState(false)
+  // `ArrowUp` in the Audio listbox does not move the volume. Each menu keeps its own flag:
+  // closing one while the other is open is the way a person works, and the handler has to
+  // know either one is up.
+  const [audioMenuOpen, setAudioMenuOpen] = useState(false)
+  const [subtitleMenuOpen, setSubtitleMenuOpen] = useState(false)
+  const menuOpen = audioMenuOpen || subtitleMenuOpen
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const engineRef = useRef<Engine | null>(null)
@@ -286,7 +292,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const fetchedRef = useRef<Map<number, [number, number][]>>(new Map())
   // The external files fetched once, by their index.
   const externalDoneRef = useRef<Set<number>>(new Set())
-  // The position the probe's answer will start at, in media seconds, decided once per probe.
+  // The position the probe's answer will start at, in source seconds, decided once per probe.
   const startRef = useRef(0)
 
   const offsetMs = probe?.time_offset_ms ?? 0
@@ -317,11 +323,13 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   )
 
   // Where to start, when the probe lands: the remembered position, or the beginning. It is an
-  // effect because it reads `localStorage`, which is not a pure function of the probe.
+  // effect because it reads `localStorage`, which is not a pure function of the probe. The
+  // position and the duration are both in source seconds, the clock `positions` keeps, so the
+  // comparison is the one the person thinks in.
   useEffect(() => {
     if (probe === null) return
     const remembered = loadPosition(id, file)
-    const limit = probe.duration_ms === null ? null : toMedia(probe.duration_ms, probe.time_offset_ms)
+    const limit = probe.duration_ms === null ? null : probe.duration_ms / 1000
     startRef.current =
       remembered !== null && (limit === null || remembered < limit) ? remembered : 0
   }, [probe, id, file])
@@ -351,7 +359,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     const video = videoRef.current
     if (video === null) return
 
-    const start = startRef.current
+    // The start is source seconds, the clock the position is kept in; the engine speaks source
+    // milliseconds, so the one conversion is the seconds to milliseconds, not a media mapping.
+    const startMs = Math.round(startRef.current * 1000)
     const engine = createEngine(
       video,
       { id, file },
@@ -373,7 +383,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     )
     engineRef.current = engine
     engine.onState(setState)
-    engine.seek(toSource(start, probe.time_offset_ms))
+    engine.seek(startMs)
 
     const onPlay = (): void => setPaused(false)
     const onPause = (): void => setPaused(true)
@@ -390,9 +400,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     video.addEventListener('volumechange', onVolume)
 
     // The position is saved every five seconds, and on the way out. It is remembered in source
-    // milliseconds, the clock the probe answers, and cleared the way `positions` clears it.
+    // seconds, the clock `positions` keeps, and the duration is in its own milliseconds: the
+    // conversion is the one at the boundary, not a mix of the two clocks.
     const save = (): void =>
-      savePosition(id, file, toSource(video.currentTime, probe.time_offset_ms), probe.duration_ms)
+      savePosition(id, file, toSource(video.currentTime, probe.time_offset_ms) / 1000, probe.duration_ms)
     const saveTimer = setInterval(save, 5_000)
 
     return () => {
@@ -430,15 +441,20 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     const video = videoRef.current
     if (video === null) return
     const label = subtitleLabel(key)
+    // The track is kept under its own key, not its label: two tracks named "English" are two
+    // tracks, and the key is what tells them apart.
     let found: TextTrack | null = null
     for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i]
-      if (candidate !== undefined && candidate.label === label) {
+      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
+      if (candidate !== undefined && candidate.id === `subtitle:${key}`) {
         found = candidate
         break
       }
     }
-    if (found === null) found = video.addTextTrack('subtitles', label, langOf(language))
+    if (found === null) {
+      found = video.addTextTrack('subtitles', label, langOf(language))
+      ;(found as TextTrack & { id?: string }).id = `subtitle:${key}`
+    }
     const seen = cueKeysRef.current.get(key) ?? new Set<string>()
     cueKeysRef.current.set(key, seen)
     for (const cue of mergeCues(seen, cues)) {
@@ -461,10 +477,16 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   function applySubtitleModes(): void {
     const video = videoRef.current
     if (video === null) return
+    const chosen = `subtitle:${subtitleKey}`
     for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i]
+      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
       if (candidate === undefined) continue
-      candidate.mode = candidate.label === subtitleLabel(subtitleKey) ? 'showing' : 'disabled'
+      // The track's key, or its label when it was made before the key was: the chosen track is
+      // the one shown, and the rest are not.
+      const isChosen = candidate.id !== undefined
+        ? candidate.id === chosen
+        : candidate.label === subtitleLabel(subtitleKey)
+      candidate.mode = isChosen ? 'showing' : 'disabled'
     }
   }
 
@@ -824,7 +846,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 options={audioOptions}
                 selected={audioKey ?? ''}
                 onChoose={chooseAudio}
-                onMenuChange={setMenuOpen}
+                onMenuChange={setAudioMenuOpen}
               />
             )}
             {subtitleChoices.length > 0 && (
@@ -833,7 +855,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 options={subtitleChoices}
                 selected={subtitleKey}
                 onChoose={setSubtitleKey}
-                onMenuChange={setMenuOpen}
+                onMenuChange={setSubtitleMenuOpen}
               />
             )}
             <IconButton label="Fullscreen" onClick={toggleFullscreen}>
