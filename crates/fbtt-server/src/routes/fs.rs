@@ -261,13 +261,17 @@ const RESERVED_NAMES: [&str; 32] = [
     "LPT\u{b3}",
 ];
 
+/// The characters Windows does not allow in a file or folder name, besides the separators and control
+/// characters refused on their own.
+const WINDOWS_FORBIDDEN: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
+
 /// What is wrong with `name` as the name of one new folder, or `None` when it is one: a single, ordinary
 /// path component. Not empty, `.` or `..`; no `/` or `\` (either platform's separator, whichever this is
 /// running on, so a name means the same thing on every server); no NUL or other control character; at most
 /// [`MAX_NAME_BYTES`] bytes; exactly what `clean` would show; not starting with a dot; not ending in a dot
-/// or a space, and not one of Windows' device names ([`RESERVED_NAMES`]) on any platform. And it has to
-/// parse as exactly one normal component on this platform, which is what refuses whatever else a platform reads as more than a name - a drive prefix such as `C:` on Windows,
-/// which `join` would otherwise take as a whole new path.
+/// or a space; none of the characters Windows forbids ([`WINDOWS_FORBIDDEN`]); and not one of Windows'
+/// device names ([`RESERVED_NAMES`]) on any platform. And it has to parse as exactly one normal component
+/// on this platform, which is what refuses whatever else a platform reads as more than a name.
 pub(super) fn name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("a folder name cannot be empty".to_string());
@@ -314,6 +318,14 @@ pub(super) fn name_problem(name: &str) -> Option<String> {
     if name.ends_with(['.', ' ']) {
         return Some(format!(
             "a folder name cannot end in a dot or a space: {}",
+            clean(name),
+        ));
+    }
+    // The characters Windows forbids in a name, refused everywhere for the same reason: a library made here
+    // has to be one that can be copied to any machine. `:` is also what makes `CON:` the device.
+    if name.contains(WINDOWS_FORBIDDEN) {
+        return Some(format!(
+            "a folder name cannot contain any of < > : \" | ? *: {}",
             clean(name),
         ));
     }
@@ -534,6 +546,16 @@ mod tests {
             // `fs/list` hides dot entries, so a folder named this way could never be picked.
             ".hidden",
             ".config",
+            // The characters Windows forbids, one each, and the device name they make with a colon.
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "CON:",
+            "COM1:",
         ] {
             assert!(name_problem(bad).is_some(), "{bad:?} is refused");
         }
