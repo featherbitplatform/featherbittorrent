@@ -137,6 +137,39 @@ describe('the page as a whole', () => {
   })
 })
 
+describe('the screens in the desktop frame', () => {
+  /** Whether every element from `from` up to (not including) `top` is `display: contents`. */
+  function boxless(from: Element | null, top: Element): string[] {
+    const boxes: string[] = []
+    for (let at = from; at !== null && at !== top; at = at.parentElement) {
+      if (!at.classList.contains('contents')) boxes.push(at.outerHTML.slice(0, 80))
+    }
+    return boxes
+  }
+
+  it('the_torrents_root_is_laid_out_by_the_frame_not_by_a_wrapper', async () => {
+    // The frame sizes `.h-dvh` as `height: 100%` of its page column; a box of auto height between
+    // the two leaves the percentage nothing to resolve against and the screen shrinks to its content.
+    world.behavior = alive
+    const { container } = render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    const root = screen.getByRole('button', { name: 'Add torrent' }).closest('.h-dvh')
+    expect(root, 'the Torrents root lost h-dvh, which the browser build sizes itself by').not.toBeNull()
+    expect(root!.className.split(' '), 'the Torrents root classes changed').toEqual(
+      expect.arrayContaining(['flex', 'h-dvh', 'min-h-0', 'flex-col', 'overflow-hidden']),
+    )
+    expect(boxless(root!.parentElement, container), 'a box sits between the frame and the Torrents root').toEqual([])
+
+    // The wrapper that keeps the table mounted under Settings still hides it there.
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(root!.parentElement!.hasAttribute('hidden'), 'the Torrents wrapper is not hidden under Settings').toBe(true)
+    const settings = screen.getByRole('heading', { name: 'Server' }).closest('.min-h-dvh')
+    expect(settings, 'the Settings root lost min-h-dvh').not.toBeNull()
+    expect(boxless(settings!.parentElement, container), 'a box sits between the frame and the Settings root').toEqual([])
+    world.behavior = null
+  })
+})
+
 describe('the Settings screen in the page', () => {
   it('settings_replaces_the_torrents_and_back_returns', async () => {
     world.behavior = alive

@@ -445,7 +445,8 @@ function DesktopScreens() {
 
   // The switcher goes into the title bar's slot; until the bar has mounted it there is nowhere to draw
   // it. The save-failure banner sits under the bar, above the page, which fills the rest of the window
-  // (the frame sizes `h-dvh` screens to the space it leaves them).
+  // (the frame sizes `h-dvh` screens to the space it leaves them, as `height: 100%`, which holds only
+  // while every box between this flex column and a screen's root is `contents`; see `App`).
   return (
     <>
       {slots?.switcher != null &&

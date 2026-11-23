@@ -187,6 +187,19 @@ it('connects_to_this_computer_and_renders_the_app_on_its_endpoint', async () => 
   expect(shell.connect).toHaveBeenCalledWith('local')
 })
 
+it('the_page_column_hands_its_height_to_the_screen', async () => {
+  // The frame sizes `h-dvh` screens as `height: 100%`: the box the screens go into has to be a
+  // flex item that takes the rest of the window and a flex column itself, or the percentage is void.
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  const app = (await screen.findByText(`workspace ${BASE} first`)).parentElement!
+  const column = app.parentElement!
+  expect(column.className.split(' ')).toEqual(
+    expect.arrayContaining(['flex', 'min-h-0', 'flex-1', 'flex-col', 'overflow-auto']),
+  )
+  expect(column.parentElement, 'the page column is not a child of the frame').toBe(screen.getByTestId('page'))
+})
+
 it('a_rejected_launch_token_reconnects_without_signing_in', async () => {
   shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('second'))
   renderRoot()

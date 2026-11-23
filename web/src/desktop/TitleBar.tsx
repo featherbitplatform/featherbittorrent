@@ -198,6 +198,9 @@ function guessPlatform(): DesktopInfo['platform'] {
 /**
  * The bar above `children`, with the bar's slots provided to them. `children` gets the rest of the
  * window: a screen that sizes itself to the viewport (`h-dvh`, `min-h-dvh`) is sized to that space.
+ * The override is a percentage (`h-full`, `min-h-full`), which only resolves against a parent of
+ * definite height: this flex column and the page's own one below it qualify, but a plain block of
+ * auto height between them and the screen's root does not, so such wrappers must be `contents`.
  */
 export function DesktopChrome({ children }: { children: ReactNode }) {
   const [platform, setPlatform] = useState<DesktopInfo['platform']>(guessPlatform)

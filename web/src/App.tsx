@@ -184,8 +184,13 @@ export default function App() {
           {settingsOpen && (
             <Settings onBack={closeSettings} section={settingsSection} />
           )}
-          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
-          <div hidden={settingsOpen}>
+          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again.
+              `contents` while shown, so the wrapper draws no box and the screen's own root is the one
+              its parent lays out: the desktop frame sizes `h-dvh` as `height: 100%` of the space under
+              the title bar, and a percentage through a block of auto height is no height at all, which
+              cut the Torrents screen (sidebar and all) to its content. Preflight's `display: none
+              !important` on `[hidden]` still hides it while Settings is up. */}
+          <div hidden={settingsOpen} className="contents">
             <Torrents
               hidden={settingsOpen}
               onSettings={() => openSettings()}
