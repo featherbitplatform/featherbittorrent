@@ -125,8 +125,10 @@ describe('the Server section', () => {
 
   it('saving twice quickly sends once', async () => {
     const { setSessionLimits, setQueueSettings } = await open()
-    save()
-    save()
+    // Enter in a field submits the form even though the button is already disabled.
+    const form = field('Active seeds').closest('form') as HTMLFormElement
+    fireEvent.submit(form)
+    fireEvent.submit(form)
     await waitFor(() => {
       expect(setQueueSettings).toHaveBeenCalledTimes(1)
     })
