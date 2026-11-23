@@ -10,11 +10,12 @@
 
 mod commands;
 mod local;
+mod window;
 
 use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
 use tauri::{Manager, RunEvent};
 
-use crate::commands::DesktopState;
+use crate::commands::{DesktopState, Platform};
 
 /// The exit code for anything else that stops the app before its window opens.
 const EXIT_PROBLEM: i32 = 1;
@@ -51,9 +52,15 @@ fn main() {
 
     let app = tauri::Builder::default()
         .manage(DesktopState::new(this_computer))
+        .manage(window::ChromeState::new(
+            paths.settings_file(),
+            settings.system_title_bar,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
-            commands::connect
+            commands::connect,
+            window::system_title_bar,
+            window::set_system_title_bar
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -62,6 +69,12 @@ fn main() {
                 EXIT_PROBLEM,
             )
         });
+
+    // The title bar goes on the window before the event loop first draws it. This belongs as the first
+    // step of the app's single setup function once there is one: `Builder::setup` replaces, never chains.
+    if let Some(main) = app.get_webview_window("main") {
+        window::apply_chrome(&main, Platform::current(), settings.system_title_bar);
+    }
 
     app.run(|handle, event| {
         if let RunEvent::Exit = event

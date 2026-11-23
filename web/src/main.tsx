@@ -17,10 +17,12 @@ import App from './App'
 const root = createRoot(document.getElementById('root')!)
 
 if ('__TAURI_INTERNALS__' in window) {
-  void import('./desktop').then(({ DesktopRoot }) => {
+  void import('./desktop').then(({ DesktopChrome, DesktopRoot }) => {
     root.render(
       <StrictMode>
-        <DesktopRoot />
+        <DesktopChrome>
+          <DesktopRoot />
+        </DesktopChrome>
       </StrictMode>,
     )
   })
