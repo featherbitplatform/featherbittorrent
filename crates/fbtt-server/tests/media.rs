@@ -1406,6 +1406,84 @@ async fn media_routes_refuse_a_stream_token() {
     served.stop().await;
 }
 
+/// The same stream token, sent the other way: in the `Authorization: Bearer` header a sign-in hands its
+/// own token in, on a route that accepts that header.
+///
+/// The query form is the form a player can use and the form that leaks into histories and proxy logs;
+/// the header form is the one this API's own page uses, and it is reserved for the credential a sign-in
+/// issued. A stream token names one file's stream address and nothing else, so treating it as a bearer
+/// credential would make it a login for whatever the header is sent to, with a shorter lease on the
+/// same machine. The last two requests are the control that this is a verdict about the credential and
+/// not about the header: the same token on the address it was issued for streams, and the login token
+/// in the same header on the same probe route answers as it always did.
+#[tokio::test(flavor = "multi_thread")]
+async fn media_routes_refuse_a_stream_token_as_bearer() {
+    let served = Served::start("media-bearer-token", |dir| {
+        base_config(dir, vec![alice()], Some(true))
+    })
+    .await;
+    let token = bearer(&served).await;
+    let id = seed_show(&served, Some(&token)).await;
+    let address = {
+        let response = within(
+            http()
+                .post(served.url("/api/v1/stream-tokens"))
+                .json(&serde_json::json!({ "torrent": id, "file": 0 }))
+                .bearer_auth(&token)
+                .send(),
+        )
+        .await
+        .expect("the token request reached the server");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "no token was issued"
+        );
+        let answer = body(response).await;
+        answer["path"]
+            .as_str()
+            .expect("the answer names a path")
+            .to_string()
+    };
+    let stream_token = token_of(&address);
+    let probe = served.url(&format!("/api/v1/media/{id}/0"));
+
+    let (status, code) = error_of(get(&http(), &probe, Some(&stream_token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token opened a media route as a bearer header"
+    );
+    assert_eq!(code, "unauthorized");
+
+    // The stream address the token was issued for, which is the one place it is a credential.
+    let response = get(&http(), &served.url(&address), None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the stream address its token was issued for did not stream"
+    );
+    let bytes = within(response.bytes()).await.expect("a body");
+    assert!(!bytes.is_empty(), "and it carried bytes");
+
+    // And the same header carrying the credential a sign-in issued.
+    let response = get(&http(), &probe, Some(&token)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the bearer header itself was refused, which is not what this test is about"
+    );
+    assert_eq!(
+        body(response).await["tracks"]
+            .as_array()
+            .expect("tracks")
+            .len(),
+        5
+    );
+
+    served.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn permits_are_released_when_the_client_goes_away() {
     let served = Served::start("media-permits", |dir| base_config(dir, vec![], Some(false))).await;
