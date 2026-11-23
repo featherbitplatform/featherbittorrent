@@ -17,6 +17,7 @@ import { useConnection } from '../connection'
 import { useSavePassword } from '../savePassword'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
+import { installDialogShim } from '../dialog-shim'
 
 const shell = vi.hoisted(() => ({
   connect: vi.fn(),
@@ -24,6 +25,7 @@ const shell = vi.hoisted(() => ({
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
   setTrayInstance: vi.fn(() => Promise.resolve()),
+  takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   seen: [] as Connection[],
   mounts: 0,
   hostMounts: 0,
@@ -40,6 +42,8 @@ vi.mock('./bridge', () => ({
   LOCAL_ID: 'local',
   THIS_COMPUTER: 'This computer',
   setTrayInstance: shell.setTrayInstance,
+  takeOpened: shell.takeOpened,
+  onOpened: () => Promise.resolve(() => {}),
 }))
 vi.mock('./CloseChoice', () => ({
   CloseChoiceHost: function FakeCloseChoiceHost() {
@@ -78,6 +82,8 @@ vi.mock('../App', () => ({
 
 import { DesktopRoot } from './DesktopRoot'
 
+installDialogShim()
+
 const BASE = 'http://127.0.0.1:53211'
 const PI = 'http://pi.local:8090'
 const bearer = (token: string) => ({ kind: 'bearer' as const, base: BASE, token })
@@ -98,6 +104,8 @@ afterEach(() => {
   shell.probeInstance.mockReset()
   shell.savePassword.mockReset()
   shell.setTrayInstance.mockClear()
+  shell.takeOpened.mockReset()
+  shell.takeOpened.mockResolvedValue([])
   shell.seen.length = 0
   shell.mounts = 0
   shell.hostMounts = 0
@@ -323,4 +331,33 @@ it('the_close_question_is_ready_while_connecting_and_unreachable', async () => {
   await screen.findByText(UNREACHABLE_COPY)
   expect(screen.getByText('close question ready')).toBeTruthy()
   expect(shell.hostMounts).toBe(1)
+})
+
+it('the_tray_names_the_instance_shown_in_every_phase', async () => {
+  shell.listInstances.mockResolvedValue(list('local'))
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  await waitFor(() => expect(shell.setTrayInstance).toHaveBeenLastCalledWith('This computer'))
+
+  // Switched to an instance that is down: the window shows the Pi, so the tray names the Pi.
+  shell.probeInstance.mockResolvedValue({ reachable: false, cors_ok: false })
+  switchTo(/Pi at home/)
+  await screen.findByText(UNREACHABLE_COPY)
+  await waitFor(() => expect(shell.setTrayInstance).toHaveBeenLastCalledWith('Pi at home'))
+})
+
+it('an_opened_link_survives_a_switch', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+  const magnet = 'magnet:?xt=urn:btih:aaaa'
+  shell.takeOpened.mockResolvedValueOnce([{ kind: 'magnet', uri: magnet }])
+  shell.listInstances.mockResolvedValue(list('local'))
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValue({ kind: 'bearer', base: PI, token: 'session' })
+  renderRoot()
+  const field = (await screen.findByLabelText('Magnet link')) as HTMLInputElement
+  expect(field.value).toBe(magnet)
+
+  switchTo(/Pi at home/)
+  await screen.findByText(`workspace ${PI} session`)
+  expect((screen.getByLabelText('Magnet link') as HTMLInputElement).value).toBe(magnet)
 })

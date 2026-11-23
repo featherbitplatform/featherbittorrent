@@ -168,3 +168,22 @@ export async function setTrayInstance(name: string): Promise<void> {
 export async function onCloseRequested(handler: () => void): Promise<() => void> {
   return listen(CLOSE_REQUESTED_EVENT, () => handler())
 }
+
+/** One link or file the app was opened with, as the shell hands it over. A `refused` file is one the shell would not read (too large, or unreadable), with the line saying so. */
+export type OpenedItem =
+  | { kind: 'magnet'; uri: string }
+  | { kind: 'file'; name: string; bytes_b64: string }
+  | { kind: 'refused'; name: string; message: string }
+
+/** The shell's event for each link or file opened once the page has asked for the earlier ones. */
+export const OPENED_EVENT = 'opened'
+
+/** The links and files that arrived before the page asked, oldest first. From this call on the shell emits {@link OPENED_EVENT} instead. */
+export async function takeOpened(): Promise<OpenedItem[]> {
+  return invoke<OpenedItem[]>('take_opened')
+}
+
+/** Calls `handler` for each link or file opened from now on; resolves to the function that stops listening. */
+export async function onOpened(handler: (item: OpenedItem) => void): Promise<() => void> {
+  return listen<OpenedItem>(OPENED_EVENT, (event) => handler(event.payload))
+}

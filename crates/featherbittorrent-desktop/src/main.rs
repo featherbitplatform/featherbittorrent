@@ -13,6 +13,7 @@ mod instances;
 mod keychain;
 mod lifecycle;
 mod local;
+mod opened;
 mod settings_store;
 mod tray;
 mod window;
@@ -47,23 +48,28 @@ fn main() {
         DesktopSettings::default()
     });
 
-    let this_computer =
-        tauri::async_runtime::block_on(local::start(&paths, settings.serve.enabled))
-            .unwrap_or_else(|problem| {
-                let code = if problem == local::ALREADY_RUNNING {
-                    local::EXIT_ALREADY_RUNNING
-                } else {
-                    EXIT_PROBLEM
-                };
-                refuse(&problem, code)
-            });
+    // This computer starts in the setup, after the single-instance plugin has had its say: a second
+    // launch hands its arguments to the copy already running and exits before it would find the library
+    // locked.
+    let serve = settings.serve.enabled;
 
     let app = tauri::Builder::default()
+        // First among the plugins, as its documentation requires: a second launch forwards what it was
+        // opened with to this copy, which shows its window, and exits without starting anything.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            opened::on_second_launch(
+                &app.state::<opened::OpenedState>(),
+                argv,
+                &cwd,
+                &opened::AppPage(app),
+            );
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![lifecycle::BACKGROUND_FLAG]),
         ))
-        .manage(DesktopState::new(this_computer))
+        .manage(opened::OpenedState::new())
         .manage(settings_store.clone())
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
@@ -74,7 +80,7 @@ fn main() {
         .manage(lifecycle::Lifecycle::new(settings_store))
         // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
         // be added anywhere: a new step goes into `setup` below, in its place in the order.
-        .setup(setup)
+        .setup(move |app| setup(app, &paths, serve))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -97,7 +103,8 @@ fn main() {
             lifecycle::close_window_now,
             lifecycle::tray_available,
             lifecycle::set_start_at_login,
-            tray::set_tray_instance
+            tray::set_tray_instance,
+            opened::take_opened
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -112,10 +119,27 @@ fn main() {
     app.run(lifecycle::handle_run_event);
 }
 
-/// Everything that needs the app built and its window made, in a fixed order: the window's chrome, then
-/// the tray, then how the window starts (which depends on whether there is a tray), then the quit signals.
-/// This is the only setup function; `Builder::setup` keeps one.
-fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+/// Everything that needs the app built and its window made, in a fixed order: This computer, the window's
+/// chrome, then the tray, then how the window starts (which depends on whether there is a tray), then the
+/// quit signals, then what this launch was opened with. This is the only setup function; `Builder::setup`
+/// keeps one.
+fn setup(
+    app: &mut tauri::App,
+    paths: &DesktopPaths,
+    serve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 0. This computer, which only the one copy that got past the single-instance plugin starts. Its
+    //    window is still invisible, so a refusal here is the native message alone.
+    let this_computer =
+        tauri::async_runtime::block_on(local::start(paths, serve)).unwrap_or_else(|problem| {
+            let code = if problem == local::ALREADY_RUNNING {
+                local::EXIT_ALREADY_RUNNING
+            } else {
+                EXIT_PROBLEM
+            };
+            refuse(&problem, code)
+        });
+    app.manage(DesktopState::new(this_computer));
     let handle = app.handle();
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
     //    them before it calls the setup); a missing one is said once and the app goes on without it.
@@ -138,6 +162,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     );
     // 4. A quit by signal runs the final save too.
     lifecycle::quit_on_signals(handle);
+    // 5. The links and files this launch was opened with, kept until the page asks, and on macOS the
+    //    ones the system opens the running app with from now on.
+    opened::install(handle, &app.state::<opened::OpenedState>());
     Ok(())
 }
 

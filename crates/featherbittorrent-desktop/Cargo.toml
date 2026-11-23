@@ -25,6 +25,15 @@ tauri-build.workspace = true
 tauri = { workspace = true, features = ["tray-icon"] }
 # Start at login: the app's own login item, launched with `--background`.
 tauri-plugin-autostart.workspace = true
+# One copy of the app: a second launch forwards its arguments (the links and files it was opened with)
+# to the first and exits.
+tauri-plugin-single-instance.workspace = true
+# The `magnet:` scheme and the links the system hands the running app (`opened.rs`).
+tauri-plugin-deep-link.workspace = true
+# A `.torrent` the app was opened with goes to the page as base64 (`opened.rs`).
+base64.workspace = true
+# The file URLs macOS hands an app that was opened with a `.torrent`.
+url.workspace = true
 # The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save. The
 # runtime itself is Tauri's; this only names the feature.
 tokio = { workspace = true, features = ["signal"] }
