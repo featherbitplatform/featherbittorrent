@@ -606,11 +606,13 @@ export function makeVideoPlayable(video: HTMLVideoElement): void {
 }
 
 /**
- * Give an element the browser's `currentTime`: a write fires `seeking` asynchronously once the
- * element has loaded its metadata, and fires nothing before that (the spec only records the
- * default playback start position then). jsdom's `currentTime` is a plain field, so it is stood in
- * for with a setter. `metadata: false` starts the element before its metadata, and the handle's
- * `loadMetadata` is the moment it arrives.
+ * Give an element the browser's `currentTime` and `readyState`: a write fires `seeking`
+ * asynchronously once the element has loaded its metadata (`readyState` 1, `HAVE_METADATA`), and
+ * fires nothing before that (`readyState` 0): the spec only records the write as the default
+ * playback start position then, and seeks there, firing `seeking`, when the metadata arrives if
+ * that point is above 0. jsdom's `currentTime` is a plain field and its `readyState` is always 0,
+ * so both are stood in for. `metadata: false` starts the element before its metadata, and the
+ * handle's `loadMetadata` is the moment it arrives.
  */
 export function makeVideoSeekable(
   video: HTMLVideoElement,
@@ -618,19 +620,27 @@ export function makeVideoSeekable(
 ): { loadMetadata(): void } {
   let current = 0
   let metadata = options.metadata ?? true
+  const fireSeeking = (): void => queueMicrotask(() => video.dispatchEvent(new Event('seeking')))
   Object.defineProperty(video, 'currentTime', {
     get: (): number => current,
     set: (value: number): void => {
       current = value
       // A browser fires `seeking` asynchronously once metadata is loaded; the event goes out on
       // the next microtask, the way the browser's does relative to the write.
-      if (metadata) queueMicrotask(() => video.dispatchEvent(new Event('seeking')))
+      if (metadata) fireSeeking()
     },
+    configurable: true,
+  })
+  Object.defineProperty(video, 'readyState', {
+    get: (): number => (metadata ? 1 : 0),
     configurable: true,
   })
   return {
     loadMetadata(): void {
+      if (metadata) return
       metadata = true
+      // The default playback start position: a point above 0 is sought to now.
+      if (current > 0) fireSeeking()
     },
   }
 }

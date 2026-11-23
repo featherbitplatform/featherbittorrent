@@ -2512,4 +2512,31 @@ describe('the final review fixes', () => {
       native.restore()
     }
   })
+
+  it('a remembered position starts with one fetch per track', async () => {
+    // The start at the remembered point is written before the element has metadata, so it
+    // becomes the element's default start position, and the element seeks there when the
+    // metadata arrives: by then the video has fed data. That seek is the start itself, not a
+    // person's, and must not restart a body that is working.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 3000, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 3000, body: () => new FakeBody() }))
+    const { video, loadMetadata } = fakeVideoBeforeMetadata()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    engine.seek(3000)
+    source.open()
+    await settle()
+    expect(video.currentTime, 'the start did not land at the remembered position').toBe(4)
+    recorder.callsFor('/tracks/1/stream')[0]?.body?.push(new Uint8Array([1]))
+    await settle()
+    loadMetadata()
+    await settle()
+    await settle()
+    expect(recorder.callsFor('/tracks/1/stream').length, 'the metadata seek restarted the video').toBe(1)
+    expect(recorder.callsFor('/tracks/2/stream').length, 'the metadata seek restarted the audio').toBe(1)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
 })

@@ -154,6 +154,8 @@ interface VideoLike extends EventTarget {
   srcObject?: unknown
   disableRemotePlayback?: boolean
   currentTime: number
+  /** `HAVE_NOTHING` (0) until the element has its metadata; a write then fires no `seeking`. */
+  readyState: number
   buffered: { length: number; start(i: number): number; end(i: number): number }
 }
 
@@ -317,10 +319,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   // The point the engine itself put the playhead at, so the `seeking` that write fires is not
   // answered with a restart of the streams it was just asking for.
   let engineSeekTo: number | null = null
-  // The video stream's generation when the engine made that write. An element with no metadata
-  // yet (the very first start) fires no `seeking` for it, so the point can outlive the write; it
-  // only names the engine's own move while that body is still the live one and has not fed data.
-  let engineSeekGeneration = -1
+  // The video stream's generation when the engine made that write, or null when the element had
+  // no metadata yet. A write before metadata fires no `seeking`: it becomes the element's default
+  // start position, and the element seeks there (firing `seeking` at that point) once its
+  // metadata arrives, however much data the body has fed by then. So a point written before
+  // metadata is kept until that seek; one written after it names the engine's own move only while
+  // the body that made it is still the live one.
+  let engineSeekGeneration: number | null = null
   let videoStream: Stream
   let audioStream: Stream | null
 
@@ -421,9 +426,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       const startMsLanded = Math.max(requestedMs, bodyStartMs)
       if (stream.role !== 'video' || !stream.isStart) return
       stream.isStart = false
-      engineSeekTo = mapTimes.toMedia(startMsLanded)
-      engineSeekGeneration = stream.generation
-      video.currentTime = engineSeekTo
+      const landed = mapTimes.toMedia(startMsLanded)
+      const beforeMetadata = video.readyState === 0
+      // A start at 0 before metadata is the element's own default: no seek ever comes for it, so
+      // there is nothing to arm.
+      engineSeekTo = beforeMetadata && landed === 0 ? null : landed
+      engineSeekGeneration = beforeMetadata ? null : stream.generation
+      video.currentTime = landed
       // The follow is asked for at the same point the primary landed on.
       if (follow !== null) beginStream(follow, bodyStartMs)
       if (state === 'loading') setState('playing')
@@ -1000,13 +1009,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (engineSeekTo !== null) {
       const target = engineSeekTo
       engineSeekTo = null
-      // A match is the engine's own move only while the body that made it is still the live
-      // one and has not fed data yet. Otherwise the point is stale (the first start fired no
-      // `seeking`), and a person seeking back to it gets the coverage check like any seek.
+      // A point written before metadata is the element's own seek at metadata, whatever the body
+      // has fed since; one written after it is the engine's own move while that body is live.
+      // Otherwise a person seeking to the same point gets the coverage check like any seek.
       const own =
-        videoStream !== undefined &&
-        videoStream.generation === engineSeekGeneration &&
-        videoStream.fedTo === null
+        engineSeekGeneration === null ||
+        (videoStream !== undefined && videoStream.generation === engineSeekGeneration)
       if (own && Math.abs(time - target) < 1e-3) return
     }
     const covered = video.buffered.length > 0 &&
