@@ -1,4 +1,5 @@
 {
+  "productName": "featherbittorrent-desktop",
   "app": {
     "windows": [
       {
