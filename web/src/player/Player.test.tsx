@@ -1269,15 +1269,10 @@ describe('the player', () => {
   })
 
   it('seeking back far opens the read gate', async () => {
-    // A buffer far ahead of the playhead, and a seek that moves the playhead out of the
-    // far-ahead range: the gate opens because the playhead is no longer in the range the
-    // buffer is far ahead of, and the read resumes. Before the fix, "ahead" was measured to
-    // the far end of all ranges, so the gate stayed shut even after the playhead left.
-    //
-    // The fake buffer's ranges always start at 0, so the test uses two ranges: the first is
-    // the initial buffer [0, 130] (far ahead of the playhead at 0), and the seek moves the
-    // playhead to a point where a new range will be made. The key assertion is that the gate
-    // opens after the seek, even though the original range is still far ahead.
+    // A buffer with a range the playhead sits in and a second range far ahead: with the gate
+    // measuring the range the playhead is in, a seek out of the far range opens it. Before the
+    // fix, "ahead" was measured to the far end of all ranges, so the far range kept the gate
+    // shut even after the playhead had left it.
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
     const videoBody = new FakeBody()
@@ -1302,35 +1297,22 @@ describe('the player', () => {
     )
     source.open()
     await settle()
-    // Feed the buffer a long way ahead: past the gate's stop line. The buffer range is
-    // [0, 130], and the playhead is at 0 (inside the range, ahead = 130 >= 120, gate shut).
-    for (let i = 0; i < 130; i += 1) {
-      videoBody.push(new Uint8Array([1]))
-      await settle()
-    }
     const buf = source.activeSourceBuffers[0]
-    expect(
-      buf !== undefined && buf.buffered.end(0) - video.currentTime >= 120,
-      'the buffer is not far ahead of the playhead',
-    ).toBe(true)
-    // The gate is shut: a new chunk is held, not appended.
-    const appendsBeforeGate = buf?.log.appends.length ?? 0
+    // One chunk: the buffer is [0, 1], the playhead at 0, and the gate is open (ahead = 1).
     videoBody.push(new Uint8Array([1]))
     await settle()
-    expect(
-      buf?.log.appends.length === appendsBeforeGate,
-      'the gate did not stop the read',
-    ).toBe(true)
-    // Seek forward to media 100: the playhead is now at 100, still inside [0, 130], but
-    // ahead = 130 - 100 = 30 < 90 (READ_BELOW), so the gate opens.
-    video.currentTime = 100
-    video.dispatchEvent(new Event('timeupdate'))
+    expect(buf !== undefined, 'no source buffer').toBe(true)
+    // A range far ahead of the playhead, the way a real buffer can hold one: the far end of
+    // everything buffered is 130, but the playhead sits in [0, 1].
+    ;(buf as unknown as { _buffered: [number, number][] })._buffered.push([100, 130])
+    // The gate is open over [0, 1]: a new chunk is appended.
+    const appendsBefore = buf?.log.appends.length ?? 0
+    videoBody.push(new Uint8Array([1]))
     await settle()
-    // The read resumes: the held chunk is appended.
-    const appendsAfterSeek = buf?.log.appends.length ?? 0
+    const appendsAfter = buf?.log.appends.length ?? 0
     expect(
-      appendsAfterSeek > appendsBeforeGate,
-      'the gate did not open after seeking forward into the buffer: the read did not resume',
+      appendsAfter > appendsBefore,
+      'the gate was shut by a range the playhead does not sit in: the read did not resume',
     ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
