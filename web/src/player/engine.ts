@@ -317,6 +317,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   // The point the engine itself put the playhead at, so the `seeking` that write fires is not
   // answered with a restart of the streams it was just asking for.
   let engineSeekTo: number | null = null
+  // The video stream's generation when the engine made that write. An element with no metadata
+  // yet (the very first start) fires no `seeking` for it, so the point can outlive the write; it
+  // only names the engine's own move while that body is still the live one and has not fed data.
+  let engineSeekGeneration = -1
   let videoStream: Stream
   let audioStream: Stream | null
 
@@ -418,6 +422,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       if (stream.role !== 'video' || !stream.isStart) return
       stream.isStart = false
       engineSeekTo = mapTimes.toMedia(startMsLanded)
+      engineSeekGeneration = stream.generation
       video.currentTime = engineSeekTo
       // The follow is asked for at the same point the primary landed on.
       if (follow !== null) beginStream(follow, bodyStartMs)
@@ -995,7 +1000,14 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (engineSeekTo !== null) {
       const target = engineSeekTo
       engineSeekTo = null
-      if (Math.abs(time - target) < 1e-3) return
+      // A match is the engine's own move only while the body that made it is still the live
+      // one and has not fed data yet. Otherwise the point is stale (the first start fired no
+      // `seeking`), and a person seeking back to it gets the coverage check like any seek.
+      const own =
+        videoStream !== undefined &&
+        videoStream.generation === engineSeekGeneration &&
+        videoStream.fedTo === null
+      if (own && Math.abs(time - target) < 1e-3) return
     }
     const covered = video.buffered.length > 0 &&
       [...Array(video.buffered.length).keys()].some(

@@ -16,6 +16,7 @@ import {
   fakeDeps,
   fakeFetch,
   fakeVideo,
+  fakeVideoBeforeMetadata,
   makeVideoPlayable,
 } from './testing'
 
@@ -2264,6 +2265,34 @@ describe('the final review fixes', () => {
     expect(calls[1]?.url, 'the retry of the switch did not start at the playhead').toContain('start_ms=0')
     expect(t.audioBuffer.log.removes, 'the old track was not cut at the playhead').toEqual([[1, 3]])
     t.close()
+  })
+
+  it('a seek back to the start point restarts', async () => {
+    // The first start writes the playhead before the element has metadata, so no `seeking`
+    // comes for it. A later seek back to that same point, outside the buffer, is the person's
+    // and must restart the streams like any other.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    const { video, loadMetadata } = fakeVideoBeforeMetadata()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(video.currentTime, 'the start did not land at media 1').toBe(1)
+    loadMetadata()
+    recorder.callsFor('/tracks/1/stream')[0]?.body?.push(new Uint8Array([1]))
+    await settle()
+    video.currentTime = 1
+    await settle()
+    await settle()
+    expect(
+      recorder.callsFor('/tracks/1/stream').length,
+      'a seek back to the start point was taken for the engine\'s own move',
+    ).toBe(2)
+    engine.destroy()
+    document.body.removeChild(video)
   })
 
 })
