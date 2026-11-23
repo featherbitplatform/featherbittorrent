@@ -21,6 +21,7 @@ vi.mock('./bridge', () => ({
 }))
 
 import { installDialogShim } from '../dialog-shim'
+import { MODAL_DIALOG } from '../modal'
 import { CloseChoice, CloseChoiceHost } from './CloseChoice'
 
 installDialogShim()
@@ -89,4 +90,14 @@ it('the_shell_event_opens_the_question', async () => {
   await screen.findByText('What should closing the window do?')
   unmount()
   await waitFor(() => expect(unlisten).toHaveBeenCalled())
+})
+
+it('the_question_is_a_centred_shared_modal', () => {
+  // Preflight's `margin: 0` pinned this dialog under the traffic lights; the shared classes put the
+  // `margin: auto` back that a browser centres a modal with.
+  render(<CloseChoice onClose={vi.fn()} />)
+  const dialog = document.querySelector('dialog')
+  expect(dialog, 'the question is not a dialog').not.toBeNull()
+  expect(dialog!.className).toContain(MODAL_DIALOG)
+  expect(dialog!.className.split(' ')).toContain('m-auto')
 })

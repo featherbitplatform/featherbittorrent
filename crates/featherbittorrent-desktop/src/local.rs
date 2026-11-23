@@ -12,7 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fbtt_core::config::ConfigError;
-use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths, ServerConfig};
 use fbtt_desktop_core::{DesktopPaths, launch_secret};
 use fbtt_server::{DesktopAccess, Server};
 
@@ -54,6 +54,8 @@ pub fn paths_problem(problem: &ConfigError) -> String {
 pub struct ThisComputer {
     server: Server,
     secret: String,
+    /// Whether this engine was started serving other machines (Serve the web UI), not the window alone.
+    exposed: bool,
 }
 
 impl std::fmt::Debug for ThisComputer {
@@ -70,14 +72,12 @@ impl std::fmt::Debug for ThisComputer {
 /// the Serve the web UI switch: on, the library's `server:` section applies as it does for `serve`; off,
 /// the engine is the window's alone.
 ///
+/// The engine's settings are made from the config by `settings`: [`Config::session_settings`] for real,
+/// and a test keeps the engine on loopback with no DHT and no multicast while everything else runs as it
+/// does for real. The app's own start goes through [`crate::serving::Serving::start_this_computer`].
+///
 /// The error is the line to show. A library another run holds is exactly [`ALREADY_RUNNING`].
-pub async fn start(paths: &DesktopPaths, serve: bool) -> Result<ThisComputer, String> {
-    start_with(paths, serve, Config::session_settings).await
-}
-
-/// [`start`] with the engine settings made from the config by `settings`, which is how a test keeps the
-/// engine on loopback with no DHT and no multicast while everything else runs as it does for real.
-async fn start_with(
+pub(crate) async fn start_with(
     paths: &DesktopPaths,
     serve: bool,
     settings: impl FnOnce(&Config) -> fbt::Settings,
@@ -93,7 +93,7 @@ async fn start_with(
             ));
         }
     };
-    let config = library_config(&library)?;
+    let config = with_allowed_roots(library_config(&library)?, &library);
     let secret = launch_secret();
     let access = DesktopAccess {
         launch_secret: secret.clone(),
@@ -103,7 +103,11 @@ async fn start_with(
     let server = Server::start_desktop(settings(&config), config, &library, lock, access)
         .await
         .map_err(|problem| format!("This computer could not start: {problem}"))?;
-    Ok(ThisComputer { server, secret })
+    Ok(ThisComputer {
+        server,
+        secret,
+        exposed: serve,
+    })
 }
 
 /// The config This computer starts on: the library's file as read, this library's defaults written out
@@ -128,6 +132,17 @@ fn library_config(paths: &Paths) -> Result<Config, String> {
     }
 }
 
+/// `config` as the engine runs it: a library whose file names no `server:` section (the desktop's default)
+/// gets one in memory, resolved the way `featherbittorrent serve` resolves an absent one, so the folders
+/// the engine may name are the download folder rather than none at all (every add would be refused as
+/// outside the allowed folders). Nothing is written: the file stays the person's own, with no section.
+fn with_allowed_roots(mut config: Config, paths: &Paths) -> Config {
+    if config.server.is_none() {
+        config.server = Some(ServerConfig::default());
+    }
+    config.resolve(paths)
+}
+
 impl ThisComputer {
     /// Where the page reaches this engine, and the token it presents: `http://127.0.0.1:<port>` (no
     /// trailing slash) and the launch secret.
@@ -143,6 +158,17 @@ impl ThisComputer {
         };
         let base = format!("http://{}", SocketAddr::new(ip, addr.port()));
         (base, self.secret.clone())
+    }
+
+    /// The address the engine listens on, as it was bound: an unspecified address when it serves every
+    /// interface. [`crate::serving`] turns that into the address other machines type.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.server.local_addr()
+    }
+
+    /// Whether this engine serves other machines: started with Serve the web UI on.
+    pub fn exposed(&self) -> bool {
+        self.exposed
     }
 
     /// Stops the engine: the API closes, the last save runs, the library is released. A save that did not
@@ -169,7 +195,7 @@ pub(crate) mod tests {
     const DEADLINE: Duration = Duration::from_secs(60);
 
     /// The engine settings every test runs on: nothing leaves loopback, and nothing asks a router.
-    fn offline(config: &Config) -> fbt::Settings {
+    pub(crate) fn offline(config: &Config) -> fbt::Settings {
         let mut settings = config.session_settings();
         settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
         settings.dht_enabled = false;
@@ -248,6 +274,116 @@ pub(crate) mod tests {
             .expect("This computer starts again");
         assert_ne!(again.endpoint().1, secret);
         again.stop().await;
+    }
+
+    /// Desktop paths in `dir` with nothing written: a library the app has never run on.
+    fn fresh_paths(dir: &ScratchDir) -> DesktopPaths {
+        DesktopPaths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        }
+    }
+
+    /// The first run on a library with no config.yaml: the config it writes names no server, and the
+    /// engine's copy has the download folder as its one allowed root, as `serve` would have it. Nothing
+    /// starts and nothing is created but the scratch config file (the download folder may be the host's,
+    /// so it is only named, never made).
+    #[test]
+    fn a_fresh_library_gets_the_download_folder_as_its_root() {
+        let dir = ScratchDir::new("desktop-local-fresh-roots-unit");
+        let paths = fresh_paths(&dir);
+        let library = paths.library();
+        assert!(!library.config_file().exists(), "a fresh library");
+
+        let config = super::library_config(&library).expect("the defaults");
+        let written = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("the first run wrote one");
+        assert!(written.server.is_none(), "no server section was written");
+
+        let download_dir = config.download_dir.clone();
+        let engine = super::with_allowed_roots(config, &library);
+        assert_eq!(
+            engine.server.expect("a section in memory").allowed_roots,
+            vec![download_dir]
+        );
+        let after = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("still there");
+        assert!(after.server.is_none(), "still no server section on disk");
+    }
+
+    /// A library whose config.yaml names no `server:` section (the desktop's default) can add a magnet
+    /// into its download folder: the engine's allowed folders are that folder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnet_add_on_a_fresh_library_succeeds() {
+        let dir = ScratchDir::new("desktop-local-fresh-add");
+        let paths = scratch_paths(&dir);
+        let library = paths.library();
+        let written = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("written by the scratch library");
+        assert!(written.server.is_none(), "no server section");
+        let downloads = written.resolve(&library).download_dir;
+        assert!(
+            downloads.starts_with(dir.path()),
+            "a scratch download folder"
+        );
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let (base, secret) = this.endpoint();
+
+        let body = serde_json::json!({
+            "magnet": format!("magnet:?xt=urn:btih:{}", "cd".repeat(20)),
+            "save_path": downloads.to_string_lossy(),
+        });
+        let added = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .post(format!("{base}/api/v1/torrents"))
+                .bearer_auth(&secret)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed");
+        let status = added.status();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            added.text().await.unwrap_or_default()
+        );
+        this.stop().await;
+    }
+
+    /// The folder picker on a library with no `server:` section has somewhere to start: its roots list
+    /// is not empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_folder_roots_are_not_empty_on_a_fresh_library() {
+        let dir = ScratchDir::new("desktop-local-fresh-roots");
+        let paths = scratch_paths(&dir);
+        let no_section = Config::load_for_edit(&paths.library().config_file())
+            .expect("the config reads")
+            .expect("written by the scratch library");
+        assert!(no_section.server.is_none(), "no server section");
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let (base, secret) = this.endpoint();
+        let answer = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .get(format!("{base}/api/v1/fs/roots"))
+                .bearer_auth(&secret)
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed");
+        assert_eq!(answer.status(), StatusCode::OK);
+        let roots: Vec<String> =
+            serde_json::from_str(&answer.text().await.expect("a body")).expect("a list of roots");
+        assert!(!roots.is_empty(), "the download folder is a root");
+        this.stop().await;
     }
 
     /// The desktop's own variables are what the no-home line tells a person to set.

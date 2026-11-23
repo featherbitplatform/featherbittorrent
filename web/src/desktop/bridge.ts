@@ -14,6 +14,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { Window } from '@tauri-apps/api/window'
 import { normaliseBase } from '../endpoint'
 import type { Endpoint } from '../endpoint'
+import type { ShortcutOverride } from '../keys'
 
 /** The shell's id for This computer, the app's own engine, and the instance the page opens on until saved instances arrive. */
 export const LOCAL_ID = 'local'
@@ -167,4 +168,92 @@ export async function setTrayInstance(name: string): Promise<void> {
 /** Calls `handler` each time closing the window asks the page first; resolves to the function that stops listening. */
 export async function onCloseRequested(handler: () => void): Promise<() => void> {
   return listen(CLOSE_REQUESTED_EVENT, () => handler())
+}
+
+/** One link or file the app was opened with, as the shell hands it over. A `refused` file is one the shell would not read (too large, or unreadable), with the line saying so. */
+export type OpenedItem =
+  | { kind: 'magnet'; uri: string }
+  | { kind: 'file'; name: string; bytes_b64: string }
+  | { kind: 'refused'; name: string; message: string }
+
+/** The shell's event for each link or file opened once the page has asked for the earlier ones. */
+export const OPENED_EVENT = 'opened'
+
+/** The links and files that arrived before the page asked, oldest first. From this call on the shell emits {@link OPENED_EVENT} instead. */
+export async function takeOpened(): Promise<OpenedItem[]> {
+  return invoke<OpenedItem[]>('take_opened')
+}
+
+/** Calls `handler` for each link or file opened from now on; resolves to the function that stops listening. */
+export async function onOpened(handler: (item: OpenedItem) => void): Promise<() => void> {
+  return listen<OpenedItem>(OPENED_EVENT, (event) => handler(event.payload))
+}
+
+/** How This computer's start went: still under way (ask again), fine, or why it did not start (the shell's line). */
+export type StartupStatus = { state: 'starting' } | { state: 'fine' } | { state: 'problem'; message: string }
+
+/** How This computer's start went. Waits a while for a start under way and answers `starting` if it still is. */
+export async function startupProblem(): Promise<StartupStatus> {
+  return invoke<StartupStatus>('startup_problem')
+}
+
+/** Quits the app; after a failed start the exit code says why (3 when another run holds the library). */
+export async function quitApp(): Promise<void> {
+  await invoke('quit_app')
+}
+
+/** What closing the window does now (`ask` until the first answer) and whether the app starts at login. */
+export interface DesktopPreferences {
+  close: 'ask' | 'quit' | 'tray'
+  start_at_login: boolean
+}
+
+/** The Desktop section's switches as the shell's settings file has them. */
+export async function desktopPreferences(): Promise<DesktopPreferences> {
+  return invoke<DesktopPreferences>('desktop_preferences')
+}
+
+/** The keyboard shortcuts a person changed, as saved in the shell's settings file. */
+export async function getShortcuts(): Promise<ShortcutOverride[]> {
+  return invoke<ShortcutOverride[]>('get_shortcuts')
+}
+
+/** Saves the changed shortcuts; rejects with the shell's line when they cannot be saved. */
+export async function setShortcuts(list: ShortcutOverride[]): Promise<void> {
+  await invoke('set_shortcuts', { list })
+}
+
+/**
+ * Serve the web UI as the shell has it: the switch, the address and login the config names, where it is
+ * reachable now (null while off), and why serving is off although this launch asked for it (the engine
+ * would not start serving and started for the window alone), null otherwise.
+ */
+export interface ServingState {
+  enabled: boolean
+  bind: string
+  user: string
+  address: string | null
+  problem: string | null
+}
+
+/** What turning serving on or off asks for. The password is only needed for a user the config does not have yet. */
+export interface ServingRequest {
+  enabled: boolean
+  bind: string
+  user: string
+  password: string
+}
+
+/** Serve the web UI as it is now. */
+export async function servingStatus(): Promise<ServingState> {
+  return invoke<ServingState>('serving_status')
+}
+
+/**
+ * Turns Serve the web UI on or off, which restarts This computer: its launch secret changes, so the page
+ * connects to `local` again afterwards. Rejects with the shell's line (a missing password, an address
+ * that is taken).
+ */
+export async function setServing(request: ServingRequest): Promise<ServingState> {
+  return invoke<ServingState>('set_serving', { request })
 }

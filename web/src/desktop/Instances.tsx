@@ -25,7 +25,10 @@ export interface InstancesProps {
   current: string
   /** Read the list again: something changed. */
   onChanged(): Promise<void>
-  onClose(): void
+  /** Back to the page; only the standalone screen has a Back button. */
+  onClose?(): void
+  /** Drawn inside Settings' Desktop section: no screen of its own, no Back, no page title. */
+  embedded?: boolean
 }
 
 /** The shell's refusal as a line to show: it answers with a string, anything else gets a general line. */
@@ -33,7 +36,7 @@ function line(cause: unknown): string {
   return typeof cause === 'string' && cause !== '' ? cause : 'That did not work. Try again.'
 }
 
-export function Instances({ list, current, onChanged, onClose }: InstancesProps) {
+export function Instances({ list, current, onChanged, onClose, embedded = false }: InstancesProps) {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -62,15 +65,19 @@ export function Instances({ list, current, onChanged, onClose }: InstancesProps)
     }
   }
 
+  const Frame = embedded ? 'div' : 'main'
+  const AddHeading = embedded ? 'h4' : 'h2'
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-6">
-      <div className="flex flex-wrap items-center gap-4">
-        <Button variant="secondary" onClick={onClose}>
-          <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-          Back
-        </Button>
-        <h1 className="text-lg font-semibold text-strong">Instances</h1>
-      </div>
+    <Frame className={embedded ? 'flex flex-col gap-4' : 'mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-6'}>
+      {!embedded && (
+        <div className="flex flex-wrap items-center gap-4">
+          <Button variant="secondary" onClick={onClose}>
+            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+            Back
+          </Button>
+          <h1 className="text-lg font-semibold text-strong">Instances</h1>
+        </div>
+      )}
 
       <ul className="flex flex-col divide-y divide-rule rounded-card border border-rule bg-surface">
         {inSwitcherOrder(list.items).map((item) => (
@@ -123,7 +130,7 @@ export function Instances({ list, current, onChanged, onClose }: InstancesProps)
         className="flex flex-col gap-3.5 rounded-card border border-rule bg-surface p-4"
         onSubmit={(event) => void add(event)}
       >
-        <h2 className="text-base font-medium text-strong">Add an instance</h2>
+        <AddHeading className="text-base font-medium text-strong">Add an instance</AddHeading>
         <TextField label="Name" value={name} onChange={(event) => setName(event.target.value)} />
         <TextField
           label="Address"
@@ -142,7 +149,7 @@ export function Instances({ list, current, onChanged, onClose }: InstancesProps)
 
       {error !== null && <Banner tone="danger">{error}</Banner>}
       {!list.keychain && <p className="text-[13px] text-muted">{NO_KEYCHAIN}</p>}
-    </main>
+    </Frame>
   )
 }
 

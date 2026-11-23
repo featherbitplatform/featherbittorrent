@@ -8,6 +8,11 @@
 //! down) reaches [`handle_run_event`] as `RunEvent::Exit` with nothing before it, and the process ends
 //! when that handler returns: so the handler stops This computer itself when no quit has started, and
 //! waits for the save of the quit that has ([`on_exit`], [`QUIT_WAIT`]).
+//!
+//! This computer is also stopped and started again while the app runs, when Serve the web UI changes
+//! ([`Lifecycle::restart_this_computer`]). A restart and a quit take the same engine lock, so they never
+//! overlap: a quit that arrives during a restart waits for it and then stops (and saves) whatever engine
+//! the restart left, and a restart that finds a quit under way does not start a new engine at all.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -18,7 +23,9 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::DesktopState;
+use crate::local::ThisComputer;
 use crate::settings_store::SettingsStore;
+use crate::startup::START_WAIT;
 
 /// The argument the login item launches the app with: start without showing the window.
 pub const BACKGROUND_FLAG: &str = "--background";
@@ -176,7 +183,12 @@ pub struct Lifecycle {
     tray_available: AtomicBool,
     phase: Mutex<QuitPhase>,
     stopped: Condvar,
+    /// Held by whatever stops or starts This computer: a quit's final stop and a restart. One at a time.
+    engine: tokio::sync::Mutex<()>,
 }
+
+/// What a restart answers when the app is already quitting: nothing is started again.
+pub const QUITTING: &str = "featherbittorrent is quitting.";
 
 impl Lifecycle {
     /// The lifecycle of a run whose settings live in `settings`. No tray until [`set_tray_available`]
@@ -189,6 +201,7 @@ impl Lifecycle {
             tray_available: AtomicBool::new(false),
             phase: Mutex::new(QuitPhase::Running),
             stopped: Condvar::new(),
+            engine: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -217,7 +230,7 @@ impl Lifecycle {
 
     /// Moves from running to quitting. True the first time, false every time after: one quit runs, the
     /// rest wait for it.
-    fn begin_quit(&self) -> bool {
+    pub(crate) fn begin_quit(&self) -> bool {
         let mut phase = self
             .phase
             .lock()
@@ -251,6 +264,62 @@ impl Lifecycle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *phase != QuitPhase::Quitting
     }
+
+    /// The quit's stop: waits for any restart in progress, and for This computer's first start when it is
+    /// still under way (at most [`START_WAIT`]), then takes the engine out and stops it (its final save).
+    /// Nothing to stop is not a problem: a failed start, or a restart that found the quit under way and
+    /// started no new engine. The code to exit with is then [`crate::startup::Startup::exit_code`].
+    pub async fn stop_for_quit(&self, state: &DesktopState) {
+        let _engine = self.engine.lock().await;
+        if let Some(this_computer) = state.startup().take_when_settled(START_WAIT).await {
+            this_computer.stop().await;
+        }
+    }
+
+    /// Stops This computer and starts it again with `start`, under the engine lock, so a quit never sees
+    /// it half way. A restart asked for while the first start is still under way waits for it (at most
+    /// [`START_WAIT`]); one after a failed first start answers that start's line and starts nothing.
+    /// `start` runs with the old engine stopped and the library free (it may change the library's config
+    /// before it starts the new one); it answers the engine to keep running, if any, and the answer for
+    /// the caller. Meanwhile a connect for This computer waits for the new engine. A quit that began
+    /// before the lock was taken, or while the old engine was stopping, means no new engine is started
+    /// and the answer is [`QUITTING`].
+    pub async fn restart_this_computer<T, F, Fut>(
+        &self,
+        state: &DesktopState,
+        start: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = (Option<ThisComputer>, Result<T, String>)>,
+    {
+        let _engine = self.engine.lock().await;
+        if self.phase() != QuitPhase::Running {
+            return Err(QUITTING.to_string());
+        }
+        let startup = state.startup();
+        if !startup.settled(START_WAIT).await {
+            return Err(crate::startup::START_TOO_SLOW.to_string());
+        }
+        if let Some(old) = startup.begin_restart()? {
+            old.stop().await;
+        }
+        if self.phase() != QuitPhase::Running {
+            startup.finish_restart(None);
+            return Err(QUITTING.to_string());
+        }
+        let (running, answer) = start().await;
+        startup.finish_restart(running);
+        answer
+    }
+}
+
+/// The code a system exit (logout, shutdown, the last window gone) ends the process with, once This
+/// computer was stopped: `None` for 0, which is what the event loop exits with anyway, or the failed
+/// start's code (3 for a library another run holds, 1 otherwise), as a quit from the page would.
+pub fn system_exit_code(state: &DesktopState) -> Option<i32> {
+    let code = state.startup().exit_code();
+    (code != 0).then_some(code)
 }
 
 /// Shows the main window, brings it out of the Dock or taskbar, and focuses it.
@@ -283,7 +352,14 @@ pub fn apply_initial_state<R: Runtime>(app: &AppHandle<R>, state: WindowState) {
 
 /// Does what closing the window means now. The close itself has already been held back by the caller,
 /// so the window only goes away through here.
+///
+/// After a failed start of This computer the page shows only the problem and its Quit, so a close is a
+/// quit (with that start's exit code): there is nothing to keep running in the tray and nobody to ask.
 pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
+    if system_exit_code(&app.state::<DesktopState>()).is_some() {
+        quit(app);
+        return;
+    }
     match app.state::<Lifecycle>().close_outcome() {
         CloseOutcome::Quit => quit(app),
         CloseOutcome::HideToTray => {
@@ -300,7 +376,9 @@ pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// Quits the app: the window goes away at once, This computer stops (its final save), then the process
-/// exits. A second quit while the first is stopping does nothing, so it cannot exit before the save.
+/// exits. A second quit while the first is stopping does nothing, so it cannot exit before the save. A
+/// quit while This computer is still starting waits for the start, then stops it. The exit code is 0, or
+/// a failed start's (`startup::StartProblem::exit_code`).
 pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     if !app.state::<Lifecycle>().begin_quit() {
         return;
@@ -310,13 +388,13 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let this_computer = app.state::<DesktopState>().take();
-        if let Some(this_computer) = this_computer {
-            this_computer.stop().await;
-        }
+        let lifecycle = app.state::<Lifecycle>();
+        let state = app.state::<DesktopState>();
+        lifecycle.stop_for_quit(&state).await;
+        let code = state.startup().exit_code();
         // Stopped before the exit, so the exit request it causes is let through.
         app.state::<Lifecycle>().finish_quit();
-        app.exit(0);
+        app.exit(code);
     });
 }
 
@@ -341,9 +419,9 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
             match on_exit(lifecycle.phase()) {
                 ExitAnswer::StopHere => {
                     if lifecycle.begin_quit() {
-                        if let Some(this_computer) = app.state::<DesktopState>().take() {
-                            tauri::async_runtime::block_on(this_computer.stop());
-                        }
+                        tauri::async_runtime::block_on(
+                            lifecycle.stop_for_quit(&app.state::<DesktopState>()),
+                        );
                         lifecycle.finish_quit();
                     } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
                         eprintln!("The final save did not finish in time; quitting without it.");
@@ -355,6 +433,11 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
                     }
                 }
                 ExitAnswer::Nothing => {}
+            }
+            // The process ends when this handler returns, with 0; after a failed start it ends with that
+            // start's code instead, whichever way out was taken.
+            if let Some(code) = system_exit_code(&app.state::<DesktopState>()) {
+                std::process::exit(code);
             }
         }
         _ => {}
@@ -455,6 +538,31 @@ mod tests {
             close,
             ..DesktopSettings::default()
         }
+    }
+
+    /// A system exit (logout, shutdown) after a failed start ends the process with that start's code, as
+    /// the page's Quit does: 3 for a library another run holds, 1 otherwise; a start that went fine leaves
+    /// the event loop's own 0.
+    #[test]
+    fn a_system_exit_after_a_failed_start_keeps_its_code() {
+        use crate::commands::DesktopState;
+        use crate::local::{ALREADY_RUNNING, EXIT_ALREADY_RUNNING};
+        use crate::startup::StartProblem;
+
+        let held = DesktopState::starting();
+        held.startup().finish(Err(StartProblem::from_start_error(
+            ALREADY_RUNNING.to_string(),
+        )));
+        assert_eq!(super::system_exit_code(&held), Some(EXIT_ALREADY_RUNNING));
+
+        let other = DesktopState::starting();
+        other.startup().finish(Err(StartProblem::from_start_error(
+            "This computer could not start: no port".to_string(),
+        )));
+        assert_eq!(super::system_exit_code(&other), Some(1));
+
+        let starting = DesktopState::starting();
+        assert_eq!(super::system_exit_code(&starting), None);
     }
 
     #[test]

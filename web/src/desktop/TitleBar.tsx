@@ -3,7 +3,8 @@
  *
  * The window has no system title bar (see `window.rs` in the shell): on macOS the system's title strip
  * is transparent and untitled, and the native traffic lights sit over this bar's left end, which keeps
- * 78px free for them. On Windows and Linux this bar draws Minimize, Maximize (Restore when the window
+ * 88px free for them (set by eye against a screenshot of the real window, leaving about the same gap as
+ * between the buttons themselves). On Windows and Linux this bar draws Minimize, Maximize (Restore when the window
  * is maximized) and Close on the right. Empty bar space carries `data-tauri-drag-region`: pressing
  * there moves the window, and a double click maximizes or restores it (zooms, on macOS), which Tauri's
  * own drag script does. With the system title bar switched on (Linux only: Windows always draws its
@@ -25,7 +26,7 @@ import { currentWindow, desktopInfo, onSystemTitleBar, systemTitleBar } from './
 import type { DesktopInfo } from './bridge'
 
 /** Room for the three traffic lights at the left of a macOS bar (`trafficLightPosition` in `tauri.conf.json` puts them at x 16). */
-const TRAFFIC_LIGHTS_INSET = 78
+const TRAFFIC_LIGHTS_INSET = 88
 
 export interface TitleBarProps {
   platform: DesktopInfo['platform']
@@ -197,6 +198,9 @@ function guessPlatform(): DesktopInfo['platform'] {
 /**
  * The bar above `children`, with the bar's slots provided to them. `children` gets the rest of the
  * window: a screen that sizes itself to the viewport (`h-dvh`, `min-h-dvh`) is sized to that space.
+ * The override is a percentage (`h-full`, `min-h-full`), which only resolves against a parent of
+ * definite height: this flex column and the page's own one below it qualify, but a plain block of
+ * auto height between them and the screen's root does not, so such wrappers must be `contents`.
  */
 export function DesktopChrome({ children }: { children: ReactNode }) {
   const [platform, setPlatform] = useState<DesktopInfo['platform']>(guessPlatform)

@@ -15,8 +15,11 @@ import { TitleBarSlotsContext } from '../components/titleBarSlots'
 import type { TitleBarSlots } from '../components/titleBarSlots'
 import { useConnection } from '../connection'
 import { useSavePassword } from '../savePassword'
+import { useDesktopSettings } from '../desktopSettings'
+import { effectiveBindings, KEY_BINDINGS, setOverrides } from '../keys'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
+import { installDialogShim } from '../dialog-shim'
 
 const shell = vi.hoisted(() => ({
   connect: vi.fn(),
@@ -24,6 +27,10 @@ const shell = vi.hoisted(() => ({
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
   setTrayInstance: vi.fn(() => Promise.resolve()),
+  takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
+  getShortcuts: vi.fn(() => Promise.resolve([])),
+  startupProblem: vi.fn(() => Promise.resolve({ state: 'fine' } as unknown)),
+  finishApply: null as ((problem: string | null) => Promise<void>) | null,
   seen: [] as Connection[],
   mounts: 0,
   hostMounts: 0,
@@ -40,6 +47,39 @@ vi.mock('./bridge', () => ({
   LOCAL_ID: 'local',
   THIS_COMPUTER: 'This computer',
   setTrayInstance: shell.setTrayInstance,
+  takeOpened: shell.takeOpened,
+  onOpened: () => Promise.resolve(() => {}),
+  startupProblem: shell.startupProblem,
+  quitApp: vi.fn(),
+  getShortcuts: shell.getShortcuts,
+}))
+vi.mock('./DesktopSettings', () => ({
+  INSTANCES_SECTION: 'settings-desktop-instances',
+  SERVING_SECTION: 'settings-desktop-serving',
+  DesktopSettings: function FakeDesktopSettings({
+    onServingApplying,
+    onServingChanged,
+  }: {
+    onServingApplying(): void
+    onServingChanged(problem: string | null): Promise<void>
+  }) {
+    return (
+      <>
+        <button type="button" onClick={() => void onServingChanged(null)}>
+          serving applied
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onServingApplying()
+            shell.finishApply = onServingChanged
+          }}
+        >
+          start apply
+        </button>
+      </>
+    )
+  },
 }))
 vi.mock('./CloseChoice', () => ({
   CloseChoiceHost: function FakeCloseChoiceHost() {
@@ -58,8 +98,12 @@ vi.mock('../App', () => ({
     }, [])
     const endpoint = connection.endpoint
     const offer = useSavePassword()
+    const desktop = useDesktopSettings()
+    const request = desktop?.request ?? null
     return (
       <div>
+        {request !== null && <div>settings at {request.section}</div>}
+        {desktop?.sections}
         <div>
           workspace {endpoint.kind === 'bearer' ? `${endpoint.base} ${endpoint.token ?? 'signed out'}` : ''}
         </div>
@@ -77,6 +121,8 @@ vi.mock('../App', () => ({
 }))
 
 import { DesktopRoot } from './DesktopRoot'
+
+installDialogShim()
 
 const BASE = 'http://127.0.0.1:53211'
 const PI = 'http://pi.local:8090'
@@ -98,6 +144,10 @@ afterEach(() => {
   shell.probeInstance.mockReset()
   shell.savePassword.mockReset()
   shell.setTrayInstance.mockClear()
+  shell.takeOpened.mockReset()
+  shell.takeOpened.mockResolvedValue([])
+  shell.startupProblem.mockReset()
+  shell.startupProblem.mockResolvedValue({ state: 'fine' })
   shell.seen.length = 0
   shell.mounts = 0
   shell.hostMounts = 0
@@ -135,6 +185,19 @@ it('connects_to_this_computer_and_renders_the_app_on_its_endpoint', async () => 
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
   expect(shell.connect).toHaveBeenCalledWith('local')
+})
+
+it('the_page_column_hands_its_height_to_the_screen', async () => {
+  // The frame sizes `h-dvh` screens as `height: 100%`: the box the screens go into has to be a
+  // flex item that takes the rest of the window and a flex column itself, or the percentage is void.
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  const app = (await screen.findByText(`workspace ${BASE} first`)).parentElement!
+  const column = app.parentElement!
+  expect(column.className.split(' ')).toEqual(
+    expect.arrayContaining(['flex', 'min-h-0', 'flex-1', 'flex-col', 'overflow-auto']),
+  )
+  expect(column.parentElement, 'the page column is not a child of the frame').toBe(screen.getByTestId('page'))
 })
 
 it('a_rejected_launch_token_reconnects_without_signing_in', async () => {
@@ -323,4 +386,129 @@ it('the_close_question_is_ready_while_connecting_and_unreachable', async () => {
   await screen.findByText(UNREACHABLE_COPY)
   expect(screen.getByText('close question ready')).toBeTruthy()
   expect(shell.hostMounts).toBe(1)
+})
+
+it('the_tray_names_the_instance_shown_in_every_phase', async () => {
+  shell.listInstances.mockResolvedValue(list('local'))
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  await waitFor(() => expect(shell.setTrayInstance).toHaveBeenLastCalledWith('This computer'))
+
+  // Switched to an instance that is down: the window shows the Pi, so the tray names the Pi.
+  shell.probeInstance.mockResolvedValue({ reachable: false, cors_ok: false })
+  switchTo(/Pi at home/)
+  await screen.findByText(UNREACHABLE_COPY)
+  await waitFor(() => expect(shell.setTrayInstance).toHaveBeenLastCalledWith('Pi at home'))
+})
+
+it('an_opened_link_survives_a_switch', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+  const magnet = 'magnet:?xt=urn:btih:aaaa'
+  shell.takeOpened.mockResolvedValueOnce([{ kind: 'magnet', uri: magnet }])
+  shell.listInstances.mockResolvedValue(list('local'))
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValue({ kind: 'bearer', base: PI, token: 'session' })
+  renderRoot()
+  const field = (await screen.findByLabelText('Magnet link')) as HTMLInputElement
+  expect(field.value).toBe(magnet)
+
+  switchTo(/Pi at home/)
+  await screen.findByText(`workspace ${PI} session`)
+  expect((screen.getByLabelText('Magnet link') as HTMLInputElement).value).toBe(magnet)
+})
+
+it('manage_instances_opens_settings_at_the_instances_section', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: /^Instance:/ }))
+  fireEvent.click(screen.getByRole('menuitem', { name: 'Manage instances' }))
+  await screen.findByText('settings at settings-desktop-instances')
+  expect(screen.queryByRole('heading', { name: 'Instances', level: 1 }), 'the standalone manager opened').toBeNull()
+})
+
+it('a_serving_change_reconnects_this_computer_at_once', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+  expect(shell.connect).toHaveBeenCalledTimes(2)
+})
+
+it('a_serving_change_that_kept_the_secret_does_not_remount', async () => {
+  shell.connect.mockResolvedValue(bearer('same'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} same`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await waitFor(() => expect(shell.connect).toHaveBeenCalledTimes(2))
+  expect(shell.mounts).toBe(1)
+})
+
+it('the_saved_shortcuts_are_applied_at_start', async () => {
+  const binding = KEY_BINDINGS.find((b) => b.where === 'Torrent list')!
+  shell.getShortcuts.mockResolvedValueOnce([{ where: binding.where, action: binding.action, keys: ['F9'] }] as never)
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await waitFor(() =>
+    expect(effectiveBindings().find((b) => b.where === binding.where && b.action === binding.action)?.keys).toEqual([
+      'F9',
+    ]),
+  )
+  setOverrides([])
+})
+
+it('a_failed_request_during_a_serving_apply_ends_on_settings_at_serving', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'start apply' }))
+  // The old engine is down: a request fails, and the new one refuses the old secret.
+  vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))))
+  fireEvent.click(screen.getByRole('button', { name: 'read torrents' }))
+  rejectToken(shell.seen[shell.seen.length - 1]!)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(shell.connect, 'no reconnect while the apply runs').toHaveBeenCalledTimes(1)
+  await act(async () => {
+    await shell.finishApply!(null)
+  })
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+  expect(screen.queryByText(UNREACHABLE_COPY)).toBeNull()
+})
+
+it('a_serving_apply_that_ends_unreachable_reconnects_to_settings_at_serving', async () => {
+  shell.connect
+    .mockResolvedValueOnce(bearer('first'))
+    .mockResolvedValueOnce(bearer('first'))
+    .mockRejectedValueOnce('This computer is not running.')
+    .mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'start apply' }))
+  const finish = shell.finishApply!
+  // Another answer clears the apply (same secret: nothing to do), then the window lands on Cannot
+  // reach the server, and only then does the first apply answer.
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await waitFor(() => expect(shell.connect).toHaveBeenCalledTimes(2))
+  rejectToken(shell.seen[shell.seen.length - 1]!)
+  await screen.findByText(UNREACHABLE_COPY)
+  await act(async () => {
+    await finish('The address is in use.')
+  })
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+})
+
+it('the_startup_problem_wins_over_everything', async () => {
+  shell.startupProblem.mockResolvedValue({ state: 'problem', message: 'featherbittorrent is already running.' })
+  shell.takeOpened.mockResolvedValueOnce([{ kind: 'magnet', uri: 'magnet:?xt=urn:btih:aaaa' }])
+  shell.connect.mockRejectedValue('featherbittorrent is already running.')
+  renderRoot()
+  await screen.findByRole('alertdialog', { name: 'featherbittorrent could not start' })
+  expect(screen.getByText('featherbittorrent is already running.')).toBeTruthy()
+  expect(screen.queryByLabelText('Magnet link'), 'no opened-link dialog over it').toBeNull()
+  expect(screen.queryByText(UNREACHABLE_COPY), 'no screen under it').toBeNull()
+  expect(screen.queryByText('close question ready'), 'no close question over it').toBeNull()
 })

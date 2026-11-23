@@ -13,7 +13,11 @@ mod instances;
 mod keychain;
 mod lifecycle;
 mod local;
+mod opened;
+mod preferences;
+mod serving;
 mod settings_store;
+mod startup;
 mod tray;
 mod window;
 
@@ -47,24 +51,32 @@ fn main() {
         DesktopSettings::default()
     });
 
-    let this_computer =
-        tauri::async_runtime::block_on(local::start(&paths, settings.serve.enabled))
-            .unwrap_or_else(|problem| {
-                let code = if problem == local::ALREADY_RUNNING {
-                    local::EXIT_ALREADY_RUNNING
-                } else {
-                    EXIT_PROBLEM
-                };
-                refuse(&problem, code)
-            });
+    // This computer starts in the setup, after the single-instance plugin has had its say: a second
+    // launch hands its arguments to the copy already running and exits before it would find the library
+    // locked.
+    let serve = settings.serve.enabled;
 
     let app = tauri::Builder::default()
+        // First among the plugins, as its documentation requires: a second launch forwards what it was
+        // opened with to this copy, which shows its window, and exits without starting anything.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            opened::on_second_launch(
+                &app.state::<opened::OpenedState>(),
+                argv,
+                &cwd,
+                &opened::AppPage(app),
+            );
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![lifecycle::BACKGROUND_FLAG]),
         ))
-        .manage(DesktopState::new(this_computer))
+        .manage(DesktopState::starting())
+        .manage(opened::OpenedState::new())
+        // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
+        .manage(serving::Serving::new(paths, settings_store.clone()))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
             settings_store.clone(),
@@ -74,7 +86,17 @@ fn main() {
         .manage(lifecycle::Lifecycle::new(settings_store))
         // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
         // be added anywhere: a new step goes into `setup` below, in its place in the order.
-        .setup(setup)
+        .setup(move |app| setup(app, serve))
+        // The app's one page-load hook (`Builder::on_page_load` replaces too): a page that starts loading
+        // is not listening for opened links until it asks again.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview
+                    .app_handle()
+                    .state::<opened::OpenedState>()
+                    .page_gone();
+            }
+        })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -97,7 +119,15 @@ fn main() {
             lifecycle::close_window_now,
             lifecycle::tray_available,
             lifecycle::set_start_at_login,
-            tray::set_tray_instance
+            tray::set_tray_instance,
+            opened::take_opened,
+            startup::startup_problem,
+            startup::quit_app,
+            preferences::desktop_preferences,
+            preferences::get_shortcuts,
+            preferences::set_shortcuts,
+            serving::serving_status,
+            serving::set_serving
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -112,11 +142,23 @@ fn main() {
     app.run(lifecycle::handle_run_event);
 }
 
-/// Everything that needs the app built and its window made, in a fixed order: the window's chrome, then
-/// the tray, then how the window starts (which depends on whether there is a tray), then the quit signals.
-/// This is the only setup function; `Builder::setup` keeps one.
-fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+/// Everything that needs the app built and its window made, in a fixed order: This computer, the window's
+/// chrome, then the tray, then how the window starts (which depends on whether there is a tray), then the
+/// quit signals, then what this launch was opened with. This is the only setup function; `Builder::setup`
+/// keeps one.
+fn setup(app: &mut tauri::App, serve: bool) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
+    // 0. This computer, which only the one copy that got past the single-instance plugin starts. It
+    //    starts off the main thread, so the event loop keeps running (a second launch's forward is
+    //    answered meanwhile); a failure is kept for the page, which says it with a Quit button. It starts
+    //    through Serve the web UI's own start, so a saved switch that is on serves from the first start,
+    //    and an engine that cannot serve falls back to the window alone with the line kept for Settings.
+    let serving = app.state::<serving::Serving>().inner().clone();
+    startup::spawn(handle, async move {
+        serving
+            .start_this_computer(serve, fbtt_core::Config::session_settings)
+            .await
+    });
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
     //    them before it calls the setup); a missing one is said once and the app goes on without it.
     match handle.get_webview_window(lifecycle::MAIN_WINDOW) {
@@ -138,11 +180,16 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     );
     // 4. A quit by signal runs the final save too.
     lifecycle::quit_on_signals(handle);
+    // 5. The links and files this launch was opened with, kept until the page asks, and on macOS the
+    //    ones the system opens the running app with from now on.
+    opened::install(handle, &app.state::<opened::OpenedState>());
     Ok(())
 }
 
 /// Says `message` in a native message box (and on stderr, for a run from a terminal), then exits with
-/// `code`. Used only before the window exists, when there is no page to say it in.
+/// `code`. Used only before the event loop runs (no home directory, a window that could not be made), when
+/// there is no page to say it in; never from inside the loop, where on Linux the box would wait on the
+/// loop it blocks. A failed start of This computer is said by the page instead (`startup`).
 fn refuse(message: &str, code: i32) -> ! {
     eprintln!("{message}");
     rfd::MessageDialog::new()

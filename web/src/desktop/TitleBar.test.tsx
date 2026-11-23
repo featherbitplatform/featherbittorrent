@@ -49,7 +49,7 @@ it('mac_bar_leaves_room_for_the_traffic_lights_and_draws_no_controls', async () 
   const { container } = await renderBar('macos')
   const inset = container.querySelector('[data-traffic-lights]')
   expect(inset, 'no inset for the traffic lights').not.toBeNull()
-  expect((inset as HTMLElement).style.width).toBe('78px')
+  expect((inset as HTMLElement).style.width).toBe('88px')
   for (const name of CONTROLS) expect(screen.queryByRole('button', { name })).toBeNull()
   screen.getByRole('button', { name: 'This computer' })
   screen.getByRole('button', { name: 'Add torrent' })
@@ -143,4 +143,22 @@ it('without_desktop_info_the_bar_still_draws_its_controls', async () => {
   await act(async () => {})
   for (const name of CONTROLS) screen.getByRole('button', { name })
   screen.getByText('page')
+})
+
+it('the_frame_sizes_viewport_screens_to_the_space_under_the_bar', async () => {
+  render(
+    <DesktopChrome>
+      <div data-testid="screen" className="flex h-dvh min-h-0 flex-col overflow-hidden" />
+    </DesktopChrome>,
+  )
+  await act(async () => {})
+  const page = screen.getByTestId('screen').parentElement!
+  // The page column takes what the bar leaves of a window-tall frame, and inside it `h-dvh` and
+  // `min-h-dvh` become percentages of that column instead of the whole window.
+  expect(page.className.split(' ')).toEqual(
+    expect.arrayContaining(['flex', 'min-h-0', 'flex-1', 'flex-col', '[&_.h-dvh]:h-full', '[&_.min-h-dvh]:min-h-full']),
+  )
+  expect(page.parentElement!.className.split(' ')).toEqual(
+    expect.arrayContaining(['flex', 'h-dvh', 'flex-col', 'overflow-hidden']),
+  )
 })

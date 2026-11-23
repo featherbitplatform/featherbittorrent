@@ -5,45 +5,55 @@
 //! here: the page calls the engine's HTTP API directly with the endpoint [`connect`] hands it, which is the
 //! one client code path the browser build uses too.
 
-use std::sync::Mutex;
+use std::time::Duration;
 
 use fbtt_desktop_core::LOCAL_ID;
 use serde::Serialize;
 
 use crate::instances::Instances;
-use crate::local::ThisComputer;
+use crate::startup::{START_WAIT, Startup};
 
-/// What the shell keeps for the commands: This computer while it runs.
-///
-/// `None` once the app is stopping and the engine has been taken out to shut down.
+/// What the shell keeps for the commands: This computer's start and, once it finished, the engine or why
+/// there is none ([`Startup`]).
 #[derive(Debug)]
 pub struct DesktopState {
-    this_computer: Mutex<Option<ThisComputer>>,
+    startup: Startup,
 }
 
 impl DesktopState {
-    /// The state for a run whose engine is `this_computer`.
-    pub fn new(this_computer: ThisComputer) -> Self {
+    /// The state while This computer starts (off the main thread, `startup::spawn`).
+    pub fn starting() -> Self {
         DesktopState {
-            this_computer: Mutex::new(Some(this_computer)),
+            startup: Startup::starting(),
         }
     }
 
-    /// Takes This computer out to stop it. The second call, and every call after, is `None`.
-    pub fn take(&self) -> Option<ThisComputer> {
-        self.this_computer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+    /// The state of a run whose engine already runs: what a test starts from.
+    #[cfg(test)]
+    pub fn running(this_computer: crate::local::ThisComputer) -> Self {
+        let state = DesktopState::starting();
+        state.startup.finish(Ok(this_computer));
+        state
     }
 
-    /// This computer's base address and secret, while it runs.
-    fn local_endpoint(&self) -> Option<(String, String)> {
-        self.this_computer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(ThisComputer::endpoint)
+    /// This computer's start, which connect, quit and a serving restart wait on.
+    pub fn startup(&self) -> &Startup {
+        &self.startup
+    }
+
+    /// The address This computer listens on, while it runs (served to others or not). The tests' view.
+    #[cfg(test)]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.startup
+            .with_running(crate::local::ThisComputer::local_addr)
+    }
+
+    /// The address This computer serves other machines on: only while it runs and was started with Serve
+    /// the web UI on. A window-only engine (loopback, launch secret only) is never an address to give out.
+    pub fn serving_addr(&self) -> Option<std::net::SocketAddr> {
+        self.startup
+            .with_running(|this| this.exposed().then(|| this.local_addr()))
+            .flatten()
     }
 }
 
@@ -97,18 +107,21 @@ impl std::fmt::Debug for EndpointDto {
     }
 }
 
-/// What [`connect`] answers for `local`: This computer's endpoint. Any other id is refused here; the
-/// command hands remote ids to [`Instances::connect`].
-pub fn connect_to(state: &DesktopState, id: &str) -> Result<EndpointDto, String> {
+/// What [`connect`] answers for `local`: This computer's endpoint, once its start finished (waiting at
+/// most `limit`), or the line saying why there is none. Any other id is refused here; the command hands
+/// remote ids to [`Instances::connect`].
+pub async fn connect_to(
+    state: &DesktopState,
+    id: &str,
+    limit: Duration,
+) -> Result<EndpointDto, String> {
     if id != LOCAL_ID {
         return Err(format!(
             "There is no instance called {}.",
             fbt::display_safe(id, fbt::MAX_DISPLAY_CHARS)
         ));
     }
-    let (base, token) = state
-        .local_endpoint()
-        .ok_or_else(|| "This computer is not running.".to_string())?;
+    let (base, token) = state.startup.endpoint(limit).await?;
     Ok(EndpointDto {
         kind: "bearer",
         base,
@@ -135,12 +148,14 @@ pub async fn connect(
     if id != LOCAL_ID {
         return instances.connect(&id).await;
     }
-    connect_to(&state, &id)
+    connect_to(&state, &id, START_WAIT).await
 }
 
 #[cfg(test)]
 mod tests {
     use fbtt_core::scratch::ScratchDir;
+
+    use std::time::Duration;
 
     use super::{DesktopState, Platform, connect_to, desktop_info};
     use crate::local::tests::{scratch_paths, start_offline};
@@ -152,9 +167,13 @@ mod tests {
         let paths = scratch_paths(&dir);
         let this = start_offline(&paths).await.expect("This computer starts");
         let (base, secret) = this.endpoint();
-        let state = DesktopState::new(this);
+        let state = DesktopState::starting();
+        state.startup().finish(Ok(this));
+        let wait = Duration::from_secs(30);
 
-        let answer = connect_to(&state, "local").expect("local connects");
+        let answer = connect_to(&state, "local", wait)
+            .await
+            .expect("local connects");
         assert_eq!(answer.kind, "bearer");
         assert_eq!(answer.base, base);
         assert_eq!(answer.token.as_deref(), Some(secret.as_str()));
@@ -163,11 +182,17 @@ mod tests {
             "Debug hides the token"
         );
 
-        assert!(connect_to(&state, "nowhere").is_err());
+        assert!(connect_to(&state, "nowhere", wait).await.is_err());
 
-        state.take().expect("still running").stop().await;
+        state
+            .startup()
+            .take_when_settled(wait)
+            .await
+            .expect("still running")
+            .stop()
+            .await;
         assert!(
-            connect_to(&state, "local").is_err(),
+            connect_to(&state, "local", wait).await.is_err(),
             "a stopped engine has no endpoint"
         );
     }

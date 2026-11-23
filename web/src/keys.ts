@@ -50,6 +50,21 @@ export interface ShortcutOverride {
 
 let effective: readonly KeyBinding[] = KEY_BINDINGS
 
+const listeners = new Set<() => void>()
+
+/**
+ * Calls `listener` after every {@link setOverrides}, wherever it came from (Settings, or the desktop
+ * shell's saved file applied at start). Returns the function that stops it. With
+ * {@link effectiveBindings} it is a `useSyncExternalStore` pair: the list keeps its identity between
+ * changes.
+ */
+export function subscribeOverrides(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => {
+    listeners.delete(listener)
+  }
+}
+
 function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, index) => key === b[index])
 }
@@ -87,6 +102,11 @@ export function conflictFor(where: KeyBinding['where'], action: string, key: str
  * against the final set, not entry by entry, so a swap of two keys survives a reload.
  */
 export function setOverrides(overrides: ShortcutOverride[]): void {
+  applyOverrides(overrides)
+  for (const listener of [...listeners]) listener()
+}
+
+function applyOverrides(overrides: ShortcutOverride[]): void {
   const fresh = (): KeyBinding[] => KEY_BINDINGS.map((binding) => ({ ...binding, keys: [...binding.keys] }))
   effective = fresh()
   if (!Array.isArray(overrides)) return
