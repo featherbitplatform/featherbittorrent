@@ -129,6 +129,10 @@ pub(super) struct StreamQuery {
 }
 
 /// `from_ms` and `to_ms` on the cue route: the window, in milliseconds of the file's own timeline.
+///
+/// Both are strings so this route can say what is wrong with them in this API's words rather than axum's
+/// own rejection, and both are `Option` only because the checking happens below in [`window_bound`]: an
+/// absent bound is refused here, not defaulted.
 #[derive(Debug, Deserialize)]
 pub(super) struct Window {
     from_ms: Option<String>,
@@ -408,9 +412,10 @@ struct Playing {
 /// This job is the request for as long as it runs, and three things end it: the track ran out, nobody is
 /// collecting fragments any more (the body was dropped, which is the viewer hanging up), or the file or the
 /// engine refused something. The first two are ordinary and are not worth a log line beyond a `debug` of who
-/// gave up; the third is logged with the torrent and the file - never the file's name, which is the
-/// viewer's business - and ends the stream where it stands, because the status code was spent hours of
-/// buffering ago.
+/// gave up; the third is logged with the torrent, the file and the verdict's *kind* through
+/// [`media_verdict`] - variant name and io kind, never the message, which for an engine or OS failure
+/// names a full path on this machine - and ends the stream where it stands, because the status code was
+/// spent hours of buffering ago.
 ///
 /// The place in the pool travels inside `out`, so that it goes back when *this* work is over and not when
 /// the handler that started it happened to return.
@@ -489,12 +494,15 @@ fn play(reader: BlockingReader, track: u32, start_ms: u64, out: Playing) {
             Ok(next) => next,
             // Past the first part the status code is spent: the body ends where it stands, which is what a
             // player reads as the end of what is fetchable, and the reason for it goes here rather than to
-            // the viewer.
+            // the viewer - as its kind only, because an `Io` verdict from the engine carries a path inside
+            // its message and a viewer's file name is not for the log.
             Err(problem) => {
+                let (verdict, kind) = media_verdict(&problem);
                 tracing::debug!(
                     torrent = %id,
                     file,
-                    problem = %clean(&problem.to_string()),
+                    verdict,
+                    ?kind,
                     "the media stream ended early",
                 );
                 return;
@@ -531,12 +539,13 @@ impl futures_util::Stream for Fragments {
 /// `GET /api/v1/media/{torrent}/{file}/tracks/{track}/cues?from_ms=A&to_ms=B`: when this track's subtitles
 /// say what, within the window the viewer is about to play.
 ///
-/// The window is checked before anything is read: `to_ms` has to come after `from_ms`, and the pair has to
-/// fit inside [`media::CUE_WINDOW_MAX_MS`], so a query naming a year of a film is refused by this route
-/// rather than by the demuxer's own bound. An absent bound is the edge of the window this route knows about:
-/// no `from_ms` is the start of the file, no `to_ms` is the widest window there is. A track that is not a
-/// text subtitle track - a video track, a bitmap subtitle track, a number the file does not carry - is
-/// `415 unsupported_media`, because there are no cues of any format to give for it.
+/// The window is checked before anything is read: both bounds have to be given and parse as numbers,
+/// `to_ms` has to come after `from_ms`, and the pair has to fit inside [`media::CUE_WINDOW_MAX_MS`], so a
+/// query naming a year of a film is refused by this route rather than by the demuxer's own bound. Neither
+/// bound is defaulted - see [`window_bound`] for why guessing "the rest of the file" is exactly the wrong
+/// answer here. A track that is not a text subtitle track - a video track, a bitmap subtitle track, a
+/// number the file does not carry - is `415 unsupported_media`, because there are no cues of any format to
+/// give for it.
 pub(super) async fn track_cues(
     State(shared): State<Arc<Shared>>,
     Path(params): Path<TrackPath>,
@@ -545,14 +554,8 @@ pub(super) async fn track_cues(
     let hashes = parse_id(&params.torrent)?;
     let file = file_index(&params.file)?;
     let track = track_number(&params.track)?;
-    let from_ms = match query.from_ms.as_deref() {
-        None => 0,
-        Some(given) => ms(given, "from_ms")?,
-    };
-    let to_ms = match query.to_ms.as_deref() {
-        None => media::CUE_WINDOW_MAX_MS,
-        Some(given) => ms(given, "to_ms")?,
-    };
+    let from_ms = window_bound(query.from_ms.as_deref(), "from_ms")?;
+    let to_ms = window_bound(query.to_ms.as_deref(), "to_ms")?;
     if to_ms <= from_ms {
         return Err(RouteError::invalid_request("to_ms has to be after from_ms"));
     }
@@ -663,11 +666,14 @@ async fn listed(
         Ok(files) => files,
         Err(SessionError::NoMetadata) => return Err(no_metadata()),
         Err(SessionError::Shutdown) => return Err(shutting_down()),
-        // Anything else is this server's own trouble, and the engine's words for it may name a file on this
-        // machine: the log gets those, the client gets what it can act on.
+        // Anything else is this server's own trouble. The engine's words for it may name a path on this
+        // machine, so the log gets the verdict's kind from [`engine_verdict`] and the client gets what it
+        // can act on; neither gets the file's name.
         Err(problem) => {
+            let (verdict, kind) = engine_verdict(&problem);
             tracing::warn!(
-                problem = %clean(&problem.to_string()),
+                verdict,
+                ?kind,
                 "the file list of a torrent could not be read",
             );
             return Err(RouteError::internal("the file list could not be read"));
@@ -738,11 +744,30 @@ fn track_number(given: &str) -> Result<u32, RouteError> {
     })
 }
 
-/// One millisecond bound of a cue window.
+/// One bound of a cue window: the client has to give it, and it has to be a number.
+///
+/// Nothing about this window is guessed. `start_ms` on the stream route may be absent because "no start"
+/// has exactly one meaning, the start of the file, while a missing `to_ms` could mean the end of the file,
+/// the end of the widest window, or a client that simply forgot the parameter - and defaulting it to a
+/// ten-minute window makes "give me everything from here on" quietly answer with only the first ten
+/// minutes of a film. A page that never asked for a limit and never got one is a page whose subtitles
+/// stop, with no answer that says why. So an absent bound is this API's `400 invalid_request`, the same
+/// verdict an unparsable one gets; `?from_ms=` with nothing after the `=` is the unparsable case, not a
+/// zero.
+fn window_bound(given: Option<&str>, what: &str) -> Result<u64, RouteError> {
+    let Some(given) = given else {
+        return Err(RouteError::invalid_request(format!(
+            "{what} is a time in milliseconds, and this route will not guess it"
+        )));
+    };
+    ms(given, what)
+}
+
+/// One millisecond bound of a cue window, as the client gave it.
 fn ms(given: &str, what: &str) -> Result<u64, RouteError> {
-    given.parse::<u64>().map_err(|_| {
-        RouteError::invalid_request(format!("{what} is a time in milliseconds, or absent"))
-    })
+    given
+        .parse::<u64>()
+        .map_err(|_| RouteError::invalid_request(format!("{what} is a time in milliseconds")))
 }
 
 /// The name to show for a file: the last component of the path the torrent carries, which is what a player
@@ -759,8 +784,10 @@ fn display_name(row: &FileStatus) -> String {
 ///
 /// One video and four subtitle files is the ordinary shape of a download, and someone picking from that list
 /// wants `movie.en.srt` before `captions.zh.ass`: sharing the video's name is the best sign available that a
-/// sidecar belongs to this file, and index order after that is at least stable. The file the request named is
-/// left out - it is the one being played, and it is not a subtitle for itself.
+/// sidecar belongs to this file, and index order after that is at least stable. "Sharing the name" means the
+/// stem and nothing after it but a dot and a suffix - see [`sidecar_of`] - so `about.srt` is not `a.mkv`'s
+/// own sidecar. The file the request named is left out - it is the one being played, and it is not a
+/// subtitle for itself.
 fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
     let base = files
         .iter()
@@ -777,7 +804,7 @@ fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
             let name = display_name(row);
             let format = media::subtitle_format(&name)?;
             let mine = name.to_ascii_lowercase();
-            let beside = base.as_deref().is_some_and(|base| mine.starts_with(base));
+            let beside = base.as_deref().is_some_and(|base| sidecar_of(base, &mine));
             Some((
                 // A row that did not match the video's name sorts after one that did.
                 !beside,
@@ -794,12 +821,43 @@ fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
     rows.into_iter().map(|(_, _, row)| row).collect()
 }
 
+/// Whether `name` is the sidecar of a video whose lower-case stem is `video_stem`: the stem exactly, or the
+/// stem with a dot and something after it.
+///
+/// Both arguments are already lower-case - [`external_subtitles`] lower-cases both before asking, so the
+/// comparison is not thrown off by a `Movie.SRT` beside a `movie.mkv`. `movie.srt`, `movie.en.srt` and
+/// `movie.ita.srt` belong to the video named `movie`; `about.srt` does not belong to a video named `a`
+/// however much its first letters agree, and neither does `movies.vtt` to a video named `movie`. A bare
+/// prefix test says all of those are sidecars, and then a folder's stray `about.srt` ranks as `a.mkv`'s
+/// own. The stem, and after it either nothing or a dot, is the whole rule.
+fn sidecar_of(video_stem: &str, name: &str) -> bool {
+    name == video_stem
+        || name
+            .strip_prefix(video_stem)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 /// A subtitle format, in the one spelling this API uses for it.
 fn format_name(format: SubtitleFormat) -> &'static str {
     match format {
         SubtitleFormat::Srt => "srt",
         SubtitleFormat::Ass => "ass",
         SubtitleFormat::Vtt => "vtt",
+    }
+}
+
+/// A media verdict's kind, for the log line that must not repeat its message.
+///
+/// `Unsupported` and `Malformed` quote what the demuxer found, and `Io` carries an `io::Error` whose words
+/// are the engine's or the OS's about a file on this machine - a full path with a viewer's file name in
+/// it. The message belongs in the client's answer (where [`media_problem`] puts the fbtt-media ones) or
+/// nowhere; a log line gets the variant's name and, for an `io`, its [`io::ErrorKind`]: enough to tell an
+/// operator which kind of "this stream stopped" happened, with no viewer's path in it.
+fn media_verdict(problem: &MediaError) -> (&'static str, Option<io::ErrorKind>) {
+    match problem {
+        MediaError::Unsupported(_) => ("unsupported", None),
+        MediaError::Malformed(_) => ("malformed", None),
+        MediaError::Io(err) => ("io", Some(err.kind())),
     }
 }
 
@@ -830,8 +888,10 @@ fn media_problem(problem: MediaError) -> RouteError {
                 unsupported_media("the file ends before its container header does")
             }
             kind => {
+                // The engine's or the OS's own words about a file on this machine, which the viewer's log
+                // must not carry: this line keeps the verdict's kind and nothing else.
                 tracing::warn!(
-                    problem = %clean(&err.to_string()),
+                    verdict = "io",
                     ?kind,
                     "reading a torrent file for the media routes failed",
                 );
@@ -841,12 +901,48 @@ fn media_problem(problem: MediaError) -> RouteError {
     }
 }
 
+/// An engine verdict's kind, for the same reason [`media_verdict`] exists.
+///
+/// The names are this API's snake_case spelling of the variant names, so an operator can read the log and
+/// the engine's source with the same word. The two variants that wrap an `io::Error` come with its kind.
+/// No message is kept: `Storage` and `Bind` carry an OS error naming a path or an address, and
+/// `InvalidPath`, `InvalidUrl`, `InvalidSettings`, `Tracker` and `Proxy` carry a viewer's path, URL or
+/// setting as their entire message. The deprecated `V2OnlyUnsupported` is deliberately not named in the
+/// match - naming a deprecated variant would make its deprecation this crate's warning to carry - so it
+/// lands in the catch-all as `session`.
+fn engine_verdict(problem: &SessionError) -> (&'static str, Option<io::ErrorKind>) {
+    match problem {
+        SessionError::Storage(err) => ("storage", Some(err.kind())),
+        SessionError::Bind(err) => ("bind", Some(err.kind())),
+        SessionError::DuplicateTorrent => ("duplicate_torrent", None),
+        SessionError::TorrentNotFound => ("torrent_not_found", None),
+        SessionError::InvalidPriorities { .. } => ("invalid_priorities", None),
+        SessionError::Shutdown => ("shutdown", None),
+        SessionError::Tracker(_) => ("tracker", None),
+        SessionError::InvalidSettings(_) => ("invalid_settings", None),
+        SessionError::NoMetadata => ("no_metadata", None),
+        SessionError::InvalidFileIndex { .. } => ("invalid_file_index", None),
+        SessionError::TooManyReaders => ("too_many_readers", None),
+        SessionError::Proxy(_) => ("proxy", None),
+        SessionError::InvalidPath(_) => ("invalid_path", None),
+        SessionError::Unsupported => ("unsupported", None),
+        SessionError::Busy => ("busy", None),
+        SessionError::InvalidUrl(_) => ("invalid_url", None),
+        SessionError::TooManyWebSeeds => ("too_many_web_seeds", None),
+        SessionError::Resume(_) => ("resume", None),
+        SessionError::DhtDisabled => ("dht_disabled", None),
+        SessionError::Dht(_) => ("dht", None),
+        _ => ("session", None),
+    }
+}
+
 /// A verdict from the engine itself, before any of the file's bytes were read.
 ///
 /// The two the client can act on are the two the plan names: a torrent whose metadata has not arrived gets
 /// the same `409` [`stream`] gives it, and a torrent with sixteen readers on it is at the engine's own
-/// limit, so it gets that limit's answer with the second fbt-api's `busy` asks a client to wait. The rest are
-/// this server failing at its job, and the engine's words for them may name a path on this machine.
+/// limit, so it gets that limit's answer with the second fbt-api's `busy` asks a client to wait. The rest
+/// are this server failing at its job, and they reach the log through [`engine_verdict`] as a kind only:
+/// the engine's words for them may name a path on this machine.
 fn engine_problem(problem: &SessionError) -> RouteError {
     match problem {
         SessionError::NoMetadata => no_metadata(),
@@ -859,8 +955,10 @@ fn engine_problem(problem: &SessionError) -> RouteError {
             RouteError::not_found("the file is not on this machine any more")
         }
         other => {
+            let (verdict, kind) = engine_verdict(other);
             tracing::warn!(
-                problem = %clean(&other.to_string()),
+                verdict,
+                ?kind,
                 "the engine could not open this file for the media routes",
             );
             RouteError::internal("the torrent file could not be opened")
@@ -941,4 +1039,40 @@ fn shutting_down() -> RouteError {
         "shutting_down",
         "the server is stopping",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidecar_of;
+
+    /// What ranks as a video's own sidecar, and what only ranks after it.
+    ///
+    /// The dot is the rule: `a.srt` and `a.en.srt` are the sidecars of a video named `a`, and
+    /// `about.srt`, `ab.srt`, `movies.vtt` and `en.srt` are not sidecars of the videos they are tested
+    /// against here, however much they agree with them at the front.
+    #[test]
+    fn sidecar_match_needs_a_dot() {
+        for (stem, name) in [
+            ("a", "a.srt"),
+            ("a", "a.en.srt"),
+            ("the show", "the show.ass"),
+            ("movie", "movie.ita.srt"),
+        ] {
+            assert!(
+                sidecar_of(stem, name),
+                "{name} should rank as {stem}'s own sidecar"
+            );
+        }
+        for (stem, name) in [
+            ("a", "about.srt"),
+            ("a", "ab.srt"),
+            ("movie", "movies.vtt"),
+            ("movie", "en.srt"),
+        ] {
+            assert!(
+                !sidecar_of(stem, name),
+                "{name} wrongly ranks as {stem}'s own sidecar"
+            );
+        }
+    }
 }

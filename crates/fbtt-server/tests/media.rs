@@ -16,7 +16,7 @@
 //! waiting: once on its read timeout, and once when the viewer hangs up mid-read and the timeout has
 //! another twenty-nine seconds to go.
 //!
-//! Logins are off except in the one test about credentials, because five of these eight tests are about
+//! Logins are off except in the one test about credentials, because nine of these ten tests are about
 //! containers and budgets, not about who is allowed to read them.
 
 use std::fs;
@@ -815,7 +815,9 @@ async fn cues_and_subtitle_file_routes() {
     // media crate's tests read out of the same bytes.
     let response = get(
         &http(),
-        &served.url(&format!("/api/v1/media/{id}/0/tracks/4/cues")),
+        &served.url(&format!(
+            "/api/v1/media/{id}/0/tracks/4/cues?from_ms=0&to_ms=10000"
+        )),
         None,
     )
     .await;
@@ -907,7 +909,9 @@ async fn cues_and_subtitle_file_routes() {
     let (status, code) = error_of(
         get(
             &http(),
-            &served.url(&format!("/api/v1/media/{id}/0/tracks/4/cues?from_ms=x")),
+            &served.url(&format!(
+                "/api/v1/media/{id}/0/tracks/4/cues?from_ms=x&to_ms=10000"
+            )),
             None,
         )
         .await,
@@ -921,7 +925,9 @@ async fn cues_and_subtitle_file_routes() {
     let (status, code) = error_of(
         get(
             &http(),
-            &served.url(&format!("/api/v1/media/{id}/0/tracks/1/cues")),
+            &served.url(&format!(
+                "/api/v1/media/{id}/0/tracks/1/cues?from_ms=0&to_ms=10000"
+            )),
             None,
         )
         .await,
@@ -959,21 +965,22 @@ async fn cues_and_subtitle_file_routes() {
     );
 
     // A file of the same torrent that is not a subtitle file, and a subtitle-looking name on a file the
-    // torrent does not have, are both answers about the file.
-    let (status, code) = error_of(
-        get(
-            &http(),
-            &served.url(&format!("/api/v1/media/{id}/0/subtitles/2")),
-            None,
-        )
-        .await,
+    // torrent does not have, are both answers about the file. The status gets its own assertion before
+    // the code is read out of the body: when this route stops knowing what a subtitle file is, the answer
+    // is a cue list rather than an error, and the failure worth having is "notes.txt is not a subtitle
+    // file" rather than a missing error code.
+    let response = get(
+        &http(),
+        &served.url(&format!("/api/v1/media/{id}/0/subtitles/2")),
+        None,
     )
     .await;
     assert_eq!(
-        status,
+        response.status(),
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
         "notes.txt is not a subtitle file"
     );
+    let (_, code) = error_of(response).await;
     assert_eq!(code, "unsupported_media");
     let (status, code) = error_of(
         get(
@@ -986,6 +993,59 @@ async fn cues_and_subtitle_file_routes() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "this torrent has no file 9");
     assert_eq!(code, "not_found");
+
+    served.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cues_route_needs_both_bounds() {
+    let served = Served::start("media-cue-bounds", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+
+    // Both bounds are the client's to give. `start_ms` may be absent on the stream route because "no
+    // start" means exactly one thing there; "no `to_ms`" could mean the end of the file, the end of the
+    // widest window, or a client that forgot the parameter - and guessing either of the first two
+    // answers "everything from here on" with ten quiet minutes. Absent is this route's `400`, same as a
+    // value that does not parse.
+    let cues = |query: &str| served.url(&format!("/api/v1/media/{id}/0/tracks/4/cues{query}"));
+    for (query, why) in [
+        ("", "a cue query with no window at all"),
+        ("?from_ms=0", "a cue query missing to_ms"),
+        ("?to_ms=10000", "a cue query missing from_ms"),
+        (
+            "?from_ms=&to_ms=10000",
+            "an empty from_ms, which is not a time",
+        ),
+    ] {
+        let response = get(&http(), &cues(query), None).await;
+        let status = response.status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query} is {why}");
+        let (_, code) = error_of(response).await;
+        assert_eq!(
+            code, "invalid_request",
+            "{query} is {why} and got the wrong code"
+        );
+    }
+
+    // The same three cues with the window spelled out, which is what every caller of this route now has
+    // to do, the tests among them.
+    let response = get(&http(), &cues("?from_ms=0&to_ms=10000"), None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an explicit window was refused"
+    );
+    assert_eq!(
+        body(response).await["cues"]
+            .as_array()
+            .expect("a cue list")
+            .len(),
+        3,
+        "an explicit window covering the whole file changed the answer"
+    );
 
     served.stop().await;
 }
@@ -1042,7 +1102,9 @@ async fn cue_text_keeps_its_lines() {
     let answer = body(
         get(
             &http(),
-            &served.url(&format!("/api/v1/media/{id}/0/tracks/4/cues")),
+            &served.url(&format!(
+                "/api/v1/media/{id}/0/tracks/4/cues?from_ms=0&to_ms=10000"
+            )),
             None,
         )
         .await,
@@ -1136,7 +1198,9 @@ async fn media_routes_refuse_a_stream_token() {
     let cookie = cookie_of(&signed_in);
     let response = within(
         http()
-            .get(served.url(&format!("/api/v1/media/{id}/0/tracks/4/cues")))
+            .get(served.url(&format!(
+                "/api/v1/media/{id}/0/tracks/4/cues?from_ms=0&to_ms=10000"
+            )))
             .header(reqwest::header::COOKIE, &cookie)
             .send(),
     )
@@ -1287,6 +1351,111 @@ async fn permits_are_released_when_the_client_goes_away() {
     served.stop().await;
 }
 
+/// A place has to come back when a viewer hangs up *after* the stream has started answering, which is
+/// the half [`permits_are_released_when_the_client_goes_away`] cannot reach: its eight viewers hang up
+/// while their jobs are still waiting on a piece, and nothing has crossed the wire. Here the eight
+/// viewers are streams of a fully-seeded file, and each is taken exactly as far as "the first bytes
+/// arrived and were read" - `send` answers once the route has built the stream's head and started the
+/// body, and `chunk` pulls those bytes across the connection - so all eight places are held by jobs
+/// that have served their first bytes. One of them then hangs up, and a place has to be free again
+/// within five seconds. A server that forgot the permit once it had served a byte - the failure this
+/// test is named for - has eight forgotten places by the ninth request, and no hang-up brings them
+/// back: the loop below waits out its five seconds on `503 too_many_media_streams` and says so.
+///
+/// What the fixture makes impossible is the more literal shape of this claim. A stream only serves
+/// bytes once the container's own index - the cues element, at the very end of this file - has been
+/// read, so blanking any of the three pieces blocks *before* the first byte, and a stream that has
+/// served bytes is reading only verified pieces: it answers its whole body (46 KiB, smaller than one
+/// flow window) and finishes without ever blocking. So the hang-up here is a hang-up after a served
+/// first byte against seven jobs that finish on their own, and the load-bearing claim - the dropped
+/// stream's place comes back - is the one the five-second bound and the mutation below both test.
+#[tokio::test(flavor = "multi_thread")]
+async fn permit_returns_after_a_dropped_stream() {
+    let served = Served::start("media-permit-return", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    // Longer than anything this test waits for. On this fully-seeded torrent no read ever blocks, so
+    // this only keeps "nothing here timed out" true; the last test needs the same setting for a real
+    // reason and explains it.
+    served
+        .server
+        .set_media_read_timeout(Duration::from_secs(30));
+
+    let stream = served.url(&format!("/api/v1/media/{id}/0/tracks/1/stream"));
+    // The viewers hold their responses; the client asking about the pool has one of its own, for the
+    // reason the last test spells out: a shared pool makes the asking request come apart on the
+    // viewer's closing connection rather than on the server's answer.
+    let viewers = http();
+    let asking = http();
+
+    // Eight viewers, one for every place this server has for demuxing, each taken past its first
+    // bytes. The status gets its own assertion because a refused viewer would leave the pool looking
+    // free for a reason this test is not about; the chunk is read because "the headers arrived" only
+    // means the route produced the head, and the bytes are what prove the stream is serving.
+    let mut held: Vec<Response> = Vec::new();
+    for _ in 0..8 {
+        let mut response = within(viewers.get(&stream).send())
+            .await
+            .expect("a viewer reached the server");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a viewer asking for a seeded video was not streamed"
+        );
+        let first = within(response.chunk())
+            .await
+            .expect("the first bytes of a stream");
+        assert!(
+            first.is_some(),
+            "a stream that answered with headers has a body"
+        );
+        held.push(response);
+    }
+
+    // The hang-up: one viewer, one chunk in, drops its response. Nothing else is touched - the other
+    // seven keep holding theirs, seeded jobs though they are.
+    let dropped_at = Instant::now();
+    drop(held.pop().expect("the eight held streams"));
+
+    // The place has to come back. The seven that stayed connected finish on their own soon enough;
+    // what this loop is really about is a server that kept the permit of a stream that had served
+    // bytes: by now it has forgotten eight of them, and every request it takes here answers with the
+    // full-pool code for the whole five seconds.
+    loop {
+        let response = get(&asking, &stream, None).await;
+        let status = response.status();
+        if status == StatusCode::OK {
+            let bytes = within(response.bytes())
+                .await
+                .expect("the stream that got the freed place");
+            assert!(
+                !bytes.is_empty(),
+                "the freed place served an empty body instead of the video"
+            );
+            break;
+        }
+        let (_, code) = error_of(response).await;
+        assert_eq!(
+            code, "too_many_media_streams",
+            "after the hang-up a stream answered {status} with the wrong code"
+        );
+        if dropped_at.elapsed() >= Duration::from_secs(5) {
+            panic!(
+                "the permit did not come back within five seconds of a stream hung up after \
+                 its first byte: a stream that has served bytes kept its place"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The probe's own place (its body was read to the end, so its job is done) and the seven
+    // viewers' come back as those responses go, and the server stops with nobody holding a job.
+    drop(held);
+    served.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn read_timeout_ends_the_stream() {
     let served = Served::start("media-timeout", |dir| base_config(dir, vec![], Some(false))).await;
@@ -1357,7 +1526,7 @@ async fn read_timeout_ends_the_stream() {
     // reader's rule, so every route that reads gets the same answer and none of them waits out the
     // default sixty seconds.
     for path in [
-        format!("/api/v1/media/{absent}/0/tracks/4/cues"),
+        format!("/api/v1/media/{absent}/0/tracks/4/cues?from_ms=0&to_ms=10000"),
         format!("/api/v1/media/{absent}/0/subtitles/1"),
     ] {
         let response = get(&client, &served.url(&path), None).await;

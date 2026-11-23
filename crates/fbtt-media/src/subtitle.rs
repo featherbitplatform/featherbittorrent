@@ -33,6 +33,18 @@ use crate::{
 use matroska_demuxer::Frame;
 use std::io::{Read, Seek};
 
+/// How much past the window's end a frame of ANOTHER track may sit before the
+/// cue walk stops on it.
+///
+/// Matroska block times are presentation times, and a file interleaves its
+/// tracks: with B-frames, or audio muxed ahead, a frame of another track can
+/// carry a time at or past the window's end while a subtitle cue a moment
+/// earlier comes after it in the stream. Stopping on the first such frame would
+/// lose that cue, so a frame of another track stops the walk only when its
+/// start is at or past the window's end plus this margin. Frames of the
+/// requested track still stop the walk exactly at the end.
+const INTERLEAVE_MARGIN_MS: u64 = 2_000;
+
 /// One line of a subtitle, in source time.
 ///
 /// `start_ms` and `end_ms` are milliseconds of the video's own timeline, the
@@ -772,8 +784,8 @@ fn open_and_read<R: Read + Seek>(
     // A seek that gave no frame at all: a file without cues, whose last
     // cluster the seek ran into and ended the stream on. Re-open from the
     // start and read forward - the reader sits after the failed open, so
-    // rewind it first. An empty window is a normal answer, not a signal to
-    // re-read the file: only a seek that read nothing at all re-opens.
+    // rewind it first. A window past the file's known end reports `saw_frame`
+    // true, so it does not re-open: the duration already decided the answer.
     if seek_ms > 0 && !saw_frame {
         reader.rewind()?;
         let (rewound, _) = read_track(&mut reader, track, from_ms, to_ms, 0)?;
@@ -833,6 +845,21 @@ fn read_track<R: Read + Seek>(
             Ok(codec)
         })?;
     budget.lift();
+    // A window that starts at or past the file's own end has no cue, whatever
+    // the track holds. The seek would give no frame and the fallback would
+    // re-read the whole file from the start, so the duration decides it first,
+    // before any seek. The duration is unknown when the file states none, or
+    // when the value is not a finite, positive number of milliseconds.
+    // `saw_frame` is true: the file was read and its end is known, so the
+    // caller does not re-open it.
+    if file
+        .info()
+        .duration()
+        .and_then(|duration| duration_ms(duration, scale))
+        .is_some_and(|duration_ms| from_ms >= duration_ms)
+    {
+        return Ok((Vec::new(), true));
+    }
     let mut slot = Frame::default();
     if seek_ms > 0 {
         let units = scale_units(seek_ms, scale)?;
@@ -850,6 +877,11 @@ fn read_track<R: Read + Seek>(
     let mut skipped = 0usize;
     let mut scanned = 0u64;
     let mut saw_frame = false;
+    // The running total of the text pushed into `cues`, checked as it grows:
+    // the cues are counted before the overlap filter drops the ones outside the
+    // window, so a window after a long pre-roll is capped on the text the walk
+    // reads, not only on the text it keeps.
+    let mut text_bytes = 0u64;
     loop {
         if !guarded_next(&mut file, &mut slot, "subtitle frames")? {
             break;
@@ -865,26 +897,35 @@ fn read_track<R: Read + Seek>(
         // BlockGroup): no frame, so it counts against the total.
         //
         // The start time of every frame is computed, any track, with the same
-        // checked maths: the walk stops at the first frame, of any track,
-        // whose start is at or past the window, so a window after the last
-        // subtitle does not read to the end of the file.
+        // checked maths. The walk stops at the first frame whose start is at
+        // or past the window's end, so a window after the last subtitle does
+        // not read to the end of the file. A frame of ANOTHER track gets the
+        // interleave margin: block times are presentation times, and a file
+        // interleaves its tracks, so a frame of another track at or past
+        // `to_ms` can still come before a cue of this track a moment earlier.
+        // Stopping on it exactly would lose that cue; the margin keeps the cue
+        // and still bounds the read. Frames of the requested track stop the
+        // walk exactly, because this track's frames are in order.
         let start_ms = frame_start_ms(slot.timestamp, scale)?;
+        if slot.track != track {
+            if start_ms >= to_ms.saturating_add(INTERLEAVE_MARGIN_MS) {
+                break;
+            }
+            // A frame of another track: it counts against the total only.
+            continue;
+        }
         if start_ms >= to_ms {
-            // The stopping frame's start is the next cue's start when it
-            // belongs to the requested track and gives text; a frame of
-            // another track stops the read first, and then the next cue is
-            // unknown, so the 5000 ms rule applies to the last kept cue.
-            if slot.track == track
-                && next_start_after_window.is_none()
+            // Only a frame of the requested track reaches this point: a frame
+            // of another track stops the walk earlier (or passes, within the
+            // interleave margin), and then the next cue is unknown, so the
+            // 5000 ms rule applies to the last kept cue. When the stopping
+            // frame gives text, its start is the next cue's start.
+            if next_start_after_window.is_none()
                 && frame_text(&slot.data, &codec).is_some_and(|text| !text.is_empty())
             {
                 next_start_after_window = Some(start_ms);
             }
             break;
-        }
-        // A frame of another track: it counts against the total only.
-        if slot.track != track {
-            continue;
         }
         // The block's duration, in milliseconds of source time, when the
         // frame states one.
@@ -912,6 +953,17 @@ fn read_track<R: Read + Seek>(
                         "track {track} holds more than {MAX_CUES} cues"
                     )));
                 }
+                // The total pushed text is bounded as it grows: the cues are
+                // counted before the overlap filter drops the ones outside the
+                // window, so a hostile file with a long pre-roll of big cues is
+                // refused the moment the total passes the cap, not only after
+                // the walk ends.
+                text_bytes = text_bytes.saturating_add(text.len() as u64);
+                if text_bytes > SUBTITLE_FILE_CAP {
+                    return Err(MediaError::Malformed(format!(
+                        "track {track} holds more than {SUBTITLE_FILE_CAP} bytes of subtitle text"
+                    )));
+                }
                 cues.push((start_ms, duration_ms, text));
             }
         }
@@ -921,7 +973,6 @@ fn read_track<R: Read + Seek>(
     // at or past the window when the walk recorded it, or start + 5000 when
     // the read ended or another track's frame stopped it first.
     let mut out = Vec::with_capacity(cues.len());
-    let mut text_bytes = 0u64;
     for (index, (start_ms, duration_ms, text)) in cues.iter().enumerate() {
         let end_ms = duration_ms
             .and_then(|duration| (*start_ms).checked_add(duration))
@@ -932,18 +983,11 @@ fn read_track<R: Read + Seek>(
             })
             .unwrap_or_else(|| start_ms.saturating_add(5000));
         // Keep the cues that overlap the window; a cue with no room on screen
-        // (end_ms <= start_ms) is dropped.
+        // (end_ms <= start_ms) is dropped. The total text is bounded as it is
+        // pushed, in the walk above, so no cap is needed here.
         if end_ms > from_ms && *start_ms < to_ms && end_ms > *start_ms {
             if text.is_empty() {
                 continue;
-            }
-            // The total kept text is bounded: a hostile file with a million
-            // small cues would otherwise grow a list of megabytes.
-            text_bytes = text_bytes.saturating_add(text.len() as u64);
-            if text_bytes > SUBTITLE_FILE_CAP {
-                return Err(MediaError::Malformed(format!(
-                    "track {track} holds more than {SUBTITLE_FILE_CAP} bytes of subtitle text"
-                )));
             }
             out.push(Cue {
                 start_ms: *start_ms,
@@ -977,6 +1021,19 @@ fn frame_start_ms(timestamp: u64, scale: u64) -> Result<u64, MediaError> {
         .ok_or_else(overflow)?;
     let ms = ns / 1_000_000;
     u64::try_from(ms).map_err(|_| overflow())
+}
+
+/// The file's `Duration`, in milliseconds, when it is a finite, positive
+/// number of the file's timeline. A non-finite, negative, or zero value is
+/// unknown: a recording cut short can carry `Duration` 0, and treating it as
+/// a known end would make every window return empty.
+fn duration_ms(duration: f64, scale: u64) -> Option<u64> {
+    let ms = duration * (scale as f64 / 1_000_000.0);
+    if ms.is_finite() && ms > 0.0 && ms.round() <= u64::MAX as f64 {
+        Some(ms.round() as u64)
+    } else {
+        None
+    }
 }
 
 /// A frame's stated duration, in milliseconds, when it fits the timeline.
