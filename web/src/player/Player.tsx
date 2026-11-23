@@ -67,6 +67,11 @@ const ERROR_COPY = 'Playback failed.'
 function unplayableCopy(codec: string): string {
   return `This browser cannot play ${codec} video.`
 }
+/**
+ * The sentence for a file with no video track at all (an audio file, or a file the probe found no
+ * tracks in): there is no video codec to name, and this player plays video files only.
+ */
+const NO_VIDEO_COPY = 'This file has no video track to play.'
 
 /** The words a track is listed under: its name when it has one, its language when it does not. The name is remote text, so it goes through `displaySafe` on the way out. */
 function trackLabel(track: MediaTrack): string {
@@ -879,7 +884,11 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
       {probe !== null && choice?.kind === 'unplayable' && (
         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
-          <p className="max-w-sm text-[14px] text-strong">{unplayableCopy(choice.codec)}</p>
+          <p className="max-w-sm text-[14px] text-strong">
+            {probe.tracks.some((entry) => entry.kind === 'video')
+              ? unplayableCopy(displaySafe(choice.codec))
+              : NO_VIDEO_COPY}
+          </p>
           <button
             type="button"
             aria-label="Download"

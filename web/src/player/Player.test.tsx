@@ -2456,4 +2456,33 @@ describe('the final review fixes', () => {
     expect(seek.getAttribute('aria-valuetext'), 'the Seek bar does not read its time').toBe('0:00 of 0:04')
   })
 
+  it('an unplayable codec name is display-safe', async () => {
+    const hostile: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'he‮vc\u0007', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const { client } = probeClient(hostile)
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(
+      screen.queryByText('This browser cannot play hevc video.') !== null,
+      'the codec name was drawn without displaySafe',
+    ).toBe(true)
+  })
+
+  it('a file with no video says so', async () => {
+    const audioOnly: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'audio', codec: 'flac', mime_codecs: ['flac'] })],
+    }
+    const { client } = probeClient(audioOnly)
+    render(<Player id="a" file={0} name="song.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(
+      screen.queryByText('This file has no video track to play.') !== null,
+      'a file with no video was described as an unplayable video codec',
+    ).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Download' }) !== null, 'the file was not offered for download').toBe(true)
+  })
+
 })
