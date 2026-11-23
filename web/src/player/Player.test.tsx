@@ -607,6 +607,49 @@ describe('the player', () => {
     expect(closeCalls === 1, 'Escape did not close through onClose').toBe(true)
   })
 
+  it('closing the audio menu keeps the subtitle menu open', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const dialog = container.querySelector('dialog') as HTMLElement
+    // The menu buttons are labelled by their content, not by an `aria-label`.
+    const buttons = Array.from(dialog.querySelectorAll('button'))
+    const audioButton = buttons.find((b) => b.textContent === 'Audio') as HTMLButtonElement
+    const subtitleButton = buttons.find((b) => b.textContent === 'Subtitles') as HTMLButtonElement
+    expect(audioButton !== undefined, 'the audio menu was not found').toBe(true)
+    expect(subtitleButton !== undefined, 'the subtitle menu was not found').toBe(true)
+
+    // Open both menus: each keeps its own flag, so both are open at once.
+    fireEvent.click(audioButton)
+    await settle()
+    fireEvent.click(subtitleButton)
+    await settle()
+    expect(
+      audioButton.getAttribute('aria-expanded') === 'true',
+      'the audio menu was not open',
+    ).toBe(true)
+    expect(
+      subtitleButton.getAttribute('aria-expanded') === 'true',
+      'the subtitle menu was not open',
+    ).toBe(true)
+
+    // Close the audio menu: the subtitle menu stays open, because each menu keeps its own flag.
+    fireEvent.click(audioButton)
+    await settle()
+    expect(
+      audioButton.getAttribute('aria-expanded') === 'false',
+      'the audio menu was not closed',
+    ).toBe(true)
+    expect(
+      subtitleButton.getAttribute('aria-expanded') === 'true',
+      'closing the audio menu closed the subtitle menu too: the menus share one flag',
+    ).toBe(true)
+  })
+
   it('a seek restarts once', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
@@ -1030,6 +1073,38 @@ describe('the player', () => {
     }
     const showingAfter = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
     expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
+  })
+
+  it('a subtitle language without a name is shown through displaySafe', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // A text track with no name and a hostile language: the label is the language, and
+    // `displaySafe` is what turns `<img src=x onerror=alert(1)>` into inert text.
+    const probe: MediaProbe = {
+      ...PROBE,
+      tracks: PROBE.tracks.map((t) =>
+        t.id === 4
+          ? { ...t, name: null, language: 'eng\u202e.png' }
+          : t,
+      ),
+    }
+    const { client } = probeClient(probe)
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    const subtitles = screen.getByRole('button', { name: 'Subtitles' })
+    fireEvent.click(subtitles)
+    await settle()
+    const listbox = screen.getByRole('listbox', { name: 'Subtitles' })
+    const subTexts = Array.from(listbox.querySelectorAll('[role="option"]')).map(
+      (option) => option.textContent ?? '',
+    )
+    // The language's invisible bidi override is what `displaySafe` removes: a label still
+    // carrying it was listed raw, without the safe pass.
+    const hostile = subTexts.find((text) => text.includes('\u202e'))
+    expect(
+      hostile === undefined,
+      `the hostile language was listed raw: the label skipped displaySafe (${JSON.stringify(subTexts)})`,
+    ).toBe(true)
   })
 
   it('two subtitle tracks with the same label stay separate', async () => {
