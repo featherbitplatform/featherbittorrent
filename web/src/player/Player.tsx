@@ -288,6 +288,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   // The cues each track has already been given: a window fetched again for the same second must
   // not double the cues the `TextTrack` already shows.
   const cueKeysRef = useRef<Map<string, Set<string>>>(new Map())
+  // The `TextTrack` each subtitle key is kept under: the browser's `TextTrack.id` is read-only,
+  // so the key lives here, not on the track, and every lookup goes through the map.
+  const subtitleTracksRef = useRef<Map<string, TextTrack>>(new Map())
   // The cue windows each embedded track has already been asked for.
   const fetchedRef = useRef<Map<number, [number, number][]>>(new Map())
   // The external files fetched once, by their index.
@@ -442,18 +445,12 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (video === null) return
     const label = subtitleLabel(key)
     // The track is kept under its own key, not its label: two tracks named "English" are two
-    // tracks, and the key is what tells them apart.
-    let found: TextTrack | null = null
-    for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
-      if (candidate !== undefined && candidate.id === `subtitle:${key}`) {
-        found = candidate
-        break
-      }
-    }
+    // tracks, and the key is what tells them apart. The key lives in the map, not on the
+    // `TextTrack`, whose `id` is read-only in a browser.
+    let found = subtitleTracksRef.current.get(key) ?? null
     if (found === null) {
       found = video.addTextTrack('subtitles', label, langOf(language))
-      ;(found as TextTrack & { id?: string }).id = `subtitle:${key}`
+      subtitleTracksRef.current.set(key, found)
     }
     const seen = cueKeysRef.current.get(key) ?? new Set<string>()
     cueKeysRef.current.set(key, seen)
@@ -477,16 +474,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   function applySubtitleModes(): void {
     const video = videoRef.current
     if (video === null) return
-    const chosen = `subtitle:${subtitleKey}`
-    for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
-      if (candidate === undefined) continue
-      // The track's key, or its label when it was made before the key was: the chosen track is
-      // the one shown, and the rest are not.
-      const isChosen = candidate.id !== undefined
-        ? candidate.id === chosen
-        : candidate.label === subtitleLabel(subtitleKey)
-      candidate.mode = isChosen ? 'showing' : 'disabled'
+    // Every track the player made is in the map; the chosen key's track is the one shown, and
+    // the rest are not. A key that is not the chosen one, including `off`, is a track not shown.
+    for (const [key, track] of subtitleTracksRef.current) {
+      track.mode = key === subtitleKey ? 'showing' : 'disabled'
     }
   }
 

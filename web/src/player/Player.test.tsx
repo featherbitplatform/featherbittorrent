@@ -104,6 +104,15 @@ beforeEach(() => {
         held.push(cue)
       },
     } as unknown as TextTrack
+    // The browser's `TextTrack.id` is a getter with no setter: writing it throws, the way a
+    // module (strict mode) throws on a read-only property. The fake is at least as strict, so a
+    // player that keys its tracks by `id` is caught here the way a browser would catch it.
+    Object.defineProperty(track, 'id', {
+      get(): string {
+        return ''
+      },
+      configurable: true,
+    })
     tracks.push(track)
     element._tracks = tracks
     return track
@@ -1253,6 +1262,41 @@ describe('the player', () => {
     }
     const showingAfter = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
     expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
+  })
+
+  it('a chosen subtitle shows its cues', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // The chosen subtitle's window answers with two cues: the track the player makes for the key
+    // must be the one shown, and the cues it is given must be on it. The fake `TextTrack` keeps
+    // the browser's strictness: its `id` is a getter with no setter, so a player that writes it
+    // is caught here the way a browser would catch it.
+    const { client } = probeClient(
+      PROBE,
+      [
+        { start_ms: 1000, end_ms: 2000, text: 'hello' },
+        { start_ms: 2000, end_ms: 3000, text: 'world' },
+      ],
+    )
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+
+    // Choose the first subtitle track: one `c` takes it, and its cues arrive from the window.
+    fireEvent.keyDown(container.querySelector('dialog') as HTMLElement, { key: 'c' })
+    await settle()
+    const tracks = Array.from(video.textTracks)
+    expect(tracks.length >= 1, 'the chosen subtitle made no track').toBe(true)
+    const shown = tracks.filter((track) => track.mode === 'showing')
+    expect(shown.length === 1, 'a chosen subtitle did not show its track').toBe(true)
+    const shownCues = (shown[0] as unknown as { cues: unknown[] }).cues
+    const texts = shownCues.map((cue) => (cue as { text: string }).text)
+    expect(
+      texts.includes('hello') && texts.includes('world'),
+      `the chosen subtitle did not hold its cues (got ${JSON.stringify(texts)})`,
+    ).toBe(true)
   })
 
   it('a subtitle language without a name is shown through displaySafe', async () => {
