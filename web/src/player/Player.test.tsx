@@ -641,6 +641,11 @@ describe('the player', () => {
     // The start has landed, and the playhead is at the body's start.
     const callsAtStart = recorder.callsFor('/tracks/1/stream').length
     expect(callsAtStart, 'the start was not asked for').toBe(1)
+    // One chunk lands, and the buffer covers the start: a `seeking` the engine makes itself is
+    // the one it must ignore.
+    const startBody = recorder.callsFor('/tracks/1/stream')[0]?.body
+    startBody?.push(new Uint8Array([1]))
+    await settle()
 
     // A seek the buffer does not cover restarts the streams once. The element's `seeking` fires
     // (the fake fires it on the `currentTime` write), and the engine restarts - but it must not
@@ -690,8 +695,15 @@ describe('the player', () => {
     await settle()
     video.currentTime = 2
     await settle()
-    // The abort is the engine's own: the stream was not ended, and a fresh, un-aborted fetch was
-    // started for the seek.
+    // The new body feeds a chunk: the data is arriving, and the engine goes back to playing. A
+    // mutation that lets the old loop touch the new stream would have said the file stopped.
+    const newBody = recorder.callsFor('/tracks/1/stream').at(-1)?.body
+    newBody?.push(new Uint8Array([1]))
+    await settle()
+    // The abort is the engine's own: the old loop did not say the file stopped (which would be
+    // a `waiting` with no new data) and the stream was not ended.
+    expect(engine.state(), 'the old loop said the file stopped').not.toBe('waiting')
+    void (recorder.callsFor('/tracks/1/stream').length)
     expect(source.endOfStreamCalls.length, 'an abort ended the stream').toBe(0)
     const newCall = recorder.callsFor('/tracks/1/stream').at(-1)
     expect(
@@ -738,8 +750,14 @@ describe('the player', () => {
     expect(bufferAhead >= 120, 'the buffer is not far ahead of the playhead').toBe(true)
     // One more chunk is held, not appended: the gate said stop, and the read waited for a
     // `timeupdate` to lift it.
+    const appendsBeforeGate = source.activeSourceBuffers[0]?.log.appends.length ?? 0
     videoBody.push(new Uint8Array([1]))
     await flushMicrotasks()
+    const appendsAfterGate = source.activeSourceBuffers[0]?.log.appends.length ?? 0
+    expect(
+      appendsAfterGate === appendsBeforeGate,
+      'the gate did not stop the read: a chunk was appended past the stop line',
+    ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
   })
@@ -760,9 +778,10 @@ describe('the player', () => {
       }
       originalAppend(data)
     }
-    // Fill it with ranges, then move the playhead far ahead so they lie behind the keep line.
-    // Each append is awaited to `updateend`, the way the engine appends one at a time.
-    for (let i = 0; i < 10; i += 1) {
+    // Fill it with a few seconds of ranges, then move the playhead far ahead so they all lie
+    // behind the keep line: the eviction has to cut them, one `remove` at a time. Each append is
+    // awaited to `updateend`, the way the engine appends one at a time.
+    for (let i = 0; i < 3; i += 1) {
       originalAppend(new ArrayBuffer(4))
       await new Promise((r) => setTimeout(r, 0))
     }
@@ -782,11 +801,19 @@ describe('the player', () => {
       await new Promise((r) => setTimeout(r, 0))
     }
     // The eviction made room: the buffer no longer throws, and the same chunk is appended.
+    const retried = new ArrayBuffer(8)
     evicted = true
-    buffer.appendBuffer = originalAppend
+    buffer.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
+      originalAppend(data)
+    }
     const appendsBefore = buffer.log.appends.length
-    originalAppend(new ArrayBuffer(4))
+    buffer.appendBuffer(retried)
+    await new Promise((r) => setTimeout(r, 0))
     expect(buffer.log.appends.length === appendsBefore + 1, 'the same chunk was not retried').toBe(true)
+    expect(
+      buffer.log.appends.at(-1) === retried,
+      'a different chunk was appended instead of the one that failed',
+    ).toBe(true)
     expect(buffer.log.removes.length === cut.length, 'the eviction did not remove the ranges').toBe(true)
   })
 
