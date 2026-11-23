@@ -511,3 +511,31 @@ it('bearer_stream_paths_are_absolute', async () => {
     `${BASE}/api/v1/media/${ID}/0/tracks/1/stream?start_ms=1500&token=desk%20token`,
   )
 })
+
+it('bearer_token_is_not_added_to_a_foreign_absolute_stream_url', async () => {
+  // The stream path the token answer names is not always under the engine's own base: an answer can
+  // point at somebody else's server, and that server has no business seeing this session's token. A
+  // base-name lookalike is somebody else too.
+  const paths = [
+    'https://cdn.example.test/stream/abc',
+    `${BASE}1/stream/lookalike`,
+    `${BASE}/stream/onbase`,
+    '/stream/relative',
+  ]
+  let asked = 0
+  const { fetchFn } = record(() => json(200, `{"path":"${paths[asked++]}"}`))
+  const client = createClient(fetchFn, () => null, () => 0, () => {}, { kind: 'bearer', base: BASE, token: 'desk-token' })
+
+  expect(await client.streamToken(ID, 0), 'the bearer token went to somebody else\'s server').toBe(
+    'https://cdn.example.test/stream/abc',
+  )
+  expect(await client.streamToken(ID, 1), 'the bearer token went to a base-name lookalike').toBe(
+    `${BASE}1/stream/lookalike`,
+  )
+  expect(await client.streamToken(ID, 2), 'a stream on the engine\'s own base lost its token').toBe(
+    `${BASE}/stream/onbase?token=desk-token`,
+  )
+  expect(await client.streamToken(ID, 3), 'a relative stream path lost its token').toBe(
+    `${BASE}/stream/relative?token=desk-token`,
+  )
+})
