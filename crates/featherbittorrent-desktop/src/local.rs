@@ -77,7 +77,7 @@ pub async fn start(paths: &DesktopPaths, serve: bool) -> Result<ThisComputer, St
 
 /// [`start`] with the engine settings made from the config by `settings`, which is how a test keeps the
 /// engine on loopback with no DHT and no multicast while everything else runs as it does for real.
-async fn start_with(
+pub(crate) async fn start_with(
     paths: &DesktopPaths,
     serve: bool,
     settings: impl FnOnce(&Config) -> fbt::Settings,
@@ -145,6 +145,12 @@ impl ThisComputer {
         (base, self.secret.clone())
     }
 
+    /// The address the engine listens on, as it was bound: an unspecified address when it serves every
+    /// interface. [`crate::serving`] turns that into the address other machines type.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.server.local_addr()
+    }
+
     /// Stops the engine: the API closes, the last save runs, the library is released. A save that did not
     /// complete is said on stderr; there is nobody left to show it to.
     pub async fn stop(self) {
@@ -169,7 +175,7 @@ pub(crate) mod tests {
     const DEADLINE: Duration = Duration::from_secs(60);
 
     /// The engine settings every test runs on: nothing leaves loopback, and nothing asks a router.
-    fn offline(config: &Config) -> fbt::Settings {
+    pub(crate) fn offline(config: &Config) -> fbt::Settings {
         let mut settings = config.session_settings();
         settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
         settings.dht_enabled = false;

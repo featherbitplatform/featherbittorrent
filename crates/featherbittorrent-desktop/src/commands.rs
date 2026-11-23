@@ -37,6 +37,23 @@ impl DesktopState {
             .take()
     }
 
+    /// Puts This computer back after a restart ([`crate::lifecycle::Lifecycle::restart_this_computer`]).
+    pub fn put(&self, this_computer: ThisComputer) {
+        *self
+            .this_computer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(this_computer);
+    }
+
+    /// The address This computer listens on, while it runs.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.this_computer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(ThisComputer::local_addr)
+    }
+
     /// This computer's base address and secret, while it runs.
     fn local_endpoint(&self) -> Option<(String, String)> {
         self.this_computer

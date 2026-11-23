@@ -13,6 +13,8 @@ mod instances;
 mod keychain;
 mod lifecycle;
 mod local;
+mod preferences;
+mod serving;
 mod settings_store;
 mod tray;
 mod window;
@@ -64,7 +66,9 @@ fn main() {
             Some(vec![lifecycle::BACKGROUND_FLAG]),
         ))
         .manage(DesktopState::new(this_computer))
+        // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
+        .manage(serving::Serving::new(paths.clone(), settings_store.clone()))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
             settings_store.clone(),
@@ -97,7 +101,12 @@ fn main() {
             lifecycle::close_window_now,
             lifecycle::tray_available,
             lifecycle::set_start_at_login,
-            tray::set_tray_instance
+            tray::set_tray_instance,
+            preferences::desktop_preferences,
+            preferences::get_shortcuts,
+            preferences::set_shortcuts,
+            serving::serving_status,
+            serving::set_serving
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {

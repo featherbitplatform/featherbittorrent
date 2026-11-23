@@ -15,6 +15,8 @@ import { TitleBarSlotsContext } from '../components/titleBarSlots'
 import type { TitleBarSlots } from '../components/titleBarSlots'
 import { useConnection } from '../connection'
 import { useSavePassword } from '../savePassword'
+import { useDesktopSettings } from '../desktopSettings'
+import { setOverrides } from '../keys'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
 
@@ -24,6 +26,7 @@ const shell = vi.hoisted(() => ({
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
   setTrayInstance: vi.fn(() => Promise.resolve()),
+  getShortcuts: vi.fn(() => Promise.resolve([])),
   seen: [] as Connection[],
   mounts: 0,
   hostMounts: 0,
@@ -40,6 +43,22 @@ vi.mock('./bridge', () => ({
   LOCAL_ID: 'local',
   THIS_COMPUTER: 'This computer',
   setTrayInstance: shell.setTrayInstance,
+  getShortcuts: shell.getShortcuts,
+}))
+vi.mock('./DesktopSettings', () => ({
+  INSTANCES_SECTION: 'settings-desktop-instances',
+  SERVING_SECTION: 'settings-desktop-serving',
+  DesktopSettings: function FakeDesktopSettings({
+    onServingChanged,
+  }: {
+    onServingChanged(problem: string | null): Promise<void>
+  }) {
+    return (
+      <button type="button" onClick={() => void onServingChanged(null)}>
+        serving applied
+      </button>
+    )
+  },
 }))
 vi.mock('./CloseChoice', () => ({
   CloseChoiceHost: function FakeCloseChoiceHost() {
@@ -58,8 +77,12 @@ vi.mock('../App', () => ({
     }, [])
     const endpoint = connection.endpoint
     const offer = useSavePassword()
+    const desktop = useDesktopSettings()
+    const request = desktop?.request ?? null
     return (
       <div>
+        {request !== null && <div>settings at {request.section}</div>}
+        {desktop?.sections}
         <div>
           workspace {endpoint.kind === 'bearer' ? `${endpoint.base} ${endpoint.token ?? 'signed out'}` : ''}
         </div>
@@ -323,4 +346,45 @@ it('the_close_question_is_ready_while_connecting_and_unreachable', async () => {
   await screen.findByText(UNREACHABLE_COPY)
   expect(screen.getByText('close question ready')).toBeTruthy()
   expect(shell.hostMounts).toBe(1)
+})
+
+it('manage_instances_opens_settings_at_the_instances_section', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: /^Instance:/ }))
+  fireEvent.click(screen.getByRole('menuitem', { name: 'Manage instances' }))
+  await screen.findByText('settings at settings-desktop-instances')
+  expect(screen.queryByRole('heading', { name: 'Instances', level: 1 }), 'the standalone manager opened').toBeNull()
+})
+
+it('a_serving_change_reconnects_this_computer_at_once', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+  expect(shell.connect).toHaveBeenCalledTimes(2)
+})
+
+it('a_serving_change_that_kept_the_secret_does_not_remount', async () => {
+  shell.connect.mockResolvedValue(bearer('same'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} same`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await waitFor(() => expect(shell.connect).toHaveBeenCalledTimes(2))
+  expect(shell.mounts).toBe(1)
+})
+
+it('the_saved_shortcuts_are_applied_at_start', async () => {
+  const applied = vi.fn()
+  shell.getShortcuts.mockResolvedValueOnce([{ where: 'Torrent list', action: 'x', keys: ['F9'] }] as never)
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  const keys = await import('../keys')
+  const stop = keys.subscribeOverrides(applied)
+  renderRoot()
+  await waitFor(() => expect(applied).toHaveBeenCalled())
+  stop()
+  setOverrides([])
 })

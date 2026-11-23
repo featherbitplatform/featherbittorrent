@@ -29,9 +29,16 @@
  * instance, so it answers in every phase and is never remounted by a switch. The tray names the
  * connected instance by its name in the list, never by its id.
  *
+ * Settings gets the Desktop section through {@link DesktopSettingsContext}. The switcher's `Manage
+ * instances` opens Settings at its Instances part (the standalone manager is kept for when no workspace
+ * is on screen: connecting, unreachable, or a remote's sign-in). Applying Serve the web UI restarts This
+ * computer with a new launch secret: the page then asks the shell for `local` again at once, rather than
+ * waiting for a `401`, and reopens Settings at the serving part. The saved keyboard shortcuts are applied
+ * when the page starts.
+ *
  * @module desktop/DesktopRoot
  */
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import App from '../App'
 import Banner from '../components/Banner'
@@ -39,12 +46,25 @@ import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { useTitleBarSlots } from '../components/titleBarSlots'
+import { DesktopSettingsContext } from '../desktopSettings'
+import type { DesktopSettingsSlot, SettingsRequest } from '../desktopSettings'
+import { setOverrides } from '../keys'
 import { UNREACHABLE_COPY } from '../live'
 import { SavePasswordContext } from '../savePassword'
 import type { SavePasswordOffer } from '../savePassword'
-import { connect, listInstances, LOCAL_ID, probeInstance, savePassword, setTrayInstance, THIS_COMPUTER } from './bridge'
+import {
+  connect,
+  getShortcuts,
+  listInstances,
+  LOCAL_ID,
+  probeInstance,
+  savePassword,
+  setTrayInstance,
+  THIS_COMPUTER,
+} from './bridge'
 import type { InstancesList, Probe } from './bridge'
 import { CloseChoiceHost } from './CloseChoice'
+import { DesktopSettings, INSTANCES_SECTION, SERVING_SECTION } from './DesktopSettings'
 import { InstanceSwitcher } from './InstanceSwitcher'
 import { Instances } from './Instances'
 
@@ -172,6 +192,29 @@ function DesktopScreens() {
   // The newest connect; an answer for an older one arrives too late to matter.
   const latest = useRef(0)
   const probing = useRef(false)
+  // Settings opened at a section by the shell's side of the page, and the last one asked.
+  const [settingsRequest, setSettingsRequest] = useState<SettingsRequest | null>(null)
+  const requests = useRef(0)
+  const [servingProblem, setServingProblem] = useState<string | null>(null)
+  // The phase as of the last render, for callbacks that outlive it.
+  const phaseNow = useRef(phase)
+  useEffect(() => {
+    phaseNow.current = phase
+  }, [phase])
+
+  const askSettings = useCallback((section: string) => {
+    requests.current += 1
+    setSettingsRequest({ section, seq: requests.current })
+  }, [])
+
+  // The saved shortcuts, applied once at start; the list in Settings follows them.
+  useEffect(() => {
+    getShortcuts()
+      .then(setOverrides)
+      .catch((cause: unknown) => {
+        console.warn('The saved shortcuts could not be read:', cause)
+      })
+  }, [])
 
   const reload = useCallback(async (): Promise<InstancesList | null> => {
     try {
@@ -268,10 +311,40 @@ function DesktopScreens() {
     (id: string) => {
       setManaging(false)
       setSaveFailed(null)
+      setSettingsRequest(null)
       if (id === current && phase.phase === 'ready') return
       void open(id, null)
     },
     [open, current, phase.phase],
+  )
+
+  /** Manage instances: Settings at its Instances part when a workspace is on screen, the standalone manager otherwise. */
+  const onManage = useCallback(() => {
+    const now = phaseNow.current
+    const session = now.phase === 'ready' ? now.connection.session.get().phase : null
+    if (session === 'signedIn' || session === 'open') askSettings(INSTANCES_SECTION)
+    else setManaging(true)
+  }, [askSettings])
+
+  /** Serving was applied (or refused): if This computer is on screen with an old secret, connect again now. */
+  const onServingChanged = useCallback(
+    async (problem: string | null): Promise<void> => {
+      setServingProblem(problem)
+      const now = phaseNow.current
+      if (now.id !== LOCAL_ID || now.phase !== 'ready') return
+      let endpoint
+      try {
+        endpoint = await connect(LOCAL_ID)
+      } catch {
+        void open(LOCAL_ID, null)
+        return
+      }
+      if (endpoint.kind === 'bearer' && endpoint.token === launchToken(now.connection, LOCAL_ID)) return
+      latest.current += 1
+      setPhase({ phase: 'ready', connection: createConnection(endpoint), id: LOCAL_ID })
+      askSettings(SERVING_SECTION)
+    },
+    [open, askSettings],
   )
 
   const onChanged = useCallback(async () => {
@@ -305,6 +378,23 @@ function DesktopScreens() {
           },
         }
 
+  const desktopSettings = useMemo<DesktopSettingsSlot>(
+    () => ({
+      sections: (
+        <DesktopSettings
+          list={list}
+          current={current}
+          onInstancesChanged={onChanged}
+          onServingChanged={onServingChanged}
+          servingProblem={servingProblem}
+        />
+      ),
+      request: settingsRequest,
+      onOpened: (seq) => setSettingsRequest((was) => (was?.seq === seq ? null : was)),
+    }),
+    [list, current, onChanged, onServingChanged, servingProblem, settingsRequest],
+  )
+
   let body
   if (managing) {
     body = <Instances list={list} current={current} onChanged={onChanged} onClose={() => setManaging(false)} />
@@ -334,7 +424,7 @@ function DesktopScreens() {
             instances={list.items}
             current={current}
             onSwitch={onSwitch}
-            onManage={() => setManaging(true)}
+            onManage={onManage}
           />,
           slots.switcher,
         )}
@@ -349,7 +439,9 @@ function DesktopScreens() {
         </div>
       )}
       <div className="relative flex min-h-0 flex-1 flex-col overflow-auto">
-        <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
+        <DesktopSettingsContext.Provider value={desktopSettings}>
+          <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
+        </DesktopSettingsContext.Provider>
       </div>
     </>
   )
