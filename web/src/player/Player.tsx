@@ -297,6 +297,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const externalDoneRef = useRef<Set<number>>(new Set())
   // The position the probe's answer will start at, in source seconds, decided once per probe.
   const startRef = useRef(0)
+  // True once the open has asked the element to play: the open plays once, and later data or
+  // events do not ask it again. Opening a file starts playback, so a second press is not needed;
+  // an autoplay the browser refuses leaves the Play control showing, the person's own choice.
+  const autoPlayedRef = useRef(false)
 
   const offsetMs = probe?.time_offset_ms ?? 0
   const durationMs = probe?.duration_ms ?? null
@@ -355,6 +359,26 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     }
   }, [choice, client, id, file])
 
+  // The native path's transport: the open asks the element to play once its data can play, the
+  // way the remux path does, and a refused autoplay leaves the Play control (the element's own
+  // `controls`) showing.
+  useEffect(() => {
+    if (choice?.kind !== 'native' || nativeSrc === null) return
+    const video = videoRef.current
+    if (video === null) return
+    const onCanPlay = (): void => {
+      if (autoPlayedRef.current) return
+      autoPlayedRef.current = true
+      void video.play().catch(() => {
+        // An autoplay the browser refuses is not an error: the element's own Play control stays.
+      })
+    }
+    video.addEventListener('canplay', onCanPlay)
+    return () => {
+      video.removeEventListener('canplay', onCanPlay)
+    }
+  }, [choice, nativeSrc])
+
   // The engine, for the remux. It owns the source and the buffers; the element's transport events
   // are read here, and the position is saved on its clock.
   useEffect(() => {
@@ -397,10 +421,21 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       setVolume(video.volume)
       setMuted(video.muted)
     }
+    // The open's own word for "there is data to play": the element can play. The ask happens here,
+    // once, so a `canplay` that fires for later data does not ask a second time.
+    const onCanPlay = (): void => {
+      if (autoPlayedRef.current) return
+      autoPlayedRef.current = true
+      void video.play().catch(() => {
+        // An autoplay the browser refuses (its policy, or the element's) is not an error: the
+        // Play control stays showing, and the person's own press is the one that plays.
+      })
+    }
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('volumechange', onVolume)
+    video.addEventListener('canplay', onCanPlay)
 
     // The position is saved every five seconds, and on the way out. It is remembered in source
     // seconds, the clock `positions` keeps: the duration is converted to the same clock, so the
@@ -415,6 +450,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       video.removeEventListener('pause', onPause)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('volumechange', onVolume)
+      video.removeEventListener('canplay', onCanPlay)
       save()
       engine.destroy()
       engineRef.current = null

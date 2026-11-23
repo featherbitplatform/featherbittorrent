@@ -922,6 +922,48 @@ describe('the player', () => {
     }
   })
 
+  it('opening the player starts playback', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // The stream the engine reads: one body, held open, so the test can feed data after it lands.
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // The element the test reads `play()` back from: the open asks it once, and the ask is
+    // counted here.
+    let playCalls = 0
+    video.play = (): Promise<void> => {
+      playCalls += 1
+      return Promise.resolve()
+    }
+
+    // The first data arrives: the engine appends it, the element can play, and the open's one
+    // play happens.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(playCalls, 'the open did not start playback').toBe(1)
+
+    // Later data does not ask again: the open plays once, not once per chunk.
+    videoBody.push(new Uint8Array([2]))
+    await settle()
+    await settle()
+    expect(playCalls, 'later data asked for playback again').toBe(1)
+
+    // `canplay` on later data does not ask either: the element saying it can play is not the
+    // open asking to play a second time.
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(playCalls, 'a later canplay asked for playback again').toBe(1)
+  })
+
   it('reading pauses at the gate', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
