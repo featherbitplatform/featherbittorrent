@@ -10,7 +10,8 @@
 //!
 //! Two rules about the file, because a file this short is a file people edit by hand:
 //!
-//! - A missing file is [`DesktopSettings::default`], and an empty one is the same thing. There is no
+//! - A missing file is [`DesktopSettings::default`], and one holding nothing but blank lines or
+//!   whole-line comments is the same thing. There is no
 //!   first-run wizard to fill in: every setting has a default the app is happy to run on.
 //! - A file that does not parse is an [`SettingsError`] the shell shows. Nothing is written and nothing
 //!   is moved aside: unlike the CLI's config, which has to run on *something* and so keeps the bad file
@@ -172,9 +173,10 @@ impl Default for DesktopSettings {
 impl DesktopSettings {
     /// Reads the settings file at `path`.
     ///
-    /// No file is [`DesktopSettings::default`], and a file holding nothing but blank lines is the same:
-    /// an empty file names no settings, and making it a parse failure would have a person explain a
-    /// truncation to themselves. A file that does not parse is [`SettingsError::Unparsable`] and nothing
+    /// No file is [`DesktopSettings::default`], and a file holding nothing but blank lines or
+    /// whole-line comments is the same: such a file names no settings, and making it a parse failure
+    /// would have a person explain a note beside their settings to themselves. A file that does not
+    /// parse is [`SettingsError::Unparsable`] and nothing
     /// else happens - nothing is written and nothing is renamed, which is the difference from the CLI's
     /// [`fbtt_core::Config::load`]: a run of the CLI has to start on *something*, so it moves the file it
     /// could not read aside and goes on with defaults rooted in that library. This load has no such
@@ -198,9 +200,12 @@ impl DesktopSettings {
                 });
             }
         };
-        // The check a YAML parser would make for us, made here so the answer for "no bytes" is the same
-        // as for "no file" instead of a parse error.
-        if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        // The check a YAML parser would make for us, made here so the answer for "no bytes" and for
+        // "nothing but comments" is the same as for "no file" instead of a parse error. A parser that
+        // is handed a document whose every line is blank or a `#` comment has nothing to build a
+        // mapping from, and saying so as a parse failure would make a person explain a note beside
+        // their settings to themselves.
+        if holds_no_settings(&bytes) {
             return Ok(DesktopSettings::default());
         }
         serde_norway::from_slice::<DesktopSettings>(&bytes).map_err(|error| {
@@ -238,6 +243,21 @@ impl DesktopSettings {
         }
         replace_file(path, text.as_bytes()).map_err(cannot_write)
     }
+}
+
+/// Whether `bytes` name no settings at all: nothing, blank lines, or blank lines and whole-line `#`
+/// comments. A `#` is only read as opening a comment where the line has nothing before it but spaces
+/// and tabs - which is where a whole-line comment sits - so a line carrying a setting never counts,
+/// whatever comment it may trail. Bytes that are not text are not "nothing" either: only the parser
+/// can say what they are, and its refusal is the [`SettingsError::Unparsable`] the person gets.
+fn holds_no_settings(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.lines().all(|line| {
+        let line = line.trim_start();
+        line.is_empty() || line.starts_with('#')
+    })
 }
 
 /// One line about a parse failure: the whole message with its newlines folded into spaces, so the shell
@@ -326,6 +346,21 @@ mod tests {
 
         let settings = DesktopSettings::load(&path).expect("an empty file is not a broken one");
         assert_eq!(settings, DesktopSettings::default());
+    }
+
+    /// A file whose whole content is comments holds no settings either, and gets the same answer as an
+    /// empty file and as no file at all. A person's note beside the settings they commented out is not a
+    /// parse failure they have to explain to themselves.
+    #[test]
+    fn comment_only_file_is_default_settings() {
+        let dir = ScratchDir::new("desktop_settings_comment_only");
+        let path = settings_file(&dir);
+        for file in ["# note\n", "# one\n\n   # two\n\t\n# three\n"] {
+            fs::write(&path, file).expect("write a file of nothing but comments");
+            let settings = DesktopSettings::load(&path)
+                .expect("a file of nothing but comments is not a broken one");
+            assert_eq!(settings, DesktopSettings::default(), "{file:?}");
+        }
     }
 
     /// Bytes nobody could read are an error the shell shows, and they stay exactly where they are. This

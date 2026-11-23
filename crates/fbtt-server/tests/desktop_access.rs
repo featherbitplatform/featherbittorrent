@@ -147,13 +147,6 @@ async fn get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Respon
     within(request.send()).await.expect("the server answered")
 }
 
-/// A port nothing is listening on right now, for the test that needs the config's own bind to be used.
-fn free_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a probe listener");
-    listener.local_addr().expect("the probe's address").port()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn desktop_mode_binds_loopback_only() {
     let served = Served::start("desktop-bind", false, |scratch| {
@@ -306,6 +299,27 @@ async fn desktop_mode_has_no_login_routes() {
     served.stop().await;
 }
 
+/// A path that matched no route on the app's own engine is not asked for the launch secret, and it
+/// answers the plain `404` with nothing in it. That is safe only because nothing stands behind such a
+/// path: no router this engine serves registers a fallback, which is what `routes::router` and `web.rs`
+/// say out loud. Should one ever appear, this test is what notices - a fallback would answer something
+/// real, or ask for a credential, where an unmatched path is supposed to say `404` without either.
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_only_unknown_path_is_an_empty_404() {
+    let served = Served::start("desktop-empty-404", false, plain).await;
+    let client = http();
+    for path in ["/", "/api/v1/not-a-route", "/no-such-page.html"] {
+        let response = get(&client, &served.url(path), None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+        let body = within(response.bytes()).await.expect("the body of a 404");
+        assert!(
+            body.is_empty(),
+            "GET {path} answered {body:?} where an empty 404 was owed",
+        );
+    }
+    served.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn desktop_mode_answers_the_desktop_origin_preflight() {
     let served = Served::start("desktop-preflight", false, plain).await;
@@ -342,26 +356,30 @@ async fn desktop_mode_answers_the_desktop_origin_preflight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exposed_desktop_mode_requires_logins_and_keeps_the_secret() {
-    let port = free_port();
+    // The config asks for loopback on a port the OS picks, and an exposed engine serves the config's
+    // own address, so `0` here gets a port this server is bound to and nobody else's. A fixed port
+    // probed and released before the start would be somebody else's to take in between, and that is a
+    // flake, not a failure. What still decides whether the config's bind was served and not the
+    // secret-only `127.0.0.1:0` is the behavior below, which only the config's expose path has: a
+    // secret-only engine answers `404` to `POST /api/v1/auth/session` (see
+    // `desktop_mode_has_no_login_routes`), and here the logins work on the very address that the
+    // server reports as its own.
     let served = Served::start("desktop-exposed", true, |scratch| {
         config_on(
             scratch,
-            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             Some(true),
             vec![alice()],
         )
     })
     .await;
-    assert_eq!(
-        served.server.local_addr(),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        "the config's bind",
-    );
+    let address = served.server.local_addr();
+    assert_eq!(address.ip(), Ipv4Addr::LOCALHOST, "bound to {address}");
     let client = http();
     // Logins are on: no credential, no library.
     let response = get(&client, &served.url("/api/v1/torrents"), None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    // A password login works and its session opens the API.
+    // A password login works on the bound address, and its session opens the API.
     let response = within(
         client
             .post(served.url("/api/v1/auth/session"))

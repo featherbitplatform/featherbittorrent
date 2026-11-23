@@ -3,9 +3,10 @@
 //! A second launch is how most systems deliver one (the single-instance plugin forwards the arguments and
 //! the first copy shows it), and a cold start gets them as plain process arguments. Either way the
 //! arguments are somebody else's input - a desktop file, a registry entry, a browser - so they are read
-//! the same way remote input is read everywhere else in this product: a fixed shape, a fixed bound of
-//! sixteen things to open, and anything that is neither a `magnet:` URI nor an existing
-//! `.torrent` file on this machine is ignored rather than trusted.
+//! the same way remote input is read everywhere else in this product: a fixed shape, a fixed window of
+//! two hundred fifty-six arguments to read, a fixed bound of sixteen things to open, and anything that
+//! is neither a `magnet:` URI nor an existing `.torrent` file on this machine is ignored rather than
+//! trusted.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,13 @@ use url::Url;
 /// The most things one launch may hand over: a fixed amount of work for the Add page, whatever a browser
 /// or a file manager decided to select, and no allocation that grows with it.
 const MAX_OPENED: usize = 16;
+
+/// The most arguments after `args[0]` that are looked at, whatever the launcher handed over. A kept item
+/// costs at most a `metadata`, and the kept list stops at [`MAX_OPENED`]; what this bounds is the walk
+/// itself, because an argument that keeps nothing would otherwise be read one by one however many a
+/// second launch forwarded. argv is somebody else's list, so its length gets the same fixed shape as
+/// everything else read off it.
+const MAX_ARGS_EXAMINED: usize = 256;
 
 /// The scheme this app registers itself for. Read case-insensitively: a desktop entry and a browser's
 /// handler list both hand over `MAGNET:` as readily as `magnet:`.
@@ -46,8 +54,9 @@ pub enum Opened {
 ///
 /// `args[0]` is the program and never something to open, and anything starting with `-` is somebody else's
 /// switch, which is safe to skip because neither a torrent file's path nor a magnet URI starts with one.
-/// What is kept is at most the bound this module sets (sixteen items), with an argument naming something
-/// already named skipped:
+/// At most 256 arguments after it (the module's `MAX_ARGS_EXAMINED`) are looked at, whatever list a
+/// second launch forwarded. What is kept is at most the bound this module sets (sixteen items), with an
+/// argument naming something already named skipped:
 /// a system that delivers one file as both a path and a `file://` URL is naming one torrent, not two.
 ///
 /// Everything else is ignored rather than trusted, because these arguments come from a desktop entry, a
@@ -56,7 +65,7 @@ pub enum Opened {
 /// page gets a list of things to open, not a list of things a launcher half-understood.
 pub fn opened_from_args(args: &[OsString]) -> Vec<Opened> {
     let mut opened: Vec<Opened> = Vec::new();
-    for arg in args.iter().skip(1) {
+    for arg in args.iter().skip(1).take(MAX_ARGS_EXAMINED) {
         if opened.len() == MAX_OPENED {
             break;
         }
@@ -121,7 +130,7 @@ fn torrent_file(path: &Path) -> Option<Opened> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OPENED, Opened, opened_from_args};
+    use super::{MAX_ARGS_EXAMINED, MAX_OPENED, Opened, opened_from_args};
     use fbtt_core::scratch::ScratchDir;
     use std::ffi::OsString;
     use url::Url;
@@ -189,6 +198,40 @@ mod tests {
             opened.last(),
             Some(&Opened::Magnet("magnet:?xt=urn:btih:16".to_string())),
             "and the sixteenth is the last one kept"
+        );
+    }
+
+    /// The arguments are read for a fixed window, whatever the launcher handed over: argv[0], then
+    /// `MAX_ARGS_EXAMINED` of them, and nothing after that is looked at. A flood of a thousand fillers
+    /// costs a bounded amount of work, and a magnet parked deep inside one is not something this app
+    /// goes hunting for.
+    #[test]
+    fn args_past_the_examined_cap_are_ignored() {
+        assert_eq!(
+            MAX_ARGS_EXAMINED, 256,
+            "the window the arguments are read against"
+        );
+        let mut args: Vec<OsString> = (0..300)
+            .map(|n| OsString::from(format!("filler-{n}")))
+            .collect();
+        args[0] = OsString::from("/usr/bin/featherbittorrent-desktop");
+
+        // The only real thing in the list sits past the window: the 280th argument is one more than
+        // the 256 this reads after argv[0].
+        args[280] = OsString::from("magnet:?xt=urn:btih:deep");
+        assert!(
+            opened_from_args(&args).is_empty(),
+            "an argument at position 280 is past the {} that are examined",
+            MAX_ARGS_EXAMINED,
+        );
+
+        // The window is exactly that wide: the 256th argument after argv[0] is still read.
+        args[280] = OsString::from("filler-280");
+        args[MAX_ARGS_EXAMINED] = OsString::from("magnet:?xt=urn:btih:edge");
+        assert_eq!(
+            opened_from_args(&args),
+            vec![Opened::Magnet("magnet:?xt=urn:btih:edge".to_string())],
+            "the 256th argument after argv[0] is the last one read"
         );
     }
 }

@@ -10,6 +10,14 @@
 //! the same `{error: {code, message}}` shape the API uses for a missing torrent. A catch-all returning
 //! the page instead would make a typo'd address look like a broken app.
 //!
+//! And a fallback must never be added - here or on the API side - while the desktop app's own engine
+//! runs secret-only: that engine lets every path matching no route past its credential check
+//! (`crate::auth`'s `matched_path.is_none()` shortcut), and a request holding no launch secret only
+//! gets the harmless empty `404` because there is no catch-all for it to land on. A fallback would
+//! serve the page, or start asking for the secret, where an unknown path is supposed to say `404` for
+//! free. `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs` is the guard, and
+//! [`crate::routes::router`] carries the same warning.
+//!
 //! The page is open to somebody who has not signed in, which is the one thing about this module that
 //! is a security decision rather than plumbing: the sign-in form is *on* the page, so a page that
 //! asked for a session before it showed a sign-in form could never be signed in to. The exemption is

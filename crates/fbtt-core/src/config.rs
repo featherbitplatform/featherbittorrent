@@ -1502,6 +1502,63 @@ mod tests {
         );
     }
 
+    /// The desktop webview's origin key round-trips: a YAML that names `cors_origins` reads them into
+    /// the field, what the save writes back reads in again as the same config, and a config that names
+    /// none - the state every config file was in before this key existed - still writes no
+    /// `cors_origins` line, so a save never adds one to a file that never had it.
+    #[test]
+    fn cors_origins_round_trips_in_yaml() {
+        let dir = ScratchDir::new("config_cors_origins_round_trip");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        fs::write(&path, "server:\n  cors_origins: [tauri://localhost]\n")
+            .expect("write a config naming the desktop webview's origin");
+        let ConfigLoad::Loaded(chosen) = Config::load(&paths).expect("read the origin") else {
+            panic!("a config naming cors_origins is still a config");
+        };
+        let server = chosen
+            .server
+            .as_ref()
+            .expect("naming the origins gives a section");
+        assert_eq!(
+            server.cors_origins,
+            vec!["tauri://localhost".to_string()],
+            "`cors_origins: [tauri://localhost]` reads into the field"
+        );
+
+        // What that config saves, the next run reads back unchanged, and the key is in the file.
+        chosen
+            .save(&path)
+            .expect("save the config that named an origin");
+        let written = fs::read_to_string(&path).expect("read the save back");
+        assert!(
+            yaml_value(&written, "cors_origins").is_some(),
+            "a config that named origins writes them back: {written}"
+        );
+        let ConfigLoad::Loaded(again) = Config::load(&paths).expect("read the save back") else {
+            panic!("the save wrote a config");
+        };
+        assert_eq!(again, chosen, "the round trip is the identity");
+
+        // And a config that names none writes no line at all: this is every file written before this
+        // key existed, and a save must leave it exactly that.
+        let quiet = Config {
+            server: Some(ServerConfig::default()),
+            ..Config::default()
+        }
+        .resolve(&paths);
+        quiet
+            .save(&path)
+            .expect("save a config that named no origins");
+        let written = fs::read_to_string(&path).expect("read the silent save back");
+        assert_eq!(
+            yaml_value(&written, "cors_origins"),
+            None,
+            "no cors_origins line for a config that named none: {written}"
+        );
+    }
+
     /// A config that never chose to serve - which is what the TUI saves when somebody changes a rate or a
     /// download folder - writes no `[server]` at all and reads back with none. That is the difference
     /// between "this library has a server on it, at this address" and "nobody has said so": the machine
