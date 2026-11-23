@@ -20,7 +20,7 @@ import {
   makeVideoPlayable,
   makeVideoSeekable,
 } from './testing'
-import { FOCUSABLE_SELECTOR } from '../modal'
+import { FOCUSABLE_SELECTOR, MODAL_CENTRED } from '../modal'
 import { KEY_BINDINGS } from '../keys'
 
 
@@ -315,6 +315,16 @@ describe('the Files tab', () => {
 })
 
 describe('the player', () => {
+  it('opens centred in the window', () => {
+    // Preflight zeroes the `margin: auto` a browser centres a modal with; the shared class puts it back.
+    const { client } = probeClient()
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    const dialog = document.querySelector('dialog')
+    expect(dialog, 'the player is not a dialog').not.toBeNull()
+    expect(dialog!.className.split(' ')).toContain(MODAL_CENTRED)
+    expect(dialog!.className.split(' '), 'the player lost its phone margin').toContain('max-[640px]:m-0')
+  })
+
   it('lists audio and subtitle choices', async () => {
     const { client } = probeClient()
     render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)

@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
-import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
+import { MODAL_DIALOG, useModalDialog } from '../modal'
 import { closeWindow, onCloseRequested, setCloseAction } from './bridge'
 import type { CloseAction } from './bridge'
 
@@ -66,7 +66,7 @@ export function CloseChoice({ onClose }: CloseChoiceProps) {
       onKeyDown={onKeyDown}
       aria-labelledby="close-choice-title"
       aria-describedby="close-choice-note"
-      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
+      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${MODAL_DIALOG}`}
     >
       <div className="flex items-start justify-between gap-3 border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="close-choice-title" className="text-[16px] font-semibold text-strong">

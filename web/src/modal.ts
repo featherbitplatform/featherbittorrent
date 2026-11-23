@@ -41,6 +41,18 @@ import type { KeyboardEvent, RefObject } from 'react'
 export const PHONE_FULLSCREEN =
   'max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0 max-[640px]:overflow-y-auto'
 
+/**
+ * What centres a modal `<dialog>` in the window. A browser centres one with `margin: auto` against
+ * the `inset: 0` its own stylesheet gives `dialog:modal`, and Tailwind's preflight resets the margin
+ * of every element to 0, which leaves the dialog pinned to the top-left corner in Chrome and WebKit
+ * alike. Putting `auto` back on the dialog itself is what centres it; the phone classes' `m-0` still
+ * wins at 640 px and below, where the dialog fills the screen instead.
+ */
+export const MODAL_CENTRED = 'm-auto'
+
+/** The classes every modal `<dialog>` here carries: centred in the window, and full screen on a phone. */
+export const MODAL_DIALOG = `${MODAL_CENTRED} ${PHONE_FULLSCREEN}`
+
 /** What a dialog component needs from this hook: the element to attach to, and its `onKeyDown`. */
 export interface ModalDialog {
   ref: RefObject<HTMLDialogElement | null>

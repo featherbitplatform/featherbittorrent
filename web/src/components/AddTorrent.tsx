@@ -38,7 +38,7 @@ import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
 import { displaySafe, formatBytes } from '../format'
 import { announcePolite } from '../live'
-import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
+import { MODAL_DIALOG, useModalDialog } from '../modal'
 import Banner from './Banner'
 import Button from './Button'
 import FolderPicker from './FolderPicker'
@@ -247,7 +247,7 @@ export default function AddTorrent({
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="add-torrent-title"
-      className={`w-[min(720px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
+      className={`w-[min(720px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${MODAL_DIALOG}`}
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="add-torrent-title" className="text-[16px] font-semibold text-strong">
