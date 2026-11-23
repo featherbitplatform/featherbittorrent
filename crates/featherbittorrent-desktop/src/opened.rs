@@ -227,6 +227,7 @@ pub fn on_second_launch(state: &OpenedState, argv: Vec<String>, cwd: &str, page:
 
 /// The URLs the system opened the running app with (macOS): magnets, and `file://` URLs for `.torrent`
 /// files. Read by the same handoff as arguments, so the same bounds and the same checks apply.
+#[cfg(any(target_os = "macos", test))]
 pub fn on_open_urls(state: &OpenedState, urls: Vec<String>, page: &impl Page) {
     let args: Vec<OsString> = std::iter::once(OsString::new())
         .chain(urls.into_iter().map(OsString::from))
