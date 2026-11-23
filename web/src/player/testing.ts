@@ -218,7 +218,14 @@ export class FakeBody {
   /** Set once the body's `AbortSignal` has fired; a `read` after that rejects with the `AbortError`. */
   private aborted = false
 
+  /** A fresh fetch of the same body clears an earlier fetch's abort. */
+  resetAbort(): void {
+    this.aborted = false
+  }
+
   getReader(): ReadableStreamDefaultReader<Uint8Array> {
+    // A body is read through the one reader its fetch gave it; a later `getReader` is the same
+    // reader, the way the browser's body reader is reused.
     if (this.reader !== null) return this.reader
     this.reader = {
       read: async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
@@ -386,6 +393,9 @@ export function fakeFetch(): FetchRecorder {
     // at the `read()`.
     let bodyReader: ReadableStreamDefaultReader<Uint8Array> | null = null
     if (body !== null) {
+      // A fresh body for this fetch: any abort from an earlier fetch of the same body is gone, so
+      // this fetch's signal is the only one that can reject its reads.
+      body.resetAbort()
       bodyReader = body.getReader()
       if (signal.aborted) body.fireAbort()
       else signal.addEventListener('abort', () => body.fireAbort(), { once: true })

@@ -46,7 +46,7 @@ export interface Engine {
   /** Stop everything: the fetches, the buffers, and the object URL the engine made, when it made one. */
   destroy(): void
   /** Subscribe to state changes. The engine does not hand back an unsubscribe; it dies with the player. */
-  onState(cb: (state: EngineState) => void): void
+  onState(cb: (s: EngineState) => void): void
 }
 
 interface Target {
@@ -81,15 +81,23 @@ interface Stream {
   appending: boolean
   /** True while the read loop is between reads, which is to say: running. */
   reading: boolean
-  /** The point of source time the current body begins at, from `X-Fbtt-Start-Ms`, or null for its start. */
-  bodyStartMs: number | null
-  /** True once the body has been read to its end. */
-  bodyDone: boolean
-  /** How many times this body has ended early and been asked again. */
+  /** The point of source time the current body began at, from `X-Fbtt-Start-Ms`, or its start. */
+  bodyStartMs: number
+  /** True once the body has been read to its end at the end of the file: done, and not to be refetched. */
+  atEnd: boolean
+  /** How many times this body has stopped and been asked again; the delay follows it. */
   retries: number
   /** True while a retry is waiting on its timer: one timer per stream, never two. */
   retrying: boolean
   retryTimer: ReturnType<typeof setTimeout> | null
+  /** What this stream is, for the engine's own bookkeeping: the video, or the audio. */
+  role: 'video' | 'audio'
+  /**
+   * The generation the stream's read loop and its timers run under. It goes up on every abort,
+   * seek and audio switch, and a loop that wakes from an `await` to find its generation gone
+   * stops at once: the old stream must not touch the new one's reader or state.
+   */
+  generation: number
   /** The read pump: set on the stream once the function that closes over it is defined. */
   pump?: () => void
 }
@@ -100,6 +108,7 @@ interface BufferLike extends EventTarget {
   appendBuffer(data: ArrayBuffer | ArrayBufferView): void
   remove(start: number, end: number): void
   abort(): void
+  changeType(mime: string): void
 }
 
 /** The shape the fake and the real media source both give the engine. */
@@ -150,9 +159,21 @@ function defaultDeps(): EngineDeps {
       ((): unknown => {
         throw new Error('no MediaSource in this browser')
       })) as typeof MediaSource
+  // The browser's own source: the element's `load` (an object URL on a video) is what opens it,
+  // and it does so asynchronously, firing `sourceopen`. A fake source has no element to load it,
+  // so the engine opens one it makes itself, the way the element's load would.
+  const openSource = (raw: unknown): void => {
+    const open = (raw as { open?: () => void }).open
+    if (typeof open === 'function') open.call(raw)
+  }
+  const Ctor: typeof MediaSource = function (this: unknown) {
+    const instance = new mediaCtor()
+    openSource(instance)
+    return instance
+  } as unknown as typeof MediaSource
   return {
     fetch: window.fetch,
-    MediaSource: mediaCtor,
+    MediaSource: Ctor,
     managed: managedCtor !== undefined,
   }
 }
@@ -182,6 +203,16 @@ function isQuotaError(cause: unknown): boolean {
   )
 }
 
+/** The engine's own abort: an `AbortError` is the engine asking the stream to stop, not a failure. */
+function isAbort(cause: unknown): boolean {
+  return cause instanceof DOMException && cause.name === 'AbortError'
+}
+
+/** Whether the stream's fetch has been aborted: the engine's own word for "this stream is gone". */
+function isAborted(stream: Stream): boolean {
+  return stream.abort !== null && stream.abort.signal.aborted
+}
+
 /**
  * Feed one video element from the server's per-track streams.
  *
@@ -204,6 +235,14 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   let objectUrl: string | null = null
   let destroyed = false
   let endedFired = false
+  // The source is not open yet when `createEngine` runs, and the player may ask to start away from
+  // the beginning (the remembered position) before it opens: the start the `onOpen` will act on.
+  let pendingStartMs: number | null = null
+  // The point the engine itself put the playhead at, so the `seeking` that write fires is not
+  // answered with a restart of the streams it was just asking for.
+  let engineSeekTo: number | null = null
+  let videoStream: Stream
+  let audioStream: Stream | null
 
   function setState(next: EngineState): void {
     if (next === state) return
@@ -221,11 +260,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     video.src = objectUrl
   }
 
-  const videoStream = addStream(probe.video, probe.videoMime)
-  const audioStream =
-    probe.audio !== null && probe.audioMime !== null ? addStream(probe.audio, probe.audioMime) : null
-
-  function addStream(track: MediaTrack, mime: string): Stream {
+  function addStream(track: MediaTrack, mime: string, role: 'video' | 'audio'): Stream {
     // The source the engine holds is its own structural read; the buffer it returns is the same.
     const stream: Stream = {
       track,
@@ -235,11 +270,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       reader: null,
       appending: false,
       reading: false,
-      bodyStartMs: null,
-      bodyDone: false,
+      bodyStartMs: 0,
+      atEnd: false,
       retries: 0,
       retrying: false,
       retryTimer: null,
+      role,
+      generation: 0,
     }
     // One `updateend` ends the append the buffer was busy with, and it is also where a stopped
     // read finds out there is room to go again.
@@ -252,6 +289,17 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     // all in scope: the `updateend` above and the `timeupdate` below both call it through this field.
     stream.pump = () => pump(stream)
     return stream
+  }
+
+  // The buffers are added when the source opens, not when the engine is made: a `SourceBuffer`
+  // refused by a source that is not yet open is the browser's `InvalidStateError`, and the order
+  // the decoder wants them in is the video first, the audio after.
+  function openBuffers(): void {
+    videoStream = addStream(probe.video, probe.videoMime, 'video')
+    audioStream =
+      probe.audio !== null && probe.audioMime !== null
+        ? addStream(probe.audio, probe.audioMime, 'audio')
+        : null
   }
 
   function streamUrl(trackId: number, startMs: number): string {
@@ -268,22 +316,30 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
    */
   function openAt(primary: Stream, follow: Stream | null, startMs: number): void {
     if (destroyed) return
-    beginStream(primary, startMs, (bodyStartMs) => {
-      // The playhead is the server's own word for where this body began, in source milliseconds.
-      video.currentTime = mapTimes.toMedia(bodyStartMs ?? startMs)
+    beginStream(primary, startMs, (bodyStartMs, requestedMs) => {
+      // The playhead follows the server's own word for where this body began, but only when that
+      // point is past where the person asked for: a start at or before the request, inside what
+      // the body will buffer, is the request itself, and moving the element would fire a `seeking`
+      // the streams do not need.
+      if (bodyStartMs > requestedMs) {
+        engineSeekTo = bodyStartMs
+        video.currentTime = mapTimes.toMedia(bodyStartMs)
+      }
       // The follow is asked for at the same point the primary landed on.
-      if (follow !== null) beginStream(follow, bodyStartMs ?? startMs)
+      if (follow !== null) beginStream(follow, bodyStartMs)
       if (state === 'loading') setState('playing')
     })
   }
 
-  function beginStream(stream: Stream, startMs: number, onStarted?: (bodyStartMs: number | null) => void): void {
+  function beginStream(
+    stream: Stream,
+    startMs: number,
+    onStarted?: (bodyStartMs: number, requestedMs: number) => void,
+  ): void {
     if (destroyed) return
     abortStream(stream)
     clearRetry(stream)
-    stream.bodyDone = false
-    stream.bodyStartMs = null
-    stream.retries = 0
+    stream.atEnd = false
 
     const abort = new AbortController()
     stream.abort = abort
@@ -293,21 +349,29 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       let response: Response
       try {
         response = await full.fetch(url, { signal: abort.signal, credentials: 'same-origin' })
-      } catch {
-        // Aborted is the engine's own word; a fetch that throws any other way is a network error,
-        // and it gets the waiting state and its retries.
-        if (destroyed || abort.signal.aborted) return
+      } catch (cause) {
+        // The engine's own abort is not a failure: the stream is being replaced, and the old
+        // fetch is the way the engine said so.
+        if (destroyed || abort.signal.aborted || isAbort(cause)) return
+        // A network error is a wait, not an end: the state, and its retries. A first fetch of
+        // the video that fails re-runs the whole start, so the audio is asked for too.
         setState('waiting')
-        scheduleRetry(stream)
+        if (stream.role === 'video') scheduleRetry(stream, () => restartAll(startMs))
+        else scheduleRetry(stream)
         return
       }
       if (destroyed || abort.signal.aborted) return
       if (!response.ok) {
-        // A 504 is a read timeout: the data is there, the disk is not answering yet, and it is a
-        // wait, not an error. Anything else is an answer the engine cannot act on.
-        if (response.status === 504) {
+        // A 504 is a read timeout and a 503 a full set of streams: both are waits, not errors,
+        // and a 503's `Retry-After` is the shortest the wait may be.
+        if (response.status === 504 || response.status === 503) {
+          const retryAfterMs = parseRetryAfterMs(response)
           setState('waiting')
-          scheduleRetry(stream)
+          if (stream.role === 'video') {
+            scheduleRetry(stream, () => restartAll(startMs), retryAfterMs ?? undefined)
+          } else {
+            scheduleRetry(stream, undefined, retryAfterMs ?? undefined)
+          }
           return
         }
         setState('error')
@@ -316,11 +380,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
       const header = response.headers?.get?.('x-fbtt-start-ms')
       const parsed = header === null || header === undefined ? Number.NaN : Number(header)
-      stream.bodyStartMs = Number.isFinite(parsed) && parsed > 0 ? parsed : null
-      onStarted?.(stream.bodyStartMs)
+      const bodyStartMs = Number.isFinite(parsed) && parsed > 0 ? parsed : Math.max(0, startMs)
+      stream.bodyStartMs = bodyStartMs
+      onStarted?.(bodyStartMs, startMs)
 
       if (response.body === null) {
-        stream.bodyDone = true
+        stream.reader = null
         settleEnd(stream)
         return
       }
@@ -332,24 +397,35 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
   async function readStream(stream: Stream): Promise<void> {
     for (;;) {
+      // The generation is the stream's identity: a loop that wakes to find it changed is the old
+      // stream, and it stops at once, never touching the new stream's reader or state.
       if (destroyed) return
       if (stream.reader === null) return
+      const generation = stream.generation
+      // The gate answers before each read: a buffer a minute ahead of the playhead is not one
+      // the person is watching, and its fetch stops until a `timeupdate` says the playhead moved.
+      const ahead = bufferEnd(stream.buffer.buffered) - video.currentTime
+      if (!stream.gate(ahead)) {
+        stream.reading = false
+        return
+      }
       let result: ReadableStreamReadResult<Uint8Array>
       try {
         result = await stream.reader.read()
-      } catch {
-        // A body that dies mid-read is the same as one that ends early: waiting, with retries.
-        if (destroyed || (stream.abort !== null && stream.abort.signal.aborted)) return
+      } catch (cause) {
+        // The engine's own abort is not the body ending: the stream is being replaced, and the
+        // old loop must not say the file stopped.
+        if (destroyed || isAborted(stream) || isAbort(cause) || stream.generation !== generation) return
         setState('waiting')
         scheduleRetry(stream)
         return
       }
-      if (stream.abort !== null && stream.abort.signal.aborted) return
-
+      if (stream.generation !== generation) return
       if (result.done) {
+        // A `done` after the engine aborted is the abort, not an end: the stream is being replaced.
+        if (isAborted(stream)) return
         stream.reader = null
         stream.reading = false
-        stream.bodyDone = true
         settleEnd(stream)
         return
       }
@@ -357,68 +433,86 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       // One chunk at a time, in order, and a wait for `updateend` before the next: a
       // `SourceBuffer` is not a queue, and two appends in flight is an error at best.
       const chunk = result.value
-      appendChunk(stream, chunk.buffer as ArrayBuffer, chunk.byteOffset, chunk.byteLength)
-      if (destroyed || (stream.abort !== null && stream.abort.signal.aborted)) return
-      await appendDone(stream)
+      const data: ArrayBuffer = (chunk.buffer as ArrayBuffer).slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)
+      const appended = await appendChunk(stream, data, generation)
+      if (stream.generation !== generation) return
+      if (appended) {
+        // An append that landed while the engine was waiting is the data arriving: the state
+        // goes back to playing, and the retry count starts again from the first stop.
+        if (state === 'waiting') setState('playing')
+        stream.retries = 0
+      }
     }
   }
 
-  function appendChunk(stream: Stream, buffer: ArrayBuffer, byteOffset: number, byteLength: number): void {
-    const data: ArrayBuffer = buffer.slice(byteOffset, byteOffset + byteLength)
-    stream.appending = true
+  /**
+   * Append one chunk, and if the buffer is full, run the eviction ranges one at a time, each
+   * awaited to `updateend`, and retry the same chunk before any later one. A chunk that still
+   * does not fit stops the read at the gate rather than throwing.
+   */
+  async function appendChunk(
+    stream: Stream,
+    data: ArrayBuffer,
+    generation: number,
+  ): Promise<boolean> {
     try {
+      stream.appending = true
       stream.buffer.appendBuffer(data)
+      if (stream.generation !== generation) return false
+      await appendDone(stream, generation)
+      return stream.generation === generation
     } catch (cause) {
+      if (stream.generation !== generation) return false
       stream.appending = false
-      if (isQuotaError(cause)) {
-        // The buffer is full: cut what lies far behind the playhead and try the chunk once more.
-        // `evictRanges` can answer a range whose end is not past its start, and a `remove` of
-        // nothing is a `remove` of nothing: those are skipped.
-        const cut = evictRanges(ranges(stream.buffer.buffered), video.currentTime).filter(
-          ([start, end]) => end > start,
-        )
-        for (const [start, end] of cut) {
-          try {
-            stream.buffer.remove(start, end)
-          } catch {
-            // A remove the buffer refuses is data it already let go.
-          }
+      if (!isQuotaError(cause)) return false
+      // The buffer is full: cut what lies far behind the playhead, one range at a time, each
+      // `remove` awaited to its `updateend`, and a `remove` of nothing is skipped.
+      const cut = evictRanges(ranges(stream.buffer.buffered), video.currentTime).filter(
+        ([start, end]) => end > start,
+      )
+      for (const [start, end] of cut) {
+        if (stream.generation !== generation) return false
+        try {
+          stream.buffer.remove(start, end)
+        } catch {
+          // A remove the buffer refuses is data it already let go.
         }
-        // The pending `remove`s settle on their own `updateend`, and the retry of the chunk waits
-        // for that: an `appendBuffer` before the buffer is clean throws.
-        stream.retryTimer = setTimeout(() => {
-          stream.retryTimer = null
-          if (destroyed) return
-          stream.appending = true
-          try {
-            stream.buffer.appendBuffer(data)
-          } catch {
-            // Still full after one eviction: the waiting state and the retries take it from here.
-            stream.appending = false
-            setState('waiting')
-            scheduleRetry(stream)
-          }
-        }, 0)
-        return
+        await appendDone(stream, generation)
       }
-      throw cause
+      // The same chunk, again, before any later one: the eviction made room for it, and the
+      // order of the buffer is the order the decoder wants it in.
+      try {
+        stream.appending = true
+        stream.buffer.appendBuffer(data)
+        if (stream.generation !== generation) return false
+        await appendDone(stream, generation)
+        return stream.generation === generation
+      } catch {
+        // Still full after one eviction: the read stops at the gate, and a `timeupdate` or a
+        // later eviction may make room again. It is not an error, and nothing is lost.
+        stream.appending = false
+        return false
+      }
     }
   }
 
   /** A read loop that is stopped by its gate, woken by a `timeupdate` moving the playhead. */
   function pump(stream: Stream): void {
     if (destroyed || stream.reading || stream.appending || stream.reader === null) return
-    // The gate answers from how far the buffer already reaches: a buffer a minute ahead of the
-    // playhead is not one the person is watching, and its fetch stops.
     const ahead = bufferEnd(stream.buffer.buffered) - video.currentTime
     if (!stream.gate(ahead)) return
     stream.reading = true
     void readStream(stream)
   }
 
-  function appendDone(stream: Stream): Promise<void> {
+  /** Wait for the buffer to stop updating: one `updateend` per append, and none the stream no longer is. */
+  function appendDone(stream: Stream, generation: number): Promise<void> {
     return new Promise((resolve) => {
       const check = (): void => {
+        if (stream.generation !== generation) {
+          resolve()
+          return
+        }
         if (!stream.appending) resolve()
         else stream.buffer.addEventListener('updateend', check, { once: true })
       }
@@ -426,18 +520,22 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     })
   }
 
+  /** A body that has been read to its end: is the file over, or does the stream wait to be asked again? */
   function settleEnd(stream: Stream): void {
     if (destroyed || endedFired) return
     const end = probe.durationMs === null ? null : mapTimes.toMedia(probe.durationMs)
     if (end !== null) {
-      const allDone = streams.every((other) => other.bodyDone || other.retrying)
-      const allReached = streams.every((other) => bufferEnd(other.buffer.buffered) >= end - END_WITHIN)
-      if (allDone && allReached) {
-        endedFired = true
-        try {
-          source.endOfStream()
-        } catch {
-          // A source that is already done is the best outcome the call could have.
+      const reached = bufferEnd(stream.buffer.buffered) >= end - END_WITHIN
+      if (reached) {
+        // This body ended at the end of the file: it is done, and not to be refetched.
+        stream.atEnd = true
+        if (streams.every((other) => other.atEnd)) {
+          endedFired = true
+          try {
+            source.endOfStream()
+          } catch {
+            // A source that is already done is the best outcome the call could have.
+          }
         }
         return
       }
@@ -448,20 +546,42 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     scheduleRetry(stream)
   }
 
-  function scheduleRetry(stream: Stream): void {
+  /**
+   * Ask again after a stop. The delay follows the retry count, which persists across stops and
+   * resets only on a successful append, so the cadence is one, two, four, and then five seconds
+   * each. A `minimumMs` (a 503's `Retry-After`) lengthens the wait, never shortens it.
+   */
+  function scheduleRetry(
+    stream: Stream,
+    action?: () => void,
+    minimumMs?: number,
+  ): void {
     if (destroyed || stream.retrying) return
     stream.retrying = true
-    const delay = stream.retries < RETRY_DELAYS.length ? RETRY_DELAYS[stream.retries] : RETRY_STEADY
+    let delay = stream.retries < RETRY_DELAYS.length ? RETRY_DELAYS[stream.retries] : RETRY_STEADY
+    if (minimumMs !== undefined) delay = Math.max(delay, minimumMs)
     stream.retries += 1
     stream.retryTimer = setTimeout(() => {
       stream.retryTimer = null
       stream.retrying = false
       if (destroyed) return
+      if (action !== undefined) {
+        action()
+        return
+      }
       // The retry goes from the end of what the buffer already has, not from where the fetch
       // began: the data that made it in is kept, and the server resumes where the buffer stops.
       const fromMs = mapTimes.toSource(bufferEnd(stream.buffer.buffered))
       beginStream(stream, fromMs)
     }, delay)
+  }
+
+  /** The `Retry-After` seconds a 503 answers with, or null when the header is not one. */
+  function parseRetryAfterMs(response: Response): number | null {
+    const value = response.headers?.get?.('retry-after')
+    if (value === null || value === undefined) return null
+    const seconds = Number(value)
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null
   }
 
   function clearRetry(stream: Stream): void {
@@ -472,9 +592,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     stream.retrying = false
   }
 
+  /** Bump the stream's generation and stop it: the old loops and timers find it gone. */
   function abortStream(stream: Stream): void {
+    stream.generation += 1
     clearRetry(stream)
     stream.reading = false
+    stream.appending = false
     if (stream.reader !== null) {
       const reader = stream.reader
       stream.reader = null
@@ -491,14 +614,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
   function restartAll(fromMs: number): void {
     // Every stream stops where it is and starts again at the same point of source time: the
-    // buffers are cut, the fetches aborted, and the playhead is where the person put it.
+    // fetches abort (and the generation bumps), and the playhead is where the person put it.
     for (const stream of streams) {
       abortStream(stream)
-      try {
-        stream.buffer.abort()
-      } catch {
-        // Nothing in the buffer, or a buffer that is already clean: the seek takes it from here.
-      }
     }
     if (audioStream !== null) {
       // The playhead follows the video; the audio is asked for at the same point it lands on.
@@ -509,11 +627,19 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   // A seek the buffer already covers costs nothing: the element plays from what it has. A seek
-  // that does not is a restart of both streams at the point the element moved to.
+  // that does not is a restart of both streams at the point the element moved to. The `seeking`
+  // the engine's own `currentTime` write fires is answered with a restart, not a second one:
+  // `engineSeekTo` names that point, and the event that matches it is the engine's, so it is
+  // ignored and cleared.
   function onSeeking(): void {
     if (destroyed || endedFired) return
     const time = video.currentTime
     if (time < 0) return
+    if (engineSeekTo !== null) {
+      const target = engineSeekTo
+      engineSeekTo = null
+      if (Math.abs(time - target) < 1e-3) return
+    }
     const covered = video.buffered.length > 0 &&
       [...Array(video.buffered.length).keys()].some(
         (i) => video.buffered.start(i) <= time && time <= video.buffered.end(i),
@@ -530,35 +656,40 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   function setAudio(track: MediaTrack): void {
-    if (destroyed || audioStream === null) return
+    // The buffers are added when the source opens; a switch asked for before then has no buffer
+    // to switch, and the track the probe chose is already the one the open will play.
+    if (destroyed || audioStream === null || source.readyState !== 'open') return
     const mime = probe.mimeFor(track)
     if (mime === null) return
-    // The old audio is cut at the playhead, not at its start: what has played stays, what has not
-    // goes, and the new track is asked for at the point the buffer now covers.
-    abortStream(audioStream)
+    // The audio track changes on the buffer it already has: a `SourceBuffer` cannot change its
+    // mime in place, but it can `changeType`, and a second `addSourceBuffer` after media data has
+    // arrived is the browser's `QuotaExceededError`. The old fetch stops, the buffer is cut at
+    // the playhead and re-typed, and the new track is asked for at the point the buffer covers.
+    const old = audioStream
+    abortStream(old)
     const cutFrom = video.currentTime
-    const buffered = audioStream.buffer.buffered
-    for (let i = buffered.length - 1; i >= 0; i -= 1) {
-      const start = buffered.start(i)
-      const end = buffered.end(i)
-      if (end <= cutFrom) continue
+    const cutEnd = bufferEnd(old.buffer.buffered)
+    old.track = track
+    const finish = (): void => {
+      if (destroyed) return
       try {
-        audioStream.buffer.remove(Math.max(start, cutFrom), end)
+        old.buffer.changeType(mime)
+      } catch {
+        // A buffer that will not change its type is one that is already gone.
+      }
+      beginStream(old, mapTimes.toSource(cutFrom))
+    }
+    if (cutEnd > cutFrom) {
+      // Remove from the playhead to the end, awaited to `updateend`, then switch the type.
+      try {
+        old.buffer.remove(Math.max(cutFrom, 0), cutEnd)
       } catch {
         // A remove the buffer refuses is data it already let go.
       }
+      appendDone(old, old.generation).then(finish)
+      return
     }
-    // The new track gets a new buffer: a `SourceBuffer` cannot change the mime it was made with.
-    const old = audioStream
-    const index = streams.indexOf(old)
-    try {
-      source.removeSourceBuffer(old.buffer)
-    } catch {
-      // A buffer that will not be removed is one that is already gone.
-    }
-    const fresh = addStream(track, mime)
-    streams.splice(index, 1, fresh)
-    beginStream(fresh, mapTimes.toSource(cutFrom))
+    finish()
   }
 
   function destroy(): void {
@@ -583,7 +714,16 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
   function onOpen(): void {
     if (probe.durationMs !== null) source.duration = mapTimes.toMedia(probe.durationMs)
-    openAt(videoStream, audioStream, 0)
+    openBuffers()
+    // The start is where the player asked to begin, when it did before the source opened; that is
+    // the remembered position, and it is where the streams will be asked for.
+    const startMs = pendingStartMs ?? 0
+    pendingStartMs = null
+    if (audioStream !== null) {
+      openAt(videoStream, audioStream, startMs)
+    } else {
+      openAt(videoStream, null, startMs)
+    }
   }
   source.addEventListener('sourceopen', onOpen)
   video.addEventListener('timeupdate', onTimeUpdate)
@@ -592,6 +732,11 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   return {
     seek(sourceMs: number): void {
       if (destroyed || endedFired) return
+      // Before the source opens there is no stream to restart: the start is held for `onOpen`.
+      if (source.readyState !== 'open') {
+        pendingStartMs = sourceMs
+        return
+      }
       video.currentTime = mapTimes.toMedia(sourceMs)
     },
     setAudio,

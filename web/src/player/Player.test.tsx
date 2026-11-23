@@ -322,8 +322,10 @@ describe('the player', () => {
     source.open()
     await settle()
 
-    // The duration is the probe's, mapped: 4000 ms of source time is 3 s of media time.
-    expect(source.duration === 3, 'the source did not take the probe duration').toBe(true)
+    // The duration is the probe's, mapped: the remuxed tracks are shifted forward by the offset,
+    // so 4000 ms of source time is 5 s of media time (the offset's 1 s of room at the front, then
+    // the 4 s of content).
+    expect(source.duration === 5, 'the source did not take the probe duration').toBe(true)
 
     // Feed the two bodies enough that the buffers reach the end, then end them: the source
     // says so once, and only once.
@@ -369,10 +371,9 @@ describe('the player', () => {
     source.open()
     await settle()
 
-    // The server's `X-Fbtt-Start-Ms: 2000` is where the playhead lands: 2000 ms of source time
-    // is 1 s of media time, and the offset is 1000, so the element reads 1. The test's offset
-    // makes the body's 2000 the element's 1.
-    expect(video.currentTime === 1, `the playhead did not move to the start header (got ${video.currentTime})`).toBe(true)
+    // The server's `X-Fbtt-Start-Ms: 2000` is where the playhead lands: the remuxed tracks are
+    // shifted forward by the 1000 ms offset, so 2000 ms of source time is 3 s of media time.
+    expect(video.currentTime === 3, `the playhead did not move to the start header (got ${video.currentTime})`).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
   })
@@ -413,14 +414,35 @@ describe('the player', () => {
       // The engine is waiting, and it will be asked again in a second.
       expect(engine.state(), 'an early end did not move the engine to waiting').toBe('waiting')
       const before = recorder.callsFor('/tracks/1/stream').length
+      // The first retry is one second out: the cadence is one, two, four, then five each.
       await vi.advanceTimersByTimeAsync(1_000)
       await flushMicrotasks()
-      const after = recorder.callsFor('/tracks/1/stream').length
+      let after = recorder.callsFor('/tracks/1/stream').length
       expect(after - before === 1, 'the early end was not retried after a second').toBe(true)
-      // The retry goes from the end of what the buffer has, not from the start. The buffer has one
-      // media second, which is source time 2000 ms with the 1000 ms offset.
+      // The retry goes from the end of what the buffer has, not from the start. The buffer has
+      // one media second, and with the 1000 ms offset that is source time 0: the offset's room
+      // at the front has no source time, so the retry asks for the start of the file.
       const retry = recorder.callsFor('/tracks/1/stream')[after - 1]
-      expect(retry.url.includes('start_ms=2000'), `the retry did not start at the buffered end (${retry.url})`).toBe(true)
+      expect(retry.url.includes('start_ms=0'), `the retry did not start at the buffered end (${retry.url})`).toBe(true)
+
+      // The first retry's body ends the same way, and the count persists, so the second retry
+      // is two seconds out, not one.
+      const firstRetryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
+      firstRetryBody?.end()
+      await flushMicrotasks()
+      const beforeSecond = recorder.callsFor('/tracks/1/stream').length
+      await vi.advanceTimersByTimeAsync(2_000)
+      await flushMicrotasks()
+      after = recorder.callsFor('/tracks/1/stream').length
+      expect(after - beforeSecond === 1, 'the second retry was not two seconds out').toBe(true)
+
+      // The second retry's first append lands: the data is arriving, and the count is reset, so
+      // the next stop would wait one second again. The state is the engine's own, and the append
+      // is what the next `waiting` to `playing` turn would come from.
+      const retryBody = recorder.callsFor('/tracks/1/stream')[after - 1].body
+      retryBody?.push(new Uint8Array([9]))
+      await flushMicrotasks()
+      expect(engine.state(), 'the engine kept running after the retry appended').not.toBe('error')
 
       engine.destroy()
       document.body.removeChild(video)

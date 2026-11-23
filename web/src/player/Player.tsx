@@ -61,21 +61,34 @@ interface SubtitleOption {
 
 /** The engine's word for a stream that has stopped: the line the player draws over the video. */
 const WAITING_COPY = 'Waiting for data...'
+/** The line the player draws when the engine's state is `error`, beside the file it can still offer. */
+const ERROR_COPY = 'Playback failed.'
 /** The one sentence a browser that cannot decode the video gets, with the codec in it. */
 function unplayableCopy(codec: string): string {
   return `This browser cannot play ${codec} video.`
 }
 
-/** The words a track is listed under: its name when it has one, its language when it does not. */
+/** The words a track is listed under: its name when it has one, its language when it does not. The name is remote text, so it goes through `displaySafe` on the way out. */
 function trackLabel(track: MediaTrack): string {
-  if (track.name !== null && track.name !== '') return track.name
+  if (track.name !== null && track.name !== '') return displaySafe(track.name)
   return track.language ?? 'Audio'
 }
 
-/** Whether a mime is one the browser's `SourceBuffer` will take. */
+/**
+ * Whether a mime is one the browser's `SourceBuffer` will take, checked against whichever source
+ * constructor the browser offers: a `ManagedMediaSource` manages its own playback and is the one
+ * to ask when it is present, and a `MediaSource` when it is not. The mime is checked on that same
+ * constructor, because the answer is the constructor's.
+ */
 function remuxSupported(mime: string): boolean {
+  const managed = (window as { ManagedMediaSource?: { isTypeSupported(m: string): boolean } })
+    .ManagedMediaSource
+  const source =
+    (managed ?? (typeof MediaSource !== 'undefined' ? MediaSource : undefined)) as
+      | { isTypeSupported(m: string): boolean }
+      | undefined
   try {
-    return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime)
+    return source !== undefined && source.isTypeSupported(mime)
   } catch {
     return false
   }
@@ -113,18 +126,25 @@ function ChoiceMenu({
   options,
   selected,
   onChoose,
+  onMenuChange,
 }: {
   label: string
   options: SubtitleOption[]
   selected: string
   onChoose(key: string): void
+  onMenuChange(open: boolean): void
 }) {
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
+  function setOpenAndReport(next: boolean): void {
+    setOpen(next)
+    onMenuChange(next)
+  }
+
   function close(): void {
-    setOpen(false)
+    setOpenAndReport(false)
     buttonRef.current?.focus()
   }
 
@@ -132,7 +152,7 @@ function ChoiceMenu({
     if (!open) {
       if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
         event.preventDefault()
-        setOpen(true)
+        setOpenAndReport(true)
       }
       return
     }
@@ -140,7 +160,10 @@ function ChoiceMenu({
       listRef.current?.querySelectorAll<HTMLElement>('[role="option"]:not([disabled])') ?? [],
     )
     if (items.length === 0) return
-    const current = items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
+    // The option the cursor is on is the one focused, not the one selected: the arrows move the
+    // focus, and Enter takes the focused option, so a person can move and then choose.
+    const focused = items.findIndex((item) => item === listRef.current?.querySelector<HTMLElement>(':focus'))
+    const current = focused !== -1 ? focused : items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
     if (event.key === 'Escape') {
       event.preventDefault()
       close()
@@ -170,7 +193,7 @@ function ChoiceMenu({
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
-        onClick={() => (open ? close() : setOpen(true))}
+        onClick={() => (open ? close() : setOpenAndReport(true))}
         className={`flex h-8 cursor-pointer items-center rounded-control px-2.5 text-[13px] ${
           open ? 'bg-accent-soft text-violet-300' : 'bg-transparent text-body hover:text-strong'
         }`}
@@ -249,6 +272,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  // True while a menu is open: the dialog's key handler ignores keys from inside it, so an
+  // `ArrowUp` in the Audio listbox does not move the volume.
+  const [menuOpen, setMenuOpen] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const engineRef = useRef<Engine | null>(null)
@@ -265,7 +291,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   const offsetMs = probe?.time_offset_ms ?? 0
   const durationMs = probe?.duration_ms ?? null
-  const durationSec = durationMs === null ? 0 : toMedia(durationMs, offsetMs)
+  const durationSourceSec = durationMs === null ? 0 : durationMs / 1000
 
   // The probe, once: the player is opened for one file and asks for it once.
   useEffect(() => {
@@ -351,7 +377,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
     const onPlay = (): void => setPaused(false)
     const onPause = (): void => setPaused(true)
-    const onTime = (): void => setTime(video.currentTime)
+    // The display is in source time, the clock the probe answers and the person thinks in: the
+    // element's media time mapped back through the offset.
+    const onTime = (): void => setTime(toSource(video.currentTime, probe.time_offset_ms))
     const onVolume = (): void => {
       setVolume(video.volume)
       setMuted(video.muted)
@@ -361,8 +389,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('volumechange', onVolume)
 
-    // The position is saved every five seconds, and on the way out.
-    const save = (): void => savePosition(id, file, video.currentTime, probe.duration_ms / 1000)
+    // The position is saved every five seconds, and on the way out. It is remembered in source
+    // milliseconds, the clock the probe answers, and cleared the way `positions` clears it.
+    const save = (): void =>
+      savePosition(id, file, toSource(video.currentTime, probe.time_offset_ms), probe.duration_ms)
     const saveTimer = setInterval(save, 5_000)
 
     return () => {
@@ -381,10 +411,25 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     return probeNow.tracks.find((track) => track.id === trackId)?.language ?? null
   }
 
+  /** The label a subtitle `TextTrack` is kept under: its human label, not the internal key. */
+  function subtitleLabel(key: string): string {
+    if (key.startsWith('track:')) {
+      const trackId = Number(key.slice('track:'.length))
+      const track = probe?.tracks.find((entry) => entry.id === trackId)
+      if (track !== undefined) return trackLabel(track)
+    }
+    if (key.startsWith('external:')) {
+      const index = Number(key.slice('external:'.length))
+      const entry = probe?.external_subtitles.find((item) => item.file === index)
+      if (entry !== undefined) return displaySafe(entry.name)
+    }
+    return key
+  }
+
   function addCues(key: string, cues: Cue[], language: string | null): void {
     const video = videoRef.current
     if (video === null) return
-    const label = key
+    const label = subtitleLabel(key)
     let found: TextTrack | null = null
     for (let i = 0; i < video.textTracks.length; i += 1) {
       const candidate = video.textTracks[i]
@@ -407,13 +452,26 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         // A cue the `TextTrack` will not take is not a cue the player stops over.
       }
     }
-    // The track that is chosen is the one shown, and the rest are not.
+    applySubtitleModes()
+  }
+
+  // The chosen subtitle is the one shown and the rest are not, or none are when the choice is
+  // `Off`: a `TextTrack` that is not `showing` shows nothing, and `Off` is the one that turns
+  // them all off rather than leaving the last chosen one up.
+  function applySubtitleModes(): void {
+    const video = videoRef.current
+    if (video === null) return
     for (let i = 0; i < video.textTracks.length; i += 1) {
       const candidate = video.textTracks[i]
       if (candidate === undefined) continue
-      candidate.mode = candidate.label === subtitleKey ? 'showing' : 'disabled'
+      candidate.mode = candidate.label === subtitleLabel(subtitleKey) ? 'showing' : 'disabled'
     }
   }
+
+  useEffect(() => {
+    applySubtitleModes()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subtitleKey])
 
   // The subtitles: the embedded text track is fetched by window as the playhead moves, and the
   // chosen external file is fetched once.
@@ -477,12 +535,13 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       }
     }
     for (const entry of probe.external_subtitles) {
-      out.push({ key: `external:${entry.file}`, text: entry.name })
+      out.push({ key: `external:${entry.file}`, text: displaySafe(entry.name) })
     }
     return out
   }
 
   const waiting = choice?.kind === 'remux' && state === 'waiting'
+  const failed = choice?.kind === 'remux' && state === 'error'
 
   function togglePlay(): void {
     const video = videoRef.current
@@ -493,8 +552,12 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   function nudge(deltaSec: number): void {
     const video = videoRef.current
-    if (video === null || choice?.kind !== 'remux') return
-    video.currentTime = Math.min(Math.max(0, video.currentTime + deltaSec), durationSec || Infinity)
+    if (video === null || choice?.kind !== 'remux' || probe === null) return
+    // The nudge is in the source seconds the display shows: move in source time, then set the
+    // element from there, clamped to the file's duration in source milliseconds.
+    const sourceMs = toSource(video.currentTime, probe.time_offset_ms)
+    const nextMs = Math.min(Math.max(0, sourceMs + deltaSec * 1000), probe.duration_ms ?? Infinity)
+    video.currentTime = toMedia(nextMs, probe.time_offset_ms)
   }
 
   function nudgeVolume(delta: number): void {
@@ -515,8 +578,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (choice?.kind !== 'remux') return
     const playable = choice.audioOptions.filter((option) => option.playable)
     if (playable.length === 0) return
-    const current = choice.audio?.id
-    const index = playable.findIndex((option) => option.track.id === current)
+    // Cycle from the track that is playing now, not from the track the probe preferred: a
+    // person who chose the Italian audio gets the English next, not the Italian again.
+    const currentId = audioKey !== null ? Number(audioKey) : choice.audio?.id
+    const index = playable.findIndex((option) => option.track.id === currentId)
     const next = playable[(index + 1) % playable.length].track
     engineRef.current?.setAudio(next)
     setAudioKey(String(next.id))
@@ -562,9 +627,15 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   function onDialogKey(event: KeyboardEvent): void {
     const target = event.target
+    // A key from inside a range input or an open menu is the menu's, not the player's: an
+    // `ArrowUp` on a listbox option moves the cursor, and the same key here would move the
+    // volume. The menu's `role` on its items and its listbox names it either way.
     if (
       target instanceof HTMLElement &&
-      (target.tagName === 'INPUT' || target.getAttribute('role') === 'listbox')
+      (target.tagName === 'INPUT' ||
+        target.getAttribute('role') === 'listbox' ||
+        target.getAttribute('role') === 'option' ||
+        (menuOpen && target.closest('[role="listbox"]') !== null))
     ) {
       return
     }
@@ -689,23 +760,30 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>
               </div>
             )}
+            {failed && (
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{ERROR_COPY}</span>
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-ink-700 px-3 py-2.5">
             <input
               type="range"
               aria-label="Seek"
               min={0}
-              max={durationSec || 0}
+              max={durationSourceSec}
               step={0.1}
-              value={time}
+              value={time / 1000}
               onChange={(event) => {
                 const video = videoRef.current
-                if (video !== null) video.currentTime = Number(event.target.value)
+                if (video === null) return
+                // The bar is in source time: the value is source seconds, mapped to the element.
+                video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
               }}
               className="h-1.5 min-w-40 flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             <span className="font-mono text-[12px] text-strong">
-              {clock(time)} / {clock(durationSec)}
+              {clock(time / 1000)} / {clock(durationSourceSec)}
             </span>
             <IconButton label={paused ? 'Play' : 'Pause'} onClick={togglePlay}>
               {paused ? <Play className="h-4 w-4" aria-hidden="true" /> : <Pause className="h-4 w-4" aria-hidden="true" />}
@@ -741,7 +819,13 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             {audioOptions.length > 0 && (
-              <ChoiceMenu label="Audio" options={audioOptions} selected={audioKey ?? ''} onChoose={chooseAudio} />
+              <ChoiceMenu
+                label="Audio"
+                options={audioOptions}
+                selected={audioKey ?? ''}
+                onChoose={chooseAudio}
+                onMenuChange={setMenuOpen}
+              />
             )}
             {subtitleChoices.length > 0 && (
               <ChoiceMenu
@@ -749,6 +833,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 options={subtitleChoices}
                 selected={subtitleKey}
                 onChoose={setSubtitleKey}
+                onMenuChange={setMenuOpen}
               />
             )}
             <IconButton label="Fullscreen" onClick={toggleFullscreen}>
