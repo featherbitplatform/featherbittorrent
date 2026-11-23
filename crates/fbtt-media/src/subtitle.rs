@@ -17,6 +17,10 @@
 //! frames of one subtitle track, and keeps the cues that overlap the asked
 //! window. A frame is at most the file cap and a track is at most the cue
 //! cap, so a hostile file holds one decoded string and a bounded cue list.
+//! Subtitles embedded in an MP4 file are read through the same function from
+//! their `tx3g` sample tables: `mp4in::text_samples` lands the read and
+//! bounds the bytes, and the cues that overlap the window follow the same
+//! rules as here.
 
 use crate::capped::ReadBudget;
 use crate::codec::Codec;
@@ -695,9 +699,10 @@ fn clean_html_tags(text: &str) -> String {
 /// remuxer take. The window is checked before anything is read: `to_ms <=
 /// from_ms`, or a window wider than [`CUE_WINDOW_MAX_MS`], is
 /// [`MediaError::Unsupported`], because neither names a moment of the video.
-/// A file that is not Matroska or WebM is [`MediaError::Unsupported`] too; an
-/// MP4 (`ftyp`/`moov` at offset 4) is `Unsupported("embedded MP4 subtitles")`
-/// until the MP4 path lands.
+/// A file that is not Matroska or WebM is [`MediaError::Unsupported`] too;
+/// an MP4 (`ftyp`/`moov` at offset 4) answers with the cues of that track's
+/// `tx3g` samples, and a fragmented MP4 or a track that is not a mov_text
+/// subtitle track is refused.
 ///
 /// The file is opened exactly the way
 /// [`open_track`](crate::open_track) opens it: through the crate's
@@ -729,7 +734,7 @@ pub fn embedded_cues<R: Read + Seek>(
         )));
     }
     // The container. Eight bytes decide: the EBML magic is Matroska or WebM,
-    // an `ftyp` or `moov` box is the MP4 path (Unsupported for now), anything
+    // an `ftyp` or `moov` box is the MP4 path, anything
     // else is not a container this function reads.
     let mut magic = [0u8; 8];
     match reader.read_exact(&mut magic) {
@@ -743,9 +748,7 @@ pub fn embedded_cues<R: Read + Seek>(
     }
     reader.rewind()?;
     if magic[4..] == *b"ftyp" || magic[4..] == *b"moov" {
-        return Err(MediaError::Unsupported(
-            "embedded MP4 subtitles".to_string(),
-        ));
+        return mp4_cues(reader, track, from_ms, to_ms);
     }
     if magic[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
         return Err(MediaError::Unsupported(format!(
@@ -1063,6 +1066,52 @@ fn frame_text(data: &[u8], codec: &Codec) -> Option<String> {
         _ => clean_html_tags(&text),
     };
     Some(cleaned)
+}
+
+/// The `embedded_cues` walk for an MP4 file: the `tx3g` samples its tables
+/// place in the window, read by `mp4in::text_samples`, turned into cues here.
+///
+/// The sample rules are the container's and were applied there: the 2-byte
+/// length prefix, the text it counts, the style boxes dropped, and the caps
+/// on what may be read before a buffer of the size exists. What happens here
+/// is the text rule of `decode` - strip a BOM, decode lossily - and the same
+/// cue rules the Matroska walk applies: keep the cues that overlap
+/// `[from_ms, to_ms)`, drop the ones with no text or an `end_ms` that does
+/// not pass their `start_ms`, answer sorted by `start_ms`, and give up with
+/// `Malformed` past [`MAX_CUES`] cues of the track.
+fn mp4_cues<R: Read + Seek>(
+    reader: R,
+    track: u32,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<Vec<Cue>, MediaError> {
+    let samples = crate::mp4in::text_samples(reader, track, from_ms, to_ms)?;
+    let mut cues: Vec<Cue> = Vec::new();
+    for sample in samples {
+        // The same overlap test as the Matroska walk's end: a cue the window
+        // never shows is not a cue the caller asked for, and one with no room
+        // on screen (end_ms <= start_ms) is dropped. The samples arrive in
+        // table order, which a hostile `ctts` need not put in time order, so
+        // the answer is sorted like the Matroska one.
+        if sample.end_ms > from_ms && sample.start_ms < to_ms && sample.end_ms > sample.start_ms {
+            let text = decode(&sample.text);
+            if text.is_empty() {
+                continue;
+            }
+            if cues.len() >= MAX_CUES {
+                return Err(MediaError::Malformed(format!(
+                    "track {track} holds more than {MAX_CUES} cues"
+                )));
+            }
+            cues.push(Cue {
+                start_ms: sample.start_ms,
+                end_ms: sample.end_ms,
+                text,
+            });
+        }
+    }
+    cues.sort_by_key(|cue| cue.start_ms);
+    Ok(cues)
 }
 
 #[cfg(test)]

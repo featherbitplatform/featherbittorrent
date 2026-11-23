@@ -4,6 +4,10 @@
 //! (a subtitle track with cues, a track that never makes a cue) are not
 //! things the fixture set carries.
 
+/// Where a track's boxes are and what its sample tables say, for the in-memory MP4 files the
+/// mov_text tests build out of the checked-in fixture.
+pub mod mp4;
+
 pub const EBML_HEADER: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
 pub const SEGMENT: [u8; 4] = [0x18, 0x53, 0x80, 0x67];
 pub const SEEK_HEAD: [u8; 4] = [0x11, 0x4D, 0x9B, 0x74];

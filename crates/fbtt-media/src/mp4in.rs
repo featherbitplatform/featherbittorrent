@@ -52,13 +52,18 @@
 //! `Io` and not a verdict about the file: a torrent that has the header and not the tail is a
 //! stream that has not finished arriving, so a `moov` at byte 40 and an `mdat` still on its way is
 //! exactly what this module expects to be handed.
+//!
+//! The module answers one question about a subtitle track too, for
+//! [`embedded_cues`](crate::subtitle::embedded_cues): [`text_samples`] walks a `tx3g` track's tables
+//! the same way [`scan`] walks the others and reads just the samples the requested window lands on.
+//! A subtitle track streams no fragments, so [`open_source`] keeps refusing it.
 
-use crate::codec::TrackKind;
+use crate::codec::{Codec, TrackKind};
 use crate::probe;
 use crate::source::{
     Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource, mp4_mime,
 };
-use crate::{ELEMENT_CAP, MAX_MP4_SAMPLES, MediaError};
+use crate::{ELEMENT_CAP, MAX_CUE_SCAN_FRAMES, MAX_MP4_SAMPLES, MediaError, SUBTITLE_FILE_CAP};
 use mp4_atom::{CttsEntry, Stbl, StscEntry, StszSamples, SttsEntry};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -453,21 +458,12 @@ impl<R: Read + Seek> Mp4Source<R> {
         }))
     }
 
-    /// The bytes at one sample's offset: seek to it, and read exactly the size `stsz` gave it.
+    /// The bytes at one sample's offset, through [`read_sample_bytes`].
     ///
     /// A stream that ends short of that is an `Io` verdict, keeping the reader's own error kind,
     /// because a file whose tail has not arrived yet is not a file that lied about this sample.
     fn read_sample(&mut self, meta: &Meta) -> Result<Vec<u8>, MediaError> {
-        let size = usize::try_from(meta.size).map_err(|_| {
-            MediaError::Malformed(format!(
-                "a sample of {} bytes does not fit this platform's address space",
-                meta.size
-            ))
-        })?;
-        self.reader.seek(SeekFrom::Start(meta.offset))?;
-        let mut data = vec![0u8; size];
-        self.reader.read_exact(&mut data)?;
-        Ok(data)
+        read_sample_bytes(&mut self.reader, meta)
     }
 
     fn time_overflow(&self, which: &str, ticks: i128) -> MediaError {
@@ -964,4 +960,254 @@ pub(crate) fn open_source<R: Read + Seek>(
         emitted: false,
         failed: None,
     })
+}
+
+/// One `tx3g` sample of an embedded-subtitle window: its times in milliseconds of source time,
+/// and the text bytes its length prefix counts.
+pub(crate) struct TextSample {
+    /// The sample's presentation time, in milliseconds.
+    pub(crate) start_ms: u64,
+    /// Presentation time plus the sample's `stts` duration, in milliseconds.
+    pub(crate) end_ms: u64,
+    /// The sample's text: the bytes the 2-byte length prefix counts. Everything the sample holds
+    /// after the text is style boxes, which are dropped here; a BOM, when the text has one, is
+    /// still in these bytes for [`embedded_cues`](crate::subtitle::embedded_cues) to strip.
+    pub(crate) text: Vec<u8>,
+}
+
+/// Milliseconds of source time, in the track's own ticks, `Malformed` when the timescale cannot
+/// count them.
+///
+/// With `ceil` the division rounds up, and without it it truncates toward zero. The two roundings
+/// are the two ways a target is aimed at: one a landing may sit before (a decoder needs the sync
+/// sample behind the requested time), one a sample may not reach early (nothing from before the
+/// requested time is usable) - [`open_source`] aims its video and audio targets the same pair.
+fn ticks_for(ms: u64, timescale: u32, ceil: bool) -> Result<i128, MediaError> {
+    let product = u128::from(ms) * u128::from(timescale);
+    let ticks = if ceil {
+        product.div_ceil(1_000)
+    } else {
+        product / 1_000
+    };
+    i128::try_from(ticks).map_err(|_| {
+        MediaError::Malformed(format!(
+            "time {ms} ms is past what timescale {timescale} can count"
+        ))
+    })
+}
+
+/// The bytes at one sample's offset: seek to it, and read exactly the size `stsz` gave it.
+///
+/// A stream that ends short of that is an `Io` verdict, keeping the reader's own error kind,
+/// because a file whose tail has not arrived yet is not a file that lied about this sample. This
+/// is the seek-and-read [`Mp4Source::read_sample`] runs, shared with [`text_samples`] so the
+/// stream path and the cue path cannot drift on what a failed read means.
+fn read_sample_bytes<R: Read + Seek>(reader: &mut R, meta: &Meta) -> Result<Vec<u8>, MediaError> {
+    let size = usize::try_from(meta.size).map_err(|_| {
+        MediaError::Malformed(format!(
+            "a sample of {} bytes does not fit this platform's address space",
+            meta.size
+        ))
+    })?;
+    reader.seek(SeekFrom::Start(meta.offset))?;
+    let mut data = vec![0u8; size];
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
+/// The `tx3g` samples of one MP4 track that the file's own tables place in the window
+/// `[from_ms, to_ms)`, the MP4 half of
+/// [`embedded_cues`](crate::subtitle::embedded_cues): times converted with [`ms_from_ticks`]
+/// like every other time this module reports, text bytes not yet decoded.
+///
+/// The header is read by the same box walk and under the same bounds as [`open_source`] reads it,
+/// and a fragmented input is `Unsupported` for the same reason: the tables of a fragmented file's
+/// track live in its fragments, not in this `moov`. The track must be a subtitle track whose
+/// codec is mov_text. Audio, video, a bitmap subtitle track, a `wvtt` or unknown subtitle codec,
+/// and a track number the file does not carry are `Unsupported`, the verdicts
+/// [`embedded_cues`](crate::subtitle::embedded_cues) gives for a Matroska file that is not one
+/// either; a subtitle track streams no fragments, so [`open_source`] keeps refusing it while this
+/// function is the reason the two paths coexist in one module.
+///
+/// The landing and the stop come from the tables alone, and no byte is read outside them. The
+/// read starts at the last sample whose presentation time is at or before `from_ms`: a cue that
+/// opened before the window is still on screen when it opens, and its own sample is the only
+/// source of its text and its end. When no sample reaches back that far the read starts at the
+/// first one. It stops at the first sample whose presentation time is at or past `to_ms`: a
+/// sample that starts at the window's end shows after the window, never in it. The two targets
+/// are converted to the track's own ticks with [`ticks_for`], the start rounding down (a landing
+/// may sit before the time asked for, and rounding up would aim past the sample that is on
+/// screen) and the end rounding up (a sample the end target does not reach yet is a sample that
+/// shows before the window closes). The landing walk is the whole track, as [`scan`] walks it:
+/// nothing says a track's presentation times increase - a `ctts` can put a sample back - so "the
+/// last one at or before" is only known once the last one has been looked at, and that walk is
+/// [`MAX_MP4_SAMPLES`] additions, never a byte.
+///
+/// A `tx3g` sample is a 2-byte big-endian text length, that many bytes of text, and then optional
+/// style boxes, which are dropped. A sample of zero bytes, or of zero declared length, is the gap
+/// a muxer writes between cues - read, counted against the bound below, and skipped; it is not a
+/// cue with no text. A length past the sample's own size minus the two prefix bytes is a sample
+/// that lied: `Malformed`, because the file described a text it does not hold.
+///
+/// # What is bounded
+///
+/// Before a single byte of a sample is allocated, three bounds stand: a sample whose `stsz` entry
+/// declares more than [`SUBTITLE_FILE_CAP`] bytes is `Malformed` at once, the running total of
+/// the sample bytes read may not pass that cap either, and more than [`MAX_CUE_SCAN_FRAMES`]
+/// samples read - every one the window lands on, empty gaps included - is `Malformed` rather
+/// than an unbounded read of a hostile track. A sample past what the stream holds stays
+/// [`MediaError::Io`], as in [`Mp4Source`]: a header and a tail that has not arrived yet is a
+/// stream still arriving, not a broken file.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] for a fragmented input, a track number the file does not carry, a
+/// handler that carries no media a player would offer, a track that is not a subtitle track, and
+/// a subtitle codec that is not mov_text. [`MediaError::Malformed`] for a `moov` that does not
+/// parse, tables that contradict each other (see [`validate`]), a length past its sample's own
+/// bytes, a sample too small to hold its length prefix, a sample over [`SUBTITLE_FILE_CAP`]
+/// bytes, more subtitle data in the window than that cap, and more samples in the window than
+/// [`MAX_CUE_SCAN_FRAMES`]. [`MediaError::Io`] for a reader that failed, which includes a `moov`
+/// this reader has not been given yet.
+///
+/// # Panics
+///
+/// None. What a hostile file can do is a verdict, and the indexing that assumes the validated
+/// tables is sound is written as `expect` with its reason.
+pub(crate) fn text_samples<R: Read + Seek>(
+    mut reader: R,
+    track: u32,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<Vec<TextSample>, MediaError> {
+    let (moov, saw_moof) = probe::read_moov(&mut reader)?;
+    // The same fragmented-input verdict as `open_source`: a fragmented file's track has empty
+    // tables in this moov, its real ones being in fragments this walk does not follow.
+    if saw_moof || moov.mvex.is_some() {
+        return Err(MediaError::Unsupported("fragmented MP4 input".to_string()));
+    }
+    let index = moov
+        .trak
+        .iter()
+        .position(|trak| trak.tkhd.track_id == track)
+        .ok_or_else(|| {
+            MediaError::Unsupported(format!("track {track} is not one of this file's tracks"))
+        })?;
+    let trak = moov
+        .trak
+        .into_iter()
+        .nth(index)
+        .expect("the index came from this very vec");
+    let info = probe::mp4_track(&trak)?.ok_or_else(|| {
+        MediaError::Unsupported(format!(
+            "track {track} has a {} handler, which carries no media this reads",
+            trak.mdia.hdlr.handler
+        ))
+    })?;
+    if info.kind != TrackKind::Subtitle {
+        return Err(MediaError::Unsupported(format!(
+            "track {track} is not a subtitle track"
+        )));
+    }
+    if info.codec != Codec::MovText {
+        return Err(MediaError::Unsupported(format!(
+            "track {track} has subtitle codec {}, which fbtt does not read",
+            info.codec.name()
+        )));
+    }
+    let timescale = trak.mdia.mdhd.timescale;
+    let tables = tables_from(trak.mdia.minf.stbl, track, timescale)?;
+    // The window in the track's own ticks, rounded the two ways above: the start target a landing
+    // may sit at or before, the end target a read stops at.
+    let from_ticks = ticks_for(from_ms, timescale, false)?;
+    let to_ticks = ticks_for(to_ms, timescale, true)?;
+    // The landing, decided from the tables alone and costing no byte. `scan` picks its video
+    // landing among sync samples and falls back to the first one; a cue walk has no decoder to
+    // start, so it takes the last sample at or before the window's start, of any kind, and its
+    // fallback is the first sample itself.
+    let start_cursor = Cursor::start(&tables)?;
+    let mut cursor = start_cursor.clone();
+    let mut landing: Option<Cursor> = None;
+    while let Some(meta) = peek(&tables, &cursor)? {
+        if meta.pts <= from_ticks {
+            landing = Some(cursor.clone());
+        }
+        step(&tables, &mut cursor)?;
+    }
+    // The reads, from the landing sample to the first one at or past the window's end. The three
+    // bounds are checked in the tables - declared numbers - before any buffer of the size exists.
+    let mut cursor = landing.unwrap_or(start_cursor);
+    let mut out: Vec<TextSample> = Vec::new();
+    let mut read_samples = 0_u64;
+    let mut read_bytes = 0_u64;
+    while let Some(meta) = peek(&tables, &cursor)? {
+        if meta.pts >= to_ticks {
+            break;
+        }
+        let number = cursor.index + 1;
+        if u64::from(meta.size) > SUBTITLE_FILE_CAP {
+            return Err(MediaError::Malformed(format!(
+                "track {track}'s sample {number} declares {} bytes, more than the \
+                 {SUBTITLE_FILE_CAP} byte subtitle cap this reads without allocating",
+                meta.size
+            )));
+        }
+        read_samples += 1;
+        if read_samples > MAX_CUE_SCAN_FRAMES {
+            return Err(MediaError::Malformed(format!(
+                "track {track} puts more than {MAX_CUE_SCAN_FRAMES} samples before the \
+                 window's end"
+            )));
+        }
+        read_bytes += u64::from(meta.size);
+        if read_bytes > SUBTITLE_FILE_CAP {
+            return Err(MediaError::Malformed(format!(
+                "track {track}'s samples up to the window's end hold more than \
+                 {SUBTITLE_FILE_CAP} bytes, more than the {SUBTITLE_FILE_CAP} byte \
+                 subtitle cap"
+            )));
+        }
+        let data = read_sample_bytes(&mut reader, &meta)?;
+        step(&tables, &mut cursor)?;
+        // A zero-byte sample states nothing, and a zero-length one states a text of nothing:
+        // both are the gap the muxer wrote, read and counted, but no cue. One byte is neither:
+        // it cannot even hold the length prefix, so it is a sample that does not add up.
+        if meta.size == 0 {
+            continue;
+        }
+        if meta.size < 2 {
+            return Err(MediaError::Malformed(format!(
+                "track {track}'s sample {number} is {} byte, less than the two its \
+                 length prefix needs",
+                meta.size
+            )));
+        }
+        let len = u16::from_be_bytes([data[0], data[1]]);
+        if u64::from(len) > u64::from(meta.size) - 2 {
+            return Err(MediaError::Malformed(format!(
+                "track {track}'s sample {number} declares {len} bytes of text, more \
+                 than the {} the sample has after its length prefix",
+                meta.size - 2
+            )));
+        }
+        if len == 0 {
+            continue;
+        }
+        out.push(TextSample {
+            start_ms: ms_from_ticks(meta.pts, timescale),
+            end_ms: ms_from_ticks(
+                meta.pts
+                    .checked_add(i128::from(meta.duration))
+                    .ok_or_else(|| {
+                        MediaError::Malformed(format!(
+                            "track {track}'s sample {number} has a presentation time plus \
+                         duration past what a timeline holds"
+                        ))
+                    })?,
+                timescale,
+            ),
+            text: data[2..2 + usize::from(len)].to_vec(),
+        });
+    }
+    Ok(out)
 }
