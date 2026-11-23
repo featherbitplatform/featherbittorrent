@@ -28,7 +28,17 @@ export function resolve(endpoint: Endpoint, path: string): string {
   if (endpoint.kind === 'sameOrigin') return path
   // An address that already names its scheme is somebody else's, not a path to prefix.
   if (isAbsolute(path)) return path
-  return `${endpoint.base.replace(/\/+$/, '')}${path}`
+  return `${normaliseBase(endpoint.base)}${path}`
+}
+
+/**
+ * An instance's base address in the one spelling every URL is built on: surrounding space and trailing
+ * slashes dropped, so `http://host:1/` and `http://host:1` are one instance and `base + '/api/...'`
+ * never makes `//api`. This computer's address from the shell and a saved instance's address both go
+ * through here before a connection is made on them.
+ */
+export function normaliseBase(base: string): string {
+  return base.trim().replace(/\/+$/, '')
 }
 
 /**
