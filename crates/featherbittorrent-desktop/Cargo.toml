@@ -36,6 +36,13 @@ fbtt-core.workspace = true
 fbtt-server.workspace = true
 # The engine's own settings type, which `Server::start_desktop` takes beside the config.
 fbt.workspace = true
+# Saved instance passwords, in the system keychain (`keychain.rs`).
+keyring.workspace = true
+# Holds a saved password while the shell signs in with it, and overwrites it when done.
+zeroize.workspace = true
+# The shell's HTTP client for remote instances: the saved-password sign-in and the reachability probe.
+# rustls, as `fbtt-core` already asks for it, so https servers need no system TLS stack.
+reqwest = { workspace = true, features = ["rustls-tls"] }
 
 # The native message for a library already in use. macOS needs no feature: its alert is the
 # platform's own. Windows takes the same common controls v6 the webview's manifest asks for, as

@@ -6,4 +6,4 @@
  */
 export { DesktopRoot } from './DesktopRoot'
 export { connect, desktopInfo, inDesktop, LOCAL_ID } from './bridge'
-export type { DesktopInfo } from './bridge'
+export type { DesktopInfo, InstanceItem, InstancesList, Probe } from './bridge'

@@ -1,16 +1,28 @@
 /**
- * The desktop page: {@link App} on a connection the shell hands out, instead of the browser's own.
+ * The desktop page: {@link App} on a connection the shell hands out, instead of the browser's own, with
+ * the instance switcher above it.
  *
- * At startup it asks the shell to connect to the default instance (This computer, `local`, until saved
- * instances arrive) and renders `App` under that connection. Nothing about the connection is kept
- * outside memory: the token is the launch secret, which the shell hands over again on request.
+ * At startup it asks the shell for the instance list and connects to the default instance (This
+ * computer, `local`, unless another one was made the default), then renders `App` under that
+ * connection. Switching builds a new connection and remounts `App` under a key of the instance id, so
+ * nothing of one instance's screens carries over to the next. Nothing about a connection is kept outside
+ * memory: This computer's token is the launch secret, which the shell hands over again on request, and a
+ * remote instance's token comes from a sign-in (the page's, or the shell's with a saved password).
  *
  * A launch token can stop working while the window is open: This computer restarted (with Serve the web
  * UI switched, say) and made a new secret. The client sees a `401` and ends the session, which in a
  * browser means the sign-in screen. This computer has no sign-in routes, so that screen would be a dead
  * end: instead the page asks the shell to connect again and rebuilds its connection on the answer. If
  * that fails, or hands back the same token that was just refused, the page says it cannot reach the
- * server and offers to try again, rather than asking again in a loop.
+ * server and offers to try again, rather than asking again in a loop. A remote instance's `401` is the
+ * sign-in screen, as in a browser.
+ *
+ * A remote instance that does not answer gets the same screen, never an empty table: before connecting
+ * the page asks the shell to probe it, and once connected any request that fails before an HTTP status
+ * (which is also what a CORS refusal looks like from inside the webview) has the shell probe it again.
+ * Down is "Cannot reach the server."; up but not listing this app's origin adds the line naming the
+ * origin to put in the server's `cors_origins`. The switcher stays on screen through all of it, so a
+ * default instance that is down at startup is one click away from This computer.
  *
  * @module desktop/DesktopRoot
  */
@@ -20,17 +32,39 @@ import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
-import { connect, LOCAL_ID } from './bridge'
+import { SavePasswordContext } from '../savePassword'
+import type { SavePasswordOffer } from '../savePassword'
+import { connect, listInstances, LOCAL_ID, probeInstance, savePassword } from './bridge'
+import type { InstancesList, Probe } from './bridge'
+import { InstanceSwitcher } from './InstanceSwitcher'
+import { Instances } from './Instances'
 
 type Phase =
-  | { phase: 'connecting' }
+  | { phase: 'connecting'; id: string }
   | { phase: 'ready'; connection: Connection; id: string }
-  | { phase: 'unreachable'; id: string }
+  /** `corsOrigin` is this app's origin when the server answered but does not let it in. */
+  | { phase: 'unreachable'; id: string; corsOrigin: string | null }
+
+/** The list before the shell has answered, and if it never does: This computer alone. */
+const LOCAL_ONLY: InstancesList = {
+  default: LOCAL_ID,
+  items: [{ id: LOCAL_ID, name: 'This computer', url: '', saved_password: false }],
+  keychain: false,
+}
+
+/** The line naming the origin a server has to list, verbatim from the plan with the origin after it. */
+export const CORS_HINT = "Add this to the server's cors_origins: "
 
 /** The token a connection started with, when it is a launch token for This computer. */
 function launchToken(connection: Connection, id: string): string | null {
   if (id !== LOCAL_ID || connection.endpoint.kind !== 'bearer') return null
   return connection.endpoint.token
+}
+
+/** The unreachable phase for what a probe found (null: the probe itself failed). */
+function unreachable(id: string, probe: Probe | null): Phase {
+  const corsOrigin = probe !== null && probe.reachable && !probe.cors_ok ? window.location.origin : null
+  return { phase: 'unreachable', id, corsOrigin }
 }
 
 /** The mark and the word, while a connection is being made. */
@@ -44,14 +78,20 @@ function Connecting() {
 }
 
 /** The same screen `App` shows when the server gives no answer, with the shell asked again on Try again. */
-function Unreachable({ onRetry }: { onRetry: () => Promise<void> }) {
+function Unreachable({ corsOrigin, onRetry }: { corsOrigin: string | null; onRetry: () => Promise<void> }) {
   const [trying, setTrying] = useState(false)
   return (
-    <main className="flex min-h-dvh flex-col items-center justify-center gap-4">
+    <main className="flex min-h-dvh flex-col items-center justify-center gap-4 px-4">
       <img className="h-16 w-auto" src="/favicon.png" alt="" />
       <div role="alert" className="text-base font-medium text-strong">
         {UNREACHABLE_COPY}
       </div>
+      {corsOrigin !== null && (
+        <p className="m-0 text-center text-[13px] text-body">
+          {CORS_HINT}
+          <code className="font-mono text-strong">{corsOrigin}</code>
+        </p>
+      )}
       <Button
         variant="secondary"
         disabled={trying}
@@ -91,44 +131,167 @@ function Connected({
 }
 
 export function DesktopRoot() {
-  const [phase, setPhase] = useState<Phase>({ phase: 'connecting' })
-  // One connect at a time: a second request while one is out would race it for the last word.
-  const pending = useRef<Promise<void> | null>(null)
+  const [phase, setPhase] = useState<Phase>({ phase: 'connecting', id: LOCAL_ID })
+  const [list, setList] = useState<InstancesList>(LOCAL_ONLY)
+  const [managing, setManaging] = useState(false)
+  // One connect per instance at a time: a second request for the same one while it is out would race
+  // it for the last word. A connect to another instance supersedes it.
+  const pending = useRef<{ id: string; promise: Promise<void> } | null>(null)
+  // The newest connect; an answer for an older one arrives too late to matter.
+  const latest = useRef(0)
+  const probing = useRef(false)
 
-  const open = useCallback((id: string, refused: string | null): Promise<void> => {
-    pending.current ??= (async () => {
-      try {
-        const endpoint = await connect(id)
-        // The shell handed back the token the engine just refused: asking again would only loop.
-        if (refused !== null && endpoint.kind === 'bearer' && endpoint.token === refused) {
-          setPhase({ phase: 'unreachable', id })
-          return
-        }
-        setPhase({ phase: 'ready', connection: createConnection(endpoint), id })
-      } catch {
-        setPhase({ phase: 'unreachable', id })
-      }
-    })().finally(() => {
-      pending.current = null
-    })
-    return pending.current
+  const reload = useCallback(async (): Promise<InstancesList | null> => {
+    try {
+      const fresh = await listInstances()
+      setList(fresh)
+      return fresh
+    } catch {
+      return null
+    }
   }, [])
 
-  useEffect(() => {
-    void open(LOCAL_ID, null)
-  }, [open])
+  /** A request to remote instance `id` failed before any HTTP status: down, or refusing this origin? */
+  const lost = useCallback(async (id: string, seq: number): Promise<void> => {
+    if (probing.current || seq !== latest.current) return
+    probing.current = true
+    let probe: Probe | null = null
+    try {
+      probe = await probeInstance(id)
+    } catch {
+      // The shell could not ask: nothing is known to be reachable.
+    } finally {
+      probing.current = false
+    }
+    if (seq !== latest.current) return
+    // A blip that is already over is no reason to take the screen away.
+    if (probe !== null && probe.reachable && probe.cors_ok) return
+    latest.current += 1
+    setPhase(unreachable(id, probe))
+  }, [])
 
-  const current = phase.phase === 'connecting' ? LOCAL_ID : phase.id
+  /** `fetch`, with a failure that got no answer at all reported to {@link lost}. */
+  const watched = useCallback(
+    (id: string, seq: number): typeof fetch =>
+      async (input, init) => {
+        try {
+          return await globalThis.fetch(input, init)
+        } catch (cause) {
+          const aborted = cause instanceof DOMException && cause.name === 'AbortError'
+          if (!aborted) void lost(id, seq)
+          throw cause
+        }
+      },
+    [lost],
+  )
+
+  const open = useCallback(
+    (id: string, refused: string | null): Promise<void> => {
+      if (pending.current?.id === id) return pending.current.promise
+      latest.current += 1
+      const seq = latest.current
+      setPhase({ phase: 'connecting', id })
+      const promise: Promise<void> = (async () => {
+        try {
+          if (id !== LOCAL_ID) {
+            const probe = await probeInstance(id)
+            if (seq !== latest.current) return
+            if (!probe.reachable || !probe.cors_ok) {
+              setPhase(unreachable(id, probe))
+              return
+            }
+          }
+          const endpoint = await connect(id)
+          if (seq !== latest.current) return
+          // The shell handed back the token the engine just refused: asking again would only loop.
+          if (refused !== null && endpoint.kind === 'bearer' && endpoint.token === refused) {
+            setPhase(unreachable(id, null))
+            return
+          }
+          const connection = id === LOCAL_ID ? createConnection(endpoint) : createConnection(endpoint, watched(id, seq))
+          setPhase({ phase: 'ready', connection, id })
+        } catch {
+          if (seq === latest.current) setPhase(unreachable(id, null))
+        }
+      })().finally(() => {
+        if (pending.current?.promise === promise) pending.current = null
+      })
+      pending.current = { id, promise }
+      return promise
+    },
+    [watched],
+  )
+
+  useEffect(() => {
+    void (async () => {
+      const fresh = await reload()
+      await open(fresh?.default ?? LOCAL_ID, null)
+    })()
+  }, [reload, open])
+
+  const current = phase.id
   const onTokenRefused = useCallback((token: string) => void open(current, token), [open, current])
 
-  if (phase.phase === 'connecting') return <Connecting />
-  if (phase.phase === 'unreachable') return <Unreachable onRetry={() => open(phase.id, null)} />
+  const onSwitch = useCallback(
+    (id: string) => {
+      setManaging(false)
+      if (id === current && phase.phase === 'ready') return
+      void open(id, null)
+    },
+    [open, current, phase.phase],
+  )
+
+  const onChanged = useCallback(async () => {
+    const fresh = await reload()
+    // The instance on screen was removed: back to the one that is never gone.
+    if (fresh !== null && !fresh.items.some((item) => item.id === current)) void open(LOCAL_ID, null)
+  }, [reload, open, current])
+
+  const offer: SavePasswordOffer | null =
+    current === LOCAL_ID
+      ? null
+      : {
+          keychain: list.keychain,
+          save: async (user, password) => {
+            await savePassword(current, user, password)
+            await reload()
+          },
+        }
+
+  let body
+  if (managing) {
+    body = <Instances list={list} current={current} onChanged={onChanged} onClose={() => setManaging(false)} />
+  } else if (phase.phase === 'connecting') {
+    body = <Connecting />
+  } else if (phase.phase === 'unreachable') {
+    body = <Unreachable corsOrigin={phase.corsOrigin} onRetry={() => open(phase.id, null)} />
+  } else {
+    body = (
+      <Connected
+        key={`${phase.id}:${launchToken(phase.connection, phase.id) ?? ''}`}
+        connection={phase.connection}
+        id={phase.id}
+        onTokenRefused={onTokenRefused}
+      />
+    )
+  }
+
+  // Until the title bar takes the switcher (it places it itself), a plain bar above the page holds it.
+  // The screens below size themselves to the window (`h-dvh`, `min-h-dvh`); under the bar they size to
+  // what is left instead.
   return (
-    <Connected
-      key={launchToken(phase.connection, phase.id) ?? phase.id}
-      connection={phase.connection}
-      id={phase.id}
-      onTokenRefused={onTokenRefused}
-    />
+    <div className="flex h-dvh flex-col">
+      <div className="flex h-10 shrink-0 items-center border-b border-rule bg-sunken px-2">
+        <InstanceSwitcher
+          instances={list.items}
+          current={current}
+          onSwitch={onSwitch}
+          onManage={() => setManaging(true)}
+        />
+      </div>
+      <div className="relative min-h-0 flex-1 overflow-auto [&_.h-dvh]:h-full [&_.min-h-dvh]:min-h-full">
+        <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
+      </div>
+    </div>
   )
 }

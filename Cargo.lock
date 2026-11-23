@@ -2023,6 +2023,7 @@ dependencies = [
  "fbtt-core",
  "fbtt-desktop-core",
  "fbtt-server",
+ "keyring",
  "reqwest 0.12.28",
  "rfd",
  "serde",
@@ -2030,6 +2031,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

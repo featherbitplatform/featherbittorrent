@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod instances;
+mod keychain;
 mod local;
 
 use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
@@ -51,9 +53,21 @@ fn main() {
 
     let app = tauri::Builder::default()
         .manage(DesktopState::new(this_computer))
+        .manage(instances::Instances::new(
+            paths.settings_file(),
+            std::sync::Arc::new(keychain::SystemKeychain::probe()),
+            local::desktop_origin(),
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
-            commands::connect
+            commands::connect,
+            instances::list_instances,
+            instances::add_instance,
+            instances::remove_instance,
+            instances::set_default_instance,
+            instances::save_password,
+            instances::forget_password,
+            instances::probe_instance
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {

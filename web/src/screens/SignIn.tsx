@@ -9,6 +9,10 @@
  * would actually travel in the clear: over `http:` to a host that is not loopback, because a LAN
  * box answering `localhost` is nobody else's wire.
  *
+ * In the desktop app the host line and the plain-http check read the instance's address rather than the
+ * page's own, since that is where the password goes, and the card offers `Save password` when the shell
+ * has a keychain to keep it in (or says it has none): see `savePassword.ts`.
+ *
  * The two messages from the session store are its strings, shown as they are; this screen decides
  * nothing about why a sign-in failed. They are visible banners only: the page's hoisted live
  * regions (`live.ts`, mounted in `App`) carry the same words to a screen reader, because a message
@@ -23,6 +27,9 @@ import type { FormEvent } from 'react'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
 import TextField from '../components/TextField'
+import { useConnection } from '../connection'
+import type { Endpoint } from '../endpoint'
+import { NO_KEYCHAIN, useSavePassword } from '../savePassword'
 import type { SignedOutState } from '../session'
 
 export interface SignInProps {
@@ -37,9 +44,21 @@ const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]']
 const PLAIN_HTTP_WARNING =
   'This page is not encrypted: the password travels in the clear. Use https through a reverse proxy beyond your LAN.'
 
-function travelsInPlainHttp(): boolean {
+/** Where the password goes: the page's own origin in a browser, the instance's address in the desktop app. */
+function signInTarget(endpoint: Endpoint): { host: string; protocol: string; hostname: string } {
+  if (endpoint.kind === 'bearer') {
+    try {
+      return new URL(endpoint.base)
+    } catch {
+      // Not an address a URL can be made of: the page's own is the best there is to show.
+    }
+  }
+  return location
+}
+
+function travelsInPlainHttp(target: { protocol: string; hostname: string }): boolean {
   return (
-    location.protocol === 'http:' && !LOOPBACK_HOSTS.includes(location.hostname)
+    target.protocol === 'http:' && !LOOPBACK_HOSTS.includes(target.hostname)
   )
 }
 
@@ -47,12 +66,19 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
   const [user, setUser] = useState('')
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [keep, setKeep] = useState(false)
+  const offer = useSavePassword()
+  const target = signInTarget(useConnection().endpoint)
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setSubmitting(true)
     try {
-      await onSignIn(user, password)
+      const signedIn = await onSignIn(user, password)
+      // Saved only once the server took it: a wrong password kept would fail every launch.
+      if (signedIn && keep && offer?.keychain === true) {
+        void offer.save(user, password).catch(() => {})
+      }
     } finally {
       // A sign-in that worked replaced this screen under React's feet; saying the attempt is over
       // is then a message to nobody, and harmless.
@@ -60,7 +86,7 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
     }
   }
 
-  const insecure = travelsInPlainHttp()
+  const insecure = travelsInPlainHttp(target)
 
   const hasMessage = state.notice !== null || state.error !== null || insecure
 
@@ -74,7 +100,7 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
         />
         <h1 className="m-0 text-xl font-semibold text-strong">Sign in to featherbittorrent</h1>
         <span className="font-mono text-xs text-muted">
-          {location.host} &middot; {location.protocol.slice(0, -1)}
+          {target.host} &middot; {target.protocol.slice(0, -1)}
         </span>
       </div>
 
@@ -100,6 +126,22 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
             setPassword(event.target.value)
           }}
         />
+        {offer !== null &&
+          (offer.keychain ? (
+            <label className="flex items-center gap-2 text-[13px] text-body">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-accent"
+                checked={keep}
+                onChange={(event) => {
+                  setKeep(event.target.checked)
+                }}
+              />
+              Save password
+            </label>
+          ) : (
+            <p className="m-0 text-[13px] text-muted">{NO_KEYCHAIN}</p>
+          ))}
         <Button type="submit" className="w-full" disabled={submitting}>
           Sign in
         </Button>

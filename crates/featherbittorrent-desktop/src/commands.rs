@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use fbtt_desktop_core::LOCAL_ID;
 use serde::Serialize;
 
+use crate::instances::Instances;
 use crate::local::ThisComputer;
 
 /// What the shell keeps for the commands: This computer while it runs.
@@ -77,12 +78,13 @@ pub struct DesktopInfo {
 }
 
 /// An instance the page can talk to: an absolute base address with no trailing slash, and the bearer
-/// token to present there. Serialized as `{ kind: "bearer", base, token }`, the page's `Endpoint`.
+/// token to present there, or none when the page has to sign in first (a remote instance with no saved
+/// password). Serialized as `{ kind: "bearer", base, token }`, the page's `Endpoint`.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct EndpointDto {
     pub kind: &'static str,
     pub base: String,
-    pub token: String,
+    pub token: Option<String>,
 }
 
 impl std::fmt::Debug for EndpointDto {
@@ -95,8 +97,8 @@ impl std::fmt::Debug for EndpointDto {
     }
 }
 
-/// What [`connect`] answers for `id`: This computer's endpoint for `local`. Saved remote instances join
-/// with the instance list (Task 7); until then any other id is refused with a line saying so.
+/// What [`connect`] answers for `local`: This computer's endpoint. Any other id is refused here; the
+/// command hands remote ids to [`Instances::connect`].
 pub fn connect_to(state: &DesktopState, id: &str) -> Result<EndpointDto, String> {
     if id != LOCAL_ID {
         return Err(format!(
@@ -110,7 +112,7 @@ pub fn connect_to(state: &DesktopState, id: &str) -> Result<EndpointDto, String>
     Ok(EndpointDto {
         kind: "bearer",
         base,
-        token,
+        token: Some(token),
     })
 }
 
@@ -128,7 +130,11 @@ pub fn desktop_info() -> DesktopInfo {
 pub async fn connect(
     id: String,
     state: tauri::State<'_, DesktopState>,
+    instances: tauri::State<'_, Instances>,
 ) -> Result<EndpointDto, String> {
+    if id != LOCAL_ID {
+        return instances.connect(&id).await;
+    }
     connect_to(&state, &id)
 }
 
@@ -151,7 +157,7 @@ mod tests {
         let answer = connect_to(&state, "local").expect("local connects");
         assert_eq!(answer.kind, "bearer");
         assert_eq!(answer.base, base);
-        assert_eq!(answer.token, secret);
+        assert_eq!(answer.token.as_deref(), Some(secret.as_str()));
         assert!(
             !format!("{answer:?}").contains(&secret),
             "Debug hides the token"
