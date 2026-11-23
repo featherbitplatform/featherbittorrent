@@ -682,19 +682,22 @@ impl From<JsonRejection> for RouteError {
 
 impl From<BytesRejection> for RouteError {
     fn from(problem: BytesRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<QueryRejection> for RouteError {
     fn from(problem: QueryRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<PathRejection> for RouteError {
     fn from(problem: PathRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 

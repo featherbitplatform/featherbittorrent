@@ -213,7 +213,10 @@ fn confirm_inside(roots: &[Root], created: &Path, shown: &str) -> Result<(), Rou
         return Ok(());
     }
     tracing::warn!("a new folder resolved outside the allowed folders and was removed again");
-    if let Err(problem) = std::fs::remove_dir(&resolved) {
+    // The path this request created, not the resolved one: `rmdir` does not follow a link in the last
+    // component, so a name swapped for a link in the meantime makes this fail rather than remove a folder
+    // the link points at.
+    if let Err(problem) = std::fs::remove_dir(created) {
         tracing::warn!(kind = ?problem.kind(), "a new folder outside the allowed folders could not be removed");
     }
     Err(refused())
@@ -221,17 +224,49 @@ fn confirm_inside(roots: &[Root], created: &Path, shown: &str) -> Result<(), Rou
 
 /// The names Windows keeps for devices, refused on every platform so a folder made here can be copied to
 /// any machine: `CON.txt` is the device as much as `CON` is.
-const RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+/// Windows also takes the superscript digits one to three and zero as port numbers, and `CONIN$` and
+/// `CONOUT$` as the console.
+const RESERVED_NAMES: [&str; 32] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// What is wrong with `name` as the name of one new folder, or `None` when it is one: a single, ordinary
 /// path component. Not empty, `.` or `..`; no `/` or `\` (either platform's separator, whichever this is
 /// running on, so a name means the same thing on every server); no NUL or other control character; at most
-/// [`MAX_NAME_BYTES`] bytes; exactly what `clean` would show; not ending in a dot or a space, and not one of
-/// Windows' device names ([`RESERVED_NAMES`]) on any platform. And it has to parse as exactly one normal component on this platform, which is
-/// what refuses whatever else a platform reads as more than a name - a drive prefix such as `C:` on Windows,
+/// [`MAX_NAME_BYTES`] bytes; exactly what `clean` would show; not starting with a dot; not ending in a dot
+/// or a space, and not one of Windows' device names ([`RESERVED_NAMES`]) on any platform. And it has to
+/// parse as exactly one normal component on this platform, which is what refuses whatever else a platform reads as more than a name - a drive prefix such as `C:` on Windows,
 /// which `join` would otherwise take as a whole new path.
 pub(super) fn name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
@@ -239,6 +274,13 @@ pub(super) fn name_problem(name: &str) -> Option<String> {
     }
     if name == "." || name == ".." {
         return Some(format!("{name} is not a folder name"));
+    }
+    // `fs/list` leaves dot entries out, so a folder named this way could never be seen or picked again.
+    if name.starts_with('.') {
+        return Some(format!(
+            "a folder name cannot start with a dot: {}",
+            clean(name),
+        ));
     }
     if name.contains(['/', '\\']) {
         return Some(format!(
@@ -419,10 +461,12 @@ mod tests {
             "New Show",
             "Season 1",
             "a.b",
-            ".hidden",
+            "x.hidden",
+            "COM10",
+            "LPT\u{b4}",
+            "CONIN",
             "Show (2024) - Part 2",
             "CONSOLE",
-            "COM10",
             "e\u{301}t\u{e9}",
             "caf\u{e9}",
             longest.as_str(),
@@ -476,6 +520,20 @@ mod tests {
             "LPT1",
             "Lpt9",
             "CON .txt",
+            "COM0",
+            "lpt0.txt",
+            "COM\u{b9}",
+            "com\u{b2}.log",
+            "COM\u{b3}",
+            "LPT\u{b9}",
+            "lpt\u{b2}",
+            "LPT\u{b3}.txt",
+            "CONIN$",
+            "conout$",
+            "ConOut$.txt",
+            // `fs/list` hides dot entries, so a folder named this way could never be picked.
+            ".hidden",
+            ".config",
         ] {
             assert!(name_problem(bad).is_some(), "{bad:?} is refused");
         }
