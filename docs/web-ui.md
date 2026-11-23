@@ -80,47 +80,74 @@ where it is served, in setups 1 and 3, it signs in at the server.
 
 ## Streaming in the browser
 
-Streaming and playing video in the browser are provided by Playing video below.
+Streaming and playing video in the browser are provided by Playing media below.
 
-## Playing video
+## Playing media
 
-The web UI plays video and audio files in the browser.
+Files that show a `Play` button in the Files tab are those whose path ends with `.mkv`, `.mp4`,
+`.m4v`, `.webm` or `.mov` (case-insensitive); padding files have no `Play` button. Pressing the
+button opens the player modal and starts playback immediately; a torrent's pieces can still be
+downloading when playback begins.
 
-- Supported **video containers** are Matroska, WebM and MP4; supported **video codecs**
-are H.264, HEVC and AV1.
-- Supported **audio codecs** are AAC, Opus, FLAC, MP3, AC-3 and E-AC-3. Each audio
-codec plays where the browser can decode it.
+### How a file is played
 
-### Starting playback
+The player tries one of three ways in the order listed below:
 
-A `Play` button appears on rows in the Files tab whose path ends in `.mkv`, `.mp4`,
-`.m4v`, `.webm` or `.mov` (case-insensitive). Clicking it opens the player modal that
-shows the video, a seek bar, play controls and the menus.
+1. **Native**: a WebM file whose video track is VP8 or VP9, when the browser also reports it can
+   play WebM video. The player does not show its own menus or draw its own controls; the browser's
+   built-in controls are on screen.
 
-VP8/VP9 video in a WebM container plays natively, without audio or subtitle choice.
+2. **Remuxed**: every other file whose video the browser can play. The server repackages its
+   tracks, and the player's own controls, menus and keys are used.
 
-### The player
+3. **Unplayable**: when the file has no video track, or the browser cannot play any codec of the
+   video track, the player shows the sentence `This browser cannot play <codec> video.` and a
+   `Download` button. The codec shown is the video track's codec; if the file has no video track
+   it is the first track's codec or `unknown`.
 
-- `Audio`: change between playable audio tracks while video plays.
-- `Subtitles`: choose or turn off text tracks (embedded or as separate SRT/ASS/VTT
-files). Image-based subtitles like PGS or VobSub are shown disabled with the message
-`Image subtitles cannot be shown here.`
+### Controls
+
+The remuxed player shows the following controls by their exact labels:
+
+- `Seek`: a range input that moves the playhead to any point in the file.
+- `Play` and `Pause`: a toggle that starts and stops playback.
+- `Back 5 seconds` and `Forward 5 seconds`: icon buttons that move the playhead 5 seconds back and
+  forward.
+- `Mute` and `Unmute`: an icon button that toggles the audio on and off.
+- `Volume`: a slider that sets the volume from quietest to loudest.
+- `Audio`: a menu that lists the audio tracks; a track the browser will not play is listed
+  disabled with the suffix `: not playable here`.
+- `Subtitles`: a menu that lists the available subtitles; `Off` turns subtitles off, and image
+  subtitles appear disabled with the text `<name>: Image subtitles cannot be shown here.`
+- `Fullscreen`: an icon button that toggles fullscreen mode.
+- `Close player`: a button that closes the modal and stops playback.
+
+`Audio` appears whenever the file has at least one audio track. `Subtitles` always appears and
+always includes `Off`.
 
 ### Keys
 
-`Space`, `k` play or pause; `Left`, `Right` move 5 seconds; `Up`, `Down` change
-volume by 0.1; `m` mutes; `a` selects the next playable audio track; `c` cycles
-through subtitles including Off; `f` enters fullscreen; `Escape` closes.
+`Space` or `k` toggles play and pause; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds
+back or forward; `ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` selects
+the next playable audio track; `c` cycles through subtitles including `Off`; `f` toggles
+fullscreen; `Escape` closes the player.
 
-### Waiting state and partial download
+Play and pause, the arrow-key seek, `a` and `c` work only for a remuxed file; the volume keys,
+`m` and `f` also work for a native file.
 
-When playback reaches a part of the file that has not arrived yet, the player shows
-`Waiting for data...` and keeps trying again, from the end of what it already has,
-until the data is there. Playback can start even while the torrent is still
-downloading.
+Keys do nothing while an input, such as the `Seek` or `Volume` slider, or an open menu has focus,
+except `Escape`, which still closes the player.
 
-### Unplayable message
+### Remembered position
 
-When the browser cannot play a video track, the player shows `This browser cannot
-play <codec> video.` and a `Download` button. Download saves the file to your
-computer.
+For a remuxed file, the position is saved every 5 seconds and when the player closes, once
+playback is at least 10 seconds into the file. It is cleared when the position is within 30
+seconds of the end of the file. When you reopen the file, playback starts at the saved position,
+provided it is before the end of the file or the file's length is unknown.
+
+### Waiting and errors
+
+- `Waiting for data...`: the part of the file you are watching has not arrived, the server is
+  busy or the connection dropped; the player retries by itself.
+
+- `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
