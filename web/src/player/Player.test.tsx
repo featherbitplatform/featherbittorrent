@@ -1269,10 +1269,11 @@ describe('the player', () => {
   })
 
   it('seeking back far opens the read gate', async () => {
-    // A buffer with a range the playhead sits in and a second range far ahead: with the gate
-    // measuring the range the playhead is in, a seek out of the far range opens it. Before the
-    // fix, "ahead" was measured to the far end of all ranges, so the far range kept the gate
-    // shut even after the playhead had left it.
+    // A buffer far ahead of the playhead, in a range the playhead does not sit in: with the
+    // gate measuring the range the playhead sits in (0 when it sits in none), a `timeupdate`
+    // that moves the playhead out of the far range lifts the read. Before the fix, "ahead" was
+    // measured to the far end of all ranges, so the far range kept the gate shut even after
+    // the playhead had left it, and the read stayed stopped.
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
     const videoBody = new FakeBody()
@@ -1296,24 +1297,28 @@ describe('the player', () => {
       fakeDeps(source, recorder),
     )
     source.open()
-    video.paused = false
     await settle()
     const buf = source.activeSourceBuffers[0]
-    // One chunk: the buffer is [0, 1], the playhead at 0, and the gate is open (ahead = 1).
+    expect(buf !== undefined, 'no source buffer').toBe(true)
+    // One chunk: the buffer is [0, 1], the playhead at 0, the gate open, the read running.
     videoBody.push(new Uint8Array([1]))
     await settle()
-    expect(buf !== undefined, 'no source buffer').toBe(true)
-    // A range far ahead of the playhead, the way a real buffer can hold one: the far end of
-    // everything buffered is 130, but the playhead sits in [0, 1].
-    ;(buf as unknown as { _buffered: [number, number][] })._buffered.push([100, 130])
-    // The gate is open over [0, 1]: a new chunk is appended.
+    // The playhead leaves the range into the gap behind it: the buffer is [1, 131], and the
+    // playhead at 0 sits in no range. The far end of everything buffered is 131 ahead, past
+    // the gate's stop line, and a held chunk is waiting.
+    ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[1, 131]]
+    videoBody.push(new Uint8Array([1]))
+    video.dispatchEvent(new Event('timeupdate'))
+    await settle()
+    // The gate is open over a playhead that sits in no range: the held chunk is read and
+    // appended.
     const appendsBefore = buf?.log.appends.length ?? 0
     videoBody.push(new Uint8Array([1]))
     await settle()
     const appendsAfter = buf?.log.appends.length ?? 0
     expect(
       appendsAfter > appendsBefore,
-      'the gate was shut by a range the playhead does not sit in: the read did not resume',
+      'the gate stayed shut over a range the playhead does not sit in: the read did not resume',
     ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
