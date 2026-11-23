@@ -122,7 +122,8 @@ The remuxed player shows the following controls by their exact labels:
 - `Fullscreen`: an icon button that toggles fullscreen mode.
 - `Close player`: a button that closes the modal and stops playback.
 
-`Audio` and `Subtitles` appear only when the player has a choice to make.
+`Audio` appears whenever the file has at least one audio track. `Subtitles` always appears and
+always includes `Off`.
 
 ### Keys
 
@@ -131,8 +132,8 @@ back or forward; `ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles
 the next playable audio track; `c` cycles through subtitles including `Off`; `f` toggles
 fullscreen; `Escape` closes the player.
 
-Play and pause, the arrow-key seek and `a` work only for a remuxed file; the other keys also work
-for a native file.
+Play and pause, the arrow-key seek, `a` and `c` work only for a remuxed file; the volume keys,
+`m` and `f` also work for a native file.
 
 Keys do nothing while an input, such as the `Seek` or `Volume` slider, or an open menu has focus,
 except `Escape`, which still closes the player.
@@ -146,7 +147,7 @@ provided it is before the end of the file or the file's length is unknown.
 
 ### Waiting and errors
 
-- `Waiting for data...`: the part of the file you are watching has not arrived or the server is
-  busy; the player retries by itself.
+- `Waiting for data...`: the part of the file you are watching has not arrived the server is
+  busy or the connection dropped; the player retries by itself.
 
 - `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
