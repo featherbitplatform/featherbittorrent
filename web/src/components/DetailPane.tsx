@@ -64,6 +64,8 @@ export interface DetailPaneProps {
   onRemoved?: (id: string) => void
   /** Where the removal notice is announced. Defaults to the page's polite live region (`live.ts`). */
   onNotice?: (message: string) => void
+  /** Fill the space it is given instead of sitting at the bottom as a 40% pane, with 44 px tap targets: the phone's full-screen torrent. */
+  fullScreen?: boolean
   /** The lists' scroll-box height, for the tests: jsdom lays nothing out. */
   viewportHeight?: number
 }
@@ -116,6 +118,7 @@ export default function DetailPane({
   onRemoved,
   onNotice,
   viewportHeight,
+  fullScreen = false,
 }: DetailPaneProps) {
   const [tab, setTab] = useState<Tab>('files')
   const [payload, setPayload] = useState<Payload | null>(null)
@@ -243,7 +246,10 @@ export default function DetailPane({
   return (
     <section
       aria-label="Details"
-      className="flex min-h-0 shrink-0 flex-col overflow-hidden border-t border-rule bg-sunken h-[40%] max-h-[60%] min-h-[220px]"
+      className={
+        'flex min-h-0 flex-col overflow-hidden bg-sunken ' +
+        (fullScreen ? 'flex-1' : 'shrink-0 border-t border-rule h-[40%] max-h-[60%] min-h-[220px]')
+      }
     >
       <div
         role="tablist"
@@ -263,7 +269,7 @@ export default function DetailPane({
             onClick={() => {
               setTab(item.key)
             }}
-            className={`h-8 cursor-pointer rounded-control px-3 text-[13px] ${
+            className={`${fullScreen ? 'h-11' : 'h-8'} cursor-pointer rounded-control px-3 text-[13px] ${
               tab === item.key
                 ? 'bg-accent-soft text-violet-300'
                 : 'bg-transparent text-body hover:text-strong'
@@ -282,7 +288,7 @@ export default function DetailPane({
           type="button"
           aria-label="Close details"
           onClick={onDismiss}
-          className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-750 hover:text-strong"
+          className={`flex ${fullScreen ? 'h-11 w-11' : 'h-8 w-8'} cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-750 hover:text-strong`}
         >
           <X className="h-4 w-4" aria-hidden="true" />
         </button>
