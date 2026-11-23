@@ -85,6 +85,7 @@ function fakeClient(options: {
   pause?: (id: string) => Promise<void>
   resume?: (id: string) => Promise<void>
   remove?: (id: string, deleteFiles: boolean) => Promise<void>
+  moveStorage?: (id: string, path: string) => Promise<void>
 }): { client: Api; calls: Calls } {
   const rows = options.rows ?? []
   const calls: Calls = { torrents: 0, pause: [], resume: [], remove: [] }
@@ -112,6 +113,11 @@ function fakeClient(options: {
       calls.remove.push(`${id}:${String(deleteFiles)}`)
       return options.remove?.(id, deleteFiles) ?? Promise.resolve()
     },
+    moveStorage: (id: string, path: string): Promise<void> =>
+      options.moveStorage?.(id, path) ?? Promise.resolve(),
+    recheck: async (): Promise<void> => {},
+    reannounce: async (): Promise<void> => {},
+    setQueuePosition: async (): Promise<void> => {},
     addMagnet: async () => torrentInfo('added'),
     addFile: async () => torrentInfo('added'),
     roots: async (): Promise<string[]> => options.roots ?? ['/downloads'],
@@ -124,7 +130,7 @@ function openScreen(client: Api): { container: HTMLElement; polite: HTMLElement 
   const { container } = render(
     <>
       <div role="status" aria-live="polite" />
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />
     </>,
   )
   return {
@@ -311,5 +317,490 @@ describe('the dialogs the screen opens', () => {
       !enabled('Pause') && !enabled('Resume') && !enabled('Remove'),
       'the toolbar still acted on a torrent that was removed',
     ).toBe(true)
+  })
+
+  it('moving survives selecting another torrent', async () => {
+    let finish: () => void = () => {}
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+      moveStorage: () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        }),
+    })
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(row(container, 'a'))
+    await flush()
+    fireEvent.click(button('More'))
+    fireEvent.click(screen.getByRole('menuitem', { name: /move files/i }))
+    await flush()
+    fireEvent.click(button('Move'))
+    await flush()
+    expect(screen.queryByText('Moving...') !== null, 'the move showed no indicator').toBe(true)
+    fireEvent.click(row(container, 'b'))
+    await flush()
+    expect(screen.queryByText('Moving...') === null, 'another torrent showed the indicator').toBe(true)
+    fireEvent.click(row(container, 'a'))
+    await flush()
+    expect(screen.queryByText('Moving...') !== null, 'the indicator was lost on reselecting').toBe(true)
+    await act(async () => {
+      finish()
+      await Promise.resolve()
+    })
+    await flush()
+    expect(screen.queryByText('Moving...') === null, 'the indicator outlived the request').toBe(true)
+  })
+})
+
+/** Make `matchMedia('(max-width: 640px)')` answer `matches`, and hand back a way to flip it. */
+function phoneWidth(matches: boolean): (next: boolean) => void {
+  const listeners = new Set<() => void>()
+  const state = { matches }
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    get matches() {
+      return state.matches
+    },
+    media: query,
+    addEventListener: (_: string, fn: () => void) => listeners.add(fn),
+    removeEventListener: (_: string, fn: () => void) => listeners.delete(fn),
+  }))
+  return (next) => {
+    state.matches = next
+    listeners.forEach((fn) => {
+      fn()
+    })
+  }
+}
+
+describe('the phone layout', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  const cards = (container: HTMLElement): NodeListOf<Element> =>
+    container.querySelectorAll('[data-card]')
+
+  it('the phone shows cards and the desktop the table', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+    })
+    phoneWidth(true)
+    const phone = openScreen(client)
+    await flush()
+    expect(cards(phone.container).length, 'the phone did not show cards').toBe(2)
+    expect(phone.container.querySelector('table'), 'the phone still drew the table').toBeNull()
+    cleanup()
+
+    phoneWidth(false)
+    const desktop = openScreen(client)
+    await flush()
+    expect(cards(desktop.container).length, 'the desktop drew cards').toBe(0)
+    expect(desktop.container.querySelector('table'), 'the desktop lost its table').not.toBeNull()
+  })
+
+  it('tapping a card opens the full view and pushes history', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const push = vi.spyOn(window.history, 'pushState')
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    expect(push, 'opening the full view must push history exactly once').toHaveBeenCalledTimes(1)
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(view.textContent).toContain('Pause')
+    expect(view.textContent).toContain('Remove')
+    for (const tab of ['Files', 'Peers', 'Trackers', 'Pieces']) {
+      expect(
+        screen.getByRole('tab', { name: tab }),
+        `the full view lost its ${tab} tab`,
+      ).toBeTruthy()
+    }
+  })
+
+  it('back returns to the list', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    let signedOut = 0
+    const { container } = render(
+      <Torrents
+        signedIn
+        signOutError={null}
+        onSettings={() => {}}
+        onSignOut={() => {
+          signedOut += 1
+        }}
+        client={client}
+      />,
+    )
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).not.toBeNull()
+
+    // The browser's back: a popstate closes the view.
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'popstate did not close the view',
+    ).toBeNull()
+    expect(cards(container).length).toBe(1)
+    expect(signedOut, 'back signed the person out').toBe(0)
+
+    // The on-screen Back button goes through history.back, so the history stays balanced.
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(back, 'the Back button must call history.back once').toHaveBeenCalledTimes(1)
+  })
+
+  it('filters become chips', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b', { state: 'paused', download_rate: 0 })],
+    })
+    phoneWidth(true)
+    openScreen(client)
+    await flush()
+    const paused = screen.getByRole('button', { name: /Paused/ })
+    expect(paused.textContent, 'a chip lost its count').toContain('1')
+    expect(screen.getByRole('button', { name: /^All/ }).textContent).toContain('2')
+    fireEvent.click(paused)
+    expect(
+      document.querySelectorAll('[data-card]').length,
+      'choosing a chip did not narrow the cards',
+    ).toBe(1)
+  })
+
+  it('a double back stays in the app', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    const target = screen.getByRole('button', { name: 'Back' })
+    act(() => {
+      target.click()
+      target.click()
+    })
+    expect(back, 'a double tap on Back walked out of the app').toHaveBeenCalledTimes(1)
+  })
+
+  it('resizing to desktop keeps the history balanced', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    act(() => {
+      flip(false)
+    })
+    expect(back, 'the stranded history entry was not consumed').toHaveBeenCalledTimes(1)
+    expect(pane(container), 'the desktop lost the selection').not.toBeNull()
+    const push = vi.spyOn(window.history, 'pushState')
+    act(() => {
+      flip(true)
+    })
+    expect(back).toHaveBeenCalledTimes(1)
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  it('a torrent that disappears closes the full view and the history', async () => {
+    const rows = [torrentInfo('a')]
+    const { client } = fakeClient({ rows })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    rows.splice(0, 1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+    })
+    expect(screen.queryByRole('dialog', { name: 'Torrent' }), 'the full view stayed open').toBeNull()
+    expect(back, 'the history entry was not given back').toHaveBeenCalledTimes(1)
+  })
+
+  it('the live change event flips cards and table', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    expect(cards(container).length).toBe(1)
+    act(() => {
+      flip(false)
+    })
+    expect(container.querySelector('table'), 'the table did not come back on resize').not.toBeNull()
+    expect(cards(container).length).toBe(0)
+    act(() => {
+      flip(true)
+    })
+    expect(cards(container).length, 'the cards did not come back on resize').toBe(1)
+  })
+
+  it('pause and remove work in the full view', async () => {
+    const { client, calls } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(button('Pause'))
+    await flush()
+    expect(calls.pause, 'Pause did not reach the torrent').toEqual(['a'])
+    fireEvent.click(button('Remove'))
+    fireEvent.click(button('Remove and delete files'))
+    await flush()
+    expect(calls.remove, 'Remove did not go through the confirm flow').toEqual(['a:true'])
+  })
+
+  it('a popstate leaves history alone', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(back, 'a popstate went back a second time').not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+  })
+
+  it('opening a card right after back stays open', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a'), torrentInfo('b')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    // Another card is opened before the first back's popstate has arrived.
+    fireEvent.click(cards(container)[1])
+    await flush()
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate', { state: { fbttFull: 1 } }))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'a stale popstate closed the view that was just opened',
+    ).not.toBeNull()
+  })
+
+  it('unmounting gives the history entry back', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container, unmount } = render(
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
+    )
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    unmount()
+    expect(back, 'unmounting left the pushed entry behind').toHaveBeenCalledTimes(1)
+  })
+
+  it('an action error shows in the full view', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a')],
+      pause: () => Promise.reject(new ApiError(400, 'bad_request', 'that torrent cannot be paused')),
+    })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(button('Pause'))
+    await flush()
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(
+      view.textContent,
+      'the refusal went to a banner behind the full view, where nobody can see it',
+    ).toContain('that torrent cannot be paused')
+    // A later action from the More menu that the server takes clears the refusal.
+    fireEvent.click(button('More'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Recheck' }))
+    await flush()
+    // The screen itself, not the live region beside it, which keeps the last thing it said.
+    const screenRoot = container.querySelector('header')?.parentElement as HTMLElement
+    expect(
+      screenRoot.textContent,
+      'a refusal stayed after a later action went through',
+    ).not.toContain('that torrent cannot be paused')
+  })
+
+  it('the full view takes the focus and gives it back', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a'), torrentInfo('b')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    const card = container.querySelector('[data-card="b"]') as HTMLElement
+    card.focus()
+    fireEvent.click(card)
+    await flush()
+    expect(document.activeElement, 'opening the full view left the focus behind it').toBe(
+      screen.getByRole('button', { name: 'Back' }),
+    )
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+    expect(
+      document.activeElement,
+      'closing the full view did not give the focus back to its card',
+    ).toBe(container.querySelector('[data-card="b"]'))
+  })
+
+  it('the page behind the full view is inert', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(view.getAttribute('aria-modal'), 'the full view is not modal').toBe('true')
+    const header = container.querySelector('header') as HTMLElement
+    const chip = screen.getByRole('button', { name: /^All/ })
+    expect(header.closest('[inert]'), 'the header stayed reachable behind the full view').not.toBeNull()
+    expect(chip.closest('[inert]'), 'the filters stayed reachable behind the full view').not.toBeNull()
+    expect(
+      cards(container)[0].closest('[inert]'),
+      'the cards stayed reachable behind the full view',
+    ).not.toBeNull()
+    expect(view.closest('[inert]'), 'the full view itself went inert').toBeNull()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    expect(container.querySelector('[inert]'), 'the list stayed inert after the view closed').toBeNull()
+  })
+
+  it('the phone cards follow the text filter and the sort', async () => {
+    const { client } = fakeClient({
+      rows: [
+        torrentInfo('b', { name: 'beta' }),
+        torrentInfo('g', { name: 'gamma' }),
+        torrentInfo('a', { name: 'alpha' }),
+      ],
+    })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    const order = (): string[] =>
+      Array.from(cards(container)).map((card) => card.getAttribute('data-card') ?? '')
+    expect(order()).toEqual(['b', 'g', 'a'])
+    fireEvent.change(screen.getByRole('combobox', { name: 'Sort torrents' }), {
+      target: { value: 'name' },
+    })
+    expect(order(), 'the phone sort did not order the cards by name').toEqual(['a', 'b', 'g'])
+    fireEvent.click(screen.getByRole('button', { name: 'Reverse' }))
+    expect(order(), 'Reverse did not reverse the cards').toEqual(['g', 'b', 'a'])
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Filter torrents' }), {
+      target: { value: 'ta' },
+    })
+    expect(order(), 'the phone filter did not narrow the cards').toEqual(['b'])
+    // The table at the wider width shows the same filter and sort: the screen owns them.
+    act(() => {
+      flip(false)
+    })
+    expect(
+      (screen.getByRole('searchbox', { name: 'Filter torrents' }) as HTMLInputElement).value,
+      'the query did not survive the resize',
+    ).toBe('ta')
+    expect(container.querySelectorAll('tbody tr[data-row]').length).toBe(1)
+    expect(container.textContent, 'the sort did not survive the resize').toContain(
+      'Sorted by name (reverse)',
+    )
+  })
+
+  it('opening another torrent clears the last action error', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a'), torrentInfo('b')],
+      pause: () => Promise.reject(new ApiError(400, 'bad_request', 'that torrent cannot be paused')),
+    })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(container.querySelector('[data-card="a"]') as HTMLElement)
+    await flush()
+    fireEvent.click(button('Pause'))
+    await flush()
+    expect(screen.getByRole('dialog', { name: 'Torrent' }).textContent).toContain(
+      'that torrent cannot be paused',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    fireEvent.click(container.querySelector('[data-card="b"]') as HTMLElement)
+    await flush()
+    expect(
+      screen.getByRole('dialog', { name: 'Torrent' }).textContent,
+      "torrent a's refusal showed in torrent b's full view",
+    ).not.toContain('that torrent cannot be paused')
+  })
+
+  it('focus has somewhere to go when the opening card is gone', async () => {
+    const rows = [torrentInfo('a'), torrentInfo('b')]
+    const { client } = fakeClient({ rows })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    // The torrent goes away while its full view is open: its card goes with it.
+    fireEvent.click(container.querySelector('[data-card="b"]') as HTMLElement)
+    await flush()
+    rows.splice(1, 1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+    })
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+    expect(
+      document.activeElement,
+      'with its card gone the focus fell to the page body instead of the filter',
+    ).toBe(screen.getByRole('searchbox', { name: 'Filter torrents' }))
+
+    // The window grows into the table while the view is open: the selected row takes the focus.
+    fireEvent.click(container.querySelector('[data-card="a"]') as HTMLElement)
+    await flush()
+    act(() => {
+      flip(false)
+    })
+    await flush()
+    expect(document.activeElement, 'after a resize the focus did not land on the selected row').toBe(
+      row(container, 'a'),
+    )
+  })
+
+  it('a stale settings popstate does not close a new full view', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    // The late answer to Settings' own `history.back()` lands on the Settings entry.
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate', { state: { fbttSettings: 1 } }))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'a stale Settings popstate closed the full view that was just opened',
+    ).not.toBeNull()
   })
 })

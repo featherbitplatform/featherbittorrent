@@ -149,6 +149,7 @@ product adds:
 | `POST /api/v1/auth/session` / `DELETE` | Turns a signed challenge or a good password into a session token; DELETE drops the token. |
 | `GET /api/v1/auth/devices`, `POST`, `DELETE /api/v1/auth/devices/<name>` | A signed-in client manages device logins over the API, so the TUI's devices screen (`K`) works against a remote server. |
 | `GET /api/v1/fs/roots`, `GET /api/v1/fs/list` | Browse inside `server.allowed_roots` while adding a torrent: the folder picker (`Ctrl+O`) and the add dialog read this instead of the client's own disk, which is not where the server saves. |
+| `POST /api/v1/fs/mkdir` | Creates one folder, `{"parent": ..., "name": ...}`, directly inside a folder within `server.allowed_roots` (the web UI's folder picker, `New folder`). The name is one path component of at most 255 bytes that reads exactly as it is shown (no invisible characters, no leading, trailing or doubled spaces), does not start with a dot (the listing hides those), contains none of `< > : " | ? *`, does not end in a dot or a space and is not a Windows device name such as `CON`, `LPT1` or `CONIN$`; the parent is checked after links are resolved, so a link that leads out is refused. Answers `201 {"path": ...}`, or `400` for a bad name, `403` outside the allowed folders, `404` for a missing parent and `409` when the name is taken. Never creates intermediate folders. |
 | `POST /api/v1/stream-tokens` | Asks for an address to stream one file from, for a media player that cannot send headers; its own section below. |
 
 ### A stream address

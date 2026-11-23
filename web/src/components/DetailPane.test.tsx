@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import DetailPane from './DetailPane'
 import Torrents from '../screens/Torrents'
 import { ApiError } from '../api/client'
+import { KEY_BINDINGS } from '../keys'
 import type { Api, FileInfo, PeerInfo, PiecesInfo, TorrentInfo, TrackerInfo } from '../api/client'
 
 afterEach(cleanup)
@@ -342,6 +343,217 @@ describe('what the pane reads', () => {
   })
 })
 
+describe('file priorities', () => {
+  type Prio = FileInfo['priority']
+  function prioClient(initial: FileInfo[], fail?: ApiError) {
+    let current = initial
+    const sent: Array<{ id: string; priorities: string[] }> = []
+    const client = {
+      files: vi.fn(async () => current),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async (id: string, priorities: string[]) => {
+        if (fail !== undefined) throw fail
+        sent.push({ id, priorities })
+        current = current.map((f, i) => ({ ...f, priority: priorities[i] as Prio }))
+      }),
+    } as unknown as Api
+    return { client, sent }
+  }
+  const choose = (name: string, value: string): void => {
+    fireEvent.change(screen.getByLabelText(`Priority of ${name}`), { target: { value } })
+  }
+
+  it("a file's priority can be changed", async () => {
+    const { client, sent } = prioClient([
+      file(0, { priority: 'high' }),
+      file(1),
+      file(2, { priority: 'low' }),
+    ])
+    const { container, rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'skip')
+    await flush()
+    expect(
+      JSON.stringify(sent) === JSON.stringify([{ id: 'a', priorities: ['high', 'skip', 'low'] }]),
+      'the change did not send the whole list with only that file changed',
+    ).toBe(true)
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'skip',
+      'the cell does not show the new priority after a refresh',
+    ).toBe(true)
+    expect(container.querySelectorAll('tbody select').length === 3, 'a row has no select').toBe(true)
+  })
+
+  it('a second change waits for the first', async () => {
+    const { client, sent } = prioClient([file(0), file(1), file(2)])
+    let release: () => void = () => {}
+    const real = client.setFilePriorities as unknown as (id: string, p: string[]) => Promise<void>
+    client.setFilePriorities = vi.fn(async (id: string, p: string[]) => {
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return real(id, p)
+    }) as unknown as Api['setFilePriorities']
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-0.bin', 'high')
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-2.bin') as HTMLSelectElement).disabled,
+      'the other selects stay live while a change is in flight',
+    ).toBe(true)
+    choose('file-2.bin', 'low')
+    await flush()
+    release()
+    await flush()
+    expect(
+      sent.length === 1 && vi.mocked(client.setFilePriorities).mock.calls.length === 1,
+      'a second change was sent while the first was in flight',
+    ).toBe(true)
+  })
+
+  it('the new priority shows at once', async () => {
+    const { client } = prioClient([file(0), file(1)])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'high',
+      'the select snapped back before the next refresh',
+    ).toBe(true)
+  })
+
+  it('a refresh during a change keeps the new value', async () => {
+    const old = [file(0), file(1)]
+    const sent: string[][] = []
+    let release: () => void = () => {}
+    const client = {
+      files: vi.fn(async () => [...old]),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async (_id: string, p: string[]) => {
+        await new Promise<void>((resolve) => {
+          release = resolve
+        })
+        sent.push(p)
+      }),
+    } as unknown as Api
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    release()
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'high',
+      'a refresh that was in flight snapped the new value back',
+    ).toBe(true)
+  })
+
+  it('after a change, the next refresh wins', async () => {
+    let current = [file(0), file(1)]
+    const client = {
+      files: vi.fn(async () => current),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async () => {}),
+    } as unknown as Api
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    current = [file(0), file(1, { priority: 'low' })]
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'low',
+      'a stale choice hid what the server now says',
+    ).toBe(true)
+  })
+
+  it('a list with gaps is refused', async () => {
+    const { client } = prioClient([file(0), file(2)])
+    const { container } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-0.bin', 'high')
+    await flush()
+    expect(
+      (pane(container)?.textContent ?? '').includes('gaps') &&
+        vi.mocked(client.setFilePriorities).mock.calls.length === 0,
+      'a gappy list was sent or the refusal was not shown',
+    ).toBe(true)
+  })
+
+  it('switching torrents clears a pending change', async () => {
+    const { client } = prioClient([file(0), file(1)])
+    client.setFilePriorities = vi.fn(() => new Promise<void>(() => {})) as unknown as Api['setFilePriorities']
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    rerender(<DetailPane id="b" client={client} tick={0} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).disabled,
+      'the other torrent inherited the pending change',
+    ).toBe(false)
+  })
+
+  it('pad files keep their priority', async () => {
+    const { client, sent } = prioClient([
+      file(0),
+      file(1, { pad: true, priority: 'skip' }),
+      file(2),
+    ])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-2.bin', 'high')
+    await flush()
+    expect(
+      sent.length === 1 && JSON.stringify(sent[0]?.priorities) === JSON.stringify(['normal', 'skip', 'high']),
+      'the pad file lost its place or its priority in the sent list',
+    ).toBe(true)
+  })
+
+  it('an unknown priority is sent as normal', async () => {
+    const { client, sent } = prioClient([file(0, { priority: 'unknown' }), file(1)])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'low')
+    await flush()
+    expect(
+      sent.length === 1 && JSON.stringify(sent[0]?.priorities) === JSON.stringify(['normal', 'low']),
+      'unknown was sent as it is',
+    ).toBe(true)
+  })
+
+  it("a refused change shows the server's reason", async () => {
+    const { client } = prioClient(
+      [file(0), file(1)],
+      new ApiError(409, 'no_metadata', 'metadata\u202e is not known\u0007 yet'),
+    )
+    const { container } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'skip')
+    await flush()
+    const text = pane(container)?.textContent ?? ''
+    expect(text.includes('metadata is not known yet'), 'the refusal was not shown, or not cleaned').toBe(true)
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'normal',
+      'the cell moved although the server refused',
+    ).toBe(true)
+  })
+})
+
 describe('the files tab', () => {
   const files = [
     file(0, { path: 'ubuntu.iso', len: 5_800_000_000, downloaded: 3_596_000_000 }),
@@ -370,13 +582,19 @@ describe('the files tab', () => {
     // `share`: an empty file is whole, not NaN).
     const done = rowText(container, 2)
     const empty = rowText(container, 3)
-    expect(done.includes('100%') && done.includes('high'), 'a finished file did not read 100%').toBe(
-      true,
-    )
+    expect(done.includes('100%'), 'a finished file did not read 100%').toBe(true)
     expect(empty.includes('0 B') && empty.includes('100%'), 'a zero-length file did not read 100%').toBe(
       true,
     )
-    expect(rowText(container, 4).includes('low'), 'the priority word is missing').toBe(true)
+    const selected = (name: string): string =>
+      (screen.getByLabelText(`Priority of ${name}`) as HTMLSelectElement).value
+    expect(
+      selected('README.txt') === 'high' &&
+        selected('empty.txt') === 'skip' &&
+        selected('ubuntu.iso') === 'normal' &&
+        selected('a.txt') === 'low',
+      'a select does not show its file priority',
+    ).toBe(true)
 
     // Remote paths are display-safe: the bidi override and the bell are gone, the name reads true.
     const clean = rowText(container, 4)
@@ -604,6 +822,38 @@ describe('the pieces tab', () => {
 })
 
 describe('the tabs on the keyboard', () => {
+  it("every handler's key is in the list: detail tabs", async () => {
+    const { client } = spyClient({})
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    const labels = ['Files', 'Peers', 'Trackers', 'Pieces']
+    const chosen = (): string =>
+      labels.find((label) => screen.getByRole('tab', { name: label }).getAttribute('aria-selected') === 'true') ?? ''
+    // From Peers (the second tab): next is Trackers, previous is Files, first is Files, last is Pieces.
+    const effects: Record<string, string> = {
+      'Next tab': 'Trackers',
+      'Previous tab': 'Files',
+      'First tab': 'Files',
+      'Last tab': 'Pieces',
+    }
+    const listed = KEY_BINDINGS.filter((entry) => entry.where === 'Detail tabs')
+    expect(listed.length === Object.keys(effects).length, 'a case has no binding in the list').toBe(true)
+    for (const binding of listed) {
+      const want = effects[binding.action]
+      expect(want !== undefined, `no effect check for ${binding.action}`).toBe(true)
+      for (const key of binding.keys) {
+        fireEvent.click(screen.getByRole('tab', { name: 'Peers' }))
+        await flush()
+        const left = fireEvent.keyDown(screen.getByRole('tab', { name: 'Peers' }), { key })
+        expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the tabs`).toBe(true)
+        expect(chosen() === want, `${JSON.stringify(key)} (${binding.action}) chose ${chosen()}, not ${want}`).toBe(true)
+        await flush()
+      }
+    }
+    const tab = screen.getByRole('tab', { name: 'Files' })
+    expect(fireEvent.keyDown(tab, { key: 'q' }), 'the tabs took a key that is not in the list').toBe(true)
+  })
+
   it('tabs_follow_the_arrow_keys', async () => {
     const { client } = spyClient({})
     render(<DetailPane id="a" client={client} tick={0} />)
@@ -736,7 +986,7 @@ describe('what the pane shares with the table', () => {
       session: async () => SCREEN_SESSION,
     } as unknown as Api
     const { container } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
     )
     await flush()
     expect(pane(container) === null, 'the pane was drawn when nothing was selected').toBe(true)

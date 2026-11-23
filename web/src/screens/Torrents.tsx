@@ -33,23 +33,34 @@
  * re-reads its tab on that bump, so it shares the loop's cadence, its hidden-page pause and its
  * backoff instead of keeping a timer of its own.
  *
+ * The text filter and the sort are this screen's too, not the table's: the phone's cards show the
+ * same two above them, and a query typed at one width is the query at the other. On a phone the
+ * full view is modal: while it is open the header, the banners and the list behind it are `inert`,
+ * and closing it gives the focus back to the card that opened it. An action's refusal is drawn in
+ * the full view as well as in the banner, and any later action the server accepts clears it.
+ * `hidden` is App's word that Settings covers this screen: the loop then reads at its hidden-page
+ * cadence, and wakes the moment the screen is shown again.
+ *
  * @module screens/Torrents
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import AddTorrent from '../components/AddTorrent'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
+import TorrentActions from '../components/TorrentActions'
 import ConfirmDelete from '../components/ConfirmDelete'
 import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
 import StateFilters from '../components/StateFilters'
+import TorrentCards from '../components/TorrentCards'
+import TorrentFullView from '../components/TorrentFullView'
 import TorrentTable from '../components/TorrentTable'
 import { api, errorMessage } from '../api/client'
 import type { Api, SessionInfo } from '../api/client'
 import { announcePolite, startLive } from '../live'
 import type { LinkState, LiveHandle, TorrentRow } from '../live'
 import { filterCounts, matchesFilter } from '../filters'
-import type { FilterKey } from '../filters'
+import type { FilterKey, TorrentSort } from '../filters'
 
 export interface TorrentsProps {
   /** Whether there is a session to end: a server with logins off has none. */
@@ -57,6 +68,10 @@ export interface TorrentsProps {
   /** Why the last sign-out attempt did not take, or null. The session is still live in that case, and the table keeps running under the notice. */
   signOutError: string | null
   onSignOut(): void
+  /** Opens the Settings screen, which replaces this one. */
+  onSettings(): void
+  /** Whether another screen (Settings) covers this one: the live loop slows to its hidden-page cadence. */
+  hidden?: boolean
   /** The client to read through. Defaults to the page's one so tests can hand in a fake. */
   client?: Api
 }
@@ -67,16 +82,43 @@ const EVENTS_URL = '/api/v1/events?categories=status'
 /** How often the session row is re-read for the header's version and DHT count. It is decoration, not the live table; the refresh model puts the once-a-second cadence on the list. */
 const SESSION_POLL_MS = 30_000
 
+/** Whether the viewport is a phone: `matchMedia('(max-width: 640px)')`, followed through its `change` event. An environment without `matchMedia` (a test jsdom) is the desktop. */
+const PHONE_QUERY = '(max-width: 640px)'
+
+function usePhone(): boolean {
+  const [phone, setPhone] = useState(
+    () => typeof window.matchMedia === 'function' && window.matchMedia(PHONE_QUERY).matches,
+  )
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const query = window.matchMedia(PHONE_QUERY)
+    const onChange = (): void => {
+      setPhone(query.matches)
+    }
+    onChange()
+    query.addEventListener('change', onChange)
+    return () => {
+      query.removeEventListener('change', onChange)
+    }
+  }, [])
+  return phone
+}
+
 export default function Torrents({
   signedIn,
   signOutError,
   onSignOut,
+  onSettings,
+  hidden = false,
   client = api,
 }: TorrentsProps) {
   const [rows, setRows] = useState<TorrentRow[]>([])
   const [link, setLink] = useState<LinkState>({ phase: 'live' })
   const [filter, setFilter] = useState<FilterKey>('all')
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  // The text filter and the sort, shared by the desktop table and the phone cards.
+  const [query, setQuery] = useState('')
+  const [sort, setSort] = useState<TorrentSort>(null)
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null)
   // Bumped once per live refresh round. It is the pane's clock: the detail pane re-reads its tab
   // when this moves, so the pane's cadence, hidden-page pause and backoff are exactly the table's,
@@ -90,7 +132,83 @@ export default function Torrents({
   // True while an action is on the wire: a toolbar that stayed live during a pause is a toolbar that
   // lets the person press it four more times.
   const [busy, setBusy] = useState(false)
+  // The torrents whose files are being moved: kept here, not in the menu, so the indicator survives choosing another row.
+  const [movingIds, setMovingIds] = useState<ReadonlySet<string>>(new Set())
   const liveRef = useRef<LiveHandle | null>(null)
+  const phone = usePhone()
+  // Whether the full-screen torrent owns a history entry: opened once with `pushState`, closed by
+  // the browser's back (a `popstate`) or by `history.back()`, so the history stays balanced and
+  // neither path ever leaves the page.
+  const pushedRef = useRef(false)
+  // Numbers the entries the full view pushes. A popstate that lands on one of them is a stale
+  // answer to an earlier `history.back()` (a card was opened before it arrived), not the person
+  // going back to the list, so it must not close the view that is open now.
+  const tokenRef = useRef(0)
+  // The card the full view was opened from, which takes the focus back when the view closes.
+  const openerRef = useRef<string | null>(null)
+  // Read by the loop's `visibility` on every round, so it never needs restarting for Settings.
+  const hiddenRef = useRef(hidden)
+
+  useEffect(() => {
+    const onPop = (event: PopStateEvent): void => {
+      if (!pushedRef.current) return
+      // A stale answer to either screen's earlier `history.back()` (the full view's or Settings').
+      const landed = event.state as { fbttFull?: number; fbttSettings?: number } | null
+      if (landed?.fbttFull !== undefined || landed?.fbttSettings !== undefined) return
+      pushedRef.current = false
+      setSelectedId(null)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => {
+      window.removeEventListener('popstate', onPop)
+    }
+  }, [])
+
+  // Leaving the phone layout, losing the session or losing the torrent all strand the entry the
+  // full view pushed: each consumes it once and resets the ref, so the next pick pushes again.
+  const consumeEntry = useCallback((): void => {
+    if (!pushedRef.current) return
+    pushedRef.current = false
+    window.history.back()
+  }, [])
+
+  useEffect(() => {
+    if (!phone) consumeEntry()
+  }, [phone, consumeEntry])
+
+  useEffect(() => consumeEntry, [consumeEntry])
+
+  /** Pick a card: select it and open it full screen on its own history entry. */
+  function openFull(id: string): void {
+    if (!pushedRef.current) {
+      tokenRef.current += 1
+      window.history.pushState({ fbttFull: tokenRef.current }, '')
+      pushedRef.current = true
+    }
+    openerRef.current = id
+    // The last refusal belongs to the torrent it was about, not to the one being opened now.
+    setActionError(null)
+    setSelectedId(id)
+  }
+
+  /** Close the full view: through the history when it owns an entry, so the entry is consumed. */
+  function closeFull(): void {
+    // The ref and the selection go first: a second tap on Back (or Close) arriving before the
+    // next render must not call `history.back()` again and walk out of the app.
+    const owned = pushedRef.current
+    pushedRef.current = false
+    setSelectedId(null)
+    if (owned) window.history.back()
+  }
+
+  /** The torrent went away while open: clear the selection and give the history entry back. */
+  function goneFull(goneId: string): void {
+    setSelectedId((current) => (current === goneId ? null : current))
+    if (pushedRef.current) {
+      pushedRef.current = false
+      window.history.back()
+    }
+  }
 
   useEffect(() => {
     const live = startLive(
@@ -105,7 +223,8 @@ export default function Torrents({
       setTimeout: (fn: () => void, ms: number) => {
         setTimeout(fn, ms)
       },
-      visibility: () => (document.visibilityState === 'hidden' ? 'hidden' : 'visible'),
+      visibility: () =>
+        document.visibilityState === 'hidden' || hiddenRef.current ? 'hidden' : 'visible',
       // Coming back to a tab should not cost the ten-second wait: the loop reads the moment the
       // page shows itself again.
       onVisibilityChange: (listener: () => void) => {
@@ -169,9 +288,50 @@ export default function Torrents({
   )
   const selectedName = selectedRow?.name ?? null
 
+  // The chosen torrent left the list while the full view owned a history entry.
+  useEffect(() => {
+    if (selectedRow === null && pushedRef.current) {
+      setSelectedId(null)
+      consumeEntry()
+    }
+  }, [selectedRow, consumeEntry])
+
   /** Ask the refresh loop for the table again, the way a stream event does. */
   const wake = useCallback((): void => {
     liveRef.current?.wake()
+  }, [])
+
+  // Settings covering the screen is a hidden page to the loop; coming back reads at once, the way
+  // a tab coming back into view does.
+  useEffect(() => {
+    const was = hiddenRef.current
+    hiddenRef.current = hidden
+    if (was && !hidden) wake()
+  }, [hidden, wake])
+
+  const fullOpen = phone && selectedRow !== null
+  // Closing the full view hands the focus back to the card it was opened from. When that card is
+  // gone (removed, or the window grew into the table) the focus still needs somewhere to land: the
+  // selected row on the desktop, else the name filter, never `body`.
+  const wasFull = useRef(false)
+  useEffect(() => {
+    if (wasFull.current && !fullOpen && openerRef.current !== null) {
+      const card = document.querySelector<HTMLElement>(
+        `[data-card="${CSS.escape(openerRef.current)}"]`,
+      )
+      const row =
+        !phone && selectedId !== null
+          ? document.querySelector<HTMLElement>(`[data-row="${CSS.escape(selectedId)}"]`)
+          : null
+      ;(card ?? row ?? document.querySelector<HTMLElement>('[data-torrent-filter]'))?.focus()
+      openerRef.current = null
+    }
+    wasFull.current = fullOpen
+  }, [fullOpen, phone, selectedId])
+
+  /** An action the server accepted: an older refusal is no longer the news. */
+  const clearError = useCallback((): void => {
+    setActionError(null)
   }, [])
 
   async function act(kind: 'pause' | 'resume'): Promise<void> {
@@ -183,6 +343,7 @@ export default function Torrents({
       if (kind === 'pause') await client.pause(target.id)
       else await client.resume(target.id)
       // The server said yes: the row should look different before the person looks away from it.
+      setActionError(null)
       wake()
     } catch (cause) {
       // The toolbar's own failure, in the banner above the filters and through the polite region, so
@@ -193,6 +354,15 @@ export default function Torrents({
     } finally {
       setBusy(false)
     }
+  }
+
+  const setMoving = (moverId: string, on: boolean): void => {
+    setMovingIds((current) => {
+      const next = new Set(current)
+      if (on) next.add(moverId)
+      else next.delete(moverId)
+      return next
+    })
   }
 
   const toolbar = (
@@ -227,12 +397,29 @@ export default function Torrents({
       >
         Remove
       </Button>
+      {selectedRow !== null && (
+        <TorrentActions
+          key={selectedRow.id}
+          torrent={selectedRow}
+          client={client}
+          moving={movingIds.has(selectedRow.id)}
+          onMoving={(on) => {
+            setMoving(selectedRow.id, on)
+          }}
+          onError={(why) => {
+            setActionError(why)
+            announcePolite(why)
+          }}
+          onDone={clearError}
+        />
+      )}
     </>
   )
 
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden">
       <Header
+        inert={fullOpen}
         engineVersion={sessionInfo?.version ?? null}
         link={link}
         totalDown={totals.down}
@@ -240,49 +427,94 @@ export default function Torrents({
         dhtNodes={sessionInfo?.dht_nodes ?? null}
         signedIn={signedIn}
         onSignOut={onSignOut}
+        onSettings={onSettings}
         onAdd={() => {
           setAddOpen(true)
         }}
       />
       {(signOutError !== null || actionError !== null) && (
-        <div className="flex shrink-0 flex-col gap-2 px-5 pt-3">
+        <div inert={fullOpen} className="flex shrink-0 flex-col gap-2 px-5 pt-3">
           {signOutError !== null && <Banner tone="danger">{signOutError}</Banner>}
           {actionError !== null && <Banner tone="danger">{actionError}</Banner>}
         </div>
       )}
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+      <div inert={fullOpen} className="flex min-h-0 flex-1 flex-col md:flex-row">
         <StateFilters counts={counts} active={filter} onChange={setFilter} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <TorrentTable
-            rows={shown}
-            selectedId={selectedId}
-            onPick={setSelectedId}
-            actions={toolbar}
-          />
-          <DetailPane
-            id={selectedId}
-            client={client}
-            tick={tick}
-            name={selectedName}
-            onDismiss={() => {
-              setSelectedId(null)
-            }}
-            onRemoved={(goneId) => {
-              // The pane closes itself; the selection goes with it, but only when this is still
-              // the selected torrent - a late 404 about one nobody chose must not close a pane
-              // that is busy describing another.
-              setSelectedId((current) => (current === goneId ? null : current))
-            }}
-          />
+          {phone ? (
+            <TorrentCards
+              rows={shown}
+              onPick={openFull}
+              query={query}
+              onQueryChange={setQuery}
+              sort={sort}
+              onSortChange={setSort}
+            />
+          ) : (
+            <>
+              <TorrentTable
+                rows={shown}
+                selectedId={selectedId}
+                onPick={setSelectedId}
+                actions={toolbar}
+                query={query}
+                onQueryChange={setQuery}
+                sort={sort}
+                onSortChange={setSort}
+              />
+              <DetailPane
+                id={selectedId}
+                client={client}
+                tick={tick}
+                name={selectedName}
+                onDismiss={() => {
+                  setSelectedId(null)
+                }}
+                onRemoved={(goneId) => {
+                  // The pane closes itself; the selection goes with it, but only when this is still
+                  // the selected torrent - a late 404 about one nobody chose must not close a pane
+                  // that is busy describing another.
+                  setSelectedId((current) => (current === goneId ? null : current))
+                }}
+              />
+            </>
+          )}
         </main>
       </div>
 
+      {fullOpen && selectedRow !== null && (
+        <TorrentFullView
+          torrent={selectedRow}
+          client={client}
+          tick={tick}
+          busy={busy}
+          onBack={closeFull}
+          onAct={(kind) => {
+            void act(kind)
+          }}
+          onRemove={() => {
+            setConfirming({ id: selectedRow.id, name: selectedRow.name })
+          }}
+          moving={movingIds.has(selectedRow.id)}
+          onMoving={(on) => {
+            setMoving(selectedRow.id, on)
+          }}
+          onError={(why) => {
+            setActionError(why)
+            announcePolite(why)
+          }}
+          onDone={clearError}
+          error={actionError}
+          onRemoved={goneFull}
+        />
+      )}
       {addOpen && (
         <AddTorrent
           client={client}
           onAdded={() => {
             // The new torrent is on the server now: the wake is what puts it in the table. The
             // dialog closes itself and says so through the polite region.
+            setActionError(null)
             wake()
           }}
           onClose={() => {
@@ -300,7 +532,8 @@ export default function Torrents({
             setConfirming(null)
           }}
           onRemoved={(goneId) => {
-            setSelectedId((current) => (current === goneId ? null : current))
+            setActionError(null)
+            goneFull(goneId)
             wake()
           }}
         />

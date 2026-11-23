@@ -162,3 +162,118 @@ provided it is before the end of the file or the file's length is unknown.
 
 Seeking into the last part of a file that has no cue index (a live recording, for example) can give
 an empty stream, so the player shows `Waiting for data...` there.
+
+## File priorities
+
+The Files tab has a `Priority` column. Each row's priority is a select with `skip`, `low`, `normal`
+and `high`. `skip` means the file is not downloaded.
+
+## Torrent actions
+
+The `More` menu beside Pause and Remove holds the less common actions for the selected torrent:
+
+- `Move up`, `Move down`, `Move to top` and `Move to bottom` change the torrent's place in the queue.
+  They show only for a torrent the queue manages; a torrent that is not in the queue has no place to
+  move.
+- `Recheck` checks the files on disk against the torrent again.
+- `Reannounce` asks the trackers for peers now.
+- `Limits...` opens a dialog with a download limit and an upload limit in KiB/s. Both limits are set
+  together, and 0 means unlimited.
+- `Move files...` opens a folder picker and moves the torrent's files into the folder you choose. A
+  move never overwrites: if the destination already holds a file of the same name, the server refuses
+  the move and the page shows its reason. `Moving...` shows beside the menu while a move runs.
+
+A refusal from `Limits...` is shown inside the Limits dialog. A refusal from the other actions, or from a
+move, is shown in the page's banner, and on a phone also in the torrent's full-screen view, under its
+actions. Either way it is the server's own words. The next action the server accepts clears it.
+
+From the keyboard, `↓`, `Enter` or `Space` on `More` opens the menu, the arrows, `Home` and `End` move
+through it, and `Escape` closes it. `Tab` leaves the menu and closes it, as does moving the focus
+anywhere else.
+
+## New folder
+
+The folder picker, used when adding a torrent and when moving files, has a `New folder` button. It asks
+for a `Folder name` and makes that folder inside the folder you have selected, then lists it. It never
+creates parent folders, and a name that already exists is refused. The server also refuses these names:
+
+- an empty name, `.` and `..`;
+- a name with a slash or a backslash;
+- a name with one of `<`, `>`, `:`, `"`, `|`, `?` or `*`;
+- a name that starts with a dot;
+- a name with control or invisible characters, or with leading, trailing or repeated spaces;
+- a name that ends in a dot or a space;
+- a Windows device name such as `CON`, `NUL`, `COM1` or `LPT1`, with or without an extension;
+- a name over 255 bytes.
+
+## Settings
+
+The `Settings` button in the header opens the Settings screen; `Back to torrents` returns to the list, and
+so does the browser's back button or a phone's back gesture. It has three sections.
+
+### Server
+
+The five server settings are `Download limit KiB/s`, `Upload limit KiB/s`, `Active downloads`,
+`Active seeds` and `Active total`. The rates are in KiB/s, and 0 or an empty field means unlimited.
+`Save` applies them to the running server.
+
+### Devices
+
+Devices are the SSH keys the TUI signs in with. To add one, give it a `Name`, paste an `ssh-ed25519`
+public key line into `Public key` and press `Add`; the new device is listed with its fingerprint. A
+private key is refused in the page and never sent. Each device row has a `Remove` button, which asks
+for confirmation in a `Remove device` dialog; a removed device can no longer sign in. Changes are saved in the server's `config.yaml`. With logins off, the section
+says `Device logins need the server's logins on.` instead.
+
+### Keyboard shortcuts
+
+A read-only list of every shortcut, in groups.
+
+**Player**
+
+- Play or pause: `Space`, `K`
+- Seek back: `←`
+- Seek forward: `→`
+- Volume up: `↑`
+- Volume down: `↓`
+- Full screen: `F`
+- Mute or unmute: `M`
+- Next audio track: `A`
+- Next subtitle track: `C`
+
+**Torrent list**
+
+- Select the focused torrent: `Enter`, `Space`
+- Move to the next torrent: `↓`
+- Move to the previous torrent: `↑`
+
+**Detail tabs**
+
+- Next tab: `→`
+- Previous tab: `←`
+- First tab: `Home`
+- Last tab: `End`
+
+**Menus**
+
+- Open the menu: `↓`, `Enter`, `Space`
+- Choose the focused option: `Enter`, `Space`
+- Next option: `↓`
+- Previous option: `↑`
+- First option: `Home`
+- Last option: `End`
+- Close the menu: `Escape`
+
+**Dialogs**
+
+- Close the dialog: `Escape`
+
+## On a phone
+
+At 640 px wide or less the torrent list is a list of cards. The state filters are a row of chips above
+the cards, and under them are the same name filter and sort as the table: a sort choice (`Server order` or
+a column) and a `Reverse` button. The filter and the sort are kept when the window is resized between the
+cards and the table.
+
+Tapping a card opens that torrent full screen, and the browser's back returns to the list. While it is
+open, nothing behind it can be reached; closing it puts the focus back on the card you opened.

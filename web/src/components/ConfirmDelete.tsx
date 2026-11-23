@@ -22,7 +22,7 @@ import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
 import { displaySafe } from '../format'
 import { announcePolite } from '../live'
-import { useModalDialog } from '../modal'
+import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
 import Banner from './Banner'
 import Button from './Button'
 
@@ -86,7 +86,7 @@ export default function ConfirmDelete({ id, name, client, onClose, onRemoved }: 
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="confirm-delete-title"
-      className="w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72"
+      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
     >
       <div className="flex items-start justify-between gap-3 border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="confirm-delete-title" className="text-[16px] font-semibold text-strong">

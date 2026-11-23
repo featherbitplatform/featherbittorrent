@@ -44,6 +44,7 @@ import Pieces from './detail/Pieces'
 import Trackers from './detail/Trackers'
 import Peers from './detail/Peers'
 import { ApiError } from '../api/client'
+import { matches } from '../keys'
 import type { Api, FileInfo, PeerInfo, PiecesInfo, TrackerInfo } from '../api/client'
 import { displaySafe } from '../format'
 import { announcePolite, TORRENT_REMOVED_COPY } from '../live'
@@ -63,6 +64,8 @@ export interface DetailPaneProps {
   onRemoved?: (id: string) => void
   /** Where the removal notice is announced. Defaults to the page's polite live region (`live.ts`). */
   onNotice?: (message: string) => void
+  /** Fill the space it is given instead of sitting at the bottom as a 40% pane, with 44 px tap targets: the phone's full-screen torrent. */
+  fullScreen?: boolean
   /** The lists' scroll-box height, for the tests: jsdom lays nothing out. */
   viewportHeight?: number
 }
@@ -115,6 +118,7 @@ export default function DetailPane({
   onRemoved,
   onNotice,
   viewportHeight,
+  fullScreen = false,
 }: DetailPaneProps) {
   const [tab, setTab] = useState<Tab>('files')
   const [payload, setPayload] = useState<Payload | null>(null)
@@ -226,10 +230,10 @@ export default function DetailPane({
     const order = TABS.map((item) => item.key)
     const current = order.indexOf(tab)
     let next: Tab | null = null
-    if (event.key === 'ArrowRight') next = order[(current + 1) % order.length]
-    else if (event.key === 'ArrowLeft') next = order[(current - 1 + order.length) % order.length]
-    else if (event.key === 'Home') next = order[0]
-    else if (event.key === 'End') next = order[order.length - 1]
+    if (matches('Detail tabs', 'Next tab', event)) next = order[(current + 1) % order.length]
+    else if (matches('Detail tabs', 'Previous tab', event)) next = order[(current - 1 + order.length) % order.length]
+    else if (matches('Detail tabs', 'First tab', event)) next = order[0]
+    else if (matches('Detail tabs', 'Last tab', event)) next = order[order.length - 1]
     if (next === null) return
     event.preventDefault()
     setTab(next)
@@ -242,7 +246,10 @@ export default function DetailPane({
   return (
     <section
       aria-label="Details"
-      className="flex min-h-0 shrink-0 flex-col overflow-hidden border-t border-rule bg-sunken h-[40%] max-h-[60%] min-h-[220px]"
+      className={
+        'flex min-h-0 flex-col overflow-hidden bg-sunken ' +
+        (fullScreen ? 'flex-1' : 'shrink-0 border-t border-rule h-[40%] max-h-[60%] min-h-[220px]')
+      }
     >
       <div
         role="tablist"
@@ -262,7 +269,7 @@ export default function DetailPane({
             onClick={() => {
               setTab(item.key)
             }}
-            className={`h-8 cursor-pointer rounded-control px-3 text-[13px] ${
+            className={`${fullScreen ? 'h-11' : 'h-8'} cursor-pointer rounded-control px-3 text-[13px] ${
               tab === item.key
                 ? 'bg-accent-soft text-violet-300'
                 : 'bg-transparent text-body hover:text-strong'
@@ -281,7 +288,7 @@ export default function DetailPane({
           type="button"
           aria-label="Close details"
           onClick={onDismiss}
-          className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-750 hover:text-strong"
+          className={`flex ${fullScreen ? 'h-11 w-11' : 'h-8 w-8'} cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-750 hover:text-strong`}
         >
           <X className="h-4 w-4" aria-hidden="true" />
         </button>
@@ -305,9 +312,11 @@ export default function DetailPane({
         )}
         {live !== null && tab === 'files' && (
           <Files
+            key={id}
             files={live.data as FileInfo[]}
             viewportHeight={viewportHeight}
             id={id}
+            client={client}
             onPlay={(index) => {
               const file = (live.data as FileInfo[]).find((entry) => entry.index === index)
               if (file !== undefined) setPlaying({ file: index, name: file.path })

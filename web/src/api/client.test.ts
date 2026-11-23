@@ -378,3 +378,70 @@ it('a_stream_token_answer_without_a_path_is_an_error', async () => {
     'a token answer without a path was not a failure the caller could see',
   ).rejects.toThrow()
 })
+
+/** One client over a fake that answers every call with `status` and `body`, carrying a CSRF token. */
+function clientFor(status = 200, body = '{}') {
+  const { seen, fetchFn } = record(() => (status === 204 ? new Response(null, { status }) : json(status, body)))
+  return { seen, client: createClient(fetchFn, () => 'tok', () => 0, () => {}) }
+}
+
+it('each call sends its method, path and body', async () => {
+  const device = '{"name":"phone","fingerprint":"ab:cd"}'
+  const cases: Array<{
+    run: (c: ReturnType<typeof createClient>) => Promise<unknown>
+    method: string
+    url: string
+    body: unknown
+    answer?: string
+    status?: number
+  }> = [
+    { run: (c) => c.setFilePriorities(ID, ['skip', 'high']), method: 'PUT', url: `/api/v1/torrents/${ID}/file-priorities`, body: { priorities: ['skip', 'high'] }, status: 204, answer: '' },
+    { run: (c) => c.setQueuePosition(ID, 3), method: 'PUT', url: `/api/v1/torrents/${ID}/queue-position`, body: { position: 3 }, status: 204, answer: '' },
+    { run: (c) => c.recheck(ID), method: 'POST', url: `/api/v1/torrents/${ID}/recheck`, body: undefined, status: 204, answer: '' },
+    { run: (c) => c.reannounce(ID), method: 'POST', url: `/api/v1/torrents/${ID}/reannounce`, body: undefined, status: 204, answer: '' },
+    { run: (c) => c.setTorrentLimits(ID, 100, null), method: 'PUT', url: `/api/v1/torrents/${ID}/limits`, body: { download: 100, upload: null }, status: 204, answer: '' },
+    { run: (c) => c.moveStorage(ID, '/data/x'), method: 'POST', url: `/api/v1/torrents/${ID}/move`, body: { path: '/data/x', mode: 'fail_if_exists' }, status: 204, answer: '' },
+    { run: (c) => c.setSessionLimits(null, 5), method: 'PUT', url: '/api/v1/session/limits', body: { download: null, upload: 5 }, status: 204, answer: '' },
+    { run: (c) => c.queueSettings(), method: 'GET', url: '/api/v1/session/queue', body: undefined, answer: '{"active_downloads":1}' },
+    { run: (c) => c.setQueueSettings({ active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1, interval: 30, startup_grace: 60 }), method: 'PUT', url: '/api/v1/session/queue', body: { active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1, interval: 30, startup_grace: 60 }, status: 204, answer: '' },
+    { run: (c) => c.devices(), method: 'GET', url: '/api/v1/auth/devices', body: undefined, answer: `[${device}]` },
+    { run: (c) => c.addDevice('phone', 'KEY'), method: 'POST', url: '/api/v1/auth/devices', body: { name: 'phone', public_key: 'KEY' }, status: 201, answer: device },
+    { run: (c) => c.removeDevice('phone'), method: 'DELETE', url: '/api/v1/auth/devices/phone', body: undefined, status: 204, answer: '' },
+    { run: (c) => c.mkdir('/data', 'new'), method: 'POST', url: '/api/v1/fs/mkdir', body: { parent: '/data', name: 'new' }, status: 201, answer: '{"path":"/data/new"}' },
+  ]
+  for (const k of cases) {
+    const { seen, client } = clientFor(k.status ?? 200, k.answer ?? '{}')
+    await k.run(client)
+    const call = seen[0]
+    const label = `${k.method} ${k.url}`
+    expect(call.method, `${label}: wrong method`).toBe(k.method)
+    expect(call.url, `${label}: wrong url`).toBe(k.url)
+    if (k.body === undefined) {
+      expect(call.body, `${label}: sent a body`).toBeNull()
+    } else {
+      expect(JSON.parse(String(call.body)), `${label}: wrong body`).toEqual(k.body)
+      expect(call.headers.get('content-type'), `${label}: no json content type`).toBe('application/json')
+    }
+    if (k.method !== 'GET') expect(call.headers.get('x-csrf-token'), `${label}: no csrf header`).toBe('tok')
+  }
+  const { client } = clientFor(201, '{"path":"/data/new"}')
+  expect(await client.mkdir('/data', 'new')).toBe('/data/new')
+})
+
+it('a device name is escaped in the path', async () => {
+  const { seen, client } = clientFor(204, '')
+  await client.removeDevice('a b/c')
+  expect(seen[0].url).toBe('/api/v1/auth/devices/a%20b%2Fc')
+})
+
+it('an error answer keeps its code', async () => {
+  const { client } = clientFor(403, '{"error":{"code":"forbidden","message":"no"}}')
+  const failure = await client.devices().catch((e: unknown) => e)
+  expect(failure).toBeInstanceOf(ApiError)
+  expect((failure as ApiError).code).toBe('forbidden')
+})
+
+it('a mkdir answer without a path is an error', async () => {
+  const { client } = clientFor(201, '{}')
+  await expect(client.mkdir('/data', 'new')).rejects.toThrow()
+})

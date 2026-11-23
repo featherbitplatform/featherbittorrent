@@ -47,9 +47,14 @@ export interface RowWindow {
 
 /**
  * Which rows of a `count`-row list the box is showing, and the spacers around them. The pane's
- * three lists call this and slice their own arrays with the result.
+ * three lists call this and slice their own arrays with the result; the phone's torrent cards call
+ * it with their own fixed `rowHeight`.
  */
-export function useRowWindow(count: number, viewportHeight?: number): RowWindow {
+export function useRowWindow(
+  count: number,
+  viewportHeight?: number,
+  rowHeight: number = DETAIL_ROW_HEIGHT,
+): RowWindow {
   const boxRef = useRef<HTMLDivElement>(null)
   const [scrollY, setScrollY] = useState(0)
   const [measured, setMeasured] = useState(0)
@@ -74,12 +79,9 @@ export function useRowWindow(count: number, viewportHeight?: number): RowWindow 
     }
   }, [])
 
-  const height = viewportHeight ?? (measured === 0 ? FALLBACK_ROWS * DETAIL_ROW_HEIGHT : measured)
-  const windowSize = Math.ceil(height / DETAIL_ROW_HEIGHT) + 2 * OVERSCAN
-  const start = Math.max(
-    0,
-    Math.min(Math.floor(scrollY / DETAIL_ROW_HEIGHT) - OVERSCAN, count - windowSize),
-  )
+  const height = viewportHeight ?? (measured === 0 ? FALLBACK_ROWS * rowHeight : measured)
+  const windowSize = Math.ceil(height / rowHeight) + 2 * OVERSCAN
+  const start = Math.max(0, Math.min(Math.floor(scrollY / rowHeight) - OVERSCAN, count - windowSize))
   const end = Math.min(count, start + windowSize)
 
   return {
@@ -89,7 +91,7 @@ export function useRowWindow(count: number, viewportHeight?: number): RowWindow 
     },
     start,
     end,
-    padTop: start * DETAIL_ROW_HEIGHT,
-    padBottom: (count - end) * DETAIL_ROW_HEIGHT,
+    padTop: start * rowHeight,
+    padBottom: (count - end) * rowHeight,
   }
 }

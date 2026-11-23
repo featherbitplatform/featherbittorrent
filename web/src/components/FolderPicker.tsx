@@ -22,13 +22,15 @@
  *
  * @module components/FolderPicker
  */
-import { useCallback, useEffect, useState } from 'react'
-import { Folder, FolderOpen } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
+import { Folder, FolderOpen, FolderPlus } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
 import { displaySafe } from '../format'
 import { childPath } from '../paths'
 import Banner from './Banner'
+import Button from './Button'
 
 /** The note on the row that is the server's configured download folder. */
 const DEFAULT_NOTE = 'default'
@@ -67,6 +69,8 @@ interface RowProps {
   open: boolean
   /** The open set, handed down so a parent's render and its child's agree on what is expanded. */
   isOpen(path: string): boolean
+  /** Bumped when a folder was created, so every open folder asks `list()` again and shows it. */
+  reload: number
   onPick(path: string): void
 }
 
@@ -81,6 +85,7 @@ function FolderRow({
   selected,
   open,
   isOpen,
+  reload,
   onPick,
 }: RowProps) {
   const [dirs, setDirs] = useState<string[] | null>(null)
@@ -110,7 +115,7 @@ function FolderRow({
     return () => {
       cancelled = true
     }
-  }, [client, open, path])
+  }, [client, open, path, reload])
 
   const note = isDefault ? DEFAULT_NOTE : isRoot ? ROOT_NOTE : null
 
@@ -171,6 +176,7 @@ function FolderRow({
                 selected={selected}
                 open={isOpen(child)}
                 isOpen={isOpen}
+                reload={reload}
                 onPick={onPick}
               />
             )
@@ -200,6 +206,12 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   const [roots, setRoots] = useState<string[] | null>(null)
   const [rootsError, setRootsError] = useState<string | null>(null)
   const [openSet, setOpenSet] = useState<ReadonlySet<string>>(new Set())
+  const [reload, setReload] = useState(0)
+  const [naming, setNaming] = useState(false)
+  const [folderName, setFolderName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+  const newFolderRef = useRef<HTMLButtonElement>(null)
 
   /** Open this folder and every folder above it, so a pick is visible instead of remembered off screen. */
   const expand = useCallback((path: string): void => {
@@ -245,6 +257,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   const isOpen = (path: string): boolean => openSet.has(path)
 
   function pick(path: string): void {
+    setCreateError(null)
     if (path === value) {
       // Clicking the picked folder again closes its list: the row is the only handle on it.
       setOpenSet((current: ReadonlySet<string>) => {
@@ -258,9 +271,103 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
     onPathChange(path)
   }
 
+  /** Make the folder inside the one shown, send the name as typed (the server owns the rules), then open it. */
+  async function create(): Promise<void> {
+    if (creating || folderName.trim() === '' || value === '') return
+    setCreating(true)
+    try {
+      const made = await client.mkdir(value, folderName)
+      setCreateError(null)
+      closeNaming()
+      setReload((count: number) => count + 1)
+      expand(made)
+      onPathChange(made)
+    } catch (cause) {
+      setCreateError(errorMessage(cause))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  /** Close the inline field and hand the focus back to `New folder`, which was unmounted while it was open. */
+  function closeNaming(): void {
+    setNaming(false)
+    setFolderName('')
+    setCreateError(null)
+    setTimeout(() => {
+      newFolderRef.current?.focus()
+    }, 0)
+  }
+
+  function onNameKey(event: KeyboardEvent<HTMLInputElement>): void {
+    // The picker sits inside the Add dialog's form: Enter creates the folder instead of adding the torrent.
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      void create()
+    } else if (event.key === 'Escape') {
+      // Only the field closes: preventDefault stops the dialog's own cancel, stopPropagation stops
+      // the dialog shim's document listener, which does not look at defaultPrevented.
+      event.preventDefault()
+      event.stopPropagation()
+      closeNaming()
+    }
+  }
+
   return (
     <div className="flex flex-col gap-2">
-      <span className="text-[13px] text-body">Save to</span>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[13px] text-body">Save to</span>
+        {!naming && (
+          <Button
+            ref={newFolderRef}
+            variant="secondary"
+            size="sm"
+            className="max-[640px]:min-h-11"
+            disabled={value === ''}
+            onClick={() => {
+              setNaming(true)
+            }}
+          >
+            <FolderPlus className="h-3.75 w-3.75" aria-hidden="true" />
+            New folder
+          </Button>
+        )}
+      </div>
+      {naming && (
+        <div className="flex flex-col gap-2 rounded-card border border-rule bg-surface p-3">
+          <label htmlFor="new-folder-name" className="text-[13px] text-body">
+            Folder name
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              id="new-folder-name"
+              type="text"
+              value={folderName}
+              spellCheck={false}
+              autoComplete="off"
+              autoFocus
+              onChange={(event) => {
+                setFolderName(event.target.value)
+              }}
+              onKeyDown={onNameKey}
+              className="min-h-10 min-w-0 flex-1 box-border rounded-control border border-rule bg-sunken px-3 font-mono text-[12px] text-strong outline-none transition-colors focus-visible:border-accent-light focus-visible:ring-2 focus-visible:ring-accent-soft max-[640px]:min-h-11 max-[640px]:text-base"
+            />
+            <Button
+              className="max-[640px]:min-h-11"
+              disabled={folderName.trim() === '' || creating}
+              onClick={() => {
+                void create()
+              }}
+            >
+              Create
+            </Button>
+            <Button variant="secondary" className="max-[640px]:min-h-11" onClick={closeNaming}>
+              Cancel
+            </Button>
+          </div>
+          {createError !== null && <Banner tone="danger">{createError}</Banner>}
+        </div>
+      )}
       <div className="overflow-hidden rounded-card border border-rule bg-sunken">
         <ul role="list">
           {roots.map((root: string, index: number) => (
@@ -275,6 +382,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
               selected={value}
               open={isOpen(root)}
               isOpen={isOpen}
+              reload={reload}
               onPick={pick}
             />
           ))}

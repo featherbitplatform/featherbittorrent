@@ -23,6 +23,13 @@
  * announcement land. `the_live_regions_outlive_the_screens_in_the_page` is the check that they
  * really do outlive the screens, as mounted in this page and not just in a unit harness.
  *
+ * Settings owns one history entry while it is open, the way the phone's full torrent view does:
+ * opening pushes it, `Back to torrents` consumes it with `history.back()`, and the browser's back (a
+ * `popstate`) closes Settings instead of leaving the page. Each push carries a number, and a
+ * popstate that lands on one of them is a late answer to an earlier `history.back()`, not the
+ * person going back. The Torrents screen under Settings is told it is hidden, so its live loop
+ * reads at the hidden-page cadence until it is shown again.
+ *
  * @module App
  */
 import { useEffect, useRef, useState } from 'react'
@@ -30,6 +37,7 @@ import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
 import { session, useSession } from './session'
+import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
@@ -39,6 +47,42 @@ export default function App() {
   const assertiveRef = useRef<HTMLDivElement>(null)
   const live = useRef<LiveAnnouncer | null>(null)
   const [trying, setTrying] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  // Whether Settings owns a history entry, and the number of the last one it pushed.
+  const settingsPushed = useRef(false)
+  const settingsToken = useRef(0)
+
+  useEffect(() => {
+    const onPop = (event: PopStateEvent): void => {
+      if (!settingsPushed.current) return
+      // A stale answer to either screen's earlier `history.back()` (Settings' or the full view's).
+      const landed = event.state as { fbttSettings?: number; fbttFull?: number } | null
+      if (landed?.fbttSettings !== undefined || landed?.fbttFull !== undefined) return
+      settingsPushed.current = false
+      setSettingsOpen(false)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => {
+      window.removeEventListener('popstate', onPop)
+    }
+  }, [])
+
+  function openSettings(): void {
+    if (!settingsPushed.current) {
+      settingsToken.current += 1
+      window.history.pushState({ fbttSettings: settingsToken.current }, '')
+      settingsPushed.current = true
+    }
+    setSettingsOpen(true)
+  }
+
+  /** Back to torrents: through the history when Settings owns an entry, so the entry is consumed. */
+  function closeSettings(): void {
+    const owned = settingsPushed.current
+    settingsPushed.current = false
+    setSettingsOpen(false)
+    if (owned) window.history.back()
+  }
 
   // The announcer writes into the two nodes above and follows the store. The regions are React's;
   // this only ever sets their text, and React never gives them children to fight over.
@@ -53,6 +97,26 @@ export default function App() {
       announcer.stop()
     }
   }, [])
+
+  // Going back hands the focus to the button that opened Settings, which is on screen again by then.
+  const wasOpen = useRef(false)
+  useEffect(() => {
+    if (wasOpen.current && !settingsOpen) {
+      document.querySelector<HTMLElement>('[data-settings-opener]')?.focus()
+    }
+    wasOpen.current = settingsOpen
+  }, [settingsOpen])
+
+  // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
+  const workspace = state.phase === 'signedIn' || state.phase === 'open'
+  if (!workspace && settingsOpen) setSettingsOpen(false)
+  // ...and the entry Settings pushed goes back with it.
+  useEffect(() => {
+    if (!workspace && settingsPushed.current) {
+      settingsPushed.current = false
+      window.history.back()
+    }
+  }, [workspace])
 
   async function retry(): Promise<void> {
     setTrying(true)
@@ -88,11 +152,21 @@ export default function App() {
           <h1 className="mt-4 text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
         </main>
       ) : (
-        <Torrents
-          signedIn={state.phase === 'signedIn'}
-          signOutError={signOutError}
-          onSignOut={() => void signOut()}
-        />
+        <>
+          {settingsOpen && (
+            <Settings onBack={closeSettings} />
+          )}
+          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
+          <div hidden={settingsOpen}>
+            <Torrents
+              hidden={settingsOpen}
+              onSettings={openSettings}
+              signedIn={state.phase === 'signedIn'}
+              signOutError={signOutError}
+              onSignOut={() => void signOut()}
+            />
+          </div>
+        </>
       )}
     </>
   )
