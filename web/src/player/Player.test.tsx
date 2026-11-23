@@ -18,6 +18,7 @@ import {
   fakeVideo,
   fakeVideoBeforeMetadata,
   makeVideoPlayable,
+  makeVideoSeekable,
 } from './testing'
 
 
@@ -2374,6 +2375,26 @@ describe('the final review fixes', () => {
     } finally {
       delete (document as unknown as { fullscreenElement?: unknown }).fullscreenElement
     }
+  })
+
+  it('dragging the seek bar restarts once', async () => {
+    const { recorder, video } = await renderRemux()
+    makeVideoSeekable(video)
+    const seek = screen.getByRole('slider', { name: 'Seek' }) as HTMLInputElement
+    const before = recorder.callsFor('/tracks/1/stream').length
+    fireEvent.pointerDown(seek)
+    for (const value of ['1', '2', '3']) {
+      fireEvent.input(seek, { target: { value } })
+      await settle()
+    }
+    expect(recorder.callsFor('/tracks/1/stream').length - before, 'the drag sought before the release').toBe(0)
+    expect(seek.value, 'the drag did not show where it is').toBe('3')
+    fireEvent.pointerUp(seek)
+    await settle()
+    await settle()
+    const calls = recorder.callsFor('/tracks/1/stream')
+    expect(calls.length - before, 'the release did not seek exactly once').toBe(1)
+    expect(calls.at(-1)?.url, 'the release did not seek to where the drag stopped').toContain('start_ms=3000')
   })
 
 })

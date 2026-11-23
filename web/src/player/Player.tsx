@@ -274,6 +274,11 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
+  // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
+  // the buffer restarts the streams, and a drag writes dozens of values.
+  const [scrub, setScrub] = useState<number | null>(null)
+  const draggingRef = useRef(false)
   // True while a menu is open: the dialog's key handler ignores keys from inside it, so an
   // `ArrowUp` in the Audio listbox does not move the volume. Each menu keeps its own flag:
   // closing one while the other is open is the way a person works, and the handler has to
@@ -658,6 +663,32 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (typeof video?.webkitEnterFullscreen === 'function') video.webkitEnterFullscreen()
   }
 
+  /** Move the playhead to a point of the Seek bar, in source seconds. */
+  function commitSeek(sourceSeconds: number): void {
+    const video = videoRef.current
+    if (video === null) return
+    // The bar is in source time: the value is source seconds, mapped to the element.
+    video.currentTime = toMedia(sourceSeconds * 1000, probe?.time_offset_ms ?? 0)
+  }
+
+  /**
+   * A pointer went down on the Seek bar: the values it writes are shown, not sought, until it
+   * comes up (or the browser takes it away), and the release seeks once to where it stopped.
+   */
+  function startDrag(input: HTMLInputElement): void {
+    draggingRef.current = true
+    const finish = (): void => {
+      window.removeEventListener('pointerup', finish)
+      window.removeEventListener('pointercancel', finish)
+      if (!draggingRef.current) return
+      draggingRef.current = false
+      commitSeek(Number(input.value))
+      setScrub(null)
+    }
+    window.addEventListener('pointerup', finish)
+    window.addEventListener('pointercancel', finish)
+  }
+
   function nextAudio(): void {
     if (choice?.kind !== 'remux') return
     const playable = choice.audioOptions.filter((option) => option.playable)
@@ -774,6 +805,8 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         }))
       : []
   const subtitleChoices = subtitleOptions()
+  // The Seek bar's position: where a drag is, or where the playhead is.
+  const shownSec = scrub ?? time / 1000
 
   return (
     <dialog
@@ -863,17 +896,18 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               min={0}
               max={durationSourceSec}
               step={0.1}
-              value={time / 1000}
+              value={shownSec}
+              onPointerDown={(event) => startDrag(event.currentTarget)}
               onChange={(event) => {
-                const video = videoRef.current
-                if (video === null) return
-                // The bar is in source time: the value is source seconds, mapped to the element.
-                video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
+                const value = Number(event.target.value)
+                // A drag shows the value and seeks on release; a key step seeks at once.
+                if (draggingRef.current) setScrub(value)
+                else commitSeek(value)
               }}
               className="h-1.5 w-full shrink-0 min-[641px]:w-auto min-[641px]:min-w-0 min-[641px]:shrink flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent max-[640px]:order-first max-[640px]:flex-none"
             />
             <span className="font-mono text-[12px] text-strong">
-              {clock(time / 1000)} / {clock(durationSourceSec)}
+              {clock(shownSec)} / {clock(durationSourceSec)}
             </span>
             <IconButton label={paused ? 'Play' : 'Pause'} onClick={togglePlay}>
               {paused ? <Play className="h-4 w-4" aria-hidden="true" /> : <Pause className="h-4 w-4" aria-hidden="true" />}
