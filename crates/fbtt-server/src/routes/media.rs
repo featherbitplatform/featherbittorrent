@@ -835,7 +835,7 @@ fn sidecar_of(video: &str, name: &str) -> bool {
         Some((stem, _)) if !stem.is_empty() => stem,
         _ => video.as_str(),
     };
-    &name == stem
+    name == stem
         || name
             .strip_prefix(stem)
             .is_some_and(|rest| rest.starts_with('.'))
