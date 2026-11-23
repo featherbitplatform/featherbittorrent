@@ -99,8 +99,9 @@ The player tries one of three ways in the order listed below:
 
 3. **Unplayable**: when the browser cannot play any codec of the video track, the player shows the
    sentence `This browser cannot play <codec> video.`, naming the video track's codec, and a
-   `Download` button. A file with no video track at all, such as an audio file, is not played
-   either: the player shows `This file has no video track to play.` and the same `Download`
+   `Download` button. A video-container file with no video track at all (for example an
+   audio-only `.mkv`) is not played either: the player shows `This file has no video track to
+   play.` and the same `Download` button. Audio files such as `.mp3` and `.flac` get no `Play`
    button.
 
 ### Controls
@@ -119,7 +120,9 @@ The remuxed player shows the following controls by their exact labels:
 - `Subtitles`: a menu that lists the available subtitles; `Off` turns subtitles off, and image
   subtitles appear disabled with the text `<name>: Image subtitles cannot be shown here.`
 - `Fullscreen`: an icon button that toggles fullscreen mode. On an iPhone, which has no
-  fullscreen for the page, it opens the video in the browser's own fullscreen player.
+  fullscreen for the page, it opens the video in the browser's own fullscreen player; there, the
+  player's own subtitles and menus are not shown. Before the video has loaded, the iPhone
+  refuses it and the button does nothing.
 - `Close player`: a button that closes the modal and stops playback.
 
 `Audio` appears whenever the file has at least one audio track. `Subtitles` always appears and
