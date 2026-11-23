@@ -41,6 +41,12 @@ use crate::routes::{self, Shared, fs};
 /// no account has it.
 const DUMMY_PASSWORD: &str = "featherbittorrent-no-such-account";
 
+/// The shortest launch secret [`Server::start_desktop`] accepts, in characters: the length of 32 random bytes
+/// in unpadded base64url, which is what the desktop app makes. A shorter one is refused rather than served,
+/// because the secret is the whole defence of the app's engine and an empty one would match an empty
+/// `?token=`.
+pub const MIN_LAUNCH_SECRET_CHARS: usize = 43;
+
 /// Why a server did not start. Every case is one the person who ran `serve` has to act on, which is why
 /// each says what to do about it in the line itself.
 #[derive(Debug, Error)]
@@ -64,6 +70,13 @@ pub enum ServerError {
     /// or could not open the listener.
     #[error(transparent)]
     Api(#[from] ApiError),
+    /// The desktop launch secret handed to [`Server::start_desktop`] is shorter than
+    /// [`MIN_LAUNCH_SECRET_CHARS`]. Nothing was started: an engine guarded by a guessable secret is not one
+    /// to serve.
+    #[error(
+        "the launch secret is too short: it needs at least {MIN_LAUNCH_SECRET_CHARS} characters"
+    )]
+    LaunchSecret,
 }
 
 /// How the desktop app reaches the engine it starts ([`Server::start_desktop`]).
@@ -170,7 +183,8 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// The same as [`start`](Self::start).
+    /// The same as [`start`](Self::start), and [`ServerError::LaunchSecret`] for a launch secret shorter
+    /// than [`MIN_LAUNCH_SECRET_CHARS`].
     pub async fn start_desktop(
         settings: Settings,
         config: Config,
@@ -178,6 +192,11 @@ impl Server {
         lock: LibraryLock,
         access: DesktopAccess,
     ) -> Result<Self, ServerError> {
+        // Checked before anything starts. Counted in characters, as the secret is text; the app's own is
+        // ASCII, so this is its byte length too.
+        if access.launch_secret.chars().count() < MIN_LAUNCH_SECRET_CHARS {
+            return Err(ServerError::LaunchSecret);
+        }
         Self::build(settings, config, paths, lock, Some(access)).await
     }
 

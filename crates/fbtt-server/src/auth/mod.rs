@@ -488,7 +488,10 @@ impl FbttAuth {
             Some(_) => bearer(request.headers),
             None => request.query_token,
         };
-        token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
+        // An empty secret is never a credential, even if one got this far: `?token=` decodes to an empty
+        // string, and an empty secret would let it in. `Server::start_desktop` refuses short secrets anyway.
+        !secret.is_empty()
+            && token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
     }
 
     /// Whether this request is a player's stream token on the file-stream route, for the path it was issued

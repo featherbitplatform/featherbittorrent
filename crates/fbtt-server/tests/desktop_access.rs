@@ -12,14 +12,15 @@ use std::time::Duration;
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{AuthConfig, Config, LibraryLock, Paths, ServerConfig, UserEntry};
 use fbtt_server::auth::password;
-use fbtt_server::{DesktopAccess, Server};
+use fbtt_server::{DesktopAccess, MIN_LAUNCH_SECRET_CHARS, Server, ServerError};
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
 /// How long a test waits for anything from the server.
 const DEADLINE: Duration = Duration::from_secs(60);
 /// The secret every test here launches with. A test value, not anybody's credential.
-const LAUNCH_SECRET: &str = "launch-secret-for-this-test-only";
+/// As long as the shortest secret `start_desktop` accepts, 43 characters, like the app's own.
+const LAUNCH_SECRET: &str = "launch-secret-for-this-test-only-0123456789";
 /// The origin the desktop app's webview sends on macOS and Linux.
 const DESKTOP_ORIGIN: &str = "tauri://localhost";
 /// The account the exposed test signs in as, and its password.
@@ -383,4 +384,63 @@ async fn exposed_desktop_mode_requires_logins_and_keeps_the_secret() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     served.stop().await;
+}
+
+/// Starts a secret-only desktop engine with `secret` and returns what `start_desktop` answered, shutting
+/// down a server that did start.
+async fn start_with_secret(tag: &str, secret: String) -> Result<(), ServerError> {
+    let dir = ScratchDir::new(tag);
+    let paths = Paths {
+        config_dir: dir.path().join("config"),
+        data_dir: dir.path().join("data"),
+    };
+    let config = plain(dir.path()).resolve(&paths);
+    let lock = LibraryLock::acquire(&paths.lock_file()).expect("lock the library");
+    let access = DesktopAccess {
+        launch_secret: secret,
+        origins: vec![DESKTOP_ORIGIN.to_string()],
+        expose: false,
+    };
+    let started = within(Server::start_desktop(
+        loopback(&config),
+        config,
+        &paths,
+        lock,
+        access,
+    ))
+    .await;
+    let result = match started {
+        Ok(server) => {
+            within(server.shutdown()).await.expect("the last save ran");
+            Ok(())
+        }
+        Err(problem) => Err(problem),
+    };
+    drop(dir);
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_mode_refuses_an_empty_launch_secret() {
+    let refused = start_with_secret("desktop-empty-secret", String::new()).await;
+    assert!(
+        matches!(refused, Err(ServerError::LaunchSecret)),
+        "an empty secret was served: {refused:?}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_mode_refuses_a_launch_secret_one_character_short() {
+    assert_eq!(MIN_LAUNCH_SECRET_CHARS, 43);
+    let short = "a".repeat(MIN_LAUNCH_SECRET_CHARS - 1);
+    let refused = start_with_secret("desktop-short-secret", short).await;
+    assert!(
+        matches!(refused, Err(ServerError::LaunchSecret)),
+        "a 42-character secret was served: {refused:?}",
+    );
+    // And exactly the minimum is enough.
+    let enough = "a".repeat(MIN_LAUNCH_SECRET_CHARS);
+    start_with_secret("desktop-enough-secret", enough)
+        .await
+        .expect("a 43-character secret starts the engine");
 }
