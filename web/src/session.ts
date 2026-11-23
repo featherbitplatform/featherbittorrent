@@ -412,11 +412,33 @@ function createBearerStore(
     // before any answer could arrive.
     refresh: async () => {},
     signIn,
-    // The token is in memory only, so forgetting it is the whole of signing out.
+    // The same rule as the cookie store: the server ends the session, because the token has already
+    // travelled in query strings and forgetting it here would leave it good until it expires. A 2xx
+    // or a 401 means it is over; anything else left it alive, so the page stays signed in and says so.
     signOut: async () => {
-      if (state.phase !== 'signedIn') return
-      generation += 1
-      signedOut(null, null)
+      if (state.phase !== 'signedIn' || token === null) return
+      const given = token
+      const mine = generation
+      let ended: boolean
+      try {
+        const response = await fetchFn(resolve(endpoint, BEARER_SIGN_IN), {
+          method: 'DELETE',
+          headers: { authorization: `Bearer ${given}` },
+          credentials: 'omit',
+        })
+        ended = response.ok || response.status === 401
+      } catch {
+        ended = false
+      }
+      // A `401` elsewhere may have ended this session while the DELETE was in flight: that ending,
+      // and its notice, already happened.
+      if (generation !== mine || state.phase !== 'signedIn') return
+      if (ended) {
+        generation += 1
+        signedOut(null, null)
+        return
+      }
+      set({ ...state, error: SIGN_OUT_FAILED })
     },
     csrf: () => null,
     generation: () => generation,

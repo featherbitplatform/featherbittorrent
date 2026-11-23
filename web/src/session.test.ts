@@ -10,6 +10,7 @@
 import { expect, it, vi } from 'vitest'
 import { SESSION_ENDED, createSessionStore } from './session'
 import type { SessionStore } from './session'
+import { createClient } from './api/client'
 
 function json(status: number, body: string): Response {
   return new Response(body, { status, headers: { 'content-type': 'application/json' } })
@@ -174,4 +175,54 @@ it('bearer_401_returns_to_sign_in_with_session_ended', async () => {
     error: null,
   })
   expect(store.token(), 'the ended token was kept').toBeNull()
+})
+
+it('bearer_sign_out_deletes_the_session_with_the_token', async () => {
+  const seen: Array<{ url: string; init: RequestInit | undefined }> = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push({ url: String(input), init })
+    if (init?.method === 'DELETE') return new Response(null, { status: 204 })
+    return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+  }, { kind: 'bearer', base: BASE, token: null })
+  await store.signIn('alice', 'password')
+
+  await store.signOut()
+
+  const del = seen[1]
+  expect(del?.init?.method, 'sign-out did not DELETE the session').toBe('DELETE')
+  expect(del?.url, 'sign-out did not go to the engine').toBe(`${BASE}/api/v1/auth/session`)
+  expect(new Headers(del?.init?.headers).get('authorization'), 'sign-out did not prove which session to end').toBe(
+    'Bearer tok-1',
+  )
+  expect(del?.init?.credentials, 'sign-out rode cookies along').toBe('omit')
+  expect(shown(store), 'a sign-out the server took did not land on sign-in').toEqual({
+    phase: 'signedOut',
+    notice: null,
+    error: null,
+  })
+  expect(store.token(), 'the ended token was kept').toBeNull()
+})
+
+it('bearer_sign_out_failure_keeps_the_session', async () => {
+  const seen: Array<{ url: string; auth: string | null }> = []
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push({ url: String(input), auth: new Headers(init?.headers).get('authorization') })
+    if (init?.method === 'DELETE') return json(500, 'boom')
+    if (String(input).endsWith('/auth/session')) return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+    return json(200, '[]')
+  }) as typeof fetch
+  const store = createSessionStore(fetchFn, { kind: 'bearer', base: BASE, token: null })
+  await store.signIn('alice', 'password')
+
+  await store.signOut()
+
+  const state = store.get()
+  expect(
+    state.phase === 'signedIn' && state.subject === 'alice' && state.error === 'Could not sign out. Try again.',
+    'a refused sign-out did not keep the session with its error',
+  ).toBe(true)
+  expect(store.token(), 'a refused sign-out dropped a token the server still honours').toBe('tok-1')
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession, { kind: 'bearer', base: BASE, token: null }, store.token)
+  await client.torrents()
+  expect(seen[seen.length - 1].auth, 'the next call went out without the kept token').toBe('Bearer tok-1')
 })
