@@ -408,7 +408,10 @@ pub(super) struct Listing {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NAME_BYTES, Root, confirm_inside, inside_lexically, list_dirs, name_problem};
+    // Only the unix test that builds a symlink calls it.
+    #[cfg(unix)]
+    use super::confirm_inside;
+    use super::{MAX_NAME_BYTES, Root, inside_lexically, list_dirs, name_problem};
     use axum::http::StatusCode;
     use fbtt_core::fs_list::MAX_DIRS;
     use fbtt_core::scratch::ScratchDir;
