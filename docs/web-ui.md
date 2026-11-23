@@ -147,7 +147,7 @@ provided it is before the end of the file or the file's length is unknown.
 
 ### Waiting and errors
 
-- `Waiting for data...`: the part of the file you are watching has not arrived the server is
+- `Waiting for data...`: the part of the file you are watching has not arrived, the server is
   busy or the connection dropped; the player retries by itself.
 
 - `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
