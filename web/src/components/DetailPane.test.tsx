@@ -432,7 +432,7 @@ describe('file priorities', () => {
     const sent: string[][] = []
     let release: () => void = () => {}
     const client = {
-      files: vi.fn(async () => old),
+      files: vi.fn(async () => [...old]),
       peers: vi.fn(async () => []),
       trackers: vi.fn(async () => []),
       pieces: vi.fn(async () => PIECES_10),
