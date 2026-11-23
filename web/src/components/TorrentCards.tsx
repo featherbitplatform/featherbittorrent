@@ -65,8 +65,7 @@ export default function TorrentCards({ rows, onPick }: TorrentCardsProps) {
         const name = displaySafe(row.name) || displaySafe(row.id)
         const fraction = fractionOf(row)
         const speed = speedOf(row)
-        const label =
-          row.rowState === 'seeding' ? 'seeding' : `${row.rowState} ${formatPercent(fraction)}`
+        const label = `${row.rowState} ${formatPercent(fraction)}`
         return (
           <li key={row.id}>
             <button

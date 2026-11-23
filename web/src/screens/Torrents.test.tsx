@@ -471,4 +471,107 @@ describe('the phone layout', () => {
       'choosing a chip did not narrow the cards',
     ).toBe(1)
   })
+
+  it('a double back stays in the app', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    const target = screen.getByRole('button', { name: 'Back' })
+    act(() => {
+      target.click()
+      target.click()
+    })
+    expect(back, 'a double tap on Back walked out of the app').toHaveBeenCalledTimes(1)
+  })
+
+  it('resizing to desktop keeps the history balanced', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    act(() => {
+      flip(false)
+    })
+    expect(back, 'the stranded history entry was not consumed').toHaveBeenCalledTimes(1)
+    expect(pane(container), 'the desktop lost the selection').not.toBeNull()
+    const push = vi.spyOn(window.history, 'pushState')
+    act(() => {
+      flip(true)
+    })
+    expect(back).toHaveBeenCalledTimes(1)
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  it('a torrent that disappears closes the full view and the history', async () => {
+    const rows = [torrentInfo('a')]
+    const { client } = fakeClient({ rows })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    rows.splice(0, 1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+    })
+    expect(screen.queryByRole('dialog', { name: 'Torrent' }), 'the full view stayed open').toBeNull()
+    expect(back, 'the history entry was not given back').toHaveBeenCalledTimes(1)
+  })
+
+  it('the live change event flips cards and table', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    expect(cards(container).length).toBe(1)
+    act(() => {
+      flip(false)
+    })
+    expect(container.querySelector('table'), 'the table did not come back on resize').not.toBeNull()
+    expect(cards(container).length).toBe(0)
+    act(() => {
+      flip(true)
+    })
+    expect(cards(container).length, 'the cards did not come back on resize').toBe(1)
+  })
+
+  it('pause and remove work in the full view', async () => {
+    const { client, calls } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(button('Pause'))
+    await flush()
+    expect(calls.pause, 'Pause did not reach the torrent').toEqual(['a'])
+    fireEvent.click(button('Remove'))
+    fireEvent.click(button('Remove and delete files'))
+    await flush()
+    expect(calls.remove, 'Remove did not go through the confirm flow').toEqual(['a:true'])
+  })
+
+  it('a popstate leaves history alone', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(back, 'a popstate went back a second time').not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+  })
 })

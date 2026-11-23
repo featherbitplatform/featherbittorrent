@@ -136,6 +136,20 @@ export default function Torrents({
     }
   }, [])
 
+  // Leaving the phone layout, losing the session or losing the torrent all strand the entry the
+  // full view pushed: each consumes it once and resets the ref, so the next pick pushes again.
+  const consumeEntry = useCallback((): void => {
+    if (!pushedRef.current) return
+    pushedRef.current = false
+    window.history.back()
+  }, [])
+
+  useEffect(() => {
+    if (!phone) consumeEntry()
+  }, [phone, consumeEntry])
+
+  useEffect(() => consumeEntry, [consumeEntry])
+
   /** Pick a card: select it and open it full screen on its own history entry. */
   function openFull(id: string): void {
     if (!pushedRef.current) {
@@ -147,8 +161,12 @@ export default function Torrents({
 
   /** Close the full view: through the history when it owns an entry, so the entry is consumed. */
   function closeFull(): void {
-    if (pushedRef.current) window.history.back()
-    else setSelectedId(null)
+    // The ref and the selection go first: a second tap on Back (or Close) arriving before the
+    // next render must not call `history.back()` again and walk out of the app.
+    const owned = pushedRef.current
+    pushedRef.current = false
+    setSelectedId(null)
+    if (owned) window.history.back()
   }
 
   /** The torrent went away while open: clear the selection and give the history entry back. */
@@ -236,6 +254,14 @@ export default function Torrents({
     [rows, selectedId],
   )
   const selectedName = selectedRow?.name ?? null
+
+  // The chosen torrent left the list while the full view owned a history entry.
+  useEffect(() => {
+    if (selectedRow === null && pushedRef.current) {
+      setSelectedId(null)
+      consumeEntry()
+    }
+  }, [selectedRow, consumeEntry])
 
   /** Ask the refresh loop for the table again, the way a stream event does. */
   const wake = useCallback((): void => {
