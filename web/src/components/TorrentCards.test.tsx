@@ -35,7 +35,7 @@ describe('a torrent card', () => {
         name: 'stall',
         rowState: 'stalled',
         progress: 0.18,
-        num_peers: 0,
+        num_peers: 7,
       }),
     ]
     const { container } = render(<TorrentCards rows={rows} onPick={() => {}} />)
