@@ -3957,6 +3957,14 @@ fn mp4_oversized_uniform_sample_is_refused() {
 /// the demuxer's own verdict about a stream that ended, and this is the crate's verdict about a frame
 /// that is too big to be a frame. It is the file's only frame, and a keyframe, so nothing else ends
 /// the stream on the way to it.
+///
+/// The two calls below get the same verdict, and not because the refused frame is still waiting to be
+/// read. The fork had already popped it into the crate's frame slot by the time its size was visible,
+/// and the refusal is what keeps it from becoming a sample, so the frame and its bytes are gone. What
+/// answers the second call is the error latch in `MkvSource::next_sample`: `poison` stores the first
+/// failure and `poisoned` hands that stored verdict to every later request before the demuxer is asked
+/// for anything, so a stream that met an impossible frame stops there instead of walking the same
+/// bytes again for as long as a caller keeps asking.
 #[test]
 fn remux_oversized_frame_is_refused() {
     let tracks = ebml(

@@ -163,6 +163,13 @@ struct PendingFrame {
 /// copy into a sample, into a fragment and into the queue behind it. An empty
 /// `BlockGroup` leaves the slot holding the frame before it, which this check
 /// has already looked at.
+///
+/// The refused frame leaves its buffer empty handed: the error says nobody is
+/// going to copy those bytes out, and the slot is the demuxer's buffer, sized
+/// from a declaration this file only now decided not to trust. A slot that kept
+/// it would hold the biggest allocation an element may be given
+/// ([`ELEMENT_CAP`]) for as long as the source lives, which is the whole cost of
+/// a frame that was refused.
 pub(crate) fn guarded_next<R: Read + Seek>(
     file: &mut MatroskaFile<CappedLen<R>>,
     slot: &mut Frame,
@@ -172,11 +179,15 @@ pub(crate) fn guarded_next<R: Read + Seek>(
     match catch_unwind(AssertUnwindSafe(|| file.next_frame(slot))) {
         Ok(Ok(got)) => {
             if got && slot.data.len() > MAX_SAMPLE_BYTES as usize {
-                return Err(MediaError::Malformed(format!(
+                let message = format!(
                     "a frame of {} bytes is more than the {MAX_SAMPLE_BYTES} bytes one frame may \
                      hold",
                     slot.data.len()
-                )));
+                );
+                // `Vec::new` and not `clear`: `clear` keeps the capacity, and the capacity is the
+                // allocation being refused.
+                slot.data = Vec::new();
+                return Err(MediaError::Malformed(message));
             }
             Ok(got)
         }
@@ -995,5 +1006,97 @@ mod tests {
         let second = source.next_sample().expect("no error").expect("a sample");
         assert!(!second.keyframe, "a later unflagged frame is non-sync");
         assert_eq!(second.pts, 5_020 * 90, "the second frame follows the first");
+    }
+
+    /// A frame over [`MAX_SAMPLE_BYTES`] is refused, and the buffer its bytes sit in is given
+    /// back with the refusal.
+    ///
+    /// The demuxer sizes the slot from the block's own declaration, so by the time this crate
+    /// can say "that is more than a frame" the bytes are already held in a 16 MiB-plus-one
+    /// `Vec`: the refusal is the earliest point that still stops them becoming a sample, and
+    /// the only point that can give the allocation back. The slot is the demuxer's buffer, and
+    /// it lives as long as the source does, so one that kept the frame would hold up to
+    /// [`ELEMENT_CAP`] bytes for the rest of the stream on the strength of a claim about one
+    /// frame.
+    ///
+    /// This is a unit test because the slot is: `MkvSource` and its `frame` field are private,
+    /// so a test through [`open_track`](crate::open_track) cannot ask this question.
+    #[test]
+    fn a_refused_frame_gives_its_buffer_back() {
+        let tracks = ebml(
+            &[0x16, 0x54, 0xAE, 0x6B],
+            &[ebml(
+                &[0xAE],
+                &[
+                    uint(&[0xD7], 1),                  // TrackNumber
+                    uint(&[0x73, 0xC5], 11),           // TrackUID
+                    uint(&[0x83], 1),                  // TrackType: video
+                    uint(&[0x88], 1),                  // FlagDefault
+                    ebml(&[0x86], b"V_MPEG4/ISO/AVC"), // CodecID
+                    ebml(&[0x63, 0xA2], &avcc()),      // CodecPrivate
+                    ebml(
+                        &[0xE0], // Video
+                        &[uint(&[0xB0], 640), uint(&[0xBA], 360)].concat(),
+                    ),
+                ]
+                .concat(),
+            )]
+            .concat(),
+        );
+        let info = ebml(
+            &[0x15, 0x49, 0xA9, 0x66],
+            &[
+                ebml(&[0x4D, 0x80], b"fbtt"),         // MuxingApp
+                ebml(&[0x57, 0x41], b"fbtt"),         // WritingApp
+                uint(&[0x2A, 0xD7, 0xB1], 1_000_000), // TimestampScale: 1 ms
+            ]
+            .concat(),
+        );
+        // Real bytes rather than a claim: the demuxer reads the block the file declared, and
+        // the refusal is about the frame that came out of it. One byte over the cap crosses it.
+        let payload = vec![0x41_u8; MAX_SAMPLE_BYTES as usize + 1];
+        let block = ebml(
+            &[0xA3], // SimpleBlock
+            &[
+                vec![0x81],                     // track 1, a one-byte VINT
+                (0_i16).to_be_bytes().to_vec(), // the block's timecode: the cluster's own zero
+                vec![0x80], // flags: a keyframe, so nothing is dropped on the way
+                payload,
+            ]
+            .concat(),
+        );
+        let cluster = ebml(
+            &[0x1F, 0x43, 0xB6, 0x75],
+            &[uint(&[0xE7], 0), block].concat(), // ClusterTimecode 0 ms
+        );
+        let file = [
+            ebml_header(),
+            ebml(
+                &[0x18, 0x53, 0x80, 0x67], // Segment: no SeekHead, no Cues
+                &[tracks, info, cluster].concat(),
+            ),
+        ]
+        .concat();
+
+        let mut source = open_source(Cursor::new(file), 1, 0)
+            .expect("the header of a file with one big frame is a header this crate reads");
+        match source.next_sample() {
+            Err(SourceError::Malformed(message)) => assert!(
+                message.contains(&MAX_SAMPLE_BYTES.to_string())
+                    && message.contains(&(MAX_SAMPLE_BYTES + 1).to_string()),
+                "the refusal names the frame and the cap it broke: {message}"
+            ),
+            Err(other) => panic!("a frame over the cap is Malformed, got {other:?}"),
+            Ok(got) => panic!(
+                "a frame over the cap was emitted anyway ({} bytes), and the buffer question never \
+                 gets asked",
+                got.map_or(0, |sample| sample.data.len())
+            ),
+        }
+        assert_eq!(
+            source.frame.data.capacity(),
+            0,
+            "the refused frame gave its buffer back instead of holding it for the source's life"
+        );
     }
 }
