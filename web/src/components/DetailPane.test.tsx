@@ -387,6 +387,46 @@ describe('file priorities', () => {
     expect(container.querySelectorAll('tbody select').length === 3, 'a row has no select').toBe(true)
   })
 
+  it('a second change waits for the first', async () => {
+    const { client, sent } = prioClient([file(0), file(1), file(2)])
+    let release: () => void = () => {}
+    const real = client.setFilePriorities as unknown as (id: string, p: string[]) => Promise<void>
+    client.setFilePriorities = vi.fn(async (id: string, p: string[]) => {
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return real(id, p)
+    }) as unknown as Api['setFilePriorities']
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-0.bin', 'high')
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-2.bin') as HTMLSelectElement).disabled,
+      'the other selects stay live while a change is in flight',
+    ).toBe(true)
+    choose('file-2.bin', 'low')
+    await flush()
+    release()
+    await flush()
+    expect(
+      sent.length === 1 && vi.mocked(client.setFilePriorities).mock.calls.length === 1,
+      'a second change was sent while the first was in flight',
+    ).toBe(true)
+  })
+
+  it('the new priority shows at once', async () => {
+    const { client } = prioClient([file(0), file(1)])
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'high',
+      'the select snapped back before the next refresh',
+    ).toBe(true)
+  })
+
   it('pad files keep their priority', async () => {
     const { client, sent } = prioClient([
       file(0),
@@ -461,13 +501,19 @@ describe('the files tab', () => {
     // `share`: an empty file is whole, not NaN).
     const done = rowText(container, 2)
     const empty = rowText(container, 3)
-    expect(done.includes('100%') && done.includes('high'), 'a finished file did not read 100%').toBe(
-      true,
-    )
+    expect(done.includes('100%'), 'a finished file did not read 100%').toBe(true)
     expect(empty.includes('0 B') && empty.includes('100%'), 'a zero-length file did not read 100%').toBe(
       true,
     )
-    expect(rowText(container, 4).includes('low'), 'the priority word is missing').toBe(true)
+    const selected = (name: string): string =>
+      (screen.getByLabelText(`Priority of ${name}`) as HTMLSelectElement).value
+    expect(
+      selected('README.txt') === 'high' &&
+        selected('empty.txt') === 'skip' &&
+        selected('ubuntu.iso') === 'normal' &&
+        selected('a.txt') === 'low',
+      'a select does not show its file priority',
+    ).toBe(true)
 
     // Remote paths are display-safe: the bidi override and the bell are gone, the name reads true.
     const clean = rowText(container, 4)
