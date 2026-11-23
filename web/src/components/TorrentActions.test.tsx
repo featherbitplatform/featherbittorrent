@@ -22,7 +22,7 @@ function torrent(over: Partial<TorrentInfo> = {}): TorrentInfo {
   return { id: 'abc123', queue_position: 3, auto_managed: true, state: 'downloading', ...over } as TorrentInfo
 }
 
-function fake(over: Partial<Record<keyof Api, unknown>> = {}) {
+function fake(over: Partial<Record<keyof Api, unknown>> = {}): Api {
   const client = {
     setQueuePosition: vi.fn(async () => {}),
     recheck: vi.fn(async () => {}),
@@ -33,7 +33,7 @@ function fake(over: Partial<Record<keyof Api, unknown>> = {}) {
     list: vi.fn(async (path: string) => ({ path, dirs: ['movies'] })),
     ...over,
   }
-  return client as unknown as Api & typeof client
+  return client as unknown as Api
 }
 
 function open(client: Api, t: TorrentInfo = torrent(), onError = vi.fn()) {
@@ -53,7 +53,7 @@ describe('TorrentActions', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: 'Move to top' }))
     fireEvent.click(screen.getByRole('button', { name: 'More' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Move to bottom' }))
-    expect(client.setQueuePosition.mock.calls).toEqual([
+    expect(vi.mocked(client.setQueuePosition).mock.calls).toEqual([
       ['abc123', 2],
       ['abc123', 4],
       ['abc123', 0],
