@@ -226,15 +226,27 @@ if [[ "$conf_deb" != "$art_deb" ]]; then
 fi
 echo "ok: the .deb is $deb_pkg $deb_ver $deb_arc with exactly the configured Depends"
 
-# The .desktop file as packed: magnet first and torrent second in MimeType=, which is the association
-# the whole package exists to register. (smoke-desktop runs the same grep against the installed copy;
-# catching it here fails the build instead of a rollout.)
+# The .desktop file as packed: the bundler takes MimeType= from bundle.fileAssociations first and
+# appends the deep-link plugin's schemes after them (freedesktop/mod.rs), so the merged config's
+# torrent association comes first and x-scheme-handler/magnet, which comes from
+# plugins.deep-link.desktop.schemes, is appended - the two associations the whole package exists to
+# register. (smoke-desktop runs the same grep against the installed copy; catching it here fails the
+# build instead of a rollout.)
 deb_desktop="$(tar ${data_opt[@]+"${data_opt[@]}"} -xOf "$stage/$data" "usr/share/applications/$name.desktop" 2>/dev/null)"
 [[ -n "$deb_desktop" ]] || fail "the .deb's data member has no readable ./usr/share/applications/$name.desktop"
 grep '^MimeType=' <<<"$deb_desktop" | sed 's/^MimeType=//' | tr ';' '\n' | grep -qx 'x-scheme-handler/magnet' \
   || fail "the .deb's $name.desktop does not declare x-scheme-handler/magnet"
 grep '^MimeType=' <<<"$deb_desktop" | sed 's/^MimeType=//' | tr ';' '\n' | grep -qx 'application/x-bittorrent' \
   || fail "the .deb's $name.desktop does not declare application/x-bittorrent"
+# A launcher without a URL field code starts the app but never tells it what was clicked: a magnet
+# link or .torrent file handed to the desktop would open the window and drop the link on the floor.
+# linux.desktop.template adds `%u` to Exec= for exactly this reason (and the rpm ships the same file).
+grep -qE '^Exec=[^[:space:]]+[[:space:]]+%[uU]([[:space:]]|$)' <<<"$deb_desktop" \
+  || fail "the .deb's $name.desktop Exec= line has no %u field code; clicked links would never reach the app"
+# Category lines are how a desktop environment files the launcher into a menu; an empty one leaves
+# the app out of every menu even when it installs fine. linux.desktop.template sets the line.
+grep -qE '^Categories=.+' <<<"$deb_desktop" \
+  || fail "the .deb's $name.desktop has no Categories= line, so no menu would ever show the launcher"
 
 # --- the .rpm, read with rpm (the build container carries it through apt).
 if ! rpm_files="$(rpm -qlp "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qlp could not read $dist/$pkg.rpm: $(head -1 <<<"$rpm_files")"; fi
@@ -273,7 +285,7 @@ while IFS= read -r req; do
   [[ -z "$req" ]] && continue
   grep -qxF "$req" <<<"$conf_rpm" && continue
   grep -qE '^(/usr/bin/env|/bin/sh|rpmlib|rtld)' <<<"$req" && continue
-  grep -qE '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux|libgtk-3\.so|libgdk-3\.so|libgdk_pixbuf-2\.0\.so|libgobject-2\.0\.so|libglib-2\.0\.so|libgio-2\.0\.so|libpango-1\.0\.so|libpangocairo-1\.0\.so|libcairo\.so|libcairo-gobject\.so|libdbus-1\.so|libwebkit2gtk-4\.1\.so|libjavascriptcoregtk-4\.1\.so|libsoup-3\.0\.so)' <<<"$req" \
+  grep -qE '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux|libgtk-3\.so|libgdk-3\.so|libgdk_pixbuf-2\.0\.so|libgobject-2\.0\.so|libglib-2\.0\.so|libgio-2\.0\.so|libpango-1\.0\.so|libcairo\.so|libcairo-gobject\.so|libdbus-1\.so|libwebkit2gtk-4\.1\.so|libjavascriptcoregtk-4\.1\.so|libsoup-3\.0\.so)' <<<"$req" \
     || fail "the .rpm requires '$req', which the declared dependencies do not cover: add its package to $conf's bundle.linux.rpm.depends and, if the binary really gained the library, to dev/check-linux-binary.sh's desktop allow list too"
 done <<<"$rpm_reqs"
 while IFS= read -r dep; do
@@ -294,15 +306,17 @@ install -Dm644 LICENSE "$top/usr/local/share/doc/$name/LICENSE"
 install -Dm644 NOTICE "$top/usr/local/share/doc/$name/NOTICE"
 
 # The desktop file the tarball ships: same shape tauri's template generates (Exec and Icon name the
-# binary and the hicolor icon by name), with the MimeType= line spelled out, trailing semicolon
-# included, because the whole point of the file is the two associations the packages declare.
+# binary and the hicolor icon by name, and Exec carries the %u field code so a clicked magnet link or
+# .torrent file reaches the app instead of being dropped), with the MimeType= line spelled out,
+# trailing semicolon included, because the whole point of the file is the two associations the
+# packages declare.
 # mkdir first: install -D creates the directories for its own target, cat creates only the file.
 mkdir -p "$top/usr/local/share/applications"
 cat > "$top/usr/local/share/applications/$name.desktop" <<EOF
 [Desktop Entry]
-Categories=Network;FileTransfer;
+Categories=Network;FileTransfer;P2P;
 Comment=featherbittorrent desktop app: the web UI in a native window, with This computer's engine behind it
-Exec=/usr/local/bin/$name \%u
+Exec=/usr/local/bin/$name %u
 Icon=$name
 Name=featherbittorrent desktop
 StartupWMClass=$name
@@ -354,6 +368,8 @@ tar -xOf "$dist/$pkg.tar.gz" "usr/local/share/applications/$name.desktop" \
   | sed 's/^MimeType=//' | tr ';' '\n' | grep -qx 'x-scheme-handler/magnet' || fail "the tarball's desktop file does not declare magnet"
 tar -xOf "$dist/$pkg.tar.gz" "usr/local/share/applications/$name.desktop" \
   | sed 's/^MimeType=//' | tr ';' '\n' | grep -qx 'application/x-bittorrent' || fail "the tarball's desktop file does not declare application/x-bittorrent"
+tar -xOf "$dist/$pkg.tar.gz" "usr/local/share/applications/$name.desktop" \
+  | grep -qE '^Exec=[^[:space:]]+[[:space:]]+%[uU]([[:space:]]|$)' || fail "the tarball's desktop file Exec= line has no %u field code; clicked links would never reach the app"
 
 # --- no package installs or starts a service (the same rule dev/package-linux.sh enforces for the CLI
 # packages: nothing a unit manager or a login session would pick up, no maintainer scripts, no

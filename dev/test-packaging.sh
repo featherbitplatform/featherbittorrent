@@ -118,7 +118,8 @@ echo 'ok: check-linux-binary.sh accepts GLIBC_2.4 and GLIBC_2.34, refuses GLIBC_
 # ubuntu:22.04 desktop build (dev/fixtures/desktop-needed-<arch>.txt, trimmed exactly like the two CLI
 # -p fixtures, so it names no machine's paths). --desktop raises the glibc floor to 2.35 (the floor of
 # every system the desktop packages install on: the Ubuntu 22.04 build) and adds the webview, GTK, GLib,
-# libsoup, cairo, pango, gdk-pixbuf and appindicator families the desktop binary really links; without
+# libsoup, cairo, pango and gdk-pixbuf families the desktop binary really links (the tray's
+# appindicator and the at-spi bridge are dlopened, not linked, so they are not on the list); without
 # the flag the CLI allow list is exactly what it was, so the same fixture has to be refused there.
 case "$(uname -m)" in
   x86_64|amd64) want_arch=x86_64 ;;
@@ -144,8 +145,10 @@ run_desktop_check() { # <objdump -T fixture path> <objdump -p fixture path>; ret
 }
 
 # desktop_allow_list_accepts_the_fixture: what the ubuntu:22.04 desktop binary really links. The GTK and
-# webview families come from the crates that bind them (gtk-sys and webkit2gtk-sys through pkg-config,
-# rfd's gtk3 file dialogs); the T side reuses the almalinux:9 excerpt because its newest symbol
+# webview families come from the crates that bind them at link time through pkg-config (gtk-sys,
+# webkit2gtk-sys and muda's dbus; rfd opens its dialogs through a portal, and the tray's appindicator
+# and the at-spi bridge are dlopened, so none of those add a NEEDED entry); the T side reuses the
+# almalinux:9 excerpt because its newest symbol
 # (GLIBC_2.34) is below the desktop floor, and a lone GLIBC_2.35 symbol has to pass too: 2.35 is the
 # build system's own glibc, so refusing it would refuse every desktop build (case 5 feeds the same
 # version through CLI mode, where it is refused).

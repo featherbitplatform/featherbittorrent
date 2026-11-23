@@ -59,13 +59,6 @@ case "$pkg_kind" in deb|rpm|tar.gz) ;; *)
 esac
 command -v sha256sum >/dev/null || { echo "FAIL: sha256sum is missing" >&2; exit 1; }
 
-container='no'
-if [[ -r /.dockerenv ]] || grep -qE '(^|:)(docker|podman|containerd)([^a-z]|$):' /proc/1/cgroup 2>/dev/null || \
-   grep -qiE 'docker|containerd|kube|podman' /proc/1/cgroup 2>/dev/null || \
-   [[ -n "${CI:-}" ]]; then
-  container='yes'
-fi
-
 name='featherbittorrent-desktop'
 # The package path is resolved to an absolute one: apt-get reads a bare relative path as a package
 # name ("target/dist/....deb" is not a file to it), and dnf behaves the same way.
@@ -83,12 +76,11 @@ arch="$(uname -m)"
 # shellcheck source=/dev/null
 pretty="$(. /etc/os-release; echo "${PRETTY_NAME:-unknown}")"
 
-# A container is the only place to install into; in CI the check is wanted even when the runner is not
-# a container image, and every case that passes there already has the runtime the desktop needs.
-if [[ "$container" != yes && "${CI:-}" != true ]]; then
-  echo "refusing to install packages on the host: run me inside a container, e.g."
-  echo "  docker run --rm -v \"\$PWD:/src\" -w /src debian:12 bash dev/smoke-desktop-linux.sh deb target/dist <version>"
-  exit 0
+# The guard dev/smoke-linux.sh uses: this script installs and removes system packages, so it belongs
+# in a throwaway container or on a CI runner, never on the machine that built the artifact.
+if [[ ! -e /.dockerenv && ! -e /run/.containerenv && -z "${CI:-}" ]]; then
+  echo "FAIL: smoke-desktop-linux.sh installs and removes system packages: run it in a container or in CI" >&2
+  exit 1
 fi
 
 pkg_installed='no'
@@ -198,6 +190,12 @@ echo "ok: $name runs on the virtual X server on $pretty $arch"
 # findable. A .desktop without MimeType= means the package was never taught why it exists.
 [[ -n "$desktop_file" ]] || { echo "FAIL: $(basename "$pkg") installed no $name.desktop under /usr/share/applications or /usr/local/share/applications" >&2; exit 1; }
 grep -q '^Exec=' "$desktop_file" || { echo "FAIL: $desktop_file has no Exec line" >&2; exit 1; }
+# A launcher without a URL field code starts the app but never tells it what was clicked: a magnet
+# link or .torrent file handed to the desktop would open the window and drop the link on the floor.
+if ! grep -qE '^Exec=[^[:space:]]+[[:space:]]+%[uU]([[:space:]]|$)' "$desktop_file"; then
+  echo "FAIL: $desktop_file's Exec line has no %u or %U field code, so clicked links never reach the app" >&2
+  exit 1
+fi
 if ! grep '^MimeType=' "$desktop_file" | sed 's/^MimeType=//' | tr ';' '\n' | grep -qx 'x-scheme-handler/magnet'; then
   echo "FAIL: $desktop_file does not declare x-scheme-handler/magnet in MimeType=" >&2
   exit 1
@@ -240,8 +238,10 @@ echo "ok: nothing the desktop package installs starts at boot or login"
 # The settings-survival proof: HOME becomes a directory of our own so the run cannot touch a real
 # user's config, the app starts backgrounded under xvfb, the wait is for the config file the app
 # writes on first start (before any window opens), and the kill is SIGTERM, the same quit path a
-# window close takes. pkill -f matches the command line: -x would match the 15-char truncated comm
-# (featherbittorrent-de), which is true of every featherbittorrent binary and matches nothing useful.
+# window close takes. pkill -f matches command lines containing the binary's absolute path, which
+# are the app and its xvfb-run parent (and nothing else): -x would match the 15-char truncated comm
+# (featherbittorrent-de), true of every featherbittorrent process, and a bare name would hit any
+# unrelated command that merely mentions it.
 export HOME=/root/smoke-home
 mkdir -p "$HOME"
 config_file="$HOME/.config/$name/config.yaml"
@@ -259,7 +259,7 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
-pkill -TERM -f "$name" 2>/dev/null || true
+pkill -TERM -f "$bin_abs" 2>/dev/null || true
 kill -TERM "$app_job" 2>/dev/null || true
 wait "$app_job" 2>/dev/null || true
 if [[ "$appeared" != yes ]]; then
@@ -287,9 +287,11 @@ done
 
 if [[ "$pkg_kind" == deb ]]; then
   status="$(dpkg-query -W -f='${Status}' "$name" 2>/dev/null || true)"
-  if [[ "$status" != *"ok installed"* ]]; then
-    echo "ok: dpkg reports $name purged (status: ${status:-not-installed})"
+  if [[ "$status" == *"ok installed"* ]]; then
+    echo "FAIL: dpkg still reports $name installed after purge (status: $status); the removal did not take" >&2
+    exit 1
   fi
+  echo "ok: dpkg reports $name purged (status: ${status:-not-installed})"
 fi
 
 echo "smoke ok: $pkg_kind on $pretty $arch; settings file $([[ -f "$config_file" ]] && echo preserved || echo lost), package installed=$pkg_installed removed=$pkg_removed"

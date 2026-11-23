@@ -260,7 +260,11 @@ mod tests {
     /// Windows and Linux open undecorated from the first frame. Tauri merges the platform file as a
     /// JSON merge patch, which replaces the whole `windows` array, so each platform file must be the
     /// base window entry with `decorations: false` and nothing else changed: a key added to the base
-    /// entry (and not to these) would silently be lost on that platform.
+    /// entry (and not to these) would silently be lost on that platform. The one allowed addition
+    /// anywhere is Linux's `productName`: deb and rpm take their package name from it, and the
+    /// desktop packages are named `featherbittorrent-desktop` so installing them never claims the
+    /// CLI's `featherbittorrent` package. Windows keeps the base product name, so its app folder,
+    /// ProgId and installer identity stay `featherbittorrent`.
     #[test]
     fn platform_confs_are_the_main_window_undecorated() {
         let base = conf(include_str!("../tauri.conf.json"));
@@ -283,15 +287,33 @@ mod tests {
                 platform["app"]["windows"][0]["visible"], false,
                 "{name} starts hidden"
             );
+            let want_top: Vec<&str> = if name.ends_with("linux.conf.json") {
+                vec!["app", "productName"]
+            } else {
+                vec!["app"]
+            };
+            let mut top: Vec<String> = platform
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            top.sort();
             assert_eq!(
-                platform.as_object().map(|o| o.len()),
-                Some(1),
-                "{name} sets only app.windows"
+                top, want_top,
+                "{name} sets only app.windows (and on Linux the package name)"
             );
             assert_eq!(
                 platform["app"].as_object().map(|o| o.len()),
                 Some(1),
                 "{name}"
+            );
+            assert_eq!(
+                platform.get("productName").and_then(|v| v.as_str()),
+                if name.ends_with("linux.conf.json") {
+                    Some("featherbittorrent-desktop")
+                } else {
+                    None
+                },
+                "only the Linux platform file renames the product, and only for packaging"
             );
         }
     }

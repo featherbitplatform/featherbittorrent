@@ -54,6 +54,7 @@
     ],
     "linux": {
       "deb": {
+        "desktopTemplate": "linux.desktop.template",
         "depends": [
           "libc6",
           "libgcc-s1",
@@ -70,6 +71,7 @@
         ]
       },
       "rpm": {
+        "desktopTemplate": "linux.desktop.template",
         "depends": [
           "glibc",
           "libgcc",
