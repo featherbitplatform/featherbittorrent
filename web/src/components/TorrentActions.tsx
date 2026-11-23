@@ -271,6 +271,7 @@ export function TorrentActions({
           />
           <MenuItem
             label="Move files..."
+            disabled={moving}
             onClick={() => {
               setMenuOpen(false)
               setMoveOpen(true)

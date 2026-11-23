@@ -92,7 +92,6 @@ describe('TorrentActions', () => {
     expect(down.value).toBe('')
     expect(up.value).toBe('')
     expect(screen.getByText('Both limits are set together. 0 means unlimited.')).toBeTruthy()
-    expect(screen.getByText('Both limits are set together. 0 means unlimited.')).toBeTruthy()
     fireEvent.change(down, { target: { value: '500' } })
     fireEvent.change(up, { target: { value: '0' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -226,5 +225,21 @@ describe('TorrentActions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(client.moveStorage).not.toHaveBeenCalled()
     expect(screen.queryByText('Moving...')).toBeNull()
+  })
+
+  it('a running move cannot start another', () => {
+    const client = fake({ moveStorage: vi.fn(() => new Promise<void>(() => {})) })
+    open(client)
+    fireEvent.click(screen.getByRole('menuitem', { name: /move files/i }))
+    return waitFor(() => {
+      expect(document.querySelector('[data-folder="/downloads"]')).not.toBeNull()
+    }).then(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Move' }))
+      await screen.findByText('Moving...')
+      fireEvent.click(screen.getByRole('button', { name: 'More' }))
+      expect(
+        (screen.getByRole('menuitem', { name: /move files/i }) as HTMLButtonElement).disabled,
+      ).toBe(true)
+    })
   })
 })
