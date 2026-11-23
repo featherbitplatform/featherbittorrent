@@ -53,6 +53,8 @@ import { ArrowDown, ArrowUp } from 'lucide-react'
 import { displaySafe, filledPercent, formatPercent, formatRate } from '../format'
 import type { RowState, TorrentRow } from '../live'
 import { matches } from '../keys'
+import { arrangeRows, rowFraction as fractionOf, rowName as displayName } from '../filters'
+import type { SortColumn, TorrentSort } from '../filters'
 
 export interface TorrentTableProps {
   /** The rows the screen's filters left standing, in the order the server listed them. */
@@ -61,6 +63,12 @@ export interface TorrentTableProps {
   onPick?: (id: string) => void
   /** What the screen puts at the right end of the toolbar: the actions that work on the row that is chosen. A slot rather than six more props because the actions belong to the screen that owns the selection and the dialogs: the table's job is to hold the row at the same height the filter field has, at the same end of the row the prototype drew them, and to know nothing about pause or delete. */
   actions?: ReactNode
+  /** The text filter, when the screen owns it (so the phone cards share it); absent, the table keeps its own. */
+  query?: string
+  onQueryChange?: (query: string) => void
+  /** The sort, when the screen owns it; absent, the table keeps its own. */
+  sort?: TorrentSort
+  onSortChange?: (sort: TorrentSort) => void
   /** The scroll box's height in pixels. Given by tests because jsdom lays nothing out; measured from the box otherwise. */
   viewportHeight?: number
 }
@@ -82,8 +90,6 @@ const RING_EDGE_LEFT =
   'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light),inset_2px_0_0_var(--color-accent-light)]'
 const RING_EDGE_RIGHT =
   'group-focus-visible:shadow-[inset_0_2px_0_var(--color-accent-light),inset_0_-2px_0_var(--color-accent-light),inset_-2px_0_0_var(--color-accent-light)]'
-
-type SortColumn = 'name' | 'progress' | 'down' | 'up' | 'peers' | 'state'
 
 /** The columns with the alignment their header and their cells share. A `th` left to itself centres, so the alignment is said once here and taken from the same token by both. */
 const COLUMNS: { key: SortColumn; label: string; className: string }[] = [
@@ -138,16 +144,6 @@ const BAR_BG: Record<RowState, string> = {
   error: 'bg-error',
 }
 
-/** The fraction a row's bar and percent carry. A torrent hash-checking reports its fraction in the state rather than in `progress`, which for one being checked over again says nothing useful. */
-function fractionOf(row: TorrentRow): number {
-  return row.rowState === 'checking' ? (row.checking_progress ?? 0) : row.progress
-}
-
-/** The name as it is drawn: display-safe, and the hash when the server had no name to give (a magnet whose metadata has not arrived). */
-function displayName(row: TorrentRow): string {
-  return displaySafe(row.name) || displaySafe(row.id)
-}
-
 /** The state column's whole text, dots and all: what the cell shows when nothing is truncated, and what its `title` always holds. */
 function stateText(row: TorrentRow): string {
   return row.rowState === 'error' && row.error !== null && row.error !== undefined
@@ -155,57 +151,26 @@ function stateText(row: TorrentRow): string {
     : STATE_LABEL[row.rowState]
 }
 
-/** The value a column sorts on, so the header's order and the rows' contents agree. */
-function sortValue(row: TorrentRow, column: SortColumn): number | string {
-  switch (column) {
-    case 'name':
-      return displayName(row).toLowerCase()
-    case 'progress':
-      return fractionOf(row)
-    case 'down':
-      return row.download_rate
-    case 'up':
-      return row.upload_rate
-    case 'peers':
-      return row.num_peers
-    case 'state':
-      return STATE_LABEL[row.rowState]
-  }
-}
-
-function compareRows(a: TorrentRow, b: TorrentRow, column: SortColumn): number {
-  const x = sortValue(a, column)
-  const y = sortValue(b, column)
-  if (typeof x === 'number' && typeof y === 'number') return x - y
-  const xs = String(x)
-  const ys = String(y)
-  if (xs === ys) return 0
-  return xs < ys ? -1 : 1
-}
-
 export default function TorrentTable({
   rows,
   selectedId,
   onPick,
   actions,
+  query: queryProp,
+  onQueryChange,
+  sort: sortProp,
+  onSortChange,
   viewportHeight,
 }: TorrentTableProps) {
   const filterId = useId()
-  const [query, setQuery] = useState('')
-  const [sort, setSort] = useState<{ column: SortColumn; reverse: boolean } | null>(null)
+  const [ownQuery, setOwnQuery] = useState('')
+  const [ownSort, setOwnSort] = useState<TorrentSort>(null)
+  const query = queryProp ?? ownQuery
+  const setQuery = onQueryChange ?? setOwnQuery
+  const sort = sortProp === undefined ? ownSort : sortProp
+  const setSort = onSortChange ?? setOwnSort
 
-  const shown = useMemo(() => {
-    const needle = query.trim().toLowerCase()
-    const kept =
-      needle === ''
-        ? [...rows]
-        : rows.filter((row) => displayName(row).toLowerCase().includes(needle))
-    if (sort !== null) {
-      const factor = sort.reverse ? -1 : 1
-      kept.sort((a, b) => factor * compareRows(a, b, sort.column))
-    }
-    return kept
-  }, [rows, query, sort])
+  const shown = useMemo(() => arrangeRows(rows, query, sort), [rows, query, sort])
 
   // The window. The height is measured from the scroll box in a real browser; `viewportHeight`
   // overrides it (jsdom measures nothing, and the virtualisation test names the height itself).
@@ -395,9 +360,9 @@ export default function TorrentTable({
                   <button
                     type="button"
                     onClick={() => {
-                      setSort((current) =>
-                        current !== null && current.column === column.key
-                          ? current.reverse
+                      setSort(
+                        sort !== null && sort.column === column.key
+                          ? sort.reverse
                             ? null
                             : { column: column.key, reverse: true }
                           : { column: column.key, reverse: false },

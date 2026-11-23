@@ -183,4 +183,23 @@ describe('the Settings screen in the page', () => {
     })
     world.behavior = null
   })
+
+  it('browser back closes Settings', async () => {
+    world.behavior = alive
+    const push = vi.spyOn(window.history, 'pushState')
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(push, 'opening Settings must push one history entry').toHaveBeenCalledTimes(1)
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(
+      screen.queryByRole('heading', { name: 'Server' }),
+      'the browser back did not close Settings',
+    ).toBeNull()
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    push.mockRestore()
+    world.behavior = null
+  })
 })

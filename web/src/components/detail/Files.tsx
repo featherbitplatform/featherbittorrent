@@ -215,7 +215,7 @@ export default function Files({
                         onChange={(event) => {
                           void change(file.index, event.target.value as Choice);
                         }}
-                        className="h-6 max-[640px]:-my-2.5 max-[640px]:h-11 cursor-pointer rounded-control border border-rule bg-transparent px-1 text-[12px] text-body"
+                        className="h-6 max-[640px]:-my-2.5 max-[640px]:h-11 cursor-pointer rounded-control border border-rule bg-transparent px-1 text-[12px] text-body max-[640px]:text-base"
                       >
                         {CHOICES.map((choice) => (
                           <option key={choice} value={choice}>

@@ -8,13 +8,20 @@
  * Queue moves are absolute positions computed from the torrent's own `queue_position`; the server
  * clamps, so "bottom" is the largest position it accepts. They exist only for a torrent the queue
  * manages. A move of the files never overwrites (the client always asks `fail_if_exists`), and a
- * refusal of any action goes to `onError` as the server's own words.
+ * refusal of any action goes to `onError` as the server's own words, and an action the server took
+ * goes to `onDone`, so the screen can clear a refusal that is no longer the latest news.
+ *
+ * The keys are the Menus group of `keys.ts`: Arrow Down, Enter or Space on More opens the menu, the
+ * arrows, Home and End move through it, and Escape closes it and gives the focus back to More. The
+ * items are out of the Tab order (the arrows move between them), so Tab leaves the menu, and the
+ * focus leaving the menu for anywhere else closes it where the focus went.
  *
  * @module components/TorrentActions
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MoreHorizontal } from 'lucide-react'
 import { errorMessage } from '../api/client'
+import { matches } from '../keys'
 import type { KeyboardEvent } from 'react'
 import type { Api, TorrentInfo } from '../api/client'
 import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
@@ -28,6 +35,8 @@ export interface TorrentActionsProps {
   torrent: TorrentInfo
   client: Api
   onError(message: string): void
+  /** Told when an action the menu sent was accepted (a queue move, a recheck, a reannounce, a move of the files). */
+  onDone?(): void
   /** Whether a move of this torrent's files is on the wire, when the screen keeps that across selections; absent, the component tracks its own. */
   moving?: boolean
   /** Told when a move starts and when it settles, so the screen can keep the indicator while another torrent is selected. */
@@ -50,6 +59,7 @@ function MenuItem({
     <button
       type="button"
       role="menuitem"
+      tabIndex={-1}
       disabled={disabled}
       className={ITEM + ' disabled:cursor-default disabled:opacity-55'}
       onClick={onClick}
@@ -109,6 +119,7 @@ export function TorrentActions({
   torrent,
   client,
   onError,
+  onDone,
   moving: movingProp,
   onMoving,
 }: TorrentActionsProps) {
@@ -170,10 +181,10 @@ export function TorrentActions({
     )
     const at = items.indexOf(document.activeElement as HTMLElement)
     let next: number | null = null
-    if (event.key === 'ArrowDown') next = (at + 1) % items.length
-    else if (event.key === 'ArrowUp') next = (at <= 0 ? items.length : at) - 1
-    else if (event.key === 'Home') next = 0
-    else if (event.key === 'End') next = items.length - 1
+    if (matches('Menus', 'Next option', event)) next = (at + 1) % items.length
+    else if (matches('Menus', 'Previous option', event)) next = (at <= 0 ? items.length : at) - 1
+    else if (matches('Menus', 'First option', event)) next = 0
+    else if (matches('Menus', 'Last option', event)) next = items.length - 1
     if (next === null) return
     event.preventDefault()
     items[next]?.focus()
@@ -183,6 +194,7 @@ export function TorrentActions({
     closeMenu()
     try {
       await call()
+      onDone?.()
     } catch (cause) {
       onError(errorMessage(cause))
     }
@@ -194,6 +206,7 @@ export function TorrentActions({
     onMoving?.(true)
     try {
       await client.moveStorage(id, path)
+      onDone?.()
     } catch (cause) {
       onError(errorMessage(cause))
     } finally {
@@ -207,7 +220,7 @@ export function TorrentActions({
       ref={rootRef}
       className="relative"
       onKeyDown={(event) => {
-        if (event.key === 'Escape' && menuOpen) {
+        if (menuOpen && matches('Menus', 'Close the menu', event)) {
           event.stopPropagation()
           closeMenu()
         }
@@ -218,8 +231,21 @@ export function TorrentActions({
         variant="secondary"
         aria-haspopup="menu"
         aria-expanded={menuOpen}
+        onMouseDown={(event) => {
+          // A press on More while the menu is open must not move the focus out of the menu first:
+          // that would close it, and the click would open it again.
+          if (menuOpen) event.preventDefault()
+        }}
         onClick={() => {
-          setMenuOpen((open) => !open)
+          if (menuOpen) closeMenu()
+          else setMenuOpen(true)
+        }}
+        onKeyDown={(event) => {
+          if (!menuOpen && matches('Menus', 'Open the menu', event)) {
+            // Handled here, so Enter and Space do not also click the button shut again.
+            event.preventDefault()
+            setMenuOpen(true)
+          }
         }}
       >
         <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
@@ -231,6 +257,15 @@ export function TorrentActions({
           ref={menuRef}
           role="menu"
           onKeyDown={onMenuKeyDown}
+          onBlur={(event) => {
+            // The focus left the menu (Tab, Shift+Tab, a click elsewhere): it closes where the focus
+            // went. A null target is the focus going nowhere, as Safari does on a click; the
+            // pointer handler above covers that one.
+            const to = event.relatedTarget
+            if (to !== null && menuRef.current !== null && !menuRef.current.contains(to)) {
+              setMenuOpen(false)
+            }
+          }}
           className="absolute right-0 z-20 mt-1 flex min-w-44 flex-col rounded-card border border-rule bg-raised py-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]"
         >
           {queued && (

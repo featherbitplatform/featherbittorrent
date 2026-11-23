@@ -4,7 +4,7 @@
  *
  * @module components/TorrentCards.test
  */
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import TorrentCards from './TorrentCards'
 import type { TorrentRow } from '../live'
@@ -84,5 +84,23 @@ describe('a torrent card', () => {
     const { container } = render(<TorrentCards rows={[card('a', {})]} onPick={() => {}} />)
     const name = container.querySelector('[data-card="a"] > span') as HTMLElement
     expect(name.className, 'the name can wrap and grow the card').toContain('truncate')
+  })
+
+  it('cards are windowed', () => {
+    const rows = Array.from({ length: 500 }, (_, index) => card(`t${String(index)}`, {}))
+    const { container } = render(
+      <TorrentCards rows={rows} onPick={() => {}} viewportHeight={700} />,
+    )
+    const drawn = (): string[] =>
+      Array.from(container.querySelectorAll('[data-card]')).map(
+        (node) => node.getAttribute('data-card') ?? '',
+      )
+    expect(drawn().length, '500 torrents drew 500 cards').toBeLessThan(40)
+    expect(drawn()[0]).toBe('t0')
+    const box = container.querySelector('[data-card]')?.closest('ul')?.parentElement as HTMLElement
+    box.scrollTop = 88 * 300
+    fireEvent.scroll(box)
+    expect(drawn(), 'scrolling did not move the window').toContain('t300')
+    expect(drawn()).not.toContain('t0')
   })
 })

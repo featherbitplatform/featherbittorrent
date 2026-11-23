@@ -115,6 +115,9 @@ function fakeClient(options: {
     },
     moveStorage: (id: string, path: string): Promise<void> =>
       options.moveStorage?.(id, path) ?? Promise.resolve(),
+    recheck: async (): Promise<void> => {},
+    reannounce: async (): Promise<void> => {},
+    setQueuePosition: async (): Promise<void> => {},
     addMagnet: async () => torrentInfo('added'),
     addFile: async () => torrentInfo('added'),
     roots: async (): Promise<string[]> => options.roots ?? ['/downloads'],
@@ -610,5 +613,119 @@ describe('the phone layout', () => {
     const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
     unmount()
     expect(back, 'unmounting left the pushed entry behind').toHaveBeenCalledTimes(1)
+  })
+
+  it('an action error shows in the full view', async () => {
+    const { client } = fakeClient({
+      rows: [torrentInfo('a')],
+      pause: () => Promise.reject(new ApiError(400, 'bad_request', 'that torrent cannot be paused')),
+    })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(button('Pause'))
+    await flush()
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(
+      view.textContent,
+      'the refusal went to a banner behind the full view, where nobody can see it',
+    ).toContain('that torrent cannot be paused')
+    // A later action from the More menu that the server takes clears the refusal.
+    fireEvent.click(button('More'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Recheck' }))
+    await flush()
+    // The screen itself, not the live region beside it, which keeps the last thing it said.
+    const screenRoot = container.querySelector('header')?.parentElement as HTMLElement
+    expect(
+      screenRoot.textContent,
+      'a refusal stayed after a later action went through',
+    ).not.toContain('that torrent cannot be paused')
+  })
+
+  it('the full view takes the focus and gives it back', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a'), torrentInfo('b')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    const card = container.querySelector('[data-card="b"]') as HTMLElement
+    card.focus()
+    fireEvent.click(card)
+    await flush()
+    expect(document.activeElement, 'opening the full view left the focus behind it').toBe(
+      screen.getByRole('button', { name: 'Back' }),
+    )
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
+    expect(
+      document.activeElement,
+      'closing the full view did not give the focus back to its card',
+    ).toBe(container.querySelector('[data-card="b"]'))
+  })
+
+  it('the page behind the full view is inert', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const view = screen.getByRole('dialog', { name: 'Torrent' })
+    expect(view.getAttribute('aria-modal'), 'the full view is not modal').toBe('true')
+    const header = container.querySelector('header') as HTMLElement
+    const chip = screen.getByRole('button', { name: /^All/ })
+    expect(header.closest('[inert]'), 'the header stayed reachable behind the full view').not.toBeNull()
+    expect(chip.closest('[inert]'), 'the filters stayed reachable behind the full view').not.toBeNull()
+    expect(
+      cards(container)[0].closest('[inert]'),
+      'the cards stayed reachable behind the full view',
+    ).not.toBeNull()
+    expect(view.closest('[inert]'), 'the full view itself went inert').toBeNull()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    expect(container.querySelector('[inert]'), 'the list stayed inert after the view closed').toBeNull()
+  })
+
+  it('the phone cards follow the text filter and the sort', async () => {
+    const { client } = fakeClient({
+      rows: [
+        torrentInfo('b', { name: 'beta' }),
+        torrentInfo('g', { name: 'gamma' }),
+        torrentInfo('a', { name: 'alpha' }),
+      ],
+    })
+    const flip = phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    const order = (): string[] =>
+      Array.from(cards(container)).map((card) => card.getAttribute('data-card') ?? '')
+    expect(order()).toEqual(['b', 'g', 'a'])
+    fireEvent.change(screen.getByRole('combobox', { name: 'Sort torrents' }), {
+      target: { value: 'name' },
+    })
+    expect(order(), 'the phone sort did not order the cards by name').toEqual(['a', 'b', 'g'])
+    fireEvent.click(screen.getByRole('button', { name: 'Reverse' }))
+    expect(order(), 'Reverse did not reverse the cards').toEqual(['g', 'b', 'a'])
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Filter torrents' }), {
+      target: { value: 'ta' },
+    })
+    expect(order(), 'the phone filter did not narrow the cards').toEqual(['b'])
+    // The table at the wider width shows the same filter and sort: the screen owns them.
+    act(() => {
+      flip(false)
+    })
+    expect(
+      (screen.getByRole('searchbox', { name: 'Filter torrents' }) as HTMLInputElement).value,
+      'the query did not survive the resize',
+    ).toBe('ta')
+    expect(container.querySelectorAll('tbody tr[data-row]').length).toBe(1)
+    expect(container.textContent, 'the sort did not survive the resize').toContain(
+      'Sorted by name (reverse)',
+    )
   })
 })

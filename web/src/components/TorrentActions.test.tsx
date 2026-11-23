@@ -242,4 +242,15 @@ describe('TorrentActions', () => {
       ).toBe(true)
     })
   })
+
+  it('arrow down on More opens the menu', () => {
+    render(<TorrentActions torrent={torrent()} client={fake()} onError={vi.fn()} />)
+    const more = screen.getByRole('button', { name: 'More' })
+    more.focus()
+    fireEvent.keyDown(more, { key: 'ArrowDown' })
+    expect(screen.queryByRole('menu'), 'Arrow Down on More did not open the menu').not.toBeNull()
+    expect(document.activeElement, 'the first item did not take the focus').toBe(
+      screen.getByRole('menuitem', { name: 'Move up' }),
+    )
+  })
 })

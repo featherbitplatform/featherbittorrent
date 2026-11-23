@@ -350,7 +350,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
                 setFolderName(event.target.value)
               }}
               onKeyDown={onNameKey}
-              className="min-h-10 min-w-0 flex-1 box-border rounded-control border border-rule bg-sunken px-3 font-mono text-[12px] text-strong outline-none transition-colors focus-visible:border-accent-light focus-visible:ring-2 focus-visible:ring-accent-soft max-[640px]:min-h-11"
+              className="min-h-10 min-w-0 flex-1 box-border rounded-control border border-rule bg-sunken px-3 font-mono text-[12px] text-strong outline-none transition-colors focus-visible:border-accent-light focus-visible:ring-2 focus-visible:ring-accent-soft max-[640px]:min-h-11 max-[640px]:text-base"
             />
             <Button
               className="max-[640px]:min-h-11"

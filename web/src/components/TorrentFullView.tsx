@@ -6,9 +6,16 @@
  * calls; this component only lays them out. Every tap target is at least 44 px: the buttons carry
  * `min-h-11`, and the detail pane is asked for its full-screen sizing.
  *
+ * It is modal all the same: `aria-modal`, the screen makes the page behind it `inert`, the focus
+ * starts on Back when it opens, and the screen hands it back to the card that opened it on close.
+ * An action's refusal is drawn here, under the action row, because the screen's own banner is
+ * behind this overlay where nobody can see it.
+ *
  * @module components/TorrentFullView
  */
+import { useEffect, useRef } from 'react'
 import { ArrowLeft } from 'lucide-react'
+import Banner from './Banner'
 import Button from './Button'
 import DetailPane from './DetailPane'
 import TorrentActions from './TorrentActions'
@@ -29,6 +36,10 @@ export interface TorrentFullViewProps {
   moving: boolean
   onMoving(on: boolean): void
   onError(why: string): void
+  /** An action the menu sent was accepted. */
+  onDone(): void
+  /** The latest action's refusal, or null. */
+  error: string | null
   /** The pane closed itself over a 404. */
   onRemoved(id: string): void
 }
@@ -44,13 +55,26 @@ export default function TorrentFullView({
   moving,
   onMoving,
   onError,
+  onDone,
+  error,
   onRemoved,
 }: TorrentFullViewProps) {
   const paused = torrent.rowState === 'paused'
+  const backRef = useRef<HTMLButtonElement>(null)
+  // Opening moves the focus into the view, onto the way out of it.
+  useEffect(() => {
+    backRef.current?.focus()
+  }, [])
   return (
-    <div role="dialog" aria-label="Torrent" className="fixed inset-0 z-30 flex flex-col bg-canvas">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Torrent"
+      className="fixed inset-0 z-30 flex flex-col bg-canvas"
+    >
       <div className="flex shrink-0 items-center gap-2 border-b border-rule px-2 py-1">
         <button
+          ref={backRef}
           type="button"
           aria-label="Back"
           onClick={onBack}
@@ -91,8 +115,14 @@ export default function TorrentFullView({
           moving={moving}
           onMoving={onMoving}
           onError={onError}
+          onDone={onDone}
         />
       </div>
+      {error !== null && (
+        <div className="shrink-0 px-3 pt-2">
+          <Banner tone="danger">{error}</Banner>
+        </div>
+      )}
       <div className="flex min-h-0 flex-1 flex-col">
         <DetailPane
           id={torrent.id}
