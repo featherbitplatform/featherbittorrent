@@ -39,6 +39,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import AddTorrent from '../components/AddTorrent'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
+import TorrentActions from '../components/TorrentActions'
 import ConfirmDelete from '../components/ConfirmDelete'
 import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
@@ -227,6 +228,17 @@ export default function Torrents({
       >
         Remove
       </Button>
+      {selectedRow !== null && (
+        <TorrentActions
+          key={selectedRow.id}
+          torrent={selectedRow}
+          client={client}
+          onError={(why) => {
+            setActionError(why)
+            announcePolite(why)
+          }}
+        />
+      )}
     </>
   )
 
