@@ -71,9 +71,11 @@ pub struct Instance {
 #[derive(Debug, Error)]
 pub enum InstanceError {
     /// The address is not one this client can dial: not http or https, no host to reach, or something
-    /// after the host that a connection would have to guess about.
+    /// after the host that a connection would have to guess about. The typed text is shown in its
+    /// quoted, escaped spelling - `{:?}` - because what a person pasted can hold a newline, and this
+    /// message is shown as one line on the Add page.
     #[error(
-        "{given} is not an address this app can dial: http or https to a host, with no user or \
+        "{given:?} is not an address this app can dial: http or https to a host, with no user or \
          password, no path and no query"
     )]
     NotAnAddress {
@@ -310,7 +312,8 @@ mod tests {
 
     /// The addresses this client cannot dial, and therefore has no business saving: they are read by the
     /// same parser `reqwest` dials with, so refusing them here is exactly the set of spellings a
-    /// connection would fail on later.
+    /// connection would fail on later. What the message quotes back is the typed text in its escaped
+    /// spelling, so a newline pasted into an address cannot push the message onto a second line.
     #[test]
     fn add_refuses_bad_urls() {
         let mut settings = DesktopSettings::default();
@@ -320,6 +323,7 @@ mod tests {
             "http://u:p@h",
             "http://h/path",
             "http://h/?q",
+            "http://h\n/x",
             "",
         ] {
             let problem = settings
@@ -335,7 +339,10 @@ mod tests {
                 1,
                 "the Add page shows one line: {line}"
             );
-            assert!(line.contains(given), "{given:?} is named in: {line}");
+            assert!(
+                line.contains(&format!("{given:?}")),
+                "{given:?} is named in: {line}"
+            );
         }
         assert!(
             settings.instances.is_empty(),

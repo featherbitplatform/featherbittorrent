@@ -829,6 +829,14 @@ struct ErrorDetail {
 ///
 /// On the desktop app's own engine that serves nobody else, the login routes are not mounted at all: the
 /// launch secret is the only credential there, so no session can be asked for and those paths answer `404`.
+///
+/// And no route may be added here - or on fbt-api's router - that catches what every other route missed
+/// (`Router::fallback`, a `/{*rest}` nest) while that mode stands: its auth accepts a request that matched
+/// no route without asking for any credential (`FbttAuth`'s `matched_path.is_none()` shortcut in
+/// `crate::auth`), and that is safe only because an unmatched path really has nothing behind it and gets
+/// the empty `404` it is shown. A fallback would make every guessed path answer something to a request
+/// that never presented the secret; `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs`
+/// is what notices if one appears.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
     // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
