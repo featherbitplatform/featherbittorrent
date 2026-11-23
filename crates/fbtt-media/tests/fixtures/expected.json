@@ -1,0 +1,502 @@
+{
+  "ffmpeg_version": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "fixtures": {
+    "av1-ac3-eac3.mkv": {
+      "container": "matroska",
+      "duration_ms": 4000,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102"
+      },
+      "tracks": [
+        {
+          "codec_name": "av1",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "ac3",
+          "default": true,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 125,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "eac3",
+          "default": false,
+          "expect_id": 3,
+          "ffprobe_index": 2,
+          "forced": false,
+          "frame_count": 125,
+          "kind": "audio",
+          "language": null,
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    },
+    "h264-aac-moovlast.mp4": {
+      "boxes": [
+        {
+          "kind": "ftyp",
+          "offset": 0,
+          "size": 32
+        },
+        {
+          "kind": "free",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "kind": "mdat",
+          "offset": 40,
+          "size": 38960
+        },
+        {
+          "kind": "moov",
+          "offset": 39000,
+          "size": 3161
+        }
+      ],
+      "container": "mp4",
+      "duration_ms": 4000,
+      "ffprobe_format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "format_tags": {
+        "compatible_brands": "isomiso2avc1mp41",
+        "encoder": "Lavf63.1.102",
+        "major_brand": "isom",
+        "minor_version": "512"
+      },
+      "tracks": [
+        {
+          "codec_name": "h264",
+          "default": true,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "aac",
+          "default": true,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 188,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    },
+    "h264-aac-opus-srt-ass.mkv": {
+      "container": "matroska",
+      "duration_ms": 4021,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102",
+        "title": "Multi track Matroska fixture"
+      },
+      "tracks": [
+        {
+          "codec_name": "h264",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": "Main video"
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "aac",
+          "default": true,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 188,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": "English commentary"
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "opus",
+          "default": false,
+          "expect_id": 3,
+          "ffprobe_index": 2,
+          "forced": false,
+          "frame_count": 201,
+          "kind": "audio",
+          "language": "ita",
+          "sample_rate": 48000,
+          "title": "Italian commentary"
+        },
+        {
+          "codec_name": "subrip",
+          "cues": [
+            {
+              "end_ms": 2000,
+              "start_ms": 500
+            },
+            {
+              "end_ms": 3000,
+              "start_ms": 2500
+            },
+            {
+              "end_ms": 3900,
+              "start_ms": 3200
+            }
+          ],
+          "default": true,
+          "expect_id": 4,
+          "ffprobe_index": 3,
+          "forced": false,
+          "frame_count": 3,
+          "kind": "subtitle",
+          "language": "eng",
+          "title": "English subtitles"
+        },
+        {
+          "codec_name": "ass",
+          "cues": [
+            {
+              "end_ms": 2000,
+              "start_ms": 500
+            },
+            {
+              "end_ms": 3000,
+              "start_ms": 2500
+            },
+            {
+              "end_ms": 3900,
+              "start_ms": 3200
+            }
+          ],
+          "default": false,
+          "expect_id": 5,
+          "ffprobe_index": 4,
+          "forced": false,
+          "frame_count": 3,
+          "kind": "subtitle",
+          "language": "ita",
+          "title": "Italian subtitles"
+        }
+      ]
+    },
+    "h264-aac2-movtext.mp4": {
+      "boxes": [
+        {
+          "kind": "ftyp",
+          "offset": 0,
+          "size": 32
+        },
+        {
+          "kind": "moov",
+          "offset": 32,
+          "size": 6138
+        },
+        {
+          "kind": "free",
+          "offset": 6170,
+          "size": 8
+        },
+        {
+          "kind": "mdat",
+          "offset": 6178,
+          "size": 51130
+        }
+      ],
+      "container": "mp4",
+      "duration_ms": 4000,
+      "ffprobe_format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "format_tags": {
+        "compatible_brands": "isomiso2avc1mp41",
+        "encoder": "Lavf63.1.102",
+        "major_brand": "isom",
+        "minor_version": "512"
+      },
+      "tracks": [
+        {
+          "codec_name": "h264",
+          "default": true,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "aac",
+          "default": true,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 188,
+          "kind": "audio",
+          "language": null,
+          "sample_rate": 48000,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "aac",
+          "default": false,
+          "expect_id": 3,
+          "ffprobe_index": 2,
+          "forced": false,
+          "frame_count": 188,
+          "kind": "audio",
+          "language": "ita",
+          "sample_rate": 48000,
+          "title": null
+        },
+        {
+          "codec_name": "mov_text",
+          "cues": [
+            {
+              "end_ms": 2000,
+              "start_ms": 500
+            },
+            {
+              "end_ms": 3000,
+              "start_ms": 2500
+            },
+            {
+              "end_ms": 3900,
+              "start_ms": 3200
+            }
+          ],
+          "default": true,
+          "expect_id": 4,
+          "ffprobe_index": 3,
+          "forced": false,
+          "frame_count": 3,
+          "kind": "subtitle",
+          "language": "eng",
+          "title": null
+        }
+      ]
+    },
+    "h264-live-nocues.mkv": {
+      "container": "matroska",
+      "duration_ms": null,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102"
+      },
+      "tracks": [
+        {
+          "codec_name": "h264",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "aac",
+          "default": false,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 188,
+          "kind": "audio",
+          "language": null,
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    },
+    "h264-mp3.mkv": {
+      "container": "matroska",
+      "duration_ms": 4023,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102"
+      },
+      "tracks": [
+        {
+          "codec_name": "h264",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "mp3",
+          "default": false,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 168,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    },
+    "hevc-flac.mkv": {
+      "container": "matroska",
+      "duration_ms": 4000,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102"
+      },
+      "tracks": [
+        {
+          "codec_name": "hevc",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "flac",
+          "default": false,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 175,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    },
+    "vp9-opus.webm": {
+      "container": "webm",
+      "duration_ms": 4008,
+      "ffprobe_format_name": "matroska,webm",
+      "format_tags": {
+        "ENCODER": "Lavf63.1.102"
+      },
+      "tracks": [
+        {
+          "codec_name": "vp9",
+          "default": false,
+          "expect_id": 1,
+          "ffprobe_index": 0,
+          "forced": false,
+          "frame_count": 40,
+          "keyframe_pts_ms": [
+            0,
+            1000,
+            2000,
+            3000
+          ],
+          "kind": "video",
+          "language": null,
+          "title": null
+        },
+        {
+          "channel_layout": "mono",
+          "channels": 1,
+          "codec_name": "opus",
+          "default": false,
+          "expect_id": 2,
+          "ffprobe_index": 1,
+          "forced": false,
+          "frame_count": 201,
+          "kind": "audio",
+          "language": "eng",
+          "sample_rate": 48000,
+          "title": null
+        }
+      ]
+    }
+  },
+  "note": "written by dev/make-media-fixtures.sh; rerun the script instead of editing"
+}

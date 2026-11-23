@@ -157,8 +157,9 @@ fn subject_of(shared: &Shared, headers: &HeaderMap) -> String {
 
 /// A torrent id as fbt-api's own routes read one: 40 hex digits are a wire hash, 64 a v2 hash, in either
 /// case. Anything else gets the code and words fbt-api uses for it, so one client parse handles both sets of
-/// routes.
-fn parse_id(id: &str) -> Result<InfoHashes, RouteError> {
+/// routes - which is why [`media`](super::media) takes its ids through here too rather than spelling the
+/// same rule a second time.
+pub(super) fn parse_id(id: &str) -> Result<InfoHashes, RouteError> {
     let bad = || {
         RouteError::new(
             StatusCode::BAD_REQUEST,
@@ -181,7 +182,7 @@ fn parse_id(id: &str) -> Result<InfoHashes, RouteError> {
 
 /// `409 no_metadata`: the answer fbt-api's own routes give a torrent whose metadata has not arrived, spelled
 /// with its code so that one client handles "add it", "ask for an address" and "stream it".
-fn no_metadata() -> RouteError {
+pub(super) fn no_metadata() -> RouteError {
     RouteError::new(
         StatusCode::CONFLICT,
         "no_metadata",

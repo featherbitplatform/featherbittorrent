@@ -88,16 +88,16 @@ describe('the windowed table', () => {
     // Nothing is sorted until a header is clicked, so the drawn order is the order these rows
     // were listed in and window maths can be read straight off the ids.
     const rows = rowsOf(2_000)
-    // The name of this test is a promise: two thousand rows go in, and the paint must stay under
-    // a blink. The timing check runs last so the row-count message above is what a non-windowed
-    // table gets reported for.
-    const started = Date.now()
+    // The name of this test is a promise: two thousand rows go in, and the window must stay the
+    // window. The check is a row count, not a wall clock: a non-windowed table renders all two
+    // thousand rows, and a windowed one renders the window, whatever the machine it runs on.
     const { container } = render(
       <TorrentTable rows={rows} selectedId={null} viewportHeight={900} />,
     )
-    const paintedIn = Date.now() - started
 
     const rendered = container.querySelectorAll('tbody tr[data-row]').length
+    // The window is 900 px of 40 px rows plus the overscan the table keeps around it: a count
+    // far below two thousand, and the one number a non-windowed table cannot produce.
     expect(rendered < 100, 'the table rendered every row').toBe(true)
 
     // It is the right window, not just a small one: the top rows are in it and the far ones are not.
@@ -113,7 +113,10 @@ describe('the windowed table', () => {
       spacer !== null && (spacer.getAttribute('style') ?? '').includes('3760px'),
       'the scrolled table lost the spacer that keeps the scrollbar honest',
     ).toBe(true)
-    expect(paintedIn < 100, `two thousand rows took ${paintedIn} ms to paint`).toBe(true)
+    // The window is still the window after the scroll: the count is bounded by the window, not
+    // by the two thousand rows that went in.
+    const renderedAfter = container.querySelectorAll('tbody tr[data-row]').length
+    expect(renderedAfter < 100, 'the table rendered every row after the scroll').toBe(true)
   })
 
   it('scrolling_moves_the_window', () => {

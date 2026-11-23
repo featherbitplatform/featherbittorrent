@@ -295,3 +295,86 @@ it('encodes_path_segments_and_query_values', async () => {
   await client.roots()
   expect(last().url, 'the roots call went somewhere else').toBe('/api/v1/fs/roots')
 })
+
+it('the_media_calls_ask_where_the_routes_answer', async () => {
+  const { seen, fetchFn } = record((call) =>
+    call.method === 'POST'
+      ? json(201, '{"path":"/api/v1/torrents/a1/files/0/stream?token=t","expires_in":60}')
+      : json(200, '{"cues":[{"start_ms":0,"end_ms":1000,"text":"hi"}]}'),
+  )
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {})
+  const last = (): Seen => {
+    const call = seen[seen.length - 1]
+    if (!call) throw new Error('no call was made')
+    return call
+  }
+
+  await client.probe(ID, 2)
+  expect(last().url, 'the probe did not ask the media route').toBe(`/api/v1/media/${ID}/2`)
+  expect(last().headers.has('x-csrf-token'), 'a probe, a read, carried the token a read has no business sending').toBe(false)
+
+  await client.cues(ID, 2, 4, 1000, 61000)
+  expect(last().url, 'the cue window was not asked with its bounds encoded').toBe(
+    `/api/v1/media/${ID}/2/tracks/4/cues?from_ms=1000&to_ms=61000`,
+  )
+
+  await client.subtitleFile(ID, 2, 7)
+  expect(last().url, 'the subtitle file was not asked by its index').toBe(`/api/v1/media/${ID}/2/subtitles/7`)
+
+  expect(client.mediaStreamUrl(ID, 2, 1, 2000), 'the stream url was not the route the stream answers on').toBe(
+    `/api/v1/media/${ID}/2/tracks/1/stream?start_ms=2000`,
+  )
+
+  const token = await client.streamToken(ID, 0)
+  expect(token, 'the stream token call returned the path the answer names').toBe(
+    '/api/v1/torrents/a1/files/0/stream?token=t',
+  )
+  const tokenCall = last()
+  expect(tokenCall.url, 'the token was not asked at the token route').toBe('/api/v1/stream-tokens')
+  expect(tokenCall.method, 'the token was not asked with a POST').toBe('POST')
+  expect(tokenCall.headers.get('x-csrf-token'), 'the token request did not carry the CSRF token').toBe('csrf-value')
+  expect(tokenCall.headers.get('content-type'), 'the token request did not say it was JSON').toBe('application/json')
+  expect(JSON.parse(String(tokenCall.body)), 'the token body was not the shape the route takes').toEqual({
+    torrent: ID,
+    file: 0,
+  })
+})
+
+it('sends_whole_non_negative_milliseconds', async () => {
+  const { seen, fetchFn } = record(() => json(200, '{"cues":[]}'))
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {})
+  const last = (): Seen => {
+    const call = seen[seen.length - 1]
+    if (!call) throw new Error('no call was made')
+    return call
+  }
+
+  await client.cues(ID, 2, 4, -5, 61000.9)
+  expect(last().url, 'a cue bound was not sent as a whole non-negative millisecond').toBe(
+    `/api/v1/media/${ID}/2/tracks/4/cues?from_ms=0&to_ms=61000`,
+  )
+
+  expect(
+    client.mediaStreamUrl(ID, 2, 1, -3.7),
+    'a negative stream start was not clamped to the first millisecond',
+  ).toBe(`/api/v1/media/${ID}/2/tracks/1/stream?start_ms=0`)
+  expect(
+    client.mediaStreamUrl(ID, 2, 1, 2000.4),
+    'a fractional stream start was not sent whole',
+  ).toBe(`/api/v1/media/${ID}/2/tracks/1/stream?start_ms=2000`)
+  expect(
+    client.mediaStreamUrl(ID, 2, 1, Number.NaN),
+    'a non-finite stream start was not sent as a number the route would refuse',
+  ).toBe(`/api/v1/media/${ID}/2/tracks/1/stream?start_ms=0`)
+})
+
+it('a_stream_token_answer_without_a_path_is_an_error', async () => {
+  const { fetchFn } = record((call) =>
+    call.method === 'POST' ? json(201, '{"expires_in":60}') : json(200, '[]'),
+  )
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {})
+  await expect(
+    client.streamToken(ID, 0),
+    'a token answer without a path was not a failure the caller could see',
+  ).rejects.toThrow()
+})

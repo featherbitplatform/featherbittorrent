@@ -39,11 +39,12 @@ export interface ModalDialog {
 }
 
 /**
- * Everything a Tab key can land on, in the order the keyboard reaches them. Exported because
+ * Everything a Tab key can land on, in the order the keyboard reaches them, a media element with
+ * its own controls included (a browser puts it in the tab order). Exported because
  * `dialog-shim` has to answer `showModal()` with the same element a browser would have focused.
  */
 export const FOCUSABLE_SELECTOR =
-  'a[href], area, button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), iframe, object, embed, [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
+  'a[href], area, button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), iframe, object, embed, audio[controls], video[controls], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
 
 function focusableWithin(root: HTMLDialogElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))

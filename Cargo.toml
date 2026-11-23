@@ -31,6 +31,8 @@ fbtt-core = { path = "crates/fbtt-core" }
 fbtt-tui = { path = "crates/fbtt-tui" }
 # Joins the table now that the binary depends on it for `serve`.
 fbtt-server = { path = "crates/fbtt-server" }
+# Joins the table now that the server's media routes read a file through it.
+fbtt-media = { path = "crates/fbtt-media" }
 clap = { version = "4.6", features = ["derive"] }
 # The man pages and shell completions the packages install, written by the hidden `generate-assets`
 # subcommand from the same `Command` that prints `--help`, so they cannot drift from the flags.
@@ -179,3 +181,12 @@ crossterm_winapi = "0.9.1"
 rust-embed = { version = "8.14", default-features = false }
 mime_guess = "2.0"
 subtle = "2.6"
+# The media player (plan 2026-11-21-web-ui-milestone-2-media-player): `matroska-demuxer` reads Matroska
+# and WebM (Zlib OR MIT OR Apache-2.0, and `#![forbid(unsafe_code)]` like every crate here), `mp4-atom`
+# is the box codec `fbtt-media` reads MP4 with and writes its fragmented MP4 with (MIT OR Apache-2.0).
+# Neither decodes nor transcodes anything: both are container codecs, which is what "no native
+# libraries" (plan Global Constraints) asks for. The `matroska-demuxer` pin is the owner's fork,
+# which fixes seeking with `CueRelativePosition` and adds overflow checks on hostile cue, block
+# and timestamp values.
+matroska-demuxer = { git = "https://github.com/featherbitplatform/matroska-demuxer", tag = "v0.8.1+featherbit.1" }
+mp4-atom = "0.17.1"

@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fbt::{SessionError, Settings};
 use fbt_api::{ApiConfig, ApiError, ApiServer, Auth};
@@ -254,6 +255,19 @@ impl Server {
     /// The address being served on - with the real port when the config asked for `0`.
     pub fn local_addr(&self) -> SocketAddr {
         self.api.local_addr()
+    }
+
+    /// How long one read or one seek of a media route may take on this server, for every media request
+    /// that opens a file after the call.
+    ///
+    /// The default is the media routes' own bound - sixty seconds, longer than any piece of a healthy
+    /// torrent takes and far shorter than waiting forever for one - and nothing in `config.yaml` sets it,
+    /// because it is not a preference about a library: it is how long a request is willing to wait on a
+    /// peer for somebody else's piece. A test that wants to watch a stream give up, or a run behind a
+    /// tracker that has gone quiet, is what changes it. A media stream already playing keeps the window it
+    /// started with, because a media route takes its deadline once, when it opens the file.
+    pub fn set_media_read_timeout(&self, timeout: Duration) {
+        self.shared.set_media_read_timeout(timeout);
     }
 
     /// How many Argon2 password checks this server has run. Only a test reads this: the one that says an

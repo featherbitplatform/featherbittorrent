@@ -17,18 +17,19 @@ mod devices;
 // [`Root`]s before fbt-api is handed any of them, and it has to name the type to do that.
 pub(crate) mod fs;
 mod login;
+mod media;
 mod stream;
 mod web_session;
 
 use std::collections::BTreeMap;
 use std::io;
-// Only the test-support counters and the hold they update need these; the fields they belong to exist only
-// with that feature too.
-#[cfg(feature = "test-support")]
+// The media read timeout's own field needs these, and so do the test-support counters and the hold they
+// update: the counters' fields exist only with that feature, the timeout's exist always.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "test-support")]
 use std::sync::{Condvar, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -125,6 +126,26 @@ pub(crate) struct Shared {
     /// [`VerifyTally`] for why both the permit and this have to travel with the work rather than with the
     /// request, and [`login::verify_password`] for the check that does it.
     verify_tally: Arc<VerifyTally>,
+    /// How many of the media routes may run at once, across all four of them: [`media::MEDIA_PERMITS`].
+    ///
+    /// Every media request is a thread on the blocking pool holding a container demuxer, a file reader and
+    /// the read-ahead the engine keeps warm for it, which is nothing the login limiter bounds and only
+    /// partly what the engine's own bound of readers per torrent bounds. The same reason [`Self`] carries
+    /// `verify_permits` is the reason for this one: the pool will start as many threads as it is asked to,
+    /// and the cost of a media request is not the handler's but the job's. An `Arc` for the same reason
+    /// again - the stream route's permit has to outlive its handler, because it is the job that plays the
+    /// file ([`media`]).
+    media_permits: Arc<tokio::sync::Semaphore>,
+    /// How long one read or one seek of a media route may take, in milliseconds: [`media::READ_TIMEOUT`]
+    /// until [`Server::set_media_read_timeout`](crate::Server) says otherwise.
+    ///
+    /// Milliseconds in an `AtomicU64` rather than a `Mutex<Duration>` because the two things that touch it
+    /// have no reason to wait for one another: a handler reads it once, when it builds its reader, and a
+    /// test or an operator writes it whenever they want the next request to give up sooner. A media route
+    /// takes its deadline when it opens the file and keeps it for the life of that reader, which is the
+    /// honest meaning of "changing the timeout": requests already playing finish on the window they started
+    /// with.
+    media_read_ms: AtomicU64,
 }
 
 impl Shared {
@@ -158,6 +179,8 @@ impl Shared {
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             verify_tally: Arc::new(VerifyTally::new()),
+            media_permits: Arc::new(tokio::sync::Semaphore::new(media::MEDIA_PERMITS)),
+            media_read_ms: AtomicU64::new(media::READ_TIMEOUT.as_millis() as u64),
         }
     }
 
@@ -173,6 +196,34 @@ impl Shared {
     /// torrents exist.
     pub(crate) fn session(&self) -> &fbt::Session {
         &self.session
+    }
+
+    /// The pool the media routes take a place from before they start demuxing: `media`'s `media_permit` is
+    /// what asks it for one.
+    ///
+    /// An `Arc` clone rather than a borrow: the stream route hands its permit to the blocking job that
+    /// writes its response, and that job outlives the handler that started it, so the permit cannot be
+    /// borrowing anything the handler owns ([`media`]).
+    pub(crate) fn media_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.media_permits)
+    }
+
+    /// How long one read or one seek of a media route may take: [`media::READ_TIMEOUT`] until
+    /// [`set_media_read_timeout`](Self::set_media_read_timeout) says otherwise. A media route asks once, when
+    /// it opens its reader, and keeps that answer for the whole request.
+    pub(crate) fn media_read_timeout(&self) -> Duration {
+        Duration::from_millis(self.media_read_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets that window, for every media request that opens a file from now on.
+    ///
+    /// Nothing in a normal run changes it; the reason it is not a config key is that the window is not a
+    /// preference about a library, it is about how long a request is willing to wait on a peer, and a test
+    /// that wants to watch a stream give up cannot afford a minute per attempt. A request already playing
+    /// keeps the window it started with ([`Self::media_read_timeout`]).
+    pub(crate) fn set_media_read_timeout(&self, timeout: Duration) {
+        let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.media_read_ms.store(millis, Ordering::Relaxed);
     }
 
     /// The device named by `fingerprint`: the name to give a successful login, and the public key from
@@ -811,6 +862,23 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/api/v1/stream-tokens",
             post(stream::issue).layer(DefaultBodyLimit::max(stream::MAX_TOKEN_BODY)),
+        )
+        // The media routes: what a torrent's file is, one track of it as fragmented MP4, when a subtitle
+        // track of it says what, and the cue list of a subtitle file of the same torrent. All four read the
+        // file through fbtt-media from the blocking pool, and all four take a place in the media pool
+        // before they touch the engine ([`media`]).
+        .route("/api/v1/media/{torrent}/{file}", get(media::probe))
+        .route(
+            "/api/v1/media/{torrent}/{file}/tracks/{track}/stream",
+            get(media::track_stream),
+        )
+        .route(
+            "/api/v1/media/{torrent}/{file}/tracks/{track}/cues",
+            get(media::track_cues),
+        )
+        .route(
+            "/api/v1/media/{torrent}/{file}/subtitles/{sub}",
+            get(media::subtitle_file),
         )
         .with_state(shared)
 }

@@ -39,6 +39,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import Files from './detail/Files'
+import Player from '../player/Player'
 import Pieces from './detail/Pieces'
 import Trackers from './detail/Trackers'
 import Peers from './detail/Peers'
@@ -122,6 +123,9 @@ export default function DetailPane({
   // sees it: the pane draws nothing for that id and reads nothing for it, while the pane lives,
   // because a torrent that is gone does not un-remove itself between one second and the next.
   const [closedId, setClosedId] = useState<string | null>(null)
+  // The file the player is open on, or nothing. The player is mounted only while it is open, the
+  // way every dialog here is, and it unmounts itself through `onClose` the way they do.
+  const [playing, setPlaying] = useState<{ file: number; name: string } | null>(null)
 
   // Which request is still current. The counter moves only when a genuinely new question is
   // asked - a new torrent, a new tab, or a new poll of a question already answered. A tick while
@@ -300,7 +304,15 @@ export default function DetailPane({
           <p className="shrink-0 px-5 py-3 text-[12px] text-muted">Loading...</p>
         )}
         {live !== null && tab === 'files' && (
-          <Files files={live.data as FileInfo[]} viewportHeight={viewportHeight} />
+          <Files
+            files={live.data as FileInfo[]}
+            viewportHeight={viewportHeight}
+            id={id}
+            onPlay={(index) => {
+              const file = (live.data as FileInfo[]).find((entry) => entry.index === index)
+              if (file !== undefined) setPlaying({ file: index, name: file.path })
+            }}
+          />
         )}
         {live !== null && tab === 'peers' && (
           <Peers peers={live.data as PeerInfo[]} viewportHeight={viewportHeight} />
@@ -310,6 +322,19 @@ export default function DetailPane({
         )}
         {live !== null && tab === 'pieces' && <Pieces pieces={live.data as PiecesInfo} />}
       </div>
+
+      {playing !== null && (
+        <Player
+          key={`${id}:${playing.file}`}
+          id={id}
+          file={playing.file}
+          name={playing.name}
+          client={client}
+          onClose={() => {
+            setPlaying(null)
+          }}
+        />
+      )}
     </section>
   )
 }
