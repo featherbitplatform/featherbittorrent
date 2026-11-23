@@ -21,6 +21,7 @@ import {
   makeVideoSeekable,
 } from './testing'
 import { FOCUSABLE_SELECTOR } from '../modal'
+import { KEY_BINDINGS } from '../keys'
 
 
 installDialogShim()
@@ -687,6 +688,27 @@ describe('the player', () => {
       'Escape did not reach the dialog close handler and prevent the element closing itself',
     ).toBe(true)
     expect(closeCalls === 1, 'Escape did not close through onClose').toBe(true)
+  })
+
+  it("every handler's key is in the list: player", async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const dialog = container.querySelector('dialog') as HTMLDialogElement
+    makeVideoPlayable(container.querySelector('video') as HTMLVideoElement)
+    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Player')) {
+      for (const key of binding.keys) {
+        const left = fireEvent.keyDown(dialog, { key })
+        expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the player`).toBe(true)
+        await settle()
+      }
+    }
+    // A key the list does not give the player is left alone.
+    expect(fireEvent.keyDown(dialog, { key: 'q' }), 'the player took a key that is not in the list').toBe(true)
   })
 
   it('closing the audio menu keeps the subtitle menu open', async () => {

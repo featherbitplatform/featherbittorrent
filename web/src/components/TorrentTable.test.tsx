@@ -6,6 +6,7 @@ import TorrentTable from './TorrentTable'
 import Torrents from '../screens/Torrents'
 import type { Api, TorrentInfo } from '../api/client'
 import type { RowState, TorrentRow } from '../live'
+import { KEY_BINDINGS } from '../keys'
 
 afterEach(cleanup)
 
@@ -307,6 +308,18 @@ describe('the keyboard', () => {
       container.querySelector('[data-row="t1"][aria-selected="true"]') !== null,
       'Space on a row did not select it',
     ).toBe(true)
+  })
+
+  it("every handler's key is in the list: torrent list", () => {
+    const { container } = render(<PickingTable rows={rowsOf(5)} initial={'t2'} />)
+    const row = container.querySelector('[data-row="t2"]') as HTMLElement
+    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Torrent list')) {
+      for (const key of binding.keys) {
+        const left = fireEvent.keyDown(row, { key })
+        expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the list`).toBe(true)
+      }
+    }
+    expect(fireEvent.keyDown(row, { key: 'q' }), 'the list took a key that is not in the list').toBe(true)
   })
 
   it('the_selected_row_marks_its_edge_once', () => {

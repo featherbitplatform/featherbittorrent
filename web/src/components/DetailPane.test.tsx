@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import DetailPane from './DetailPane'
 import Torrents from '../screens/Torrents'
 import { ApiError } from '../api/client'
+import { KEY_BINDINGS } from '../keys'
 import type { Api, FileInfo, PeerInfo, PiecesInfo, TorrentInfo, TrackerInfo } from '../api/client'
 
 afterEach(cleanup)
@@ -604,6 +605,21 @@ describe('the pieces tab', () => {
 })
 
 describe('the tabs on the keyboard', () => {
+  it("every handler's key is in the list: detail tabs", async () => {
+    const { client } = spyClient({})
+    render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Detail tabs')) {
+      for (const key of binding.keys) {
+        const tab = screen.getAllByRole('tab')[1] as HTMLElement
+        const left = fireEvent.keyDown(tab, { key })
+        expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the tabs`).toBe(true)
+      }
+    }
+    const tab = screen.getAllByRole('tab')[0] as HTMLElement
+    expect(fireEvent.keyDown(tab, { key: 'q' }), 'the tabs took a key that is not in the list').toBe(true)
+  })
+
   it('tabs_follow_the_arrow_keys', async () => {
     const { client } = spyClient({})
     render(<DetailPane id="a" client={client} tick={0} />)

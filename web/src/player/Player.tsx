@@ -31,6 +31,7 @@ import {
 import { api } from '../api/client'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe } from '../format'
+import { matches } from '../keys'
 import { useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
 import { createEngine } from './engine'
@@ -825,46 +826,34 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     ) {
       return
     }
-    switch (event.key) {
-      case ' ':
-      case 'k':
-        event.preventDefault()
-        togglePlay()
-        return
-      case 'ArrowLeft':
-        event.preventDefault()
-        nudge(-SEEK_STEP)
-        return
-      case 'ArrowRight':
-        event.preventDefault()
-        nudge(SEEK_STEP)
-        return
-      case 'ArrowUp':
-        event.preventDefault()
-        nudgeVolume(VOLUME_STEP)
-        return
-      case 'ArrowDown':
-        event.preventDefault()
-        nudgeVolume(-VOLUME_STEP)
-        return
-      case 'f':
-        event.preventDefault()
-        toggleFullscreen()
-        return
-      case 'm':
-        event.preventDefault()
-        if (videoRef.current !== null) videoRef.current.muted = !videoRef.current.muted
-        return
-      case 'a':
-        event.preventDefault()
-        nextAudio()
-        return
-      case 'c':
-        event.preventDefault()
-        nextSubtitle()
-        return
-      default:
-        return
+    const is = (action: string): boolean => matches('Player', action, event)
+    if (is('Play or pause')) {
+      event.preventDefault()
+      togglePlay()
+    } else if (is('Seek back')) {
+      event.preventDefault()
+      nudge(-SEEK_STEP)
+    } else if (is('Seek forward')) {
+      event.preventDefault()
+      nudge(SEEK_STEP)
+    } else if (is('Volume up')) {
+      event.preventDefault()
+      nudgeVolume(VOLUME_STEP)
+    } else if (is('Volume down')) {
+      event.preventDefault()
+      nudgeVolume(-VOLUME_STEP)
+    } else if (is('Full screen')) {
+      event.preventDefault()
+      toggleFullscreen()
+    } else if (is('Mute or unmute')) {
+      event.preventDefault()
+      if (videoRef.current !== null) videoRef.current.muted = !videoRef.current.muted
+    } else if (is('Next audio track')) {
+      event.preventDefault()
+      nextAudio()
+    } else if (is('Next subtitle track')) {
+      event.preventDefault()
+      nextSubtitle()
     }
   }
 
