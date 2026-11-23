@@ -5,5 +5,14 @@
  * @module desktop
  */
 export { DesktopRoot } from './DesktopRoot'
-export { connect, desktopInfo, inDesktop, LOCAL_ID } from './bridge'
+export { DesktopChrome, TitleBar } from './TitleBar'
+export {
+  connect,
+  desktopInfo,
+  inDesktop,
+  LOCAL_ID,
+  onSystemTitleBar,
+  setSystemTitleBar,
+  systemTitleBar,
+} from './bridge'
 export type { DesktopInfo } from './bridge'

@@ -9,6 +9,9 @@
  * @module desktop/bridge
  */
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import type { Window } from '@tauri-apps/api/window'
 import { normaliseBase } from '../endpoint'
 import type { Endpoint } from '../endpoint'
 
@@ -46,4 +49,24 @@ export async function connect(id: string): Promise<Endpoint> {
 /** The app's version and platform. */
 export async function desktopInfo(): Promise<DesktopInfo> {
   return invoke<DesktopInfo>('desktop_info')
+}
+
+/** Whether the page draws a bare toolbar under the system's title bar rather than its own bar with window controls. Only on Linux. */
+export async function systemTitleBar(): Promise<boolean> {
+  return invoke<boolean>('system_title_bar')
+}
+
+/** Saves the "Use the system title bar" setting and puts the matching chrome on the window; answers what {@link systemTitleBar} now answers. On Windows and macOS it does nothing and answers `false`. */
+export async function setSystemTitleBar(on: boolean): Promise<boolean> {
+  return invoke<boolean>('set_system_title_bar', { on })
+}
+
+/** Calls `changed` whenever the shell switches the title bar; resolves to the function that stops listening. */
+export async function onSystemTitleBar(changed: (system: boolean) => void): Promise<() => void> {
+  return listen<boolean>('system-title-bar', (event) => changed(event.payload))
+}
+
+/** The window this page is in, for the title bar's own controls. */
+export function currentWindow(): Window {
+  return getCurrentWindow()
 }

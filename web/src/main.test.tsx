@@ -32,10 +32,17 @@ it('renders_the_desktop_page_when_the_chunk_loads', async () => {
   const { container, root } = blankWindow()
 
   await act(async () => {
-    await renderDesktop(root, async () => ({ DesktopRoot: () => <div>the desktop page</div> }))
+    await renderDesktop(root, async () => ({
+      DesktopChrome: ({ children }) => <section data-testid="frame">{children}</section>,
+      DesktopRoot: () => <div>the desktop page</div>,
+    }))
   })
 
   expect(container.textContent, 'a desktop chunk that loaded was not rendered').toBe('the desktop page')
+  expect(
+    container.querySelector('[data-testid="frame"]')?.textContent,
+    'the desktop page was not rendered inside the window frame',
+  ).toBe('the desktop page')
   act(() => {
     root.unmount()
   })

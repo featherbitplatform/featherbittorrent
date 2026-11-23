@@ -10,11 +10,12 @@
 
 mod commands;
 mod local;
+mod window;
 
 use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
 use tauri::{Manager, RunEvent};
 
-use crate::commands::DesktopState;
+use crate::commands::{DesktopState, Platform};
 
 /// The exit code for anything else that stops the app before its window opens.
 const EXIT_PROBLEM: i32 = 1;
@@ -51,9 +52,15 @@ fn main() {
 
     let app = tauri::Builder::default()
         .manage(DesktopState::new(this_computer))
+        .manage(window::ChromeState::new(
+            paths.settings_file(),
+            settings.system_title_bar,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
-            commands::connect
+            commands::connect,
+            window::system_title_bar,
+            window::set_system_title_bar
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -63,7 +70,17 @@ fn main() {
             )
         });
 
-    app.run(|handle, event| {
+    let system_title_bar = settings.system_title_bar;
+    app.run(move |handle, event| {
+        // The config's windows exist from `Ready` on. The title bar's decorations must go on before the
+        // window is first shown: when the app gets its single setup function, this is its first step,
+        // ahead of any `show()` (`Builder::setup` replaces, never chains, so it cannot be a second one).
+        if let RunEvent::Ready = event {
+            match handle.get_webview_window("main") {
+                Some(main) => window::apply_chrome(&main, Platform::current(), system_title_bar),
+                None => eprintln!("The main window was not there to put its title bar on."),
+            }
+        }
         if let RunEvent::Exit = event
             && let Some(this_computer) = handle.state::<DesktopState>().take()
         {

@@ -13,7 +13,7 @@
  * @module main
  */
 import { StrictMode } from 'react'
-import type { ComponentType } from 'react'
+import type { ComponentType, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import './theme.css'
@@ -29,13 +29,18 @@ const DESKTOP_LOAD_FAILED = 'The desktop part of the page did not load. Restart 
  */
 export async function renderDesktop(
   root: Root,
-  load: () => Promise<{ DesktopRoot: ComponentType }> = () => import('./desktop'),
+  load: () => Promise<{
+    DesktopChrome: ComponentType<{ children: ReactNode }>
+    DesktopRoot: ComponentType
+  }> = () => import('./desktop'),
 ): Promise<void> {
   try {
-    const { DesktopRoot } = await load()
+    const { DesktopChrome, DesktopRoot } = await load()
     root.render(
       <StrictMode>
-        <DesktopRoot />
+        <DesktopChrome>
+          <DesktopRoot />
+        </DesktopChrome>
       </StrictMode>,
     )
   } catch (problem) {
