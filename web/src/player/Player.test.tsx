@@ -160,10 +160,9 @@ function probeClient(probe: MediaProbe = PROBE, cues: import('../api/client').Cu
   tokenCalls(): number
 } {
   let tokenCalls = 0
-  let cueCalls = 0
   const client = {
     probe: async () => probe,
-    cues: async () => { cueCalls += 1; return { cues } },
+    cues: async () => ({ cues }),
     subtitleFile: async () => ({ cues }),
     streamToken: async () => {
       tokenCalls += 1
