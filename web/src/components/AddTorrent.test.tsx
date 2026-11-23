@@ -371,11 +371,11 @@ describe('a new folder in the picker', () => {
     expect(rowPaths(container), 'the new folder was not listed').toContain('/downloads/Season 2')
   })
 
-  it('a refused name stays in the form with the reason', async () => {
+  it.each([400, 403, 404, 409])('a refused name stays in the form with the reason (%i)', async (status) => {
     const { client } = server({
       roots: ['/downloads'],
       mkdirAnswer: () =>
-        json(409, '{"error":{"code":"already_exists","message":"that folder already exists"}}'),
+        json(status, '{"error":{"code":"refused","message":"the server refused that folder"}}'),
     })
     const { container } = openDialog(client)
     await flush()
@@ -384,8 +384,50 @@ describe('a new folder in the picker', () => {
     fireEvent.click(createButton())
     await flush()
     expect(screen.queryByLabelText('Folder name') !== null, 'the form closed on a refusal').toBe(true)
-    expect(container.textContent, 'the server reason was not shown').toContain('that folder already exists')
+    expect(container.textContent, 'the server reason was not shown').toContain('the server refused that folder')
     expect(chosenPath(container), 'the folder shown changed on a refusal').toBe('/downloads')
+  })
+
+  it('enter in the folder name field creates the folder', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: 'Season 2' } })
+    fireEvent.keyDown(nameField(), { key: 'Enter' })
+    await flush()
+    expect(mkdirCalls(seen).length, 'Enter did not create exactly one folder').toBe(1)
+    expect(
+      seen.filter((call) => call.url.startsWith('/api/v1/torrents')).length,
+      'Enter added the torrent',
+    ).toBe(0)
+  })
+
+  it('the folder name is sent as typed', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: ' a ' } })
+    fireEvent.click(createButton())
+    await flush()
+    expect(mkdirCalls(seen)[0]?.body, 'the name was changed before it was sent').toBe(
+      JSON.stringify({ parent: '/downloads', name: ' a ' }),
+    )
+  })
+
+  it('escape in the folder name field closes only the field', async () => {
+    const { client } = server({ roots: ['/downloads'] })
+    const { events } = openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.keyDown(nameField(), { key: 'Escape' })
+    await flush()
+    expect(events.includes('closed'), 'Escape closed the whole dialog').toBe(false)
+    expect(screen.queryByLabelText('Folder name'), 'the field stayed open').toBeNull()
+    expect(document.activeElement, 'focus did not return to New folder').toBe(
+      screen.getByRole('button', { name: 'New folder' }),
+    )
   })
 
   it('an empty name cannot be sent', async () => {

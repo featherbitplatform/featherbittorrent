@@ -22,7 +22,7 @@
  *
  * @module components/FolderPicker
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { Folder, FolderOpen, FolderPlus } from 'lucide-react'
 import { errorMessage } from '../api/client'
@@ -211,6 +211,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   const [folderName, setFolderName] = useState('')
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  const newFolderRef = useRef<HTMLButtonElement>(null)
 
   /** Open this folder and every folder above it, so a pick is visible instead of remembered off screen. */
   const expand = useCallback((path: string): void => {
@@ -256,6 +257,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   const isOpen = (path: string): boolean => openSet.has(path)
 
   function pick(path: string): void {
+    setCreateError(null)
     if (path === value) {
       // Clicking the picked folder again closes its list: the row is the only handle on it.
       setOpenSet((current: ReadonlySet<string>) => {
@@ -276,8 +278,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
     try {
       const made = await client.mkdir(value, folderName)
       setCreateError(null)
-      setNaming(false)
-      setFolderName('')
+      closeNaming()
       setReload((count: number) => count + 1)
       expand(made)
       onPathChange(made)
@@ -288,10 +289,14 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
     }
   }
 
-  function cancelNaming(): void {
+  /** Close the inline field and hand the focus back to `New folder`, which was unmounted while it was open. */
+  function closeNaming(): void {
     setNaming(false)
     setFolderName('')
     setCreateError(null)
+    setTimeout(() => {
+      newFolderRef.current?.focus()
+    }, 0)
   }
 
   function onNameKey(event: KeyboardEvent<HTMLInputElement>): void {
@@ -299,6 +304,12 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
     if (event.key === 'Enter') {
       event.preventDefault()
       void create()
+    } else if (event.key === 'Escape') {
+      // Only the field closes: preventDefault stops the dialog's own cancel, stopPropagation stops
+      // the dialog shim's document listener, which does not look at defaultPrevented.
+      event.preventDefault()
+      event.stopPropagation()
+      closeNaming()
     }
   }
 
@@ -308,6 +319,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
         <span className="text-[13px] text-body">Save to</span>
         {!naming && (
           <Button
+            ref={newFolderRef}
             variant="secondary"
             size="sm"
             className="max-[640px]:min-h-11"
@@ -349,7 +361,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
             >
               Create
             </Button>
-            <Button variant="secondary" className="max-[640px]:min-h-11" onClick={cancelNaming}>
+            <Button variant="secondary" className="max-[640px]:min-h-11" onClick={closeNaming}>
               Cancel
             </Button>
           </div>
