@@ -705,31 +705,30 @@ describe('the player', () => {
     expect(audioButton !== undefined, 'the audio menu was not found').toBe(true)
     expect(subtitleButton !== undefined, 'the subtitle menu was not found').toBe(true)
 
-    // Open both menus: each keeps its own flag, so both are open at once.
+    const video = dialog.querySelector('video') as HTMLVideoElement
+    // Open the audio menu, then the subtitle menu: the focus moves into the subtitle choices, and
+    // the audio menu closes as the focus leaves it. Each menu keeps its own flag, so the audio
+    // menu's close, reported after the subtitle menu's open, must not clear the subtitle menu's.
     fireEvent.click(audioButton)
     await settle()
+    expect(audioButton.getAttribute('aria-expanded'), 'the audio menu was not open').toBe('true')
     fireEvent.click(subtitleButton)
     await settle()
     expect(
-      audioButton.getAttribute('aria-expanded') === 'true',
-      'the audio menu was not open',
+      audioButton.getAttribute('aria-expanded') === 'false',
+      'the audio menu stayed open when the focus moved into the subtitle menu',
     ).toBe(true)
     expect(
       subtitleButton.getAttribute('aria-expanded') === 'true',
       'the subtitle menu was not open',
     ).toBe(true)
-
-    // Close the audio menu: the subtitle menu stays open, because each menu keeps its own flag.
-    fireEvent.click(audioButton)
+    // The player's keys stay off while the subtitle menu is open: `m` does not mute.
+    fireEvent.keyDown(dialog, { key: 'm' })
     await settle()
     expect(
-      audioButton.getAttribute('aria-expanded') === 'false',
-      'the audio menu was not closed',
-    ).toBe(true)
-    expect(
-      subtitleButton.getAttribute('aria-expanded') === 'true',
-      'closing the audio menu closed the subtitle menu too: the menus share one flag',
-    ).toBe(true)
+      video.muted,
+      'closing the audio menu cleared the subtitle menu too: the menus share one flag',
+    ).toBe(false)
   })
 
   it('a seek restarts once', async () => {
@@ -2538,5 +2537,25 @@ describe('the final review fixes', () => {
     expect(recorder.callsFor('/tracks/2/stream').length, 'the metadata seek restarted the audio').toBe(1)
     engine.destroy()
     document.body.removeChild(video)
+  })
+
+  it('tabbing out of a menu closes it', async () => {
+    const { video } = await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    fireEvent.click(audio)
+    await settle()
+    const option = screen.getByRole('option', { name: 'eng' })
+    expect(document.activeElement, 'the open menu did not take the focus').toBe(option)
+    // Tab past the last choice: the focus goes on to the next control, outside the menu.
+    const next = screen.getByRole('button', { name: 'Subtitles' })
+    fireEvent.blur(option, { relatedTarget: next })
+    next.focus()
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'the menu stayed open with the focus outside it').toBe('false')
+    expect(document.activeElement, 'closing the menu took the focus back').toBe(next)
+    // The player's keys work again: `m` mutes.
+    fireEvent.keyDown(next, { key: 'm' })
+    await settle()
+    expect(video.muted, 'the keys stayed off after the menu lost the focus').toBe(true)
   })
 })

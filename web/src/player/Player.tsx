@@ -224,7 +224,18 @@ function ChoiceMenu({
   }
 
   return (
-    <div ref={wrapperRef} className="relative" onKeyDown={onKeyDown}>
+    <div
+      ref={wrapperRef}
+      className="relative"
+      onKeyDown={onKeyDown}
+      onBlur={(event) => {
+        // Focus that leaves the menu (Tab past its last choice) closes it, and leaves the focus
+        // where it went: an open menu nobody is in would keep the player's keys off.
+        const next = event.relatedTarget
+        if (!open || (next instanceof Node && wrapperRef.current?.contains(next) === true)) return
+        setOpenAndReport(false)
+      }}
+    >
       <button
         ref={buttonRef}
         type="button"
