@@ -18,11 +18,11 @@ import type { Endpoint } from '../endpoint'
 /** The shell's id for This computer, the app's own engine, and the instance the page opens on until saved instances arrive. */
 export const LOCAL_ID = 'local'
 
-/** What the shell's `connect` answers: an absolute base address and the bearer token to present there. */
+/** What the shell's `connect` answers: an absolute base address and the bearer token to present there, or null when the page has to sign in. */
 interface EndpointAnswer {
   kind: 'bearer'
   base: string
-  token: string
+  token: string | null
 }
 
 /** The app's version, and the system it runs on. */
@@ -38,8 +38,10 @@ export function inDesktop(): boolean {
 
 /**
  * The endpoint for instance `id`. For This computer that is its loopback address and this launch's
- * secret, asked for each time rather than kept anywhere: an engine that restarted has a new one. A
- * refusal (no such instance, the engine is not running) rejects with the shell's line.
+ * secret, asked for each time rather than kept anywhere: an engine that restarted has a new one. For a
+ * saved instance it is its address, with a token when the shell signed in with a saved password and
+ * null when the page has to ask for one. A refusal (no such instance, the engine is not running, the
+ * server gives no answer) rejects with the shell's line.
  */
 export async function connect(id: string): Promise<Endpoint> {
   const answer = await invoke<EndpointAnswer>('connect', { id })
@@ -69,4 +71,61 @@ export async function onSystemTitleBar(changed: (system: boolean) => void): Prom
 /** The window this page is in, for the title bar's own controls. */
 export function currentWindow(): Window {
   return getCurrentWindow()
+}
+
+/** One instance the switcher lists. This computer's `url` is empty: its address changes every launch. */
+export interface InstanceItem {
+  id: string
+  name: string
+  url: string
+  saved_password: boolean
+}
+
+/** The instance list: This computer first, the instance the app opens on, and whether this system can save passwords. */
+export interface InstancesList {
+  default: string
+  items: InstanceItem[]
+  keychain: boolean
+}
+
+/** What the shell found at a saved instance's address: anything answering, and a CORS answer naming this app's origin. */
+export interface Probe {
+  reachable: boolean
+  cors_ok: boolean
+}
+
+/** Every instance the app can switch to. */
+export async function listInstances(): Promise<InstancesList> {
+  const list = await invoke<InstancesList>('list_instances')
+  return { ...list, items: list.items.map((item) => ({ ...item, url: normaliseBase(item.url) })) }
+}
+
+/** Saves a new instance; rejects with the line saying why it was refused. */
+export async function addInstance(name: string, url: string): Promise<InstanceItem> {
+  return invoke<InstanceItem>('add_instance', { name, url })
+}
+
+/** Removes a saved instance and its saved password. */
+export async function removeInstance(id: string): Promise<void> {
+  await invoke('remove_instance', { id })
+}
+
+/** Makes an instance the one the app opens on. */
+export async function setDefaultInstance(id: string): Promise<void> {
+  await invoke('set_default_instance', { id })
+}
+
+/** Saves a password in the system keychain, for the shell to sign in with next time. */
+export async function savePassword(id: string, user: string, password: string): Promise<void> {
+  await invoke('save_password', { id, user, password })
+}
+
+/** Forgets a saved password. */
+export async function forgetPassword(id: string): Promise<void> {
+  await invoke('forget_password', { id })
+}
+
+/** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */
+export async function probeInstance(id: string): Promise<Probe> {
+  return invoke<Probe>('probe_instance', { id })
 }

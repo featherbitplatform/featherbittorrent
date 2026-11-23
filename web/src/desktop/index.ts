@@ -15,4 +15,4 @@ export {
   setSystemTitleBar,
   systemTitleBar,
 } from './bridge'
-export type { DesktopInfo } from './bridge'
+export type { DesktopInfo, InstanceItem, InstancesList, Probe } from './bridge'
