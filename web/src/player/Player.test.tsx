@@ -302,9 +302,11 @@ describe('the Files tab', () => {
     )
     const mkvRow = screen.getByText('movie.mkv').closest('tr')
     const txtRow = screen.getByText('notes.txt').closest('tr')
-    const mkvButton = mkvRow?.querySelector('button[aria-label="Play"]')
-    expect(mkvButton !== null, 'a .mkv row has no Play button').toBe(true)
-    expect(txtRow?.querySelector('button[aria-label="Play"]') === null, 'a .txt row has a Play button').toBe(true)
+    // Each row's button is named after the file the row shows, so a screen reader's list of
+    // buttons tells the rows apart.
+    const mkvButton = mkvRow?.querySelector('button[aria-label="Play movie.mkv"]')
+    expect(mkvButton !== null && mkvButton !== undefined, 'a .mkv row has no Play button named after its file').toBe(true)
+    expect(txtRow?.querySelector('button') === null, 'a .txt row has a Play button').toBe(true)
     fireEvent.click(mkvButton as HTMLElement)
     expect(played === 0, 'clicking Play did not open the player on the right file').toBe(true)
   })
