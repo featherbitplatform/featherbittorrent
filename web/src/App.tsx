@@ -58,9 +58,7 @@ export default function App() {
 
   // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
   const workspace = state.phase === 'signedIn' || state.phase === 'open'
-  useEffect(() => {
-    if (!workspace) setSettingsOpen(false)
-  }, [workspace])
+  if (!workspace && settingsOpen) setSettingsOpen(false)
 
   async function retry(): Promise<void> {
     setTrying(true)
