@@ -1520,6 +1520,176 @@ fn embedded_movtext_frame_cap_is_malformed() {
     );
 }
 
+#[test]
+fn embedded_movtext_frame_cap_allows_exactly_its_limit() {
+    // The bound is a `>` on the samples read, so the boundary is two different answers and the test
+    // above pins only one of them: a window holding exactly `MAX_CUE_SCAN_FRAMES` samples is a window
+    // the read takes, and one holding one sample more is `Malformed`. `>=` on the count gets both
+    // wrong at once, refusing the track that fits.
+    //
+    // Both tracks are the fixture's subtitle track rewritten with one sample per tick, so the window
+    // 0..4000 ms (4 000 000 ticks at this track's 1 000 000 ticks per second) holds every sample of
+    // either one: the count is what the walk is deciding, not the window. The samples are 2-byte gap
+    // samples and every chunk points at the same bytes, so a million of them costs one `stsz` field,
+    // a chunk table, and 1000 bytes of media data, and together they stay under the total text cap,
+    // which is the other bound these tracks could have reached first.
+    const PER_CHUNK: u32 = 500;
+    const GAP: u32 = 2;
+    const TO_MS: u64 = 4_000;
+    let limit = u32::try_from(MAX_CUE_SCAN_FRAMES).expect("the scan bound counts samples");
+    assert_eq!(
+        limit % PER_CHUNK,
+        0,
+        "the chunks of 500 have to lay out exactly the bound, so the first track is the boundary"
+    );
+    assert!(
+        (MAX_CUE_SCAN_FRAMES + 1) * u64::from(GAP) < SUBTITLE_FILE_CAP,
+        "the samples of the longer track together stay under the text cap, so the count is the bound \
+         its walk reaches first"
+    );
+    // The bound itself, then the same track with one sample more in a chunk of its own.
+    let chunks = limit / PER_CHUNK;
+    let at_the_limit = capped_track(&[(1, PER_CHUNK)], chunks, GAP);
+    let over_the_limit = capped_track(&[(1, PER_CHUNK), (chunks + 1, 1)], chunks + 1, GAP);
+    let start = Instant::now();
+
+    let track = mp4::locate(&at_the_limit, 4);
+    let samples = mp4::samples(&at_the_limit, &track);
+    assert_eq!(
+        samples.len(),
+        MAX_CUE_SCAN_FRAMES as usize,
+        "the first track holds exactly as many samples as the bound allows"
+    );
+    let (from_ticks, to_ticks) = mp4::window_ticks(&track, 0, TO_MS);
+    assert_eq!(
+        samples[0].pts_ticks, from_ticks,
+        "the window starts on the track's first sample, so every sample is in the walk"
+    );
+    assert!(
+        samples
+            .last()
+            .expect("a track with samples has a last one")
+            .pts_ticks
+            < to_ticks,
+        "the last sample still presents before the window closes, so the walk runs out of samples \
+         and not of window"
+    );
+    let cues = embedded_cues(Cursor::new(at_the_limit), 4, 0, TO_MS)
+        .expect("a window holding exactly MAX_CUE_SCAN_FRAMES samples is one the bound allows");
+    assert!(
+        cues.is_empty(),
+        "every sample of this track is a gap, so the walk reads all of them and answers no cue: \
+         {cues:?}"
+    );
+
+    let track = mp4::locate(&over_the_limit, 4);
+    let samples = mp4::samples(&over_the_limit, &track);
+    assert_eq!(
+        samples.len(),
+        MAX_CUE_SCAN_FRAMES as usize + 1,
+        "the second track is the first one plus the sample that goes past the bound"
+    );
+    let (_, to_ticks) = mp4::window_ticks(&track, 0, TO_MS);
+    assert!(
+        samples
+            .last()
+            .expect("a track with samples has a last one")
+            .pts_ticks
+            < to_ticks,
+        "the last sample still presents before the window closes, so it is the count that refuses \
+         this track"
+    );
+    let err = embedded_cues(Cursor::new(over_the_limit), 4, 0, TO_MS)
+        .expect_err("one sample past the scan bound is Malformed");
+    let MediaError::Malformed(message) = &err else {
+        panic!("samples past the frame bound are Malformed, got {err:?}");
+    };
+    assert!(
+        message.contains(&MAX_CUE_SCAN_FRAMES.to_string()),
+        "the verdict is the frame bound, got {message}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "both sides of the bound must be reached quickly, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// The fixture's mov_text track rewritten to `chunks` chunks laid out by `groups` (`stsc` entries:
+/// the first chunk each starts on and the samples each of its chunks holds, the last group running
+/// to the last chunk), every chunk pointing at the same place in the media data.
+///
+/// The samples are one tick apart and `gap` bytes each, and the region they read is zeroed, so every
+/// one of them is a length prefix stating a text of nothing: a gap the cue walk reads, counts against
+/// the scan bound, and makes no cue of. The count the tables state is what the groups and the chunk
+/// table cover together, which is the number the reader compares its `stts` and `stsz` against, so
+/// the track is a valid one however big the count is.
+fn capped_track(groups: &[(u32, u32)], chunks: u32, gap: u32) -> Vec<u8> {
+    let bytes = fixture(MP4);
+    let track = mp4::locate(&bytes, 4);
+    let covered = |index: usize| -> u32 {
+        let first = groups[index].0;
+        let limit = groups.get(index + 1).map_or(chunks + 1, |next| next.0);
+        (limit - first) * groups[index].1
+    };
+    let count: u32 = (0..groups.len()).map(covered).sum();
+    let stts = mp4::stts_box(&[(count, 1)]);
+    let stsc = mp4::stsc_box(groups);
+    let stsz = mp4::stsz_box(count, gap);
+    // The chunk offsets name media bytes, and the media bytes slide forward when the header grows,
+    // so they are written once the growth is known. An offset costs 4 bytes whatever offset it
+    // states, which is what lets the placeholder pass measure the growth first.
+    let stub = mp4::stbl_body(
+        &bytes,
+        &track,
+        &[
+            &stts,
+            &stsc,
+            &stsz,
+            &mp4::stco_box(&vec![0u32; chunks as usize]),
+        ],
+    );
+    let growth = stub.len() - track.stbl.body_len;
+    let at = u32::try_from(mp4::mdat_payload(&bytes) + growth)
+        .expect("a chunk offset that fits a 32 bit stco entry");
+    let body = mp4::stbl_body(
+        &bytes,
+        &track,
+        &[
+            &stts,
+            &stsc,
+            &stsz,
+            &mp4::stco_box(&vec![at; chunks as usize]),
+        ],
+    );
+    assert_eq!(
+        body.len(),
+        stub.len(),
+        "a chunk offset costs the same bytes whatever offset it states"
+    );
+    let mut rewritten = mp4::rewrite_stbl(&bytes, &track, &body);
+    assert_eq!(
+        mp4::mdat_payload(&rewritten),
+        at as usize,
+        "the media data moved by exactly the growth the header gained, so the chunk offsets point \
+         at it"
+    );
+    // The widest chunk of this layout reads this many bytes from the offset every chunk shares, so
+    // zeroing it makes every sample of the track a gap, whatever chunk it was placed in.
+    let region = gap as usize
+        * groups
+            .iter()
+            .map(|group| group.1 as usize)
+            .max()
+            .expect("a chunk table with groups has a chunk size");
+    assert!(
+        at as usize + region <= rewritten.len(),
+        "the bytes every chunk points at have to be bytes the file really holds"
+    );
+    rewritten[at as usize..at as usize + region].fill(0);
+    rewritten
+}
+
 /// A reader that counts the reads of one sample's worth of bytes at one offset - the cue walk's
 /// reads of this test's samples, which all point at the same bytes - and fails the test when one
 /// more is asked for than `limit`. A passing test is a run in which sample `limit + 1` was never
