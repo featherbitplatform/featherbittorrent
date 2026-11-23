@@ -640,8 +640,22 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   function toggleFullscreen(): void {
     const root = dialogRef.current
     if (root === null) return
-    if (document.fullscreenElement !== null) void document.exitFullscreen()
-    else root.requestFullscreen?.()
+    // `!= null`, not `!== null`: a browser without the Fullscreen API (iPhone Safari) has no
+    // `fullscreenElement` at all, and reads it as `undefined`.
+    if (document.fullscreenElement != null) {
+      if (typeof document.exitFullscreen === 'function') void document.exitFullscreen().catch(() => {})
+      return
+    }
+    if (typeof root.requestFullscreen === 'function') {
+      void root.requestFullscreen().catch(() => {
+        // A refused fullscreen leaves the player as it was.
+      })
+      return
+    }
+    // iPhone Safari has no `requestFullscreen` on elements: the video's own fullscreen player is
+    // the one fullscreen there is.
+    const video = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null
+    if (typeof video?.webkitEnterFullscreen === 'function') video.webkitEnterFullscreen()
   }
 
   function nextAudio(): void {
@@ -816,14 +830,18 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
       {probe !== null && choice?.kind === 'native' && (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
-          <video ref={videoRef} src={nativeSrc ?? undefined} controls className="max-h-full max-w-full" />
+          {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
+              player on `play()`. */}
+          <video ref={videoRef} src={nativeSrc ?? undefined} controls playsInline className="max-h-full max-w-full" />
         </div>
       )}
 
       {probe !== null && choice?.kind === 'remux' && (
         <>
           <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
-            <video ref={videoRef} className="h-full w-full max-h-full max-w-full object-contain" />
+            {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
+                player on `play()`, past the controls, the menus and the subtitles drawn here. */}
+            <video ref={videoRef} playsInline className="h-full w-full max-h-full max-w-full object-contain" />
             {waiting && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>

@@ -2181,6 +2181,52 @@ describe('the player', () => {
   })
 })
 
+/** A WebM the browser plays on its own: the native path, the element's own controls. */
+const NATIVE_PROBE: MediaProbe = {
+  container: 'webm',
+  duration_ms: 4000,
+  time_offset_ms: 0,
+  tracks: [
+    track({ id: 1, kind: 'video', codec: 'vp9', mime_codecs: ['vp09.00.10.08'], default: true }),
+    track({ id: 2, kind: 'audio', codec: 'opus', mime_codecs: ['opus'], default: true }),
+  ],
+  external_subtitles: [],
+}
+
+/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. */
+async function renderNative(): Promise<{ container: HTMLElement; restore(): void }> {
+  const spy = vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockImplementation((mime: string) =>
+    mime.startsWith('video/webm') ? 'maybe' : '',
+  )
+  const { client } = probeClient(NATIVE_PROBE)
+  const { container } = render(<Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />)
+  await settle()
+  return { container, restore: () => spy.mockRestore() }
+}
+
+/** Render the remuxed player over a fake `fetch` the engine reads as `window.fetch`. */
+async function renderRemux(probe: MediaProbe = PROBE): Promise<{
+  container: HTMLElement
+  recorder: ReturnType<typeof fakeFetch>
+  video: HTMLVideoElement
+  dialog: HTMLDialogElement
+}> {
+  const recorder = fakeFetch()
+  let videoCalls = 0
+  recorder.answer('/tracks/1/stream', () => {
+    videoCalls += 1
+    return { startMs: videoCalls === 1 ? 0 : 3000, body: () => new FakeBody() }
+  })
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  vi.stubGlobal('fetch', recorder.fetch)
+  const { client } = probeClient(probe)
+  const { container } = render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+  await settle()
+  const video = container.querySelector('video') as HTMLVideoElement
+  const dialog = container.querySelector('dialog') as HTMLDialogElement
+  return { container, recorder, video, dialog }
+}
+
 describe('the final review fixes', () => {
   it('a failed resume keeps the playhead', async () => {
     // The video body stops early; its resume gets a 504, the normal answer of a slow torrent.
@@ -2293,6 +2339,41 @@ describe('the final review fixes', () => {
     ).toBe(2)
     engine.destroy()
     document.body.removeChild(video)
+  })
+
+  it('the video plays inline', async () => {
+    // Without `playsinline`, iPhone Safari takes the video into its own fullscreen player on
+    // `play()`, past the controls, the menus and the subtitles.
+    const remux = await renderRemux()
+    expect(remux.video.hasAttribute('playsinline'), 'the remuxed video does not play inline').toBe(true)
+    cleanup()
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.hasAttribute('controls'), 'the native path did not render').toBe(true)
+      expect(video.hasAttribute('playsinline'), 'the native video does not play inline').toBe(true)
+    } finally {
+      native.restore()
+    }
+  })
+
+  it('fullscreen falls back to the video on iPhone', async () => {
+    // iPhone Safari has no `requestFullscreen` on elements and no `document.fullscreenElement`;
+    // the video's own `webkitEnterFullscreen` is the fullscreen there is.
+    const { video, dialog } = await renderRemux()
+    Object.defineProperty(dialog, 'requestFullscreen', { value: undefined, configurable: true })
+    Object.defineProperty(document, 'fullscreenElement', { value: undefined, configurable: true })
+    let entered = 0
+    ;(video as HTMLVideoElement & { webkitEnterFullscreen(): void }).webkitEnterFullscreen = () => {
+      entered += 1
+    }
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
+      await settle()
+      expect(entered, 'the Fullscreen button did not use the video fullscreen').toBe(1)
+    } finally {
+      delete (document as unknown as { fullscreenElement?: unknown }).fullscreenElement
+    }
   })
 
 })
