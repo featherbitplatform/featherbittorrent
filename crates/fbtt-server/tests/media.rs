@@ -33,6 +33,7 @@ use fbtt_server::Server;
 use fbtt_server::auth::password;
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
+use tokio::task::JoinSet;
 
 /// How long a test waits for anything from the server. Starting an engine takes a moment; a media route
 /// whose pieces never arrive gives up after its read timeout, which these tests set far below its default.
@@ -40,7 +41,8 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long a stream of the partly-seeded torrent has to say nothing - no bytes, and no end of stream
 /// either - before a test may call it blocked on the missing piece. It is far shorter than anything the
-/// engine takes to give up on a piece (these tests set the read timeout to thirty seconds) and far
+/// engine takes to give up on a piece - the tests that watch one set this server's read timeout to
+/// at least thirty seconds, and the dropped-stream test raises its own to two minutes - and far
 /// longer than a fragment needs to cross a loopback connection, so quiet for this long means waiting,
 /// not slow.
 const WAIT_SILENT: Duration = Duration::from_secs(2);
@@ -74,15 +76,15 @@ const NOTES: &str = "notes for the screening, not a subtitle file\n";
 /// 46134-byte video with this many bytes puts the torrent's fourth 16 KiB piece - the only one a
 /// stream of this fixture can block on and still have streamed bytes behind it - at 29152..45536
 /// inside the video. `seed_partial` spells out why the hole has to start and end exactly there.
-const SIDEAR_BYTES: usize = 20_000;
-const SIDEAR_CUES: usize = 400;
+const SIDECAR_BYTES: usize = 20_000;
+const SIDECAR_CUES: usize = 400;
 
-/// [`SIDEAR_CUES`] SubRip cues over a rising clock - two seconds apart, half a second long, nothing a
+/// [`SIDECAR_CUES`] SubRip cues over a rising clock - two seconds apart, half a second long, nothing a
 /// parser could object to - with the last cue's text grown so the file lands exactly on
-/// [`SIDEAR_BYTES`]. The cue probe reads this file whole and asserts its cue count back.
+/// [`SIDECAR_BYTES`]. The cue probe reads this file whole and asserts its cue count back.
 fn cues_srt() -> Vec<u8> {
     let mut text = String::new();
-    for cue in 1..=SIDEAR_CUES {
+    for cue in 1..=SIDECAR_CUES {
         let seconds = cue * 2;
         text.push_str(&format!(
             "{cue}\n00:{:02}:{:02},000 --> 00:{:02}:{:02},500\ncue {cue}\n\n",
@@ -92,21 +94,21 @@ fn cues_srt() -> Vec<u8> {
             seconds % 60
         ));
     }
-    let tail = format!("cue {SIDEAR_CUES}\n\n");
+    let tail = format!("cue {SIDECAR_CUES}\n\n");
     assert!(
         text.ends_with(&tail),
         "the pad wants to grow the last cue's text"
     );
     // The last block loses its closing blank line and its text grows by the padding instead, so
     // the file ends the way `MOVIE_SRT` ends - mid-block, one newline after the last text line -
-    // and lands exactly on `SIDEAR_BYTES`.
+    // and lands exactly on `SIDECAR_BYTES`.
     let body = &text[..text.len() - tail.len()];
-    let name = format!("cue {SIDEAR_CUES}");
+    let name = format!("cue {SIDECAR_CUES}");
     assert!(
-        body.len() + name.len() < SIDEAR_BYTES,
-        "SIDEAR_BYTES has to leave room for the pad"
+        body.len() + name.len() < SIDECAR_BYTES,
+        "SIDECAR_BYTES has to leave room for the pad"
     );
-    let pad = SIDEAR_BYTES - body.len() - name.len() - 1;
+    let pad = SIDECAR_BYTES - body.len() - name.len() - 1;
     format!("{body}{name}{}\n", "x".repeat(pad)).into_bytes()
 }
 
@@ -499,11 +501,11 @@ async fn seed_partial(served: &Served, token: Option<&str>) -> String {
     let sidecar = cues_srt();
     assert_eq!(
         sidecar.len(),
-        SIDEAR_BYTES,
+        SIDECAR_BYTES,
         "cues_srt promises the length the piece geometry needs"
     );
     // The torrent lays its files end to end in name order, so the video starts at global
-    // `SIDEAR_BYTES` and its piece 3 - the fourth 16 KiB boundary, 49152, minus the sidecar's
+    // `SIDECAR_BYTES` and its piece 3 - the fourth 16 KiB boundary, 49152, minus the sidecar's
     // bytes - runs 29152..45536. The window below is the whole plan as an assertion: after 25304,
     // the last byte the first fragment needs; ending before 45931, where the cues element waits.
     let hole = 49152 - sidecar.len();
@@ -1528,15 +1530,17 @@ async fn permits_are_released_when_the_client_goes_away() {
 /// Each of the eight viewers gets its first chunk - the stream route answers 200 only after it has
 /// produced the stream's first part, so a chunk is a running job holding its place - and then every
 /// stream is confirmed silent mid-body: its buffered bytes drain, and after that it says nothing for
-/// [`WAIT_SILENT`], with no end of stream either, which is waiting rather than finishing. Only then
-/// do all eight hang up at once, and a cue probe on the same torrent's sidecar - a file whose bytes
-/// are all here - has to answer with its 200 within five seconds of the hang-up. A job waiting on
-/// the missing piece has only two ways to stop waiting: the hang-up that wakes its read, and the
-/// read's own thirty-second timeout. Five seconds from the hang-up, only the first of those is
-/// possible, so a place that comes back that fast came back *because* the body went away. Move the
-/// wake sender out of `Fragments` so a hang-up no longer wakes a blocked read, and all eight jobs
-/// sit through the whole window, the probe answers `503 too_many_media_streams` to the last
-/// retry, and this test says so.
+/// [`WAIT_SILENT`], with no end of stream either, which is waiting rather than finishing. The eight
+/// checks run together, so a blocked read is seconds old by the hang-up, not a stream per viewer
+/// old. Only then do all eight hang up at once, and a cue probe on the same torrent's sidecar - a
+/// file whose bytes are all here - has to answer with its 200 within five seconds of the hang-up.
+/// A job waiting on the missing piece has only two ways to stop waiting: the hang-up that wakes its
+/// read, and the read's own timeout, which this test raises to two minutes - past everything the
+/// checks and the probe together can take, so a place that comes back inside the window came back
+/// *because* the body went away. Move the wake sender out of `Fragments` so a hang-up no longer
+/// wakes a blocked read, and all eight jobs sit through the whole window - their reads have more
+/// than a minute to run - the probe answers `503 too_many_media_streams` to the last retry, and
+/// this test says so.
 #[tokio::test(flavor = "multi_thread")]
 async fn permit_returns_after_a_dropped_stream() {
     let served = Served::start("media-permit-return", |dir| {
@@ -1545,12 +1549,17 @@ async fn permit_returns_after_a_dropped_stream() {
     .await;
     let id = seed_partial(&served, None).await;
     // This is the timeout a blocked read gives up on, and it is what separates "the hang-up woke
-    // this job" from "the engine finally gave up on this piece": both the five seconds this test
-    // waits after the hang-up and the two seconds a silent stream counts as blocked are far under
-    // it. The job's other budget, IDLE_SEND, is ten minutes and out of the question entirely.
+    // this job" from "the engine finally gave up on this piece". The eight viewers below run their
+    // checks together, so by the hang-up a blocked read is one first fragment plus about one
+    // WAIT_SILENT old - seconds - and the probe then has five more to answer in. Two minutes is
+    // fifteen times that span: no read's deadline can be what frees the pool inside the window,
+    // so a place that comes back inside it came back *because* its body went away - and a run
+    // whose hang-ups wake nothing keeps the pool full to the last retry, because those jobs hand
+    // their places back only at the timeout, a minute past the window. The job's other budget,
+    // IDLE_SEND, is ten minutes and out of the question entirely.
     served
         .server
-        .set_media_read_timeout(Duration::from_secs(30));
+        .set_media_read_timeout(Duration::from_secs(120));
 
     // The video is file 1 here - the sidecar leads, which is what moves the piece boundaries - and
     // the cue probe below reads that sidecar as file 0.
@@ -1562,44 +1571,67 @@ async fn permit_returns_after_a_dropped_stream() {
     let asking = http();
 
     // Eight viewers, one for every place this server has for demuxing, each taken to its first
-    // chunk. The status gets its own assertion because a viewer that was refused would leave the
-    // pool looking free for a reason this test is not about.
-    let mut held: Vec<Response> = Vec::new();
+    // chunk and then watched for the stream to go quiet - all eight checks run together, so the
+    // silence phase costs one WAIT_SILENT and not eight, and no blocked read gets old before the
+    // hang-up. A viewer that was refused gets its own failure name, because it would leave the
+    // pool looking free for a reason this test is not about. What each stream delivered before
+    // the hole drains out of the connection first - those bytes are already on their way - and
+    // then the stream has to go quiet without ending: a stream whose file ended says so with an
+    // end of stream, and a stream that was still waiting says nothing. Every way this can fail
+    // is named, because it is the point of the test: an early end means the stream stopped
+    // waiting, and a broken connection means the viewer came apart for the client's own reasons.
+    // Each check hands back the response it proved silent, and dropping all eight of those at
+    // once is the hang-up.
+    let mut checking = JoinSet::new();
     for _ in 0..8 {
-        let mut response = within(viewers.get(&stream).send())
-            .await
-            .expect("a viewer reached the server");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "a video with a middle piece missing was not streamed"
-        );
-        let first = within(response.chunk())
-            .await
-            .expect("the first bytes of a stream");
-        assert!(
-            first.is_some(),
-            "a stream that answered with headers has a body"
-        );
-        held.push(response);
-    }
-
-    // All eight jobs are by now inside a read of the blanked piece. What each stream delivered
-    // before the hole drains out of the connection first - those bytes are already on their way -
-    // and then the stream has to go quiet without ending: a stream whose file ended says so with an
-    // end of stream, and a stream that was still waiting says nothing. This is the point of the
-    // test, so every way it can fail is named: an early end means the stream stopped waiting, and
-    // a broken connection means the viewer came apart for the client's own reasons.
-    for response in held.iter_mut() {
-        loop {
-            match tokio::time::timeout(WAIT_SILENT, response.chunk()).await {
-                Ok(Ok(Some(_))) => continue,
-                Ok(Ok(None)) => {
-                    panic!("a viewer's stream ended instead of waiting on the missing piece")
+        let viewer = viewers.clone();
+        let stream = stream.clone();
+        checking.spawn(async move {
+            let mut response = match within(viewer.get(&stream).send()).await {
+                Ok(response) => response,
+                Err(problem) => {
+                    return Err(format!("a viewer did not reach the server: {problem}"));
                 }
-                Ok(Err(problem)) => panic!("a viewer's stream came apart: {problem}"),
-                Err(_) => break,
+            };
+            if response.status() != StatusCode::OK {
+                let (status, code) = error_of(response).await;
+                return Err(format!(
+                    "a video with a middle piece missing was not streamed: {status} {code}"
+                ));
             }
+            match within(response.chunk()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err("a stream that answered with headers has a body".to_string());
+                }
+                Err(problem) => {
+                    return Err(format!(
+                        "a viewer's stream came apart before its first bytes: {problem}"
+                    ));
+                }
+            }
+            loop {
+                match tokio::time::timeout(WAIT_SILENT, response.chunk()).await {
+                    Ok(Ok(Some(_))) => continue,
+                    Ok(Ok(None)) => {
+                        return Err(
+                            "a viewer's stream ended instead of waiting on the missing piece"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Err(problem)) => {
+                        return Err(format!("a viewer's stream came apart: {problem}"));
+                    }
+                    Err(_) => return Ok(response),
+                }
+            }
+        });
+    }
+    let mut held: Vec<Response> = Vec::new();
+    while let Some(check) = checking.join_next().await {
+        match check.expect("a viewer's silence check ran") {
+            Ok(response) => held.push(response),
+            Err(problem) => panic!("a viewer's check failed: {problem}"),
         }
     }
 
@@ -1615,7 +1647,7 @@ async fn permit_returns_after_a_dropped_stream() {
             let answer = body(response).await;
             assert_eq!(
                 answer["cues"].as_array().expect("a cue list").len(),
-                SIDEAR_CUES,
+                SIDECAR_CUES,
                 "the freed place answered the sidecar's cues wrong"
             );
             break;
