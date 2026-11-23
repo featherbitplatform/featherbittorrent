@@ -506,6 +506,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('timeupdate', onTime)
+    // A seek (a key, a nudge, the engine's own landing) moves the shown time at once, not when
+    // the data for it arrives.
+    video.addEventListener('seeking', onTime)
     video.addEventListener('volumechange', onVolume)
     video.addEventListener('canplay', onCanPlay)
 
@@ -521,6 +524,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('timeupdate', onTime)
+      video.removeEventListener('seeking', onTime)
       video.removeEventListener('volumechange', onVolume)
       video.removeEventListener('canplay', onCanPlay)
       save()
@@ -721,6 +725,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (video === null) return
     // The bar is in source time: the value is source seconds, mapped to the element.
     video.currentTime = toMedia(sourceSeconds * 1000, probe?.time_offset_ms ?? 0)
+    // The bar stays where it was put: a seek outside the buffer fires no `timeupdate` until the
+    // data arrives, and the old time would pull it back meanwhile.
+    setTime(Math.round(sourceSeconds * 1000))
   }
 
   /**

@@ -2558,4 +2558,19 @@ describe('the final review fixes', () => {
     await settle()
     expect(video.muted, 'the keys stayed off after the menu lost the focus').toBe(true)
   })
+
+  it('the seek bar stays where it was released', async () => {
+    // The release seeks outside the buffer, and no `timeupdate` comes until the data does: the
+    // bar must stay where it was let go, not jump back to the old time.
+    const { video } = await renderRemux()
+    makeVideoSeekable(video)
+    const seek = screen.getByRole('slider', { name: 'Seek' }) as HTMLInputElement
+    fireEvent.pointerDown(seek)
+    fireEvent.input(seek, { target: { value: '3' } })
+    await settle()
+    fireEvent.pointerUp(seek)
+    expect(seek.value, 'the bar jumped back on release').toBe('3')
+    await settle()
+    expect(seek.value, 'the bar jumped back while waiting for data').toBe('3')
+  })
 })
