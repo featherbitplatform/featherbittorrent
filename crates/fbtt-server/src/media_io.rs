@@ -249,7 +249,9 @@ impl<R: Read + Seek> SeekAwareReader<R> {
     /// `inner` is moved first: this runs only when the byte the caller wants is outside what was held, and
     /// a reader that answers its own seeks never told `inner` about the places this one went to. The
     /// request stops at the file's length, so a fill never reads past the end looking for bytes that are
-    /// not there.
+    /// not there. A fill that fails holds nothing, and the error path below says why: the buffer was
+    /// resized to the room it asked for, which is zeros, and a retry that believed those were file bytes
+    /// would walk on through a hole with no error to show for it.
     fn fill(&mut self) -> io::Result<()> {
         let at = self.position;
         self.inner.seek(SeekFrom::Start(at))?;
@@ -259,7 +261,18 @@ impl<R: Read + Seek> SeekAwareReader<R> {
             .min(usize::try_from(self.len - at).unwrap_or(usize::MAX));
         self.bytes.clear();
         self.bytes.resize(room, 0_u8);
-        let got = self.inner.read(&mut self.bytes)?;
+        let got = match self.inner.read(&mut self.bytes) {
+            Ok(got) => got,
+            Err(problem) => {
+                // The read asked for `room` bytes and the buffer is holding `room` zeros, which are
+                // not the file's bytes. Empty it before handing the error over: a caller that retries
+                // (`read_exact` retries `ErrorKind::Interrupted` on its own) would otherwise be told
+                // the zeros are a run of the file, and the walk would go on with invented bytes and no
+                // error to show for it. `clear` keeps the capacity, which is the point of the buffer.
+                self.bytes.clear();
+                return Err(problem);
+            }
+        };
         self.bytes.truncate(got);
         self.held_from = at;
         if got == 0 {
@@ -663,6 +676,88 @@ mod tests {
              under the buffer; keeping the buffer is about one read per {BUFFER} of them ({fills} \
              for these frames), and giving it up at every seek is one per frame ({FRAMES})",
             FRAMES * FRAME,
+        );
+    }
+
+    /// A file whose next read fails once with `Interrupted` and whose later reads answer normally: the
+    /// one error a caller retries by itself, which is what makes a half filled buffer dangerous.
+    struct OnceInterrupted {
+        bytes: Vec<u8>,
+        at: u64,
+        /// Whether the next read fails instead of answering.
+        fail: bool,
+    }
+
+    impl Read for OnceInterrupted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail {
+                self.fail = false;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "the read was interrupted",
+                ));
+            }
+            let from = usize::try_from(self.at)
+                .unwrap_or(usize::MAX)
+                .min(self.bytes.len());
+            let give = buf.len().min(self.bytes.len() - from);
+            buf[..give].copy_from_slice(&self.bytes[from..from + give]);
+            self.at += give as u64;
+            Ok(give)
+        }
+    }
+
+    impl Seek for OnceInterrupted {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let SeekFrom::Start(at) = pos else {
+                panic!(
+                    "the reader under the buffer was sent {pos:?}; it only ever needs a place to read from"
+                );
+            };
+            self.at = at;
+            Ok(at)
+        }
+    }
+
+    /// A fill that fails holds nothing, so the retry reads the file instead of the failed read's zeros.
+    ///
+    /// A fill empties its buffer, resizes it to the room it means to read, and only then asks the
+    /// reader underneath for bytes. In between, the buffer holds `room` zeros, and those are not the
+    /// file's bytes. `read_exact` retries `ErrorKind::Interrupted` on its own, so one interrupted
+    /// read is enough for a caller to come back for the same bytes and be handed them: a hole read as
+    /// a run of the file, the walk going on from there with no error to show for it.
+    #[test]
+    fn a_failed_fill_holds_nothing() {
+        let mut file = SeekAwareReader::over(
+            4,
+            OnceInterrupted {
+                bytes: b"abcdefgh".as_slice().to_vec(),
+                at: 0,
+                fail: true,
+            },
+            8,
+            0,
+        );
+        let mut buf = [0_u8; 4];
+        // The first read fails inside the fill, `read_exact` asks again, and the second answer has to
+        // come from the file rather than from what the failed read left in the buffer.
+        file.read_exact(&mut buf).expect("the retry reads the file");
+        assert_eq!(
+            &buf, b"abcd",
+            "the retried read gives the file's own bytes, not the failed fill's zeros"
+        );
+        assert_eq!(
+            file.stream_position().expect("where the read landed"),
+            4,
+            "the retry moved the position the way a read does"
+        );
+        // And the buffer keeps working from the file afterwards: the next read fills again, and this
+        // time the read underneath answers.
+        file.read_exact(&mut buf)
+            .expect("the walk goes on after the retry");
+        assert_eq!(
+            &buf, b"efgh",
+            "the second fill reads the bytes after the ones it retried"
         );
     }
 }
