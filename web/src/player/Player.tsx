@@ -139,11 +139,40 @@ function ChoiceMenu({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const wrapperRef = useRef<HTMLDivElement>(null)
+  // The latest report, for the listener below: it is added once per open, not once per render.
+  const onMenuChangeRef = useRef(onMenuChange)
+  useEffect(() => {
+    onMenuChangeRef.current = onMenuChange
+  }, [onMenuChange])
 
   function setOpenAndReport(next: boolean): void {
     setOpen(next)
     onMenuChange(next)
   }
+
+  // An open menu takes the focus into its choices, the chosen one first, so the arrows move
+  // through the list from where the person is; and a press anywhere outside the menu closes it,
+  // the way a menu closes when a person moves on, without taking the focus back to the button.
+  useEffect(() => {
+    if (!open) return
+    const list = listRef.current
+    const target =
+      list?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]:not([disabled])') ??
+      list?.querySelector<HTMLElement>('[role="option"]:not([disabled])') ??
+      null
+    target?.focus()
+    const onPointerDown = (event: Event): void => {
+      const wrapper = wrapperRef.current
+      if (wrapper !== null && event.target instanceof Node && wrapper.contains(event.target)) return
+      setOpen(false)
+      onMenuChangeRef.current(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+    }
+  }, [open])
 
   function close(): void {
     setOpenAndReport(false)
@@ -158,6 +187,12 @@ function ChoiceMenu({
       }
       return
     }
+    // Escape closes the menu even when it has no choice that can be taken.
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      close()
+      return
+    }
     const items = Array.from(
       listRef.current?.querySelectorAll<HTMLElement>('[role="option"]:not([disabled])') ?? [],
     )
@@ -166,11 +201,6 @@ function ChoiceMenu({
     // focus, and Enter takes the focused option, so a person can move and then choose.
     const focused = items.findIndex((item) => item === listRef.current?.querySelector<HTMLElement>(':focus'))
     const current = focused !== -1 ? focused : items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      close()
-      return
-    }
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
       const key = items[current === -1 ? 0 : current]?.getAttribute('data-key')
@@ -189,7 +219,7 @@ function ChoiceMenu({
   }
 
   return (
-    <div className="relative" onKeyDown={onKeyDown}>
+    <div ref={wrapperRef} className="relative" onKeyDown={onKeyDown}>
       <button
         ref={buttonRef}
         type="button"
@@ -741,6 +771,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
 
   function onDialogKey(event: KeyboardEvent): void {
     const target = event.target
+    // A key a menu already answered (the ArrowDown that opens it, the arrows that move in it) is
+    // the menu's; and while a menu is open, every key is the menu's, so an `ArrowUp` there never
+    // also moves the volume.
+    if (event.defaultPrevented || menuOpen) return
     // A key from inside a range input or an open menu is the menu's, not the player's: an
     // `ArrowUp` on a listbox option moves the cursor, and the same key here would move the
     // volume. The menu's `role` on its items and its listbox names it either way.
@@ -897,6 +931,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               max={durationSourceSec}
               step={0.1}
               value={shownSec}
+              aria-valuetext={`${clock(shownSec)} of ${clock(durationSourceSec)}`}
               onPointerDown={(event) => startDrag(event.currentTarget)}
               onChange={(event) => {
                 const value = Number(event.target.value)

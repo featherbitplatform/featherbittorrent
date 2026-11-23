@@ -2410,4 +2410,50 @@ describe('the final review fixes', () => {
     expect(chosen, 'the Audio menu did not mark the track that is playing').toEqual(['eng'])
   })
 
+  it('opening a menu focuses its choices', async () => {
+    await renderRemux()
+    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }))
+    await settle()
+    const active = document.activeElement
+    expect(
+      active?.getAttribute('role') === 'option' && active.textContent === 'Off',
+      `the open menu did not take the focus to its chosen option (focus on ${active?.outerHTML.slice(0, 60)})`,
+    ).toBe(true)
+  })
+
+  it('arrows that open a menu leave the volume', async () => {
+    const { video } = await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    audio.focus()
+    fireEvent.keyDown(audio, { key: 'ArrowDown' })
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'ArrowDown did not open the menu').toBe('true')
+    expect(video.volume, 'the ArrowDown that opened the menu moved the volume').toBe(1)
+    fireEvent.keyDown(audio, { key: 'ArrowUp' })
+    await settle()
+    fireEvent.keyDown(audio, { key: 'ArrowDown' })
+    await settle()
+    expect(video.volume, 'an arrow with the menu open moved the volume').toBe(1)
+  })
+
+  it('a press outside a menu closes it', async () => {
+    await renderRemux()
+    const audio = screen.getByRole('button', { name: 'Audio' })
+    fireEvent.click(audio)
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'the menu did not open').toBe('true')
+    fireEvent.pointerDown(screen.getByRole('option', { name: 'eng' }))
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'a press inside the menu closed it').toBe('true')
+    fireEvent.pointerDown(screen.getByRole('slider', { name: 'Seek' }))
+    await settle()
+    expect(audio.getAttribute('aria-expanded'), 'a press outside the menu left it open').toBe('false')
+  })
+
+  it('the seek bar reads its time', async () => {
+    await renderRemux()
+    const seek = screen.getByRole('slider', { name: 'Seek' })
+    expect(seek.getAttribute('aria-valuetext'), 'the Seek bar does not read its time').toBe('0:00 of 0:04')
+  })
+
 })
