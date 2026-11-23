@@ -123,10 +123,16 @@ export default function Torrents({
   // the browser's back (a `popstate`) or by `history.back()`, so the history stays balanced and
   // neither path ever leaves the page.
   const pushedRef = useRef(false)
+  // Numbers the entries the full view pushes. A popstate that lands on one of them is a stale
+  // answer to an earlier `history.back()` (a card was opened before it arrived), not the person
+  // going back to the list, so it must not close the view that is open now.
+  const tokenRef = useRef(0)
 
   useEffect(() => {
-    const onPop = (): void => {
+    const onPop = (event: PopStateEvent): void => {
       if (!pushedRef.current) return
+      const landed = event.state as { fbttFull?: number } | null
+      if (landed?.fbttFull !== undefined) return
       pushedRef.current = false
       setSelectedId(null)
     }
@@ -153,7 +159,8 @@ export default function Torrents({
   /** Pick a card: select it and open it full screen on its own history entry. */
   function openFull(id: string): void {
     if (!pushedRef.current) {
-      window.history.pushState({ torrent: id }, '')
+      tokenRef.current += 1
+      window.history.pushState({ fbttFull: tokenRef.current }, '')
       pushedRef.current = true
     }
     setSelectedId(id)

@@ -574,4 +574,40 @@ describe('the phone layout', () => {
     expect(back, 'a popstate went back a second time').not.toHaveBeenCalled()
     expect(screen.queryByRole('dialog', { name: 'Torrent' })).toBeNull()
   })
+
+  it('opening a card right after back stays open', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a'), torrentInfo('b')] })
+    phoneWidth(true)
+    const { container } = openScreen(client)
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await flush()
+    // Another card is opened before the first back's popstate has arrived.
+    fireEvent.click(cards(container)[1])
+    await flush()
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate', { state: { fbttFull: 1 } }))
+    })
+    expect(
+      screen.queryByRole('dialog', { name: 'Torrent' }),
+      'a stale popstate closed the view that was just opened',
+    ).not.toBeNull()
+  })
+
+  it('unmounting gives the history entry back', async () => {
+    const { client } = fakeClient({ rows: [torrentInfo('a')] })
+    phoneWidth(true)
+    const { container, unmount } = render(
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+    )
+    await flush()
+    fireEvent.click(cards(container)[0])
+    await flush()
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {})
+    unmount()
+    expect(back, 'unmounting left the pushed entry behind').toHaveBeenCalledTimes(1)
+  })
 })
