@@ -608,8 +608,12 @@ pub(super) async fn subtitle_file(
     if row.pad {
         return Err(RouteError::not_found("no such subtitle file"));
     }
+    // The format comes from the name as the torrent carries it, and the answer quotes the cleaned one:
+    // `subtitle_format` reads the extension at a name's end, and cleaning keeps its front, so a subtitle
+    // file with a name over the display limit has its extension in the part that was cut (the same split
+    // [`subtitle_row`] makes for the list).
     let name = display_name(row);
-    let Some(format) = media::subtitle_format(&name) else {
+    let Some(format) = media::subtitle_format(&file_name_of(row)) else {
         return Err(unsupported_media(format!(
             "{name} is not a subtitle file: .srt, .ass, .ssa and .vtt are"
         )));
@@ -770,13 +774,46 @@ fn ms(given: &str, what: &str) -> Result<u64, RouteError> {
         .map_err(|_| RouteError::invalid_request(format!("{what} is a time in milliseconds")))
 }
 
+/// The name a file is judged by: the last component of the path the torrent carries, exactly as it
+/// came.
+///
+/// The name is also structure this route reads: its extension says which format to parse a subtitle
+/// as, and its stem says whether it belongs to the video beside it. Both sit at the end of a name, and
+/// cleaning counts from the front, so the two answers are taken from the name as it arrived and not
+/// from the one [`display_name`] shows.
+fn file_name_of(row: &FileStatus) -> String {
+    match row.path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => row.path.to_string_lossy().into_owned(),
+    }
+}
+
 /// The name to show for a file: the last component of the path the torrent carries, which is what a player
 /// has to name a track after, cleaned like every other name this server repeats.
 fn display_name(row: &FileStatus) -> String {
-    match row.path.file_name() {
-        Some(name) => clean(name.to_string_lossy().as_ref()),
-        None => clean(row.path.to_string_lossy().as_ref()),
-    }
+    clean(&file_name_of(row))
+}
+
+/// One subtitle file, as the list wants it: whether its name says it belongs to the video named
+/// `video`, and the row that lists it.
+///
+/// `name` and `video` are names as the torrent carries them, because both questions this answers are
+/// questions about the end of a name: [`media::subtitle_format`] reads the extension and [`sidecar_of`]
+/// compares stems, while [`clean`] keeps a name's first characters, so a name long enough to be cut is
+/// cut where its extension was. A 300 character `film.en.srt` cleaned first is no format at all and no
+/// sidecar of anything, and a file that cannot be recognised cannot be listed or played. The row carries
+/// the cleaned name, because that is the half of it a viewer reads.
+fn subtitle_row(index: usize, name: &str, video: Option<&str>) -> Option<(bool, SubtitleRow)> {
+    let format = media::subtitle_format(name)?;
+    let beside = video.is_some_and(|video| sidecar_of(video, name));
+    Some((
+        beside,
+        SubtitleRow {
+            file: index,
+            name: clean(name),
+            format: format_name(format),
+        },
+    ))
 }
 
 /// The subtitle files of one torrent, spelled the way a viewer wants a list of them: the ones named after
@@ -792,24 +829,15 @@ fn external_subtitles(files: &[FileStatus], video: usize) -> Vec<SubtitleRow> {
     let base = files
         .iter()
         .find(|row| row.index == video)
-        .map(display_name);
+        .map(file_name_of);
     let mut rows: Vec<(bool, usize, SubtitleRow)> = files
         .iter()
-        .filter(|row| !row.pad && row.index != video)
-        .filter_map(|row| {
-            let name = display_name(row);
-            let format = media::subtitle_format(&name)?;
-            let beside = base.as_deref().is_some_and(|base| sidecar_of(base, &name));
-            Some((
-                // A row that did not match the video's name sorts after one that did.
-                !beside,
-                row.index,
-                SubtitleRow {
-                    file: row.index,
-                    name,
-                    format: format_name(format),
-                },
-            ))
+        .filter(|file| !file.pad && file.index != video)
+        .filter_map(|file| {
+            let index = file.index;
+            let (beside, row) = subtitle_row(index, &file_name_of(file), base.as_deref())?;
+            // A row that did not match the video's name sorts after one that did.
+            Some((!beside, index, row))
         })
         .collect();
     rows.sort_by_key(|(later, index, _)| (*later, *index));
@@ -1047,7 +1075,42 @@ fn shutting_down() -> RouteError {
 
 #[cfg(test)]
 mod tests {
-    use super::sidecar_of;
+    use super::{clean, sidecar_of, subtitle_row};
+
+    /// A subtitle name too long for the display limit still says what it is and whose it is.
+    ///
+    /// `clean` keeps a name's first 256 characters, so a name cleaned before it is read has lost the
+    /// extension `subtitle_format` answers from and the stem `sidecar_of` compares: this 300 character
+    /// `x.srt` is SubRip text, and it is the sidecar of the 300 character video named beside it. What
+    /// the row shows stays the cleaned name, because that is the half a viewer reads.
+    #[test]
+    fn a_long_subtitle_name_keeps_its_format() {
+        let stem = "x".repeat(296);
+        let name = format!("{stem}.srt");
+        let video = format!("{stem}.mkv");
+        assert_eq!(
+            name.chars().count(),
+            300,
+            "the point of the name is that it is past the display limit"
+        );
+        let (beside, row) =
+            subtitle_row(7, &name, Some(&video)).expect("a long name is still a subtitle file");
+        assert_eq!(
+            row.format, "srt",
+            "the extension past 256 characters still named the format"
+        );
+        assert_eq!(row.file, 7, "and the row is the file it was built from");
+        assert!(
+            beside,
+            "a name built on the video's own stem is its sidecar at any length"
+        );
+        assert_eq!(row.name, clean(&name), "the name shown is the cleaned one");
+        assert_eq!(
+            row.name.chars().count(),
+            256,
+            "cleaned to the display limit, which is where the extension went"
+        );
+    }
 
     /// What ranks as a video's own sidecar, and what only ranks after it.
     ///
