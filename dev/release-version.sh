@@ -19,9 +19,12 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 manifest="${RELEASE_CARGO_TOML:-$root/Cargo.toml}"
 [[ -f "$manifest" ]] || { echo "::error::no manifest at $manifest"; exit 1; }
 
-# tr: a Windows checkout may have CRLF line endings.
+# tr: a Windows checkout may have CRLF line endings. The awk reads the manifest to the end instead of
+# exiting at the first match: an early exit hits tr with SIGPIPE, and this script's own pipefail turns
+# that scheduling race into a flaky failure when a caller captures it (twice in twenty runs measured
+# on the 15 KiB manifest, inside a container, by dev/package-desktop-linux.sh's build line).
 version="$(tr -d '\r' < "$manifest" \
-  | awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/"/,"",$3);print $3;exit}')"
+  | awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/"/,"",$3);print $3}')"
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   echo "::error::no valid [workspace.package] version in $manifest (found '$version')"
   exit 1

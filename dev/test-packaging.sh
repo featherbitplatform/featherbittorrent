@@ -8,7 +8,11 @@
 # (--print-versions), holds the requirements rpm derives from the real binary to the allow list
 # (--check-rpm-reqs), and refuses missing arguments, a version that is not X.Y.Z(-pre), and an arch
 # other than x86_64 or aarch64, and a variant other than full or headless, all before it asks anything
-# about the platform, which is why these tests run on macOS too; and dev/test-service-examples.sh passes,
+# about the platform, which is why these tests run on macOS too; dev/check-linux-binary.sh --desktop
+# accepts the NEEDED list of the real ubuntu:22.04 desktop build (the desktop-needed-<arch> fixture) at
+# its raised 2.35 floor and refuses a library off the desktop allow list, and the same fixture is
+# refused without the flag, which is how cli_allow_list_unchanged proves the CLI list did not move;
+# and dev/test-service-examples.sh passes,
 # because the packages ship those examples as documentation. The fixtures are excerpts of objdump -T and objdump -p output for the
 # binary dev/package-linux.sh builds in almalinux:9 (the failing copies are hand-edited from them), so
 # they name no machine's paths. Nothing here contacts the network, builds anything, or installs
@@ -109,6 +113,87 @@ glibc_case 2.34 0    # exactly the floor
 glibc_case 2.35 1    # just above the floor
 glibc_case 2.34.1 1  # a third number, newer than 2.34 only on its own field
 echo 'ok: check-linux-binary.sh accepts GLIBC_2.4 and GLIBC_2.34, refuses GLIBC_2.35 and GLIBC_2.34.1 by name'
+
+# 5b. The desktop allow list, run through --desktop: the NEEDED lines are read from the real
+# ubuntu:22.04 desktop build (dev/fixtures/desktop-needed-<arch>.txt, trimmed exactly like the two CLI
+# -p fixtures, so it names no machine's paths). --desktop raises the glibc floor to 2.35 (the floor of
+# every system the desktop packages install on: the Ubuntu 22.04 build) and adds the webview, GTK, GLib,
+# libsoup, cairo, pango, gdk-pixbuf and appindicator families the desktop binary really links; without
+# the flag the CLI allow list is exactly what it was, so the same fixture has to be refused there.
+case "$(uname -m)" in
+  x86_64|amd64) want_arch=x86_64 ;;
+  arm64) want_arch=aarch64 ;;
+  *) want_arch="$(uname -m)" ;;
+esac
+desktop_fixture=''
+for arch_try in "$want_arch" aarch64 x86_64; do
+  if [[ -f "$fixtures/desktop-needed-$arch_try.txt" ]]; then
+    desktop_fixture="desktop-needed-$arch_try.txt"
+    break
+  fi
+done
+[[ -n "$desktop_fixture" ]] || fail "no desktop NEEDED fixture under $fixtures (expected desktop-needed-x86_64.txt or desktop-needed-aarch64.txt)"
+echo "ok: the desktop NEEDED fixture is there ($desktop_fixture)"
+
+# run_desktop_check feeds full fixture paths (the modified copies live in $tmp, not in dev/fixtures).
+run_desktop_check() { # <objdump -T fixture path> <objdump -p fixture path>; returns the check's status
+  local t="$1" p="$2" status=0 out
+  out="$(CHECK_OBJDUMP_T="$t" CHECK_OBJDUMP_P="$p" bash "$check_sh" --desktop "$check_sh" 2>&1)" || status=$?
+  check_out="$out"
+  return "$status"
+}
+
+# desktop_allow_list_accepts_the_fixture: what the ubuntu:22.04 desktop binary really links. The GTK and
+# webview families come from the crates that bind them (gtk-sys and webkit2gtk-sys through pkg-config,
+# rfd's gtk3 file dialogs); the T side reuses the almalinux:9 excerpt because its newest symbol
+# (GLIBC_2.34) is below the desktop floor, and a lone GLIBC_2.35 symbol has to pass too: 2.35 is the
+# build system's own glibc, so refusing it would refuse every desktop build (case 5 feeds the same
+# version through CLI mode, where it is refused).
+desktop_allow_list_accepts_the_fixture() {
+  local status=0 out
+  run_desktop_check "$fixtures/objdump-T-ok.txt" "$fixtures/$desktop_fixture" || status=$?
+  [[ $status -eq 0 ]] || fail "check-linux-binary.sh --desktop refused the desktop fixture (exit $status): $check_out"
+  printf '%s\n%s\n' 'DYNAMIC SYMBOL TABLE:' \
+    '0000000000000000      DF *UND*  0000000000000000  GLIBC_2.35   some_symbol' \
+    > "$tmp/objdump-T-desktop-floor.txt"
+  status=0
+  run_desktop_check "$tmp/objdump-T-desktop-floor.txt" "$fixtures/$desktop_fixture" || status=$?
+  [[ $status -eq 0 ]] || fail "check-linux-binary.sh --desktop refused a lone GLIBC_2.35 symbol (exit $status): $check_out"
+  echo 'ok: check-linux-binary.sh --desktop accepts the ubuntu:22.04 desktop build and its own GLIBC_2.35'
+}
+
+# desktop_allow_list_refuses_an_unknown_library: the desktop allow list is what the bundle.linux depends
+# promise, so a NEEDED entry no package declares has to be refused by name, with both places to fix, as
+# section 3 insists for the CLI list. libssl.so.3 (what a ring or openssl backend would ask for) is
+# inserted into a copy of the real fixture.
+desktop_allow_list_refuses_an_unknown_library() {
+  local copy="$tmp/desktop-p-extra-lib.txt" status=0
+  awk 'BEGIN{ins=0} /^  NEEDED / && !ins {print; print "  NEEDED               libssl.so.3"; ins=1; next} {print}' \
+    "$fixtures/$desktop_fixture" > "$copy"
+  run_desktop_check "$fixtures/objdump-T-ok.txt" "$copy" || status=$?
+  [[ $status -eq 1 ]] || fail "check-linux-binary.sh --desktop exited $status on a fixture holding libssl.so.3, expected 1: $check_out"
+  grep -qF 'libssl.so.3' <<<"$check_out" || fail "the refusal did not name libssl.so.3: $check_out"
+  grep -qF 'allow list' <<<"$check_out" || fail "the refusal did not mention the allow list: $check_out"
+  grep -qF 'depends' <<<"$check_out" || fail "the refusal did not mention the depends: $check_out"
+  echo 'ok: check-linux-binary.sh --desktop refuses NEEDED libssl.so.3 and names it with both places to fix'
+}
+
+# cli_allow_list_unchanged: the same desktop fixture through CLI mode. The floor is back at 2.34 and the
+# allow list back to libc/libm/libgcc_s and the loader, so the refusal has to name a GTK-family library
+# the CLI binary never links, proving --desktop did not widen what plain featherbittorrent packages get.
+cli_allow_list_unchanged() {
+  local status=0
+  run_check objdump-T-ok.txt "$desktop_fixture" || status=$?
+  [[ $status -eq 1 ]] || fail "check-linux-binary.sh accepted the desktop fixture without --desktop (exit $status): $check_out"
+  grep -qE 'needs lib(gtk|gdk|glib|gobject|gio|pango|cairo|harfbuzz|soup|ayatana|webkit|javascriptcore|epoxy|drm|gbm|pixbuf|X11|Xext|Xdamage|Xfixes|Xrandr)' <<<"$check_out" \
+    || fail "the CLI refusal named no GTK-family library from the desktop build: $check_out"
+  grep -qF 'allow list' <<<"$check_out" || fail "the CLI refusal did not mention the allow list: $check_out"
+  echo 'ok: check-linux-binary.sh without --desktop still refuses the desktop build for its GTK libraries'
+}
+
+desktop_allow_list_accepts_the_fixture
+desktop_allow_list_refuses_an_unknown_library
+cli_allow_list_unchanged
 
 # 6. The requirements rpm derives from the real binary, held to the allow list through --check-rpm-reqs,
 # which reads stdin and asks nothing about the platform. The accepted list is verbatim what rpm -qpR
