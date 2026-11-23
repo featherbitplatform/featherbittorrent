@@ -8,18 +8,31 @@ never does: no package installs, enables or starts a service, and none of them c
 
 ## Which file is yours
 
-| System | The file to download |
-| --- | --- |
-| Debian, Ubuntu or Raspberry Pi OS 64-bit | `featherbittorrent-<version>-linux-x86_64.deb`, or `-linux-aarch64.deb` for a 64-bit ARM machine (a Pi 3, 4, 5 or Zero 2 W on 64-bit Raspberry Pi OS) |
-| Fedora, RHEL, Rocky Linux or AlmaLinux 9 | `featherbittorrent-<version>-linux-x86_64.rpm`, or `-linux-aarch64.rpm` |
-| Any other Linux with glibc 2.34 or newer | `featherbittorrent-<version>-x86_64-unknown-linux-gnu.tar.gz`, or the `aarch64-unknown-linux-gnu` one |
-| macOS, Apple Silicon or Intel | `featherbittorrent-<version>-universal-apple-darwin.tar.gz`: one binary with both architectures in it |
-| Windows, x86-64 or arm64 | `featherbittorrent-<version>-x86_64-pc-windows-msvc.zip`, or the `aarch64-pc-windows-msvc` one |
+Each release ships two builds of the same binary. The full build, `featherbittorrent`, serves the browser
+web UI beside the API, and the headless build, `featherbittorrent-headless`, carries no front end. On Linux
+both come as packages that install the same `/usr/bin/featherbittorrent`, and installing one removes the
+other, so you pick the build you want by which package you install. The two say that in different words,
+because the package managers have different words for it: the `.deb` declares that it conflicts with and
+replaces the other package, so `apt install` of one over the other removes the first; the `.rpm` declares
+that it obsoletes the other package (RPM has no "replaces" tag, and an obsoletes is what makes `dnf
+install` of one over the other remove the first), so the two do not sit on the machine at once. The
+archives and the Windows zips are not packages, so both of a system's archives can sit on disk at once; use
+the one you want. The table names the full build's files; the headless build's are the same with `-headless`
+after `featherbittorrent`.
+
+| System | The full build's file | The headless build's file |
+| --- | --- | --- |
+| Debian, Ubuntu or Raspberry Pi OS 64-bit | `featherbittorrent-<version>-linux-x86_64.deb`, or `-linux-aarch64.deb` for a 64-bit ARM machine (a Pi 3, 4, 5 or Zero 2 W on 64-bit Raspberry Pi OS) | `featherbittorrent-headless-<version>-linux-x86_64.deb`, or `-linux-aarch64.deb` |
+| Fedora, RHEL, Rocky Linux or AlmaLinux 9 | `featherbittorrent-<version>-linux-x86_64.rpm`, or `-linux-aarch64.rpm` | `featherbittorrent-headless-<version>-linux-x86_64.rpm`, or `-linux-aarch64.rpm` |
+| Any other Linux with glibc 2.34 or newer | `featherbittorrent-<version>-x86_64-unknown-linux-gnu.tar.gz`, or the `aarch64-unknown-linux-gnu` one | `featherbittorrent-headless-<version>-x86_64-unknown-linux-gnu.tar.gz`, or the `aarch64-unknown-linux-gnu` one |
+| macOS, Apple Silicon or Intel | `featherbittorrent-<version>-universal-apple-darwin.tar.gz`: one binary with both architectures in it | `featherbittorrent-headless-<version>-universal-apple-darwin.tar.gz` |
+| Windows, x86-64 or arm64 | `featherbittorrent-<version>-x86_64-pc-windows-msvc.zip`, or the `aarch64-pc-windows-msvc` one | `featherbittorrent-headless-<version>-x86_64-pc-windows-msvc.zip`, or the `aarch64-pc-windows-msvc` one |
 
 On Linux `uname -m` prints `x86_64` or `aarch64`, which is the part of the name to match. Nothing is built
 for 32-bit ARM. The `.deb`, the `.rpm` and the Linux `.tar.gz` hold the same binary, built against glibc
 2.34 (RHEL 9's), so they run from Ubuntu 22.04 and RHEL 9 up to Debian 13 and Raspberry Pi OS 13; on a system
-with an older glibc than that this binary does not start.
+with an older glibc than that this binary does not start. The web UI the full build serves is described in
+[docs/web-ui.md](web-ui.md).
 
 ## Check what you downloaded
 

@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fbt::{SessionError, Settings};
 use fbt_api::{ApiConfig, ApiError, ApiServer, Auth};
@@ -211,12 +212,26 @@ impl Server {
         api_config.auth = Auth::Custom(shared.authenticator());
         api_config.allowed_roots = Some(given_roots);
 
+        // The routes fbt-api is handed, which are featherbittorrent's own: the logins, the devices, the
+        // folder browsing, the stream token.
+        let extra = routes::router(Arc::clone(&shared));
+        // A build that carries the front end serves it on the same router, for the reason in `crate::web`:
+        // the sign-in call has to be same-origin with the page that makes it. `server.web_ui` is the
+        // switch, and `web_ui_on` is the only question asked of it; a headless build never gets here, so
+        // the same config key on that build is accepted, ignored, and said once at startup instead.
+        #[cfg(feature = "web-ui")]
+        let extra = if server.web_ui_on() {
+            extra.merge(crate::web::router())
+        } else {
+            extra
+        };
+
         let api = ApiServer::start_with(
             // A clone, and every clone is the same session: fbt-api answers requests from it while this
             // task keeps driving the saves, and neither owns it more than the other.
             engine.session().clone(),
             api_config,
-            routes::router(Arc::clone(&shared)),
+            extra,
         )
         .await
         .map_err(ServerError::Api)?;
@@ -240,6 +255,19 @@ impl Server {
     /// The address being served on - with the real port when the config asked for `0`.
     pub fn local_addr(&self) -> SocketAddr {
         self.api.local_addr()
+    }
+
+    /// How long one read or one seek of a media route may take on this server, for every media request
+    /// that opens a file after the call.
+    ///
+    /// The default is the media routes' own bound - sixty seconds, longer than any piece of a healthy
+    /// torrent takes and far shorter than waiting forever for one - and nothing in `config.yaml` sets it,
+    /// because it is not a preference about a library: it is how long a request is willing to wait on a
+    /// peer for somebody else's piece. A test that wants to watch a stream give up, or a run behind a
+    /// tracker that has gone quiet, is what changes it. A media stream already playing keeps the window it
+    /// started with, because a media route takes its deadline once, when it opens the file.
+    pub fn set_media_read_timeout(&self, timeout: Duration) {
+        self.shared.set_media_read_timeout(timeout);
     }
 
     /// How many Argon2 password checks this server has run. Only a test reads this: the one that says an

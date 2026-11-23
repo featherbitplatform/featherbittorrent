@@ -1,0 +1,11 @@
+WEBVTT
+
+00:00:00.500 --> 00:00:02.000
+First WebVTT line
+spanning two lines
+
+00:00:02.500 --> 00:00:03.000
+Second WebVTT line
+
+00:00:03.200 --> 00:00:03.900
+Third WebVTT line

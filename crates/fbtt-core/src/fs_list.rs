@@ -145,19 +145,16 @@ pub enum ListingError {
     CannotRead { shown: String, problem: String },
 }
 
-/// The directories directly inside `path`, spelled as `path` was spelled.
+/// `path` resolved, every link in it followed, once it has been held to the rules a listing holds a path to:
+/// absolute, no `..`, below a root as spelled ([`inside_lexically`]) and below a root again once resolved,
+/// and a folder. This is the one place that decides whether a path names a folder inside the roots, so
+/// that every route which acts on a folder - listing what is inside it, creating one inside it - answers
+/// that question the same way and a link that leads out is refused by all of them.
 ///
-/// Names come back cleaned for display and sorted, files and hidden entries (the dot convention, on every
-/// platform) are left out, and at most [`MAX_DIRS`] names are reported - the alphabetically first ones,
-/// so the same folder answers the same way twice rather than in whatever order the file system happened
-/// to hand them out. A path outside every root is [`ListingError::Outside`], whether it got there by
-/// `..`, by being somewhere else entirely, or by being a symlink that leads out; one that is not there is
-/// [`ListingError::Missing`]; one that is not a folder, or that no operating system could take, is
-/// [`ListingError::Unusable`] or [`ListingError::NotAFolder`].
-///
-/// This blocks: it reads a directory. Call it from a blocking thread ([`tokio::task::spawn_blocking`])
-/// when something else is waiting on the answer.
-pub fn list_dirs(roots: &[Root], path: &Path) -> Result<Vec<String>, ListingError> {
+/// A path outside every root is [`ListingError::Outside`], one that is not there is
+/// [`ListingError::Missing`], one no operating system could take is [`ListingError::Unusable`] and one
+/// that is not a folder is [`ListingError::NotAFolder`]. This blocks: it asks the file system.
+pub fn resolve_folder(roots: &[Root], path: &Path) -> Result<PathBuf, ListingError> {
     let shown = clean(&path.to_string_lossy());
     // Lexical first, so a path any caller would refuse anyway costs a comparison and not a stat - and so
     // that `..` is refused before anything has followed it somewhere else.
@@ -194,6 +191,24 @@ pub fn list_dirs(roots: &[Root], path: &Path) -> Result<Vec<String>, ListingErro
     if !canonical.is_dir() {
         return Err(ListingError::NotAFolder(shown));
     }
+    Ok(canonical)
+}
+
+/// The directories directly inside `path`, spelled as `path` was spelled.
+///
+/// Names come back cleaned for display and sorted, files and hidden entries (the dot convention, on every
+/// platform) are left out, and at most [`MAX_DIRS`] names are reported - the alphabetically first ones,
+/// so the same folder answers the same way twice rather than in whatever order the file system happened
+/// to hand them out. A path outside every root is [`ListingError::Outside`], whether it got there by
+/// `..`, by being somewhere else entirely, or by being a symlink that leads out; one that is not there is
+/// [`ListingError::Missing`]; one that is not a folder, or that no operating system could take, is
+/// [`ListingError::Unusable`] or [`ListingError::NotAFolder`].
+///
+/// This blocks: it reads a directory. Call it from a blocking thread ([`tokio::task::spawn_blocking`])
+/// when something else is waiting on the answer.
+pub fn list_dirs(roots: &[Root], path: &Path) -> Result<Vec<String>, ListingError> {
+    let shown = clean(&path.to_string_lossy());
+    let canonical = resolve_folder(roots, path)?;
     let entries = match std::fs::read_dir(&canonical) {
         Ok(entries) => entries,
         // Inside a root, and still refused: that is the file system's own answer to who may read it.

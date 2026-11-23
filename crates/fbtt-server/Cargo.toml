@@ -18,6 +18,12 @@ workspace = true
 # library away from where its config points needs it in a release build too. The `server` test target below
 # requires this feature, which is what makes the gate's `--all-features` run execute that file at all.
 test-support = []
+# The browser UI: this build serves the built `web/dist` on the API's own origin. The release
+# executable carries the bytes; a debug build reads the folder from disk on each request, which is
+# what makes editing the front end without recompiling work and what makes a debug run whose
+# `web/dist` went away answer `500` where the shipped binary could not (`src/web.rs`'s module doc
+# says the same at more length). The headless build pays for neither.
+web-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 # The password hashes.
@@ -25,6 +31,14 @@ argon2.workspace = true
 # The routes: `Router`, the body and query extractors, and the `http` types an `AuthRequest` carries.
 # fbt-api turns the serving half on for the tree; these are the parts our own code names.
 axum = { workspace = true, features = ["json", "query"] }
+# The built front end. Only with `web-ui`: the headless build carries no assets, and `build.rs` skips
+# the change-tracking line for it, so a missing `web/dist` is not even an error there. Its features
+# are decided at the workspace entry (`rust-embed` in the root `Cargo.toml`), where `default-features
+# = false` lives with the reason for it.
+rust-embed = { workspace = true, optional = true }
+# What type an asset is served as, from its extension. Vite hashes the names but keeps the
+# extensions, and the hash is exactly why the extension is the only thing left to ask.
+mime_guess = { workspace = true, optional = true }
 # Session tokens and challenge nonces, spelled in base64.
 base64.workspace = true
 # `fbt::display_safe`, because a folder name or a config device name is remote text by the time a
@@ -32,12 +46,17 @@ base64.workspace = true
 fbt.workspace = true
 fbt-api.workspace = true
 fbtt-core.workspace = true
+# The media routes' demuxing: probe, one track as fragmented MP4, and subtitle parsing. Pure
+# `Read + Seek`, so the routes hand it a `BlockingReader` over a torrent file (`media_io.rs`).
+fbtt-media.workspace = true
 # The bytes session tokens and challenge nonces are made of.
 getrandom.workspace = true
 # What a session token is stored as: its SHA-256.
 sha2.workspace = true
 # Device keys: the OpenSSH public key line and `sshsig`.
 ssh-key.workspace = true
+# The browser session's CSRF token is compared in constant time.
+subtle.workspace = true
 # The request and response bodies of our own routes.
 serde.workspace = true
 # `StreamExt::next`, for the stream-token route reading its body chunk by chunk under its own caps.
@@ -46,8 +65,10 @@ futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # The task that saves the engine every five minutes, its stop signal, and the blocking-pool calls
-# (Argon2 verify, folder listing, config save) that keep them off the connection's task.
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+# (Argon2 verify, folder listing, config save) that keep them off the connection's task. `io-util`
+# is for the media routes: `AsyncReadExt::read` and `AsyncSeekExt::seek` are what a
+# `BlockingReader` puts inside its `block_on` around a `fbt::FileReader` (`media_io.rs`).
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "io-util"] }
 # Log lines: who signed in, what a state-file problem cost, what the server is listening on.
 tracing.workspace = true
 
@@ -74,6 +95,10 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # The relay's bound test puts nine requests in flight at once: `join_all` is the one
 # combinator that does that without naming nine.
 futures.workspace = true
+# `tests/media.rs` walks the fragmented MP4 the media stream route writes - `ftyp`, `moov`, `moof` - the way
+# a demuxer would, box header by box header. Integration tests see this crate's own dependencies and not the
+# crates beside it, so the atom reader has to be named here even though `fbtt-media` already depends on it.
+mp4-atom.workspace = true
 
 [[test]]
 name = "server"

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
-use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths, web_ui_env_override};
 use fbtt_server::{Server, ServerError};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -129,15 +129,33 @@ pub async fn run(paths: &Paths, debug: &ServeDebug) -> Result<(), Failure> {
 }
 
 /// Starts the server on the engine's settings: what the config says, with `--offline` applied in a build
-/// that has that switch. There is one start path in every build, because taking the settings as an
-/// argument is not a test hook - see [`Server::start_with_settings`] - so no feature that only tests ask
-/// for is linked into a release binary here.
+/// that has that switch, and with `FBTT_WEB_UI` applied over the config's server section in every build.
+/// There is one start path in every build, because taking the settings as an argument is not a test hook -
+/// see [`Server::start_with_settings`] - so no feature that only tests ask for is linked into a release
+/// binary here.
+///
+/// This is the one place `serve` reads the process environment; everything the override decides is in
+/// [`apply_web_ui_env`], which takes the lookup as an argument.
 async fn open(
-    config: Config,
+    mut config: Config,
     paths: &Paths,
     lock: LibraryLock,
     debug: &ServeDebug,
 ) -> Result<Server, ServerError> {
+    apply_web_ui_env(&mut config, &|name| std::env::var(name).ok());
+    // A headless build has no browser UI to serve, so it says once what it is doing with a
+    // setting that asked for one: heard, kept in the file, and not acted on. (The held log
+    // writer keeps this behind `listening on ...`, where a script's contract says it belongs.)
+    #[cfg(not(feature = "web-ui"))]
+    if config
+        .server
+        .as_ref()
+        .is_some_and(|server| server.web_ui.is_some())
+    {
+        tracing::warn!(
+            "server.web_ui is set, but this is the headless build: there is no web UI to serve"
+        );
+    }
     #[cfg(debug_assertions)]
     let settings = offline_settings(&config, debug.offline());
     #[cfg(not(debug_assertions))]
@@ -147,6 +165,20 @@ async fn open(
         config.session_settings()
     };
     Server::start_with_settings(settings, config, paths, lock).await
+}
+
+/// `FBTT_WEB_UI`, applied to the config's server section: when the environment names an answer it wins
+/// over the file - even over a file that said `web_ui: true` - and when it names nothing, or a word
+/// [`web_ui_env_override`] does not take, the file keeps its choice. A config with no server section at
+/// all has nothing to override: `serve` only ever reaches this through a config that has one (see
+/// [`serve_base_from_load`]), so that arm is a shape, not a case.
+fn apply_web_ui_env(config: &mut Config, env: &dyn Fn(&str) -> Option<String>) {
+    let Some(on) = web_ui_env_override(env) else {
+        return;
+    };
+    if let Some(server) = config.server.as_mut() {
+        server.web_ui = Some(on);
+    }
 }
 
 /// The engine's settings, with `--offline` applied: every socket on loopback and
@@ -430,9 +462,9 @@ impl<'w> MakeWriter<'w> for HeldMakeWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServeBase, serve_base_from_load};
+    use super::{ServeBase, apply_web_ui_env, serve_base_from_load};
     use fbtt_core::scratch::ScratchDir;
-    use fbtt_core::{Config, Paths};
+    use fbtt_core::{Config, Paths, ServerConfig};
     use std::fs;
 
     /// A scratch library: config side and data side in the same place, which is all
@@ -523,5 +555,43 @@ mod tests {
         };
         assert!(problem.is_some(), "the problem line is kept to log");
         assert!(base.server.is_none(), "no server section to serve as read");
+    }
+
+    /// `FBTT_WEB_UI` wins over the file: the environment's word replaces what the config
+    /// chose, and nothing in the environment is not an answer - it leaves the config in
+    /// charge. The process environment is read only by `open`, so this test hands in its
+    /// own lookup and never sets anything.
+    #[test]
+    fn the_environment_wins_over_the_config() {
+        let mut chosen = Config {
+            server: Some(ServerConfig {
+                web_ui: Some(true),
+                ..ServerConfig::default()
+            }),
+            ..Config::default()
+        };
+        apply_web_ui_env(&mut chosen, &|name| {
+            (name == "FBTT_WEB_UI").then_some("0".to_string())
+        });
+        assert_eq!(
+            chosen.server.expect("the section survives").web_ui,
+            Some(false),
+            "FBTT_WEB_UI=0 turns off a UI the config turned on"
+        );
+
+        // Nothing in the environment says nothing, and the config's choice stands.
+        let mut silent = Config {
+            server: Some(ServerConfig {
+                web_ui: Some(true),
+                ..ServerConfig::default()
+            }),
+            ..Config::default()
+        };
+        apply_web_ui_env(&mut silent, &|_name| None);
+        assert_eq!(
+            silent.server.expect("the section survives").web_ui,
+            Some(true),
+            "an unset FBTT_WEB_UI leaves the config in charge"
+        );
     }
 }

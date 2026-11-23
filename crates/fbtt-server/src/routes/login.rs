@@ -130,12 +130,12 @@ pub(super) async fn challenge(
 /// With `Authorization: Basic <user:password>` the body is not read as anything; without it the body is
 /// the key login's `{public_key, nonce, signature}`. A body over the route's cap is read to its end -
 /// within [`MAX_LOGIN_REFUSED_BODY`] - before it is refused, so a client still sending gets the `413`
-/// rather than a reset. Once a body this route accepts has arrived, the
-/// address's attempt is taken before any credential is looked at: ten of them in a five-minute window close
-/// the door to guessing from that address, and one refused after the budget went costs this server no work.
-/// The answer is the same shape either way, `{token, expires_in, subject}`, where `subject` is this
-/// server's own name for whoever got in - an account name or a device name, never something the client
-/// typed.
+/// rather than a reset. Once a body this route accepts has arrived, whichever branch the credential
+/// belongs in takes the address's attempt before it looks at the credential: ten of them in a five-minute
+/// window close the door to guessing from that address, and one refused after the budget went costs this
+/// server no work. The answer is the same shape either way, `{token, expires_in, subject}`, where `subject`
+/// is this server's own name for whoever got in - an account name or a device name, never something the
+/// client typed.
 ///
 /// With auth off this route still answers a matching account: the accounts are in `config.yaml` whether or
 /// not this server asks anyone to use them, and a client that was set up with a password should not break
@@ -145,7 +145,6 @@ pub(super) async fn session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Result<Json<SessionResponse>, RouteError> {
-    let peer = peer.ip();
     // The body is read here under the route's own cap rather than by the extractor (see
     // [`MAX_LOGIN_REFUSED_BODY`]): answering with bytes still owed would close the connection the client is
     // still writing on. A body over the cap is refused in this API's error shape rather than axum's
@@ -163,19 +162,16 @@ pub(super) async fn session(
     .await?;
     // From here on the request carries a credential this server has not looked at, and everything that
     // follows is work spent on somebody else's guess: choosing a hash, running an Argon2 verify, spending a
-    // challenge. Taking the attempt now is what makes "ten per window" mean ten however they arrive - a
-    // burst cannot all pass a question asked before anybody had failed anything - and a refused address
-    // pays nothing for being refused, so knocking on a closed door does not push it further away.
-    let _attempt = shared
-        .auth
-        .limiter()
-        .reserve(peer)
-        .map_err(RouteError::too_many_requests)?;
+    // challenge. The branch that takes the credential takes the address's attempt with it - [`verify_password`]
+    // and [`key_login`] each do it at their top, before they look at anything - which is what makes "ten per
+    // window" mean ten however they arrive: a burst cannot all pass a question asked before anybody had
+    // failed anything. A refused address pays nothing for being refused, so knocking on a closed door does
+    // not push it further away, and a body this route never accepted never got this far.
     match credential(&headers, &body) {
         Credential::Password(name, password) => {
             password_login(&shared, peer, &name, &password).await
         }
-        Credential::Key(body) => key_login(&shared, peer, body),
+        Credential::Key(body) => key_login(&shared, peer.ip(), body),
     }
 }
 
@@ -256,24 +252,56 @@ fn decode_credentials(encoded: &str) -> Option<(String, String)> {
 /// cannot keep connections and tasks open on this server while it queues.
 const MAX_VERIFY_WAIT: Duration = Duration::from_secs(10);
 
-/// One login with a password: one verify against the hash on file (or the dummy), then either a token or
-/// the same answer every wrong credential gets.
-///
-/// The address's attempt was already taken by [`session`]. What is left to bound here is the work itself: a
-/// verify wants about 19 MiB and a core's worth of time, and the blocking pool will run as many of them as
-/// arrive if nothing tells it otherwise. The permit is for the whole server, so it bounds what every
-/// address together can do - which is the case an address-per-address guesser is built for, each one inside
-/// its own budget and none of them limited by anybody else's. It travels down to the verify rather than
-/// staying here, because a handler is not what makes the memory: whoever connected may hang up halfway,
-/// and this server is still going to finish the hash it started.
+/// `POST /api/v1/auth/session` with a password: the answer that route has always given, from the check
+/// [`verify_password`] shares with the browser sign-in.
 async fn password_login(
-    shared: &Arc<Shared>,
-    peer: IpAddr,
+    shared: &Shared,
+    peer: SocketAddr,
     name: &str,
     password: &str,
 ) -> Result<Json<SessionResponse>, RouteError> {
+    let subject = verify_password(shared, peer, name, password).await?;
+    let (token, ttl) = shared.auth.sessions().issue(subject.clone());
+    Ok(Json(SessionResponse {
+        token,
+        expires_in: ttl.as_secs(),
+        subject,
+    }))
+}
+
+/// The password check both sign-in routes share: the address's attempt, one verify against the hash on
+/// file (or the dummy), and the limiter's pardon when it matched. What each route does with the subject -
+/// a bearer token here, a cookie there - is not this function's business, which is why it answers the
+/// subject rather than a session.
+///
+/// The attempt is taken here, at the top, rather than by the route that called this: [`session`] dispatches
+/// on what the request brought, and the web sign-in route never dispatches at all, so an attempt that was
+/// taken in between the two would be one the second route forgot to take. What is left to bound after it is
+/// the work itself: a verify wants about 19 MiB and a core's worth of time, and the blocking pool will run
+/// as many of them as arrive if nothing tells it otherwise. The permit is for the whole server, so it bounds
+/// what every address together can do - which is the case an address-per-address guesser is built for, each
+/// one inside its own budget and none of them limited by anybody else's. It travels down to the verify
+/// rather than staying here, because a handler is not what makes the memory: whoever connected may hang up
+/// halfway, and this server is still going to finish the hash it started. The permit, and the tally the
+/// check reports into, both have to be owned by that job, which is why this takes the `Shared` by
+/// reference rather than the `Arc` its callers hold: the two things that travel down are `Arc`s of their
+/// own.
+pub(super) async fn verify_password(
+    shared: &Shared,
+    peer: SocketAddr,
+    user: &str,
+    password: &str,
+) -> Result<String, RouteError> {
+    let peer = peer.ip();
+    // Taken before anything about the credential is looked at, so a burst of guesses from one address is ten
+    // attempts and not ten answers to the same question nobody had failed yet.
+    let _attempt = shared
+        .auth
+        .limiter()
+        .reserve(peer)
+        .map_err(RouteError::too_many_requests)?;
     // Chosen before any hashing starts, so an unknown name is asked the same question a known one is.
-    let Some(phc) = shared.password_hash_for(name) else {
+    let Some(phc) = shared.password_hash_for(user) else {
         return Err(refusal(peer, "password", "no account on this server"));
     };
     // A turn at the check, or a `503` saying to come back in a second: waiting for room is bounded, so a
@@ -293,7 +321,7 @@ async fn password_login(
     // halfway makes hyper drop this handler, and a permit still held out here would be handed back while
     // its 19 MiB of hashing was still running - which is the very hole the permit exists to close. A
     // blocking job cannot be cancelled, so the only thing that can end it is the verify itself.
-    let counting = Arc::clone(shared);
+    let counting = Arc::clone(&shared.verify_tally);
     let password = password.to_string();
     let matched = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -312,25 +340,27 @@ async fn password_login(
     if !matched {
         return Err(refusal(peer, "password", "wrong password"));
     }
-    let subject = name.to_string();
-    let (token, ttl) = shared.auth.sessions().issue(subject.clone());
+    let subject = user.to_string();
     shared.auth.limiter().success(peer);
     tracing::info!(peer = %peer, method = "password", subject = %clean(&subject), "signed in");
-    Ok(Json(SessionResponse {
-        token,
-        expires_in: ttl.as_secs(),
-        subject,
-    }))
+    Ok(subject)
 }
 
 /// One login with a device key: the fingerprint of the key the client names finds this server's own
 /// copy of it, the nonce has to be one we handed that key and not spent, and the signature has to be
 /// made by the private half of *our* copy.
 fn key_login(
-    shared: &Arc<Shared>,
+    shared: &Shared,
     peer: IpAddr,
     body: &[u8],
 ) -> Result<Json<SessionResponse>, RouteError> {
+    // The same attempt the password branch takes, taken the same way: before the key line is parsed, before
+    // the nonce is looked up, so a burst of key logins from one address is counted as the attempts it is.
+    let _attempt = shared
+        .auth
+        .limiter()
+        .reserve(peer)
+        .map_err(RouteError::too_many_requests)?;
     let given: KeyLogin = serde_json::from_slice(body).map_err(|problem| {
         RouteError::invalid_request(format!(
             "a key login takes a JSON object with public_key, nonce and signature ({})",

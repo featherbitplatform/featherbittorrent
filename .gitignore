@@ -1,4 +1,6 @@
 /target
 /sast-out
+/web/node_modules
+/web/dist
 .DS_Store
 .superpowers/

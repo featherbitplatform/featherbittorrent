@@ -7,16 +7,26 @@
 # package installs or starts a service: no maintainer scripts and nothing a service manager would pick up,
 # which check_no_service below enforces at build time. Needs cargo-deb and cargo-generate-rpm (the
 # versions pinned in .github/workflows/release.yml).
-# Usage: bash dev/package-linux.sh <version> <x86_64|aarch64>   e.g. bash dev/package-linux.sh 0.1.0 aarch64
-# Output: target/dist/featherbittorrent-<version>-linux-<arch>.{deb,rpm} and
-#         target/dist/featherbittorrent-<version>-<arch>-unknown-linux-gnu.tar.gz, each with a .sha256.
+# The variant is the build behind the packages: full (default) turns on the web-ui cargo feature and
+# embeds the built web UI, and its package names are featherbittorrent; headless is the build without
+# it, named featherbittorrent-headless. Both install /usr/bin/featherbittorrent, and each declares that
+# installing it removes the other: the .deb says so with Conflicts and Replaces, and the .rpm says so
+# with Obsoletes (RPM has no "replaces" tag, and a conflict on the obsoleted name would stop the install
+# instead of replacing it), so the package managers swap one for the other.
+# Usage: bash dev/package-linux.sh <version> <x86_64|aarch64> [full|headless]
+#   e.g. bash dev/package-linux.sh 0.1.0 aarch64 full
+# Output: full, target/dist/featherbittorrent-<version>-linux-<arch>.{deb,rpm} and
+#         target/dist/featherbittorrent-<version>-<arch>-unknown-linux-gnu.tar.gz, each with a .sha256;
+#         headless, the same with -headless after featherbittorrent.
 # Test hooks that need no build and ask nothing about the platform (dev/test-packaging.sh runs them on
 # any OS): --print-versions <version> prints the deb version then the rpm version; --check-rpm-reqs
-# reads requirement lines on stdin and refuses any the declared dependencies do not cover. Both refuse
-# with one line like everything else here.
+# reads requirement lines on stdin and refuses any the declared dependencies do not cover;
+# --read-deb-control <deb> prints a .deb's control file through the ar and tar path;
+# --check-deb-control <variant> <file> and --check-rpm-metadata <variant> <name> <obsoletes-file>
+# <conflicts-file> run the metadata checks on fixture text. All refuse with one line, exit 2.
 set -euo pipefail
 
-fail() { echo "package-linux.sh: $*" >&2; exit 1; }
+fail() { echo "package-linux.sh: $*" >&2; exit 2; }
 
 # Debian and RPM sort "~" before anything, so a pre-release precedes its release, and RPM versions may
 # not contain "-", so both mappings replace the dash with a tilde. A variable holds the tilde because on
@@ -42,6 +52,23 @@ check_rpm_reqs() { # rpm requirement lines on stdin; refuses any the declared de
       || fail "the .rpm requires '$req', which the declared dependencies do not cover: add it to [package.metadata.deb] depends and to dev/check-linux-binary.sh's allow list together"
   done
 }
+check_deb_control() { # <control text> <variant name> <the other package>
+  local control_text="$1" want="$2" other="$3" pkg conflicts replaces
+  pkg="$(grep -E '^Package: ' <<<"$control_text" | head -1 | sed 's/^Package: //' || true)"
+  conflicts="$(grep -E '^Conflicts: ' <<<"$control_text" | head -1 | sed 's/^Conflicts: //' || true)"
+  replaces="$(grep -E '^Replaces: ' <<<"$control_text" | head -1 | sed 's/^Replaces: //' || true)"
+  [[ "$pkg" == "$want" ]] || fail "the .deb's control says 'Package: $pkg', expected 'Package: $want'"
+  grep -qwF -- "$other" <<<"$conflicts" || fail "the .deb's control has 'Conflicts: $conflicts', which does not name the other package $other"
+  grep -qwF -- "$other" <<<"$replaces" || fail "the .deb's control has 'Replaces: $replaces', which does not name the other package $other"
+  echo "ok: the .deb is $pkg and conflicts with and replaces $other"
+}
+check_rpm_metadata() { # <rpm name> <rpm obsoletes> <rpm conflicts> <variant name> <the other package>
+  local name="$1" obsoletes="$2" conflicts="$3" want="$4" other="$5"
+  [[ "$name" == "$want" ]] || fail "the .rpm is named '$name', expected '$want'"
+  grep -qwF -- "$other" <<<"$obsoletes" || fail "the .rpm obsoletes '$obsoletes', which does not name the other package $other"
+  [[ -z "${conflicts//[[:space:]]/}" ]] || fail "the .rpm carries 'Conflicts: $conflicts', which would stop installing it over the other package instead of replacing it"
+  echo "ok: the .rpm is $name and obsoletes $other with no conflicts"
+}
 
 # The hooks dispatch here, ahead of every platform and tool question. --print-versions checks the
 # version exactly as package mode does, so a bad one is refused the same way.
@@ -57,16 +84,74 @@ if [[ "${1:-}" == "--check-rpm-reqs" ]]; then
   echo 'package-linux.sh ok: every rpm requirement is covered by the declared dependencies'
   exit 0
 fi
+# Reads the control file out of a .deb with ar and tar, for hosts with no dpkg-deb (the build image).
+# <deb> <control member name, control.tar.gz, .xz or .zst>. GNU tar reading from stdin does not
+# auto-detect the compression, so the option follows the extension; stderr stays out of the output.
+read_deb_control() {
+  local deb="$1" member="$2" out
+  local -a decomp
+  case "$member" in
+    *.gz)  decomp=(--gzip) ;;
+    *.xz)  decomp=(--xz) ;;
+    *.zst) decomp=(--zstd) ;;
+    *)     decomp=() ;;
+  esac
+  # ${decomp[@]+...} keeps an empty array legal under set -u on bash 3.2
+  out="$(ar p "$deb" "$member" 2>/dev/null | tar ${decomp[@]+"${decomp[@]}"} -xOf - ./control 2>/dev/null)" \
+    || out="$(ar p "$deb" "$member" 2>/dev/null | tar ${decomp[@]+"${decomp[@]}"} -xOf - control 2>/dev/null)" \
+    || out=''
+  printf '%s' "$out"
+}
+if [[ "${1:-}" == "--read-deb-control" ]]; then
+  # <deb>; lists the control member like the build does, then prints what read_deb_control reads
+  [[ $# -eq 2 ]] || fail "usage: bash dev/package-linux.sh --read-deb-control <deb>"
+  [[ -r "$2" ]] || fail "could not read $2"
+  hook_members="$(ar t "$2" 2>/dev/null)" || fail "ar could not list $2"
+  hook_control="$(grep '^control\.tar' <<<"$hook_members" | head -1)" || true
+  [[ -n "$hook_control" ]] || fail "$2 has no control.tar member"
+  hook_text="$(read_deb_control "$2" "$hook_control")"
+  [[ -n "$hook_text" ]] || fail "could not read the control file from $hook_control in $2"
+  printf '%s\n' "$hook_text"
+  exit 0
+fi
+if [[ "${1:-}" == "--check-deb-control" ]]; then
+  # <variant> <control-text-file>; runs check_deb_control on the file's contents
+  [[ $# -eq 3 ]] || fail "usage: bash dev/package-linux.sh --check-deb-control <full|headless> <control-text-file>"
+  case "$2" in full|headless) ;; *) fail "invalid variant '$2' (expected full or headless)" ;; esac
+  [[ -r "$3" ]] || fail "could not read $3"
+  if [[ "$2" == headless ]]; then hook_want="featherbittorrent-headless"; hook_other="featherbittorrent";
+  else hook_want="featherbittorrent"; hook_other="featherbittorrent-headless"; fi
+  check_deb_control "$(cat "$3")" "$hook_want" "$hook_other"
+  echo "package-linux.sh ok: the .deb control for $2 is correct"
+  exit 0
+fi
+if [[ "${1:-}" == "--check-rpm-metadata" ]]; then
+  # <variant> <name> <obsoletes-file> <conflicts-file>; runs check_rpm_metadata
+  [[ $# -eq 5 ]] || fail "usage: bash dev/package-linux.sh --check-rpm-metadata <full|headless> <name> <obsoletes-file> <conflicts-file>"
+  case "$2" in full|headless) ;; *) fail "invalid variant '$2' (expected full or headless)" ;; esac
+  [[ -r "$4" ]] || fail "could not read $4"
+  [[ -r "$5" ]] || fail "could not read $5"
+  if [[ "$2" == headless ]]; then hook_want="featherbittorrent-headless"; hook_other="featherbittorrent";
+  else hook_want="featherbittorrent"; hook_other="featherbittorrent-headless"; fi
+  check_rpm_metadata "$3" "$(cat "$4")" "$(cat "$5")" "$hook_want" "$hook_other"
+  echo "package-linux.sh ok: the .rpm metadata for $2 is correct"
+  exit 0
+fi
 
 # Arguments first, before any platform or tool question, so dev/test-packaging.sh can exercise the
 # refusals on any OS.
-[[ $# -eq 2 ]] || fail "usage: bash dev/package-linux.sh <version> <x86_64|aarch64>"
+[[ $# -eq 2 || $# -eq 3 ]] || fail "usage: bash dev/package-linux.sh <version> <x86_64|aarch64> [full|headless]"
 version="$1"
 arch="$2"
+variant="${3:-full}"
 check_version "$version"
 case "$arch" in
   x86_64|aarch64) ;;
   *) fail "invalid arch '$arch' (expected x86_64 or aarch64)" ;;
+esac
+case "$variant" in
+  full|headless) ;;
+  *) fail "invalid variant '$variant' (expected full or headless)" ;;
 esac
 
 [[ "$(uname -s)" == "Linux" ]] || fail "package-linux.sh runs on Linux only"
@@ -79,18 +164,28 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 target="${CARGO_TARGET_DIR:-$root/target}"
 dist="$root/target/dist"
-pkg="featherbittorrent-${version}-linux-${arch}"
+# full is the release name and the default; headless carries -headless in every artifact name.
+if [[ "$variant" == headless ]]; then prefix="featherbittorrent-headless"; else prefix="featherbittorrent"; fi
+pkg="${prefix}-${version}-linux-${arch}"
 triple="${arch}-unknown-linux-gnu"
-targz="featherbittorrent-${version}-${triple}"
+targz="${prefix}-${version}-${triple}"
 stage="$dist/stage-linux-$arch"
 
 # The same mapping the --print-versions hook prints (see print_versions for why a variable holds "~").
 { read -r deb_version; read -r rpm_version; } < <(print_versions "$version")
 
-cargo build --locked --release -p featherbittorrent
+# The feature decides which build the packages hold; the variant must match what it prints, whole
+# string, so a headless package built from the wrong tree is refused here rather than published.
+build_features=()
+if [[ "$variant" == full ]]; then build_features=(--features web-ui); fi
+cargo build --locked --release -p featherbittorrent ${build_features[@]+"${build_features[@]}"}
 bin="$target/release/featherbittorrent"
 if ! printed="$("$bin" --version)"; then fail "$bin --version failed to run"; fi
-[[ "$printed" == "featherbittorrent $version" ]] || fail "--version printed '$printed', expected 'featherbittorrent $version'"
+# The binary's command name is featherbittorrent in both builds (it is the package's binary, which the
+# package manager installs as /usr/bin/featherbittorrent whatever the package is called); what marks
+# the build is the trailing (full) or (headless). The whole string is compared, so a package built
+# from the wrong tree is refused here rather than published.
+[[ "$printed" == "featherbittorrent $version ($variant)" ]] || fail "--version printed '$printed', expected 'featherbittorrent $version ($variant)'"
 bash dev/check-linux-binary.sh "$bin"
 
 # The man pages and completions are generated by the release binary itself, from the same clap Command
@@ -110,9 +205,21 @@ rm -rf "$stage" \
   "$dist/$pkg.deb.sha256" "$dist/$pkg.rpm.sha256" "$dist/$targz.tar.gz.sha256"
 
 # The packages ship the binary exactly as cargo built it (--no-strip), the same file in all three.
-cargo deb -p featherbittorrent --no-build --no-strip --deb-version "$deb_version" --output "$dist/$pkg.deb"
+# The headless name and the conflicts with and replace of the full package (and the other way
+# around) live in the [package.metadata.deb.variants.headless] and
+# [package.metadata.generate-rpm.variants.headless] sections of crates/featherbittorrent/Cargo.toml;
+# --variant selects them. The full variant is the base metadata, so the full build passes no
+# --variant and gets the conflicts from the base sections that both tools merge from there.
+deb_variant_args=()
+rpm_variant_args=()
+if [[ "$variant" == headless ]]; then
+  deb_variant_args=(--variant headless)
+  rpm_variant_args=(--variant headless)
+fi
+cargo deb -p featherbittorrent --no-build --no-strip --deb-version "$deb_version" \
+  ${deb_variant_args[@]+"${deb_variant_args[@]}"} --output "$dist/$pkg.deb"
 cargo generate-rpm -p crates/featherbittorrent --target-dir "$target" \
-  --set-metadata "version = \"$rpm_version\"" --output "$dist/$pkg.rpm"
+  --set-metadata "version = \"$rpm_version\"" ${rpm_variant_args[@]+"${rpm_variant_args[@]}"} --output "$dist/$pkg.rpm"
 
 # Tarball: the binary at the top of one folder (the 0.1.0 layout), with the licenses, the docs and the
 # examples that are documentation only. The flags make the archive reproducible for a given build.
@@ -132,15 +239,18 @@ tar -C "$stage" --owner=0 --group=0 --numeric-owner --sort=name -czf "$dist/$tar
 # Verify contents. No dpkg on the build image: read the .deb's data member with ar and tar. mkdir
 # first, because the members land in $stage before anything else creates it.
 mkdir -p "$stage"
+# The man pages, completions and examples keep the product's own name: generate-assets writes them
+# from the binary's command name, which is featherbittorrent in both variants. Only the doc folder
+# follows the package, so the headless package does not ship into the full package's documentation.
 want_common=(
   usr/bin/featherbittorrent
   usr/share/man/man1/featherbittorrent.1.gz
   usr/share/man/man1/featherbittorrent-serve.1.gz
   usr/share/bash-completion/completions/featherbittorrent
   usr/share/fish/vendor_completions.d/featherbittorrent.fish
-  usr/share/doc/featherbittorrent/autostart.md
-  usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service
-  usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service
+  "usr/share/doc/$prefix/autostart.md"
+  "usr/share/doc/$prefix/examples/systemd/system/featherbittorrent.service"
+  "usr/share/doc/$prefix/examples/systemd/user/featherbittorrent.service"
 )
 # Debian lets zsh own vendor-completions, Fedora's zsh reads site-functions; the metadata says so and
 # this list has to agree with it, or a renamed path would install nowhere.
@@ -174,7 +284,7 @@ done
 
 # No package installs or starts a service. Nothing may sit where a unit or init drop-in would be picked
 # up, the .deb control member may hold no maintainer script, and the .rpm may carry no scriptlet. The
-# example units live under usr/share/doc/featherbittorrent/examples/ instead.
+# example units live under usr/share/doc/<package>/examples/ instead.
 check_no_service() { # <what the list is of> <one path per line>
   local what="$1" files="$2" hit
   hit="$(grep -nE '(^|/)etc/|(^|/)lib/systemd/' <<<"$files" | head -1)" || true
@@ -195,6 +305,33 @@ while IFS= read -r entry; do
 done <<<"$control_files"
 if ! scripts="$(rpm -qp --scripts "$dist/$pkg.rpm" 2>&1)"; then fail "rpm -qp --scripts could not read $dist/$pkg.rpm: $(head -1 <<<"$scripts")"; fi
 [[ -z "${scripts//[[:space:]]/}" ]] || fail "the .rpm carries scriptlets, and no package installs or starts a service: $(head -1 <<<"$scripts")"
+
+# The package metadata is what makes the two builds replace each other on install, so it is checked here
+# rather than trusted: a .deb must be named for its variant and must conflict with and replace the other
+# package, and an .rpm must be named for its variant, must obsolete the other package (RPM has no
+# "replaces" tag, so an obsoletes is what removes the first when the second installs) and must carry no
+# conflicts at all (a conflict on the obsoleted name would stop the install instead of replacing it).
+# The logic is the same the verify job's packaging test runs offline against fixtures
+# (dev/test-packaging.sh runs this script's --check-deb-control and --check-rpm-metadata hooks, which
+# call the same check_deb_control and check_rpm_metadata functions), so there is one copy of the rule.
+# dpkg-deb with no field prints the whole control file (Package:, Conflicts:, Replaces:, ...); the
+# ar and tar path is the fallback the build image uses, because it carries no dpkg-deb. The control
+# member was already listed above, so $control holds its name (control.tar.gz, .xz or .zst), and
+# read_deb_control (defined near the top, tested through --read-deb-control) picks the tar option.
+if command -v dpkg-deb >/dev/null; then
+  if ! deb_control="$(dpkg-deb -f "$dist/$pkg.deb" 2>/dev/null)"; then
+    fail "could not read the .deb's control member from $dist/$pkg.deb (dpkg-deb failed)"
+  fi
+else
+  deb_control="$(read_deb_control "$dist/$pkg.deb" "$control")"
+  [[ -n "$deb_control" ]] || fail "could not read the .deb's control member from $dist/$pkg.deb"
+fi
+if [[ "$variant" == headless ]]; then other="featherbittorrent"; else other="featherbittorrent-headless"; fi
+check_deb_control "$deb_control" "$prefix" "$other"
+rpm_name="$(rpm -qp --queryformat '%{NAME}' "$dist/$pkg.rpm")" || fail "rpm -qp could not read $dist/$pkg.rpm"
+rpm_obsoletes="$(rpm -qp --obsoletes "$dist/$pkg.rpm" 2>/dev/null)" || rpm_obsoletes=''
+rpm_conflicts="$(rpm -qp --conflicts "$dist/$pkg.rpm" 2>/dev/null)" || rpm_conflicts=''
+check_rpm_metadata "$rpm_name" "$rpm_obsoletes" "$rpm_conflicts" "$prefix" "$other"
 
 # The requirements cargo-generate-rpm derived from the binary, printed for the release log and held to
 # the same allow list dev/check-linux-binary.sh greps: they come from the binary's own DT_NEEDED, so a

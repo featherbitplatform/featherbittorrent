@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 # Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -31,6 +31,8 @@ fbtt-core = { path = "crates/fbtt-core" }
 fbtt-tui = { path = "crates/fbtt-tui" }
 # Joins the table now that the binary depends on it for `serve`.
 fbtt-server = { path = "crates/fbtt-server" }
+# Joins the table now that the server's media routes read a file through it.
+fbtt-media = { path = "crates/fbtt-media" }
 clap = { version = "4.6", features = ["derive"] }
 # The man pages and shell completions the packages install, written by the hidden `generate-assets`
 # subcommand from the same `Command` that prints `--help`, so they cannot drift from the flags.
@@ -161,3 +163,30 @@ rustix = "1.1.6"
 # so this adds no versions to Cargo.lock. Windows only: see the binary's
 # `[target.'cfg(windows)'.dependencies]`.
 crossterm_winapi = "0.9.1"
+# The web UI (plan 2026-11-21-web-ui-milestone-1): `rust-embed` carries the built `web/dist` into
+# the server binary behind the `fbtt-server` `web-ui` feature, `mime_guess` names the type of each
+# asset it hands out, and `subtle` compares the browser session's CSRF token in constant time.
+# Declared now and joined by crates from the web UI tasks that use them (subtle from Task 2, the
+# other two from Task 4); until a crate names one it is a workspace entry with nothing depending on
+# it, which is in no build and in no Cargo.lock.
+#
+# `rust-embed`'s defaults are turned off here rather than in the member that uses it, which is how
+# this file spells every other dependency whose default features are not wanted (`reqwest` above).
+# The feature that matters is `debug-embed`, and it is not asked for: `rust-embed` 8.14 declares no
+# `default` key in its `[features]` at all, so this changes nothing about what resolves today and
+# says out loud which side of its `cfg(debug_assertions)` pair we want. With `debug-embed` off, the
+# derive keeps the embedded bytes behind `cfg(not(debug_assertions))` and compiles a disk-reading
+# implementation behind `cfg(debug_assertions)`; `crates/fbtt-server/src/web.rs`'s module doc says
+# what that means for a debug run and a shipped one.
+rust-embed = { version = "8.14", default-features = false }
+mime_guess = "2.0"
+subtle = "2.6"
+# The media player (plan 2026-11-21-web-ui-milestone-2-media-player): `matroska-demuxer` reads Matroska
+# and WebM (Zlib OR MIT OR Apache-2.0, and `#![forbid(unsafe_code)]` like every crate here), `mp4-atom`
+# is the box codec `fbtt-media` reads MP4 with and writes its fragmented MP4 with (MIT OR Apache-2.0).
+# Neither decodes nor transcodes anything: both are container codecs, which is what "no native
+# libraries" (plan Global Constraints) asks for. The `matroska-demuxer` pin is the owner's fork,
+# which fixes seeking with `CueRelativePosition` and adds overflow checks on hostile cue, block
+# and timestamp values.
+matroska-demuxer = { git = "https://github.com/featherbitplatform/matroska-demuxer", tag = "v0.8.1+featherbit.1" }
+mp4-atom = "0.17.1"

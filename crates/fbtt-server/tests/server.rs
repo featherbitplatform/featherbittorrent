@@ -2861,3 +2861,464 @@ async fn a_torrent_without_metadata_has_no_stream_address() {
 
     served.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Creating a folder: `POST /api/v1/fs/mkdir`
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/fs/mkdir` with `parent` and `name`, with the bearer token when there is one.
+async fn mkdir(served: &Served, parent: &Path, name: &str, token: Option<&str>) -> Response {
+    post_json(
+        &http(),
+        &served.url("/api/v1/fs/mkdir"),
+        serde_json::json!({ "parent": parent.to_string_lossy(), "name": name }),
+        token,
+    )
+    .await
+}
+
+/// Every name directly inside `dir`, hidden ones and links included, sorted: what is on disk, rather than
+/// what the listing route chooses to show, so "nothing was created" means nothing at all.
+fn entries_of(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read a test folder")
+        .map(|entry| {
+            entry
+                .expect("a test folder entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The ordinary case: one new folder directly inside the download folder. The answer names it the way the
+/// listing route spells paths (the parent as it was asked for, joined with the name), the folder is there
+/// on disk, and the listing of the parent offers it straight away, which is what the picker opens next.
+#[tokio::test]
+async fn mkdir_creates_one_folder_inside_a_root() {
+    let served = Served::start("mkdir-create", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+
+    let response = mkdir(&served, &root, "New Show", Some(&token)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the folder was made"
+    );
+    let answer = body(response).await;
+    let path = answer["path"].as_str().expect("the created folder's path");
+    assert!(
+        path.ends_with("New Show"),
+        "the answer names the new folder: {path}"
+    );
+    assert_eq!(
+        Path::new(path),
+        root.join("New Show"),
+        "spelled the way the listing spells paths: the parent as asked, joined with the name",
+    );
+    assert!(root.join("New Show").is_dir(), "the folder is on disk");
+
+    let listing = body(
+        get_with_query(
+            &http(),
+            &served.url("/api/v1/fs/list"),
+            "path",
+            &root,
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        listing["dirs"]
+            .as_array()
+            .expect("a list")
+            .contains(&Value::String("New Show".to_string())),
+        "the listing of the parent offers the new folder: {listing}",
+    );
+
+    served.stop().await;
+}
+
+/// A name is one path component and nothing else. Empty, `.`, `..`, a separator of either platform, an
+/// absolute path, a NUL or another control character, and a name longer than 255 bytes are each `400
+/// invalid_request` - and nothing at all appears under the parent, which is the part that matters: a name
+/// that steps out, or into a folder of its own making, is refused before anything is created.
+#[tokio::test]
+async fn mkdir_refuses_names_that_are_not_one_component() {
+    let served = Served::start("mkdir-names", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+    make_dirs(&root.join("inner"));
+    let scratch = served.dir.path().to_path_buf();
+    let before = entries_of(&root);
+    let scratch_before = entries_of(&scratch);
+
+    let long = "a".repeat(256);
+    for name in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "/etc",
+        "x\u{0}y",
+        "x\ny",
+        long.as_str(),
+    ] {
+        let (status, code) = error_of(mkdir(&served, &root, name, Some(&token)).await).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the name {name:?} is refused"
+        );
+        assert_eq!(code, "invalid_request", "the name {name:?} is refused");
+    }
+
+    assert_eq!(
+        entries_of(&root),
+        before,
+        "nothing new appeared under the parent"
+    );
+    assert!(
+        entries_of(&root.join("inner")).is_empty(),
+        "nothing appeared in a folder below it either",
+    );
+    assert_eq!(
+        entries_of(&scratch),
+        scratch_before,
+        "nothing appeared beside the parent"
+    );
+
+    served.stop().await;
+}
+
+/// A parent outside every allowed folder is `403 path_not_allowed`, and nothing is made there: the folder
+/// that holds the download folder is not part of the library just because it is next door.
+#[tokio::test]
+async fn mkdir_refuses_a_parent_outside_the_roots() {
+    let served = Served::start("mkdir-outside", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let parent = served
+        .root()
+        .parent()
+        .expect("the download folder has a parent")
+        .to_path_buf();
+
+    let (status, code) = error_of(mkdir(&served, &parent, "escaped", Some(&token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the parent is outside the roots"
+    );
+    assert_eq!(code, "path_not_allowed");
+    assert!(
+        !parent.join("escaped").exists(),
+        "nothing was made outside the roots"
+    );
+
+    served.stop().await;
+}
+
+/// A link inside the root that leads out of it is spelled like part of the library and is not: as a parent
+/// it is `403`, and nothing is created where it points. A name that is already a link out (dangling, so
+/// `mkdir` would have somewhere to go if it followed it) is an existing entry, `409`, and still nothing is
+/// created outside.
+#[cfg(unix)]
+#[tokio::test]
+async fn mkdir_does_not_follow_a_symlink_out() {
+    let served = Served::start("mkdir-link", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+    let outside = served.dir.path().join("outside");
+    make_dirs(&outside);
+    std::os::unix::fs::symlink(&outside, root.join("link-out"))
+        .expect("make a link out of the root");
+    std::os::unix::fs::symlink(outside.join("made"), root.join("trap"))
+        .expect("make a dangling link out of the root");
+
+    let (status, code) =
+        error_of(mkdir(&served, &root.join("link-out"), "escaped", Some(&token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a parent that leads out through a link is outside the roots",
+    );
+    assert_eq!(code, "path_not_allowed");
+
+    let (status, code) = error_of(mkdir(&served, &root, "trap", Some(&token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a name that is already a link is taken"
+    );
+    assert_eq!(code, "already_exists");
+
+    assert!(
+        entries_of(&outside).is_empty(),
+        "nothing was created outside the roots: {:?}",
+        entries_of(&outside),
+    );
+
+    served.stop().await;
+}
+
+/// The server never makes a folder twice, and never pretends to: the second request for the same name is
+/// `409 already_exists`, not a second `201` for a folder somebody else may already have filled.
+#[tokio::test]
+async fn mkdir_refuses_an_existing_folder() {
+    let served = Served::start("mkdir-twice", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+
+    let first = mkdir(&served, &root, "Season 1", Some(&token)).await;
+    assert_eq!(first.status(), StatusCode::CREATED, "the first one is made");
+
+    let (status, code) = error_of(mkdir(&served, &root, "Season 1", Some(&token)).await).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the second one is not");
+    assert_eq!(code, "already_exists");
+
+    served.stop().await;
+}
+
+/// Creating a folder is a change, so it sits behind the same guard as every other change: no session is
+/// `401`, and a browser session whose cookie arrives without its `X-CSRF-Token` is refused the way the other
+/// cookie changes are, `401 unauthorized` - a page from somewhere else can make the browser send the cookie,
+/// but not the token. With the token the same request goes through, so the refusal is the guard's and not
+/// some other problem with the request.
+#[tokio::test]
+async fn mkdir_needs_a_session_and_the_csrf_token() {
+    let served = Served::start("mkdir-auth", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let root = served.root().to_path_buf();
+    let url = served.url("/api/v1/fs/mkdir");
+
+    let (status, code) = error_of(mkdir(&served, &root, "no-session", None).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no session at all");
+    assert_eq!(code, "unauthorized");
+
+    // A browser sign-in: the cookie the browser keeps, and the CSRF value the page puts on every change.
+    let signed_in = within(
+        client
+            .post(served.url("/api/v1/auth/web-session"))
+            .json(&serde_json::json!({ "user": "alice", "password": "hunter2" }))
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    assert_eq!(signed_in.status(), StatusCode::OK, "the browser signed in");
+    let set_cookie = signed_in
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("a session cookie")
+        .to_string();
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("a cookie line")
+        .to_string();
+    let csrf = body(signed_in).await["csrf"]
+        .as_str()
+        .expect("a CSRF value")
+        .to_string();
+    let request = |name: &str| {
+        client
+            .post(&url)
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({ "parent": root.to_string_lossy(), "name": name }))
+    };
+
+    let response = within(request("cookie-only").send())
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a cookie change without its CSRF token was let through",
+    );
+    assert_eq!(code, "unauthorized");
+
+    assert!(
+        !root.join("no-session").exists() && !root.join("cookie-only").exists(),
+        "a refused request created nothing",
+    );
+
+    let response = within(request("with-token").header("x-csrf-token", &csrf).send())
+        .await
+        .expect("the server answered");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the same change with its own CSRF token goes through",
+    );
+    assert!(root.join("with-token").is_dir());
+
+    served.stop().await;
+}
+
+/// A stream token opens one file's stream and nothing else: presented to `fs/mkdir` as a bearer header or in
+/// the query, it is not a session, and nothing is created.
+#[tokio::test]
+async fn mkdir_refuses_a_stream_token() {
+    let served = Served::start("mkdir-stream-token", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let payload = write_file(served.root(), "payload.bin", &sample(64));
+    let id = seed_torrent(&served, Some(&session), &payload).await;
+    let address = stream_address(&served, Some(&session), &id, 0).await;
+    let (_, stream_token) = address
+        .split_once("?token=")
+        .unwrap_or_else(|| panic!("a stream address with a token in it: {address}"));
+    let root = served.root().to_path_buf();
+
+    let (status, code) =
+        error_of(mkdir(&served, &root, "as-bearer", Some(stream_token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token as a bearer header is not a session",
+    );
+    assert_eq!(code, "unauthorized");
+
+    let response = within(
+        http()
+            .post(served.url("/api/v1/fs/mkdir"))
+            .query(&[("token", stream_token)])
+            .json(&serde_json::json!({ "parent": root.to_string_lossy(), "name": "as-query" }))
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token in the query is not a session",
+    );
+    assert_eq!(code, "unauthorized");
+
+    assert!(
+        !root.join("as-bearer").exists() && !root.join("as-query").exists(),
+        "a refused request created nothing",
+    );
+
+    served.stop().await;
+}
+
+/// With logins off, `fs/mkdir` answers whoever reaches the address, so the name the request came to and the
+/// place it came from are all that stand between a rebinding page and the disk: a foreign `Host` or a
+/// foreign `Origin` is `403 forbidden` and creates nothing, and the server's own name with no origin goes
+/// through.
+#[tokio::test]
+async fn mkdir_with_logins_off_checks_host_and_origin() {
+    let served = Served::start("mkdir-auth-off", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+    let root = served.root().to_path_buf();
+    let url = served.url("/api/v1/fs/mkdir");
+    let own = format!("127.0.0.1:{}", served.server.local_addr().port());
+    let request = |host: &str, origin: Option<&str>, name: &str| {
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::HOST, host)
+            .json(&serde_json::json!({ "parent": root.to_string_lossy(), "name": name }));
+        if let Some(origin) = origin {
+            request = request.header(reqwest::header::ORIGIN, origin);
+        }
+        request
+    };
+
+    let response = within(request("evil.example", None, "from-host").send())
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Host is refused");
+    assert_eq!(code, "forbidden");
+
+    let response = within(request(&own, Some("http://evil.example"), "from-origin").send())
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Origin is refused");
+    assert_eq!(code, "forbidden");
+
+    assert!(
+        !root.join("from-host").exists() && !root.join("from-origin").exists(),
+        "a refused request created nothing",
+    );
+
+    let response = within(request(&own, None, "from-here").send())
+        .await
+        .expect("the server answered");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the server's own name goes through",
+    );
+    assert!(root.join("from-here").is_dir());
+
+    served.stop().await;
+}
+
+/// The body is a path and a name, so it has a cap of its own far below fbt-api's room for a `.torrent`: a
+/// body over it is `413 body_too_large`, whatever is in it.
+#[tokio::test]
+async fn mkdir_refuses_a_body_over_the_limit() {
+    let served = Served::start("mkdir-body", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+    // 20 KiB of padding in a field the route does not take: over the 16 KiB cap, and nothing a folder name
+    // could be.
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/fs/mkdir"),
+        serde_json::json!({
+            "parent": root.to_string_lossy(),
+            "name": "padded",
+            "padding": "x".repeat(20 * 1024),
+        }),
+        Some(&token),
+    )
+    .await;
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the body is over the cap"
+    );
+    assert_eq!(code, "body_too_large");
+    assert!(!root.join("padded").exists(), "nothing was created");
+
+    served.stop().await;
+}

@@ -10,8 +10,14 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod media_io;
 mod routes;
 mod server;
+// The front end this build carries, if it carries one: the page, its files, and the headers on them.
+// Without the `web-ui` feature there is nothing to serve and no `web/dist` to read, so none of this is
+// compiled at all (see `build.rs`).
+#[cfg(feature = "web-ui")]
+mod web;
 
 pub use auth::{Clock, FbttAuth, LOGIN_NAMESPACE};
 pub use server::{Server, ServerError};

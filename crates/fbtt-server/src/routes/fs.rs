@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use fbtt_core::fs_list::{self, ListingError, inside_lexically};
@@ -85,6 +85,281 @@ pub(super) async fn list(
     Ok(Json(Listing { path: asked, dirs }))
 }
 
+/// The longest folder name [`mkdir`] takes, in bytes: what the common file systems (ext4, APFS, NTFS by
+/// UTF-16 unit, which is never more than its UTF-8 bytes) allow for one component.
+pub(super) const MAX_NAME_BYTES: usize = 255;
+
+/// The most a `POST /api/v1/fs/mkdir` body may be: a parent path and one name, with room to spare. With
+/// logins off this route answers whoever reaches the address, so a megabyte of JSON naming one folder is
+/// not something worth buffering.
+pub(super) const MAX_MKDIR_BODY: usize = 16 * 1024;
+
+/// `POST /api/v1/fs/mkdir` with `{parent, name}`: create the one folder `name` directly inside `parent`,
+/// answering `201 {path}` with the new folder spelled the way [`list`] spells paths (the parent as it was
+/// given, joined with the name).
+///
+/// This writes to the server's disk over the network, so it is held to everything [`list`] is held to and
+/// then some. The name is one path component and nothing else ([`name_problem`]): `400`. The parent has to
+/// be inside a root by its spelling, checked before the disk is touched, and again once every link in it is
+/// resolved ([`fs_list::resolve_folder`], the same rule the listing uses), so a link inside a root that leads
+/// out of it is `403` like any other path outside. The folder is then made inside the *resolved* parent, with
+/// `create_dir` and never `create_dir_all`, so nothing but the one folder is ever created, and an entry that
+/// is already there under that name - a folder, a file, or a link, which `mkdir` does not follow - is `409`.
+pub(super) async fn mkdir(
+    State(shared): State<Arc<Shared>>,
+    given: Result<Json<MkdirBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Created>), RouteError> {
+    // A body that is not this shape comes back in this API's error shape rather than axum's plain-text one.
+    let Json(body) = given?;
+    if let Some(problem) = name_problem(&body.name) {
+        return Err(RouteError::invalid_request(problem));
+    }
+    let asked = body.parent;
+    // A NUL byte is where a path stops; one in the middle is no path at all, said at once rather than
+    // however this operating system's error for it reads.
+    if asked.contains('\0') {
+        return Err(RouteError::invalid_request(format!(
+            "invalid path {}",
+            clean(&asked),
+        )));
+    }
+    // Lexical first, so a parent this server would refuse anyway costs a comparison and not a stat.
+    if !inside_lexically(&shared.roots, Path::new(&asked)) {
+        return Err(RouteError::path_not_allowed(&asked));
+    }
+    let roots = Arc::clone(&shared.roots);
+    let parent = PathBuf::from(&asked);
+    let name = body.name.clone();
+    tokio::task::spawn_blocking(move || create_inside(&roots, &parent, &name))
+        .await
+        .map_err(|problem| {
+            RouteError::internal(format!("the folder could not be created ({problem})"))
+        })??;
+    let path = Path::new(&asked).join(&body.name);
+    Ok((
+        StatusCode::CREATED,
+        Json(Created {
+            path: path.to_string_lossy().into_owned(),
+        }),
+    ))
+}
+
+/// Creates `name` directly inside `parent`, once `parent` has been resolved and found inside a root. Runs on
+/// the blocking pool: it asks the file system twice. The errors it logs carry the kind of failure only,
+/// never a path, because a path here is the client's text.
+fn create_inside(roots: &[Root], parent: &Path, name: &str) -> Result<(), RouteError> {
+    let resolved = fs_list::resolve_folder(roots, parent).map_err(|problem| match problem {
+        // A `500` logs its message, and the listing's says which path it could not check: this route logs
+        // no path, so the server's own failure is said without one.
+        ListingError::CannotCheck { .. } | ListingError::CannotRead { .. } => {
+            RouteError::internal("the parent folder could not be checked")
+        }
+        problem => route_problem(problem),
+    })?;
+    let shown = clean(name);
+    let created = resolved.join(name);
+    match std::fs::create_dir(&created) {
+        Ok(()) => confirm_inside(roots, &created, &shown),
+        Err(problem) => {
+            let kind = problem.kind();
+            tracing::debug!(?kind, "a folder could not be created");
+            Err(match kind {
+                std::io::ErrorKind::AlreadyExists => {
+                    RouteError::already_exists(format!("{shown} is already there"))
+                }
+                // The parent went away between the check and the create.
+                std::io::ErrorKind::NotFound => {
+                    RouteError::not_found(format!("no folder {}", clean(&parent.to_string_lossy())))
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    RouteError::forbidden(format!("{shown} cannot be created here"))
+                }
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidFilename => {
+                    RouteError::invalid_request(format!("invalid folder name {shown}"))
+                }
+                // Logged as it is answered, so it names no folder: the kind above is what says why.
+                _ => RouteError::internal("the folder could not be created"),
+            })
+        }
+    }
+}
+
+/// Checks the folder [`create_inside`] just made is inside a root once resolved, and takes it back when it is
+/// not: removed again, and `403 path_not_allowed`.
+///
+/// The parent was resolved and checked before the create, so this only matters when somebody changed the
+/// path in between: replaced a folder on the way to it with a link that leads out. That needs write access
+/// inside a root on this machine as well as a login, and this check narrows what it buys to an empty folder
+/// that exists outside for a moment. It does not close the window: the swap could happen between the create
+/// and this check too, or be swapped back. Closing it means creating relative to an open handle on the
+/// parent (`mkdirat` with `O_NOFOLLOW`), which needs `rustix` in the workspace table and is Unix-only, so it
+/// is not done here. `remove_dir` only removes an empty folder, and the folder was made a moment ago, so it
+/// cannot take anything else with it.
+fn confirm_inside(roots: &[Root], created: &Path, shown: &str) -> Result<(), RouteError> {
+    let refused = || RouteError::path_not_allowed(shown);
+    let resolved = match created.canonicalize() {
+        Ok(resolved) => resolved,
+        // Gone already, or unreadable: not somewhere this route can vouch for. Nothing to take back that it
+        // can find.
+        Err(problem) => {
+            tracing::warn!(kind = ?problem.kind(), "a new folder could not be resolved after it was made");
+            return Err(refused());
+        }
+    };
+    if roots
+        .iter()
+        .any(|root| resolved.starts_with(&root.canonical))
+    {
+        return Ok(());
+    }
+    tracing::warn!("a new folder resolved outside the allowed folders and was removed again");
+    // The path this request created, not the resolved one: `rmdir` does not follow a link in the last
+    // component, so a name swapped for a link in the meantime makes this fail rather than remove a folder
+    // the link points at.
+    if let Err(problem) = std::fs::remove_dir(created) {
+        tracing::warn!(kind = ?problem.kind(), "a new folder outside the allowed folders could not be removed");
+    }
+    Err(refused())
+}
+
+/// The names Windows keeps for devices, refused on every platform so a folder made here can be copied to
+/// any machine: `CON.txt` is the device as much as `CON` is.
+/// Windows also takes the superscript digits one to three and zero as port numbers, and `CONIN$` and
+/// `CONOUT$` as the console.
+const RESERVED_NAMES: [&str; 32] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// The characters Windows does not allow in a file or folder name, besides the separators and control
+/// characters refused on their own.
+const WINDOWS_FORBIDDEN: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
+
+/// What is wrong with `name` as the name of one new folder, or `None` when it is one: a single, ordinary
+/// path component. Not empty, `.` or `..`; no `/` or `\` (either platform's separator, whichever this is
+/// running on, so a name means the same thing on every server); no NUL or other control character; at most
+/// [`MAX_NAME_BYTES`] bytes; exactly what `clean` would show; not starting with a dot; not ending in a dot
+/// or a space; none of the characters Windows forbids ([`WINDOWS_FORBIDDEN`]); and not one of Windows'
+/// device names ([`RESERVED_NAMES`]) on any platform. And it has to parse as exactly one normal component
+/// on this platform, which is what refuses whatever else a platform reads as more than a name.
+pub(super) fn name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a folder name cannot be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Some(format!("{name} is not a folder name"));
+    }
+    // `fs/list` leaves dot entries out, so a folder named this way could never be seen or picked again.
+    if name.starts_with('.') {
+        return Some(format!(
+            "a folder name cannot start with a dot: {}",
+            clean(name),
+        ));
+    }
+    if name.contains(['/', '\\']) {
+        return Some(format!(
+            "a folder name cannot contain a separator: {}",
+            clean(name)
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Some(format!(
+            "a folder name cannot contain a control character: {}",
+            clean(name),
+        ));
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Some(format!(
+            "a folder name is at most {MAX_NAME_BYTES} bytes, this one is {}",
+            name.len(),
+        ));
+    }
+    // A name has to read exactly as it is shown, because `fs/list` and every picker show it cleaned: an
+    // invisible format character (U+200B, U+202E), a name of spaces, a leading or trailing space or a run of
+    // them would let `Show` and a second folder that only looks like `Show` sit side by side.
+    if clean(name) != name {
+        return Some(format!(
+            "a folder name has to read the same as it is shown: {}",
+            clean(name),
+        ));
+    }
+    // Windows drops a trailing dot or space from a name, so the folder made would not be the one asked for;
+    // refused everywhere so a library moves between machines intact.
+    if name.ends_with(['.', ' ']) {
+        return Some(format!(
+            "a folder name cannot end in a dot or a space: {}",
+            clean(name),
+        ));
+    }
+    // The characters Windows forbids in a name, refused everywhere for the same reason: a library made here
+    // has to be one that can be copied to any machine. `:` is also what makes `CON:` the device.
+    if name.contains(WINDOWS_FORBIDDEN) {
+        return Some(format!(
+            "a folder name cannot contain any of < > : \" | ? *: {}",
+            clean(name),
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    if RESERVED_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return Some(format!("{} is a name Windows reserves", clean(name)));
+    }
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(part)), None) if part == name
+    ) {
+        return Some(format!("{} is not one folder name", clean(name)));
+    }
+    None
+}
+
+/// The body of `POST /api/v1/fs/mkdir`: the folder to create in, and the one new name to create there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MkdirBody {
+    parent: String,
+    name: String,
+}
+
+/// What `POST /api/v1/fs/mkdir` answers: the folder it created.
+#[derive(Debug, Serialize)]
+pub(super) struct Created {
+    path: String,
+}
+
 /// The directories inside `path`, in this API's answer for them. [`fbtt_core::fs_list::list_dirs`] does the
 /// work and says what went wrong in the words every featherbittorrent listing uses - only the status and
 /// code a client of this API reads are picked here. Runs on the blocking pool because it reads a directory.
@@ -133,7 +408,10 @@ pub(super) struct Listing {
 
 #[cfg(test)]
 mod tests {
-    use super::{Root, inside_lexically, list_dirs};
+    // Only the unix test that builds a symlink calls it.
+    #[cfg(unix)]
+    use super::confirm_inside;
+    use super::{MAX_NAME_BYTES, Root, inside_lexically, list_dirs, name_problem};
     use axum::http::StatusCode;
     use fbtt_core::fs_list::MAX_DIRS;
     use fbtt_core::scratch::ScratchDir;
@@ -185,6 +463,140 @@ mod tests {
             let roots = self.roots();
             list_dirs(&roots, path).expect("a listing")
         }
+    }
+
+    /// A folder name is one ordinary path component: anything that would name another place, or no place,
+    /// or that no person typed on purpose, is refused before the parent is even looked at.
+    #[test]
+    fn a_folder_name_is_one_component() {
+        let longest = "a".repeat(MAX_NAME_BYTES);
+        // Multi-byte text is measured in bytes: 85 three-byte characters is 255 bytes, one more is too many.
+        let wide = "\u{3042}".repeat(85);
+        for good in [
+            "New Show",
+            "Season 1",
+            "a.b",
+            "x.hidden",
+            "COM10",
+            "LPT\u{b4}",
+            "CONIN",
+            "Show (2024) - Part 2",
+            "CONSOLE",
+            "e\u{301}t\u{e9}",
+            "caf\u{e9}",
+            longest.as_str(),
+            wide.as_str(),
+        ] {
+            assert_eq!(name_problem(good), None, "{good:?} is one folder name");
+        }
+
+        let too_long = "a".repeat(MAX_NAME_BYTES + 1);
+        let too_wide = "\u{3042}".repeat(86);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "\\etc",
+            "../x",
+            "x/..",
+            "x\u{0}y",
+            "x\ny",
+            "x\ty",
+            "x\u{7f}y",
+            "x\u{85}y",
+            too_long.as_str(),
+            too_wide.as_str(),
+            // Shown differently from what it is: invisible format characters, spaces that `clean` trims or
+            // folds, whitespace that is not a plain space.
+            "Show\u{200B}",
+            "\u{202E}wohS",
+            "Sh\u{FEFF}ow",
+            " ",
+            "   ",
+            " Show",
+            "Show ",
+            "New  Show",
+            "New\u{a0}Show",
+            "\u{301}Show",
+            // What Windows would change or take for a device.
+            "...",
+            "Show.",
+            "CON",
+            "con",
+            "Con.txt",
+            "NUL.tar.gz",
+            "prn",
+            "AUX",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "Lpt9",
+            "CON .txt",
+            "COM0",
+            "lpt0.txt",
+            "COM\u{b9}",
+            "com\u{b2}.log",
+            "COM\u{b3}",
+            "LPT\u{b9}",
+            "lpt\u{b2}",
+            "LPT\u{b3}.txt",
+            "CONIN$",
+            "conout$",
+            "ConOut$.txt",
+            // `fs/list` hides dot entries, so a folder named this way could never be picked.
+            ".hidden",
+            ".config",
+            // The characters Windows forbids, one each, and the device name they make with a colon.
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "CON:",
+            "COM1:",
+        ] {
+            assert!(name_problem(bad).is_some(), "{bad:?} is refused");
+        }
+
+        // A drive prefix is a whole new path to `join` on Windows; elsewhere it is an ordinary name.
+        #[cfg(windows)]
+        assert!(name_problem("C:").is_some(), "a drive prefix is refused");
+    }
+
+    /// A folder that turns out, once made, to resolve outside every root - the parent was swapped for a link
+    /// out between the check and the create - is removed again and answered as outside the roots. The race
+    /// itself cannot be timed in a test, so this hands [`confirm_inside`] the outcome directly: a folder made
+    /// outside, named through a link inside the root.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_made_outside_is_taken_back() {
+        let tree = Tree::new("fs_taken_back");
+        let roots = tree.roots();
+        std::os::unix::fs::symlink(&tree.outside, tree.given.join("swapped"))
+            .expect("make a link out of the root");
+        let made = tree.given.join("swapped").join("escaped");
+        fs::create_dir(&made).expect("make the folder the race would have made");
+        assert!(tree.outside.join("escaped").is_dir());
+
+        let problem =
+            confirm_inside(&roots, &made, "escaped").expect_err("a folder outside is not kept");
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.code, "path_not_allowed");
+        assert!(
+            !tree.outside.join("escaped").exists(),
+            "the folder made outside was removed again",
+        );
+
+        // One that is where it should be stays.
+        let kept = tree.given.join("kept");
+        fs::create_dir(&kept).expect("make a folder inside");
+        assert!(confirm_inside(&roots, &kept, "kept").is_ok());
+        assert!(kept.is_dir(), "a folder inside the root is left alone");
     }
 
     /// The guard that runs before the disk is touched: absolute, no `..`, and below a root in one of its two

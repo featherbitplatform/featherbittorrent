@@ -11,6 +11,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The full build: `serve` answers the browser UI on the API's origin beside the API itself, and
+# `--version` says `(full)`. Without this feature the binary is the headless one, today's build,
+# and says `(headless)`. The feature is off by default so a plain `cargo build -p
+# featherbittorrent` stays the headless artifact; the release ships both (plan
+# 2026-11-21-web-ui-milestone-1).
+web-ui = ["fbtt-server/web-ui"]
+
 [dependencies]
 # `string` is for `assets.rs`: it builds a command again from the name and text of one that was already
 # built, and those are owned strings rather than `'static` literals.
@@ -90,6 +98,17 @@ fbtt-core = { workspace = true, features = ["test-support"] }
 # `generate-assets` output staged by dev/package-linux.sh; their sources sit under target/release because
 # that is the prefix both tools resolve to the build's own target directory, wherever CARGO_TARGET_DIR
 # sends it, and the pages arrive already gzipped because Debian policy wants them compressed.
+# The two builds ship as two packages that own the same /usr/bin/featherbittorrent. The .deb makes
+# each declare that it conflicts with and replaces the other, so installing one removes the first and
+# the other way around: full in the base section, headless in the variants.headless section, which
+# dev/package-linux.sh selects with --variant headless. (The .rpm has no "replaces" tag and uses
+# obsoletes instead; see the generate-rpm section below.) The base section is the full package; the
+# headless section is a complete set of its own because cargo-deb merges the variant over the base, so
+# the headless section carries the headless name, its conflicts and replaces the other way around, and
+# the same assets with the documentation folder renamed to the headless package's name (the binary, the
+# man pages and the completions keep the product's own name, which generate-assets writes from the
+# binary's command name, the one both packages install). The archive installs nothing, so it carries no
+# conflicts of its own.
 [package.metadata.deb]
 name = "featherbittorrent"
 maintainer = "featherbit <featherbit-gw@outlook.com>"
@@ -116,6 +135,27 @@ assets = [
     ["../../packaging/systemd/system/featherbittorrent.service", "usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service", "644"],
     ["../../packaging/systemd/user/featherbittorrent.service", "usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service", "644"],
 ]
+conflicts = "featherbittorrent-headless"
+replaces = "featherbittorrent-headless"
+
+[package.metadata.deb.variants.headless]
+name = "featherbittorrent-headless"
+conflicts = "featherbittorrent"
+replaces = "featherbittorrent"
+assets = [
+    ["target/release/featherbittorrent", "usr/bin/", "755"],
+    ["target/release/pkg/man/*.1.gz", "usr/share/man/man1/", "644"],
+    ["target/release/pkg/completions/featherbittorrent.bash", "usr/share/bash-completion/completions/featherbittorrent", "644"],
+    ["target/release/pkg/completions/_featherbittorrent", "usr/share/zsh/vendor-completions/_featherbittorrent", "644"],
+    ["target/release/pkg/completions/featherbittorrent.fish", "usr/share/fish/vendor_completions.d/featherbittorrent.fish", "644"],
+    ["../../README.md", "usr/share/doc/featherbittorrent-headless/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/featherbittorrent-headless/NOTICE", "644"],
+    ["../../docs/autostart.md", "usr/share/doc/featherbittorrent-headless/autostart.md", "644"],
+    ["../../docs/server.md", "usr/share/doc/featherbittorrent-headless/server.md", "644"],
+    ["../../docs/reverse-proxy.md", "usr/share/doc/featherbittorrent-headless/reverse-proxy.md", "644"],
+    ["../../packaging/systemd/system/featherbittorrent.service", "usr/share/doc/featherbittorrent-headless/examples/systemd/system/featherbittorrent.service", "644"],
+    ["../../packaging/systemd/user/featherbittorrent.service", "usr/share/doc/featherbittorrent-headless/examples/systemd/user/featherbittorrent.service", "644"],
+]
 
 # Fedora's zsh path is site-functions, not Debian's vendor-completions; RPM puts licenses under
 # /usr/share/licenses. `doc = true` marks the documentation files so removal owns them with the package.
@@ -125,6 +165,18 @@ assets = [
 # directories they sit in: cargo-generate-rpm 0.21.1 cannot emit a `%dir` entry (its `dir = true` asset
 # goes through rpm's `with_file`, which refuses a directory), so `dnf remove` leaves the emptied doc and
 # license directories behind. That is harmless, and dev/smoke-linux.sh prints a note about it.
+# The headless package's name and its obsoletes of the full package live in the variants.headless
+# section, which dev/package-linux.sh selects with --variant headless; the base section is the full
+# package, and it declares the other way around so installing one over the other removes the first.
+# They own the same /usr/bin/featherbittorrent, and RPM has no "replaces" tag: an `obsoletes` entry is
+# what makes dnf remove the other package when it installs this one. cargo-generate-rpm reads an
+# obsoletes entry as a TOML table whose keys are the package names, so the other package's name is the
+# key and the empty string is the version that matches any. As with cargo-deb, the headless section is a
+# complete set of its own, carrying the headless name, its obsoletes the other way around, and the same
+# assets with the documentation and license folders renamed to the headless package's name. The variant
+# wins over the base key by key (cargo-generate-rpm's CompoundMetadataConfig iterates the configs in
+# reverse and takes the first that names the key), so the headless section names its own obsoletes and
+# does not inherit the base section's, which points the other way.
 [package.metadata.generate-rpm]
 name = "featherbittorrent"
 summary = "BitTorrent client for the terminal, with a headless server"
@@ -144,3 +196,27 @@ assets = [
     { source = "../../packaging/systemd/system/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service", mode = "644", doc = true },
     { source = "../../packaging/systemd/user/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent/examples/systemd/user/featherbittorrent.service", mode = "644", doc = true },
 ]
+
+[package.metadata.generate-rpm.obsoletes]
+"featherbittorrent-headless" = ""
+
+[package.metadata.generate-rpm.variants.headless]
+name = "featherbittorrent-headless"
+assets = [
+    { source = "target/release/featherbittorrent", dest = "/usr/bin/featherbittorrent", mode = "755" },
+    { source = "target/release/pkg/man/*.1.gz", dest = "/usr/share/man/man1/", mode = "644" },
+    { source = "target/release/pkg/completions/featherbittorrent.bash", dest = "/usr/share/bash-completion/completions/featherbittorrent", mode = "644" },
+    { source = "target/release/pkg/completions/_featherbittorrent", dest = "/usr/share/zsh/site-functions/_featherbittorrent", mode = "644" },
+    { source = "target/release/pkg/completions/featherbittorrent.fish", dest = "/usr/share/fish/vendor_completions.d/featherbittorrent.fish", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/featherbittorrent-headless/README.md", mode = "644", doc = true },
+    { source = "../../docs/autostart.md", dest = "/usr/share/doc/featherbittorrent-headless/autostart.md", mode = "644", doc = true },
+    { source = "../../docs/server.md", dest = "/usr/share/doc/featherbittorrent-headless/server.md", mode = "644", doc = true },
+    { source = "../../docs/reverse-proxy.md", dest = "/usr/share/doc/featherbittorrent-headless/reverse-proxy.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/featherbittorrent-headless/LICENSE", mode = "644", doc = true },
+    { source = "../../NOTICE", dest = "/usr/share/licenses/featherbittorrent-headless/NOTICE", mode = "644", doc = true },
+    { source = "../../packaging/systemd/system/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent-headless/examples/systemd/system/featherbittorrent.service", mode = "644", doc = true },
+    { source = "../../packaging/systemd/user/featherbittorrent.service", dest = "/usr/share/doc/featherbittorrent-headless/examples/systemd/user/featherbittorrent.service", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.variants.headless.obsoletes]
+"featherbittorrent" = ""

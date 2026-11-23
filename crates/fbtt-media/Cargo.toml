@@ -1,0 +1,24 @@
+[package]
+name = "fbtt-media"
+description = "featherbittorrent media: probing Matroska, WebM and MP4, and the fragmented MP4 the web player streams."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The containers: `matroska-demuxer` reads Matroska and WebM, `mp4-atom` the boxes of MP4 in and out.
+matroska-demuxer.workspace = true
+mp4-atom.workspace = true
+# `MediaError`.
+thiserror.workspace = true
+
+[dev-dependencies]
+# The tests read `expected.json`, which `dev/make-media-fixtures.sh` writes from
+# ffprobe, so that a fixture's own recorded truth can be compared with `probe`.
+serde_json.workspace = true

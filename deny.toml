@@ -1,3 +1,12 @@
+[graph]
+# Every feature on, which is the only way this file sees the feature-gated dependencies at all.
+# `cargo deny` resolves each crate's *default* features otherwise, and `web-ui` is opt-in in both
+# crates that declare it, so the `rust-embed` family, `mime_guess` and `unicase` would sit outside
+# every check below while the full release binary ships them (plan
+# 2026-11-21-web-ui-milestone-1, Task 4). It costs nothing here: an advisory, ban or licence
+# violation would have to be answered whether the crate arrives by a default or by a feature.
+all-features = true
+
 [licenses]
 # The list below is the featherbit allow list, shared with fbt-lib and the
 # gateway. Entries whose crates arrive with a later task (fbt's rustls chain,

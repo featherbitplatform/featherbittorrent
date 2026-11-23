@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
+### Added
+
+- A web UI in the browser, served by the full build's `serve` on the API's own origin: sign in with a user name and password (an `HttpOnly` cookie session with a CSRF token on every change), a live torrent table with filters and sorting, the detail pane (files, peers, trackers, pieces), pause, resume, remove keeping or deleting the files, and add a torrent by magnet link or `.torrent` file into a folder the server allows. The page refreshes on a one-second tick and wakes early on the server's event stream. Every release now ships two builds: the full build, `featherbittorrent`, which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and changes nothing for the TUI. On Linux the two are packages that install the same binary and remove the other when they are installed: the `.deb` says so with `Conflicts` and `Replaces`, and the `.rpm` says so with `Obsoletes`. A full build's `server.web_ui: false` (or `FBTT_WEB_UI=0`) turns the UI off for a run. `featherbittorrent --version` says which build you have, and the off switch and browser sign-in are documented in `docs/web-ui.md`. ([#20](https://github.com/featherbitplatform/featherbittorrent/pull/20))
+
+- A media player in the browser for video files: a `Play` button on each `.mkv`, `.mp4`, `.m4v`, `.webm` or `.mov` row of the Files tab opens it, and playback starts while the torrent is still downloading. It has seeking, an `Audio` menu to switch between audio tracks, a `Subtitles` menu for text subtitles inside the file and subtitle files beside it, fullscreen, and keys for play and pause, seeking, volume, mute, audio, subtitles and fullscreen. It remembers where you stopped in each file and starts there the next time. When the browser cannot play the video track, the player shows `This browser cannot play <codec> video.` and a `Download` button; a video-container file with no video track (for example an audio-only `.mkv`) is not played and gets the same `Download` button. Audio files such as `.mp3` and `.flac` get no `Play` button. Documented in `docs/web-ui.md`. ([#25](https://github.com/featherbitplatform/featherbittorrent/pull/25))
+
+- The web UI's second milestone. The Files tab's `Priority` select sets a file to `skip`, `low`, `normal` or `high`. A `More` menu on each torrent has `Move up`, `Move down`, `Move to top` and `Move to bottom` for a queued torrent, `Recheck`, `Reannounce`, `Limits...` for a per-torrent download and upload limit, and `Move files...`, which never overwrites. The folder picker has a `New folder` button that makes one folder at a time and refuses unsafe names. A `Settings` screen, opened from the header, edits the server's rate limits and queue counts, lists, adds and removes devices by their `ssh-ed25519` public key (a private key is refused and never sent), and shows every keyboard shortcut. At 640 px wide or less the torrent list is cards, and a tapped torrent opens full screen with the browser's back returning to the list. Documented in `docs/web-ui.md`. ([#27](https://github.com/featherbitplatform/featherbittorrent/pull/27))
+
+### Security
+
+- The `url` library moves to 2.5.9 for RUSTSEC-2026-0592, where a URL with thousands of nested `blob:` prefixes could overflow the stack when its origin was taken. ([#24](https://github.com/featherbitplatform/featherbittorrent/pull/24))
+
 ## [0.2.3] - 2026-11-21
 
 ### Fixed
@@ -66,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.3.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0
+[0.2.3]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3
 [0.2.2]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2
 [0.2.1]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0

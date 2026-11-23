@@ -5,7 +5,7 @@
 //! (`{"error": {"code": ..., "message": ...}}`), so a client parses one shape for the whole API. They
 //! are merged into fbt-api's router by [`fbt_api::ApiServer::start_with`], which means they arrive
 //! with that server's layers on them: the [`fbt_api::Auth::Custom`] guard built from [`FbttAuth`]
-//! decides who may reach them, and so do the request body limit and CORS. Only the two login calls are
+//! decides who may reach them, and so do the request body limit and CORS. Only the three login calls are
 //! exempt from a token, and only because [`FbttAuth`] says so - see [`crate::auth`].
 //!
 //! What more than one request needs to know lives in one [`Shared`], handed to every handler as axum
@@ -17,17 +17,19 @@ mod devices;
 // [`Root`]s before fbt-api is handed any of them, and it has to name the type to do that.
 pub(crate) mod fs;
 mod login;
+mod media;
 mod stream;
+mod web_session;
 
 use std::collections::BTreeMap;
 use std::io;
-// Only the test-support counters and the hold they update need these; the fields they belong to exist only
-// with that feature too.
-#[cfg(feature = "test-support")]
+// The media read timeout's own field needs these, and so do the test-support counters and the hold they
+// update: the counters' fields exist only with that feature, the timeout's exist always.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "test-support")]
 use std::sync::{Condvar, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -117,24 +119,33 @@ pub(crate) struct Shared {
     /// stop. The login limiter bounds how many attempts an *address* gets; this bounds what all of them
     /// together can make the machine do, which is what a distributed guess - one attempt per address, and
     /// no address over its budget - would otherwise find. An `Arc` because the permit has to be able to
-    /// outlive the request that asked for it ([`login::password_login`]).
+    /// outlive the request that asked for it ([`login::verify_password`]).
     verify_permits: Arc<tokio::sync::Semaphore>,
-    /// How many Argon2 verifications this server has run. Nothing in a run reads it; the test that
-    /// proves an unknown user name still costs a verify does.
-    #[cfg(feature = "test-support")]
-    verifies: AtomicU64,
-    /// How many verifies are running right now, and the most there have been at once: the pair of counters
-    /// a test reads to show that [`parallel_verifies`] is what actually bounds the work rather than just
-    /// what it asks for. Nothing in a run reads either.
-    #[cfg(feature = "test-support")]
-    verifying: AtomicU64,
-    #[cfg(feature = "test-support")]
-    most_verifying: AtomicU64,
-    /// The place inside the verify that a test can put there to hold a check in it ([`VerifyHold`]), so
-    /// that the test counting permits does not have to guess how long a hash takes. Set by
-    /// [`Server::park_verifies`]; absent in every run that is not one.
-    #[cfg(feature = "test-support")]
-    verify_hold: OnceLock<VerifyHold>,
+    /// What the checks report to while they run: the counts nothing in a run reads and the hold no run
+    /// arms. Its own `Arc`, because a check carries it down to the blocking pool with its permit - see
+    /// [`VerifyTally`] for why both the permit and this have to travel with the work rather than with the
+    /// request, and [`login::verify_password`] for the check that does it.
+    verify_tally: Arc<VerifyTally>,
+    /// How many of the media routes may run at once, across all four of them: [`media::MEDIA_PERMITS`].
+    ///
+    /// Every media request is a thread on the blocking pool holding a container demuxer, a file reader and
+    /// the read-ahead the engine keeps warm for it, which is nothing the login limiter bounds and only
+    /// partly what the engine's own bound of readers per torrent bounds. The same reason [`Self`] carries
+    /// `verify_permits` is the reason for this one: the pool will start as many threads as it is asked to,
+    /// and the cost of a media request is not the handler's but the job's. An `Arc` for the same reason
+    /// again - the stream route's permit has to outlive its handler, because it is the job that plays the
+    /// file ([`media`]).
+    media_permits: Arc<tokio::sync::Semaphore>,
+    /// How long one read or one seek of a media route may take, in milliseconds: [`media::READ_TIMEOUT`]
+    /// until [`Server::set_media_read_timeout`](crate::Server) says otherwise.
+    ///
+    /// Milliseconds in an `AtomicU64` rather than a `Mutex<Duration>` because the two things that touch it
+    /// have no reason to wait for one another: a handler reads it once, when it builds its reader, and a
+    /// test or an operator writes it whenever they want the next request to give up sooner. A media route
+    /// takes its deadline when it opens the file and keeps it for the life of that reader, which is the
+    /// honest meaning of "changing the timeout": requests already playing finish on the window they started
+    /// with.
+    media_read_ms: AtomicU64,
 }
 
 impl Shared {
@@ -167,14 +178,9 @@ impl Shared {
             session,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
-            #[cfg(feature = "test-support")]
-            verifies: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            verifying: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            most_verifying: AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            verify_hold: OnceLock::new(),
+            verify_tally: Arc::new(VerifyTally::new()),
+            media_permits: Arc::new(tokio::sync::Semaphore::new(media::MEDIA_PERMITS)),
+            media_read_ms: AtomicU64::new(media::READ_TIMEOUT.as_millis() as u64),
         }
     }
 
@@ -190,6 +196,34 @@ impl Shared {
     /// torrents exist.
     pub(crate) fn session(&self) -> &fbt::Session {
         &self.session
+    }
+
+    /// The pool the media routes take a place from before they start demuxing: `media`'s `media_permit` is
+    /// what asks it for one.
+    ///
+    /// An `Arc` clone rather than a borrow: the stream route hands its permit to the blocking job that
+    /// writes its response, and that job outlives the handler that started it, so the permit cannot be
+    /// borrowing anything the handler owns ([`media`]).
+    pub(crate) fn media_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.media_permits)
+    }
+
+    /// How long one read or one seek of a media route may take: [`media::READ_TIMEOUT`] until
+    /// [`set_media_read_timeout`](Self::set_media_read_timeout) says otherwise. A media route asks once, when
+    /// it opens its reader, and keeps that answer for the whole request.
+    pub(crate) fn media_read_timeout(&self) -> Duration {
+        Duration::from_millis(self.media_read_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets that window, for every media request that opens a file from now on.
+    ///
+    /// Nothing in a normal run changes it; the reason it is not a config key is that the window is not a
+    /// preference about a library, it is about how long a request is willing to wait on a peer, and a test
+    /// that wants to watch a stream give up cannot afford a minute per attempt. A request already playing
+    /// keeps the window it started with ([`Self::media_read_timeout`]).
+    pub(crate) fn set_media_read_timeout(&self, timeout: Duration) {
+        let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.media_read_ms.store(millis, Ordering::Relaxed);
     }
 
     /// The device named by `fingerprint`: the name to give a successful login, and the public key from
@@ -241,11 +275,86 @@ impl Shared {
         known.or_else(|| self.dummy_password_hash.clone())
     }
 
+    /// How many Argon2 verifications this server has run since it started. Under `test-support` this is
+    /// how the test that says "an unknown user name costs a verify" reads the answer; in a run nothing
+    /// counts and so there is nothing to read. See [`crate::Server::password_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn password_verifies(&self) -> u64 {
+        self.verify_tally.password_verifies()
+    }
+
+    /// The most Argon2 verifies this server has had running at once. Under `test-support` this is how a test
+    /// checks that [`parallel_verifies`] bounds the work when logins arrive in a burst instead of merely
+    /// asking it to; in a run nothing counts, so there is nothing to read. See
+    /// [`crate::Server::max_concurrent_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn max_concurrent_verifies(&self) -> u64 {
+        self.verify_tally.max_concurrent_verifies()
+    }
+
+    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks are sitting
+    /// inside the verify right now, with a change to wait for. Under `test-support` only, and arming it
+    /// twice changes nothing about the checks - both watchers see the same count. See
+    /// [`Server::park_verifies`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
+        self.verify_tally.park()
+    }
+
+    /// Lets every parked check finish, and stops holding the ones that come after ([`Self::park_verifies`]).
+    /// Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn release_parked_verifies(&self) {
+        self.verify_tally.release_parked();
+    }
+}
+
+/// What the Argon2 checks report to while they run: the counts no run reads, and the hold no run arms.
+///
+/// A separate `Arc` rather than fields on [`Shared`] for one reason: a check has to carry its reporting
+/// down to the blocking pool with the permit it holds, because it is the work - not the request - that
+/// makes the memory and takes the time (see [`login::verify_password`]). The permit must be able to
+/// outlive the handler for the same reason, and it is the check's task that gets parked, not the
+/// handler's, so the hold lives beside it rather than beside the state the handler borrows.
+#[derive(Debug)]
+pub(crate) struct VerifyTally {
+    /// How many checks have run since the server started, under `test-support`. See
+    /// [`Shared::password_verifies`].
+    #[cfg(feature = "test-support")]
+    verifies: AtomicU64,
+    /// How many are running right now, and the most there has ever been at once, under `test-support`.
+    /// See [`Shared::max_concurrent_verifies`].
+    #[cfg(feature = "test-support")]
+    verifying: AtomicU64,
+    #[cfg(feature = "test-support")]
+    most_verifying: AtomicU64,
+    /// The hold a test arms, and nobody else ever does. A `OnceLock` because arming it is a one-way door:
+    /// once checks are being held, the checks that arrive after the release run through, so there is
+    /// nothing to re-arm and nothing to reset.
+    #[cfg(feature = "test-support")]
+    hold: OnceLock<VerifyHold>,
+}
+
+impl VerifyTally {
+    /// A tally no test has armed a hold on, which is what every run has.
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "test-support")]
+            verifies: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            most_verifying: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            hold: OnceLock::new(),
+        }
+    }
+
     /// Counts one Argon2 verification as having run, and records how many are running now against the most
     /// this server has had at once. Under `test-support` that is what lets a test prove an unknown user name
     /// still costs a verify, and that the bound in [`parallel_verifies`] is real rather than asked for; in a
-    /// run nothing reads any of these counts, so this records nothing and the fields it would update are not
-    /// even there. See [`crate::Server::password_verifies`] and [`crate::Server::max_concurrent_verifies`].
+    /// run nothing reads any of these counts, so this records nothing and the counts it would update are not
+    /// even there. See [`Server::password_verifies`] and [`Server::max_concurrent_verifies`].
     pub(crate) fn verify_started(&self) {
         #[cfg(feature = "test-support")]
         {
@@ -253,14 +362,6 @@ impl Shared {
             let running = self.verifying.fetch_add(1, Ordering::Relaxed) + 1;
             self.most_verifying.fetch_max(running, Ordering::Relaxed);
         }
-    }
-
-    /// How many Argon2 verifications this server has run since it started. Under `test-support` this is
-    /// how the test that says "an unknown user name costs a verify" reads the answer; in a run nothing
-    /// counts and so there is nothing to read. See [`crate::Server::password_verifies`].
-    #[cfg(feature = "test-support")]
-    pub(crate) fn password_verifies(&self) -> u64 {
-        self.verifies.load(Ordering::Relaxed)
     }
 
     /// Says the verify [`verify_started`](Self::verify_started) counted has finished. A verify that panicked
@@ -271,44 +372,47 @@ impl Shared {
         self.verifying.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// The most Argon2 verifies this server has had running at once. Under `test-support` this is how a test
-    /// checks that [`parallel_verifies`] bounds the work when logins arrive in a burst instead of merely
-    /// asking it to; in a run nothing counts, so there is nothing to read. See
-    /// [`crate::Server::max_concurrent_verifies`].
-    #[cfg(feature = "test-support")]
-    pub(crate) fn max_concurrent_verifies(&self) -> u64 {
-        self.most_verifying.load(Ordering::Relaxed)
-    }
-
-    /// Stops this check inside the verify until a test lets it go, if a test armed a hold ([`Server::park_verifies`],
-    /// under `test-support`). Called from inside the blocking job, after [`verify_started`](Self::verify_started)
-    /// and before any hashing, so what is parked there is a check that is holding one of this server's permits.
-    /// In a run nothing has armed a hold, so there is nowhere to stop and this does nothing - which is the only
-    /// cost it ever has.
+    /// Stops this check inside the verify until a test lets it go, if a test armed a hold
+    /// ([`Server::park_verifies`], under `test-support`). Called from inside the blocking job, after
+    /// [`verify_started`](Self::verify_started) and before any hashing, so what is parked there is a check
+    /// that is holding one of this server's permits. In a run nothing has armed a hold, so there is
+    /// nowhere to stop and this does nothing - which is the only cost it ever has.
     pub(crate) fn park_inside_verify(&self) {
         #[cfg(feature = "test-support")]
         {
-            if let Some(hold) = self.verify_hold.get() {
+            if let Some(hold) = self.hold.get() {
                 hold.arrive_and_wait();
             }
         }
     }
 
-    /// Arms [`park_inside_verify`](Self::park_inside_verify) and returns the count it moves: how many checks
-    /// are sitting inside the verify right now, with a change to wait for. Under `test-support` only, and
-    /// arming it twice changes nothing about the checks - both watchers see the same count. See
-    /// [`Server::park_verifies`].
+    /// How many verifications have run, read from [`verify_started`](Self::verify_started). Under
+    /// `test-support` only, because in a run nothing counts.
     #[cfg(feature = "test-support")]
-    pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
-        let hold = self.verify_hold.get_or_init(VerifyHold::new);
+    fn password_verifies(&self) -> u64 {
+        self.verifies.load(Ordering::Relaxed)
+    }
+
+    /// The most verifications run at once, read from [`verify_started`](Self::verify_started). Under
+    /// `test-support` only, because in a run nothing counts.
+    #[cfg(feature = "test-support")]
+    fn max_concurrent_verifies(&self) -> u64 {
+        self.most_verifying.load(Ordering::Relaxed)
+    }
+
+    /// Arms [`park_inside_verify`](Self::park_inside_verify) and returns the count it moves. Under
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn park(&self) -> watch::Receiver<u64> {
+        let hold = self.hold.get_or_init(VerifyHold::new);
         hold.counts.subscribe()
     }
 
-    /// Lets every parked check finish, and stops holding the ones that come after ([`park_verifies`](Self::park_verifies)).
-    /// Under `test-support` only.
+    /// Lets every parked check finish, and stops holding the ones that come after
+    /// ([`park`](Self::park)). Under `test-support` only.
     #[cfg(feature = "test-support")]
-    pub(crate) fn release_parked_verifies(&self) {
-        if let Some(hold) = self.verify_hold.get() {
+    fn release_parked(&self) {
+        if let Some(hold) = self.hold.get() {
             hold.release();
         }
     }
@@ -443,7 +547,8 @@ impl DeviceTable {
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
 /// `forbidden`, `not_found`, `request_timeout`, `already_exists`, `too_many_requests`, `busy`,
-/// `internal`) and a message.
+/// `internal`, and `unsupported_media_type`, which no fbt-api route answers but which is spelled the
+/// same way) and a message.
 #[derive(Debug)]
 pub(crate) struct RouteError {
     status: StatusCode,
@@ -493,7 +598,7 @@ impl RouteError {
     }
 
     /// `404 not_found`.
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
@@ -512,6 +617,18 @@ impl RouteError {
     /// `409 already_exists`: a name the list already has.
     fn already_exists(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "already_exists", message)
+    }
+
+    /// `415 unsupported_media_type`: the body is not the media type this route reads. Only the web sign-in
+    /// answers it - it is the one place here that reads JSON from someone it has not decided is anybody yet,
+    /// and the other two login calls take whatever they are handed and refuse a wrong shape as
+    /// `400 invalid_request`, which is what they have always answered.
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            message,
+        )
     }
 
     /// `429 too_many_requests`, with `Retry-After`.
@@ -536,7 +653,7 @@ impl RouteError {
     }
 
     /// `500 internal`: something this server could not do, said as briefly as it can be.
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
@@ -557,25 +674,30 @@ impl RouteError {
 
 impl From<JsonRejection> for RouteError {
     fn from(problem: JsonRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // serde's message quotes what the client sent (an unknown field's name, a string it could not read),
+        // so it is remote text like any other on its way into a response.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<BytesRejection> for RouteError {
     fn from(problem: BytesRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<QueryRejection> for RouteError {
     fn from(problem: QueryRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<PathRejection> for RouteError {
     fn from(problem: PathRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
@@ -699,12 +821,13 @@ struct ErrorDetail {
 /// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
 /// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    // The two login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
-    // for uploading a `.torrent`: they are the two places this server takes bytes from someone it has not
-    // yet decided is anybody, and all three fields of a key login fit in a few hundred bytes. The limit
-    // still on the challenge route bounds its inner `Json` re-extraction - of bytes already kept under it,
-    // so it never refuses; on the session route the handler uses no body extractor, so it bounds nothing, and
-    // it stays only so a future extractor there inherits the same cap.
+    // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
+    // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
+    // yet decided is anybody, and the three fields of a key login and the two of a password fit in a few
+    // hundred bytes. All three read the body themselves through [`read_capped`] and re-extract what they
+    // kept, so this limit only bounds that second step - of bytes already kept under it, so it never
+    // refuses on its own - and otherwise stays put so a future extractor on any of them inherits the same
+    // cap rather than fbt-api's.
     let logins = Router::new()
         .route(
             "/api/v1/auth/challenge",
@@ -714,6 +837,16 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             "/api/v1/auth/session",
             post(login::session)
                 .delete(login::logout)
+                .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
+        )
+        // The browser's own sign-in, and the two calls that read and end the session its cookie carries.
+        // Only the `POST` has a body; the `GET` and the `DELETE` are gated by the cookie and its CSRF token,
+        // which is [`crate::auth`]'s business, not this router's.
+        .route(
+            "/api/v1/auth/web-session",
+            post(web_session::sign_in)
+                .get(web_session::status)
+                .delete(web_session::sign_out)
                 .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
         );
     Router::new()
@@ -725,6 +858,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/api/v1/auth/devices/{name}", delete(devices::remove))
         .route("/api/v1/fs/roots", get(fs::roots))
         .route("/api/v1/fs/list", get(fs::list))
+        // The one route here that writes to the server's disk on a client's say-so: one folder, inside the
+        // allowed folders, behind the same login and CSRF check as every other change. Its body is a path
+        // and a name, so it gets a cap of its own rather than fbt-api's room for a `.torrent`.
+        .route(
+            "/api/v1/fs/mkdir",
+            post(fs::mkdir).layer(DefaultBodyLimit::max(fs::MAX_MKDIR_BODY)),
+        )
         // The one route here that hands out a credential, so it needs a session exactly like everything else
         // that is not a login. Its body is two short fields and fbt-api's 32 MiB is room for uploading a
         // `.torrent`, so it gets a cap of its own, which the route reads with in [`read_capped`]: with logins
@@ -734,6 +874,23 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/api/v1/stream-tokens",
             post(stream::issue).layer(DefaultBodyLimit::max(stream::MAX_TOKEN_BODY)),
+        )
+        // The media routes: what a torrent's file is, one track of it as fragmented MP4, when a subtitle
+        // track of it says what, and the cue list of a subtitle file of the same torrent. All four read the
+        // file through fbtt-media from the blocking pool, and all four take a place in the media pool
+        // before they touch the engine ([`media`]).
+        .route("/api/v1/media/{torrent}/{file}", get(media::probe))
+        .route(
+            "/api/v1/media/{torrent}/{file}/tracks/{track}/stream",
+            get(media::track_stream),
+        )
+        .route(
+            "/api/v1/media/{torrent}/{file}/tracks/{track}/cues",
+            get(media::track_cues),
+        )
+        .route(
+            "/api/v1/media/{torrent}/{file}/subtitles/{sub}",
+            get(media::subtitle_file),
         )
         .with_state(shared)
 }
