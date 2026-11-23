@@ -66,13 +66,20 @@ export default function Files({
   // the state disables the selects while a change is in flight.
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
-  // What the user just chose, held until the next files refresh brings the server's own answer.
-  const [held, setHeld] = useState<{ of: FileInfo[]; map: Record<number, Choice> }>({
-    of: files,
-    map: {},
-  })
-  // A choice only counts for the list it was made against: a refresh is a new list.
-  const chosen = held.of === files ? held.map : {};
+  // What the user just chose, by file index. It is held until a files list arrives whose priority
+  // for that file equals the choice, so a poll that was already in flight cannot snap it back.
+  const [held, setHeld] = useState<Record<number, Choice>>({});
+  const settled = Object.entries(held).filter(
+    ([index, choice]) =>
+      files.find((entry) => entry.index === Number(index))?.priority === choice,
+  );
+  if (settled.length > 0) {
+    // Dropping during render is React's own pattern for state derived from props.
+    const next = { ...held };
+    for (const [index] of settled) delete next[Number(index)];
+    setHeld(next);
+  }
+  const chosen = held;
 
   /**
    * The server wants one entry per file, pads included, so the list is read back first, the one
@@ -105,7 +112,7 @@ export default function Files({
             : entry.priority,
       );
       await client.setFilePriorities(id, priorities);
-      setHeld({ of: files, map: { ...chosen, [index]: priority } })
+      setHeld((now) => ({ ...now, [index]: priority }))
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -187,7 +194,7 @@ export default function Files({
                     {formatPercent(fraction)}
                   </td>
                   <td
-                    className={`box-border h-7 truncate px-3 text-[12px] leading-4 text-body ${DETAIL_ROW_RULE}`}
+                    className={`box-border h-7 truncate px-3 text-[12px] leading-4 text-body max-[640px]:overflow-visible ${DETAIL_ROW_RULE}`}
                   >
                     {client !== undefined && id !== undefined ? (
                       <select
@@ -202,7 +209,7 @@ export default function Files({
                         onChange={(event) => {
                           void change(file.index, event.target.value as Choice);
                         }}
-                        className="h-6 max-[640px]:h-11 cursor-pointer rounded-control border border-rule bg-transparent px-1 text-[12px] text-body"
+                        className="h-6 max-[640px]:-my-2.5 max-[640px]:h-11 cursor-pointer rounded-control border border-rule bg-transparent px-1 text-[12px] text-body"
                       >
                         {CHOICES.map((choice) => (
                           <option key={choice} value={choice}>

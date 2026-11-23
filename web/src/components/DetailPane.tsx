@@ -305,6 +305,7 @@ export default function DetailPane({
         )}
         {live !== null && tab === 'files' && (
           <Files
+            key={id}
             files={live.data as FileInfo[]}
             viewportHeight={viewportHeight}
             id={id}

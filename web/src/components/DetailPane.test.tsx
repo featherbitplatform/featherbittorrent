@@ -427,6 +427,66 @@ describe('file priorities', () => {
     ).toBe(true)
   })
 
+  it('a refresh during a change keeps the new value', async () => {
+    const old = [file(0), file(1)]
+    const sent: string[][] = []
+    let release: () => void = () => {}
+    const client = {
+      files: vi.fn(async () => old),
+      peers: vi.fn(async () => []),
+      trackers: vi.fn(async () => []),
+      pieces: vi.fn(async () => PIECES_10),
+      setFilePriorities: vi.fn(async (_id: string, p: string[]) => {
+        await new Promise<void>((resolve) => {
+          release = resolve
+        })
+        sent.push(p)
+      }),
+    } as unknown as Api
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    rerender(<DetailPane id="a" client={client} tick={1} />)
+    await flush()
+    release()
+    await flush()
+    rerender(<DetailPane id="a" client={client} tick={2} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).value === 'high',
+      'a refresh that was in flight snapped the new value back',
+    ).toBe(true)
+  })
+
+  it('a list with gaps is refused', async () => {
+    const { client } = prioClient([file(0), file(2)])
+    const { container } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-0.bin', 'high')
+    await flush()
+    expect(
+      (pane(container)?.textContent ?? '').includes('gaps') &&
+        vi.mocked(client.setFilePriorities).mock.calls.length === 0,
+      'a gappy list was sent or the refusal was not shown',
+    ).toBe(true)
+  })
+
+  it('switching torrents clears a pending change', async () => {
+    const { client } = prioClient([file(0), file(1)])
+    client.setFilePriorities = vi.fn(() => new Promise<void>(() => {})) as unknown as Api['setFilePriorities']
+    const { rerender } = render(<DetailPane id="a" client={client} tick={0} />)
+    await flush()
+    choose('file-1.bin', 'high')
+    await flush()
+    rerender(<DetailPane id="b" client={client} tick={0} />)
+    await flush()
+    expect(
+      (screen.getByLabelText('Priority of file-1.bin') as HTMLSelectElement).disabled,
+      'the other torrent inherited the pending change',
+    ).toBe(false)
+  })
+
   it('pad files keep their priority', async () => {
     const { client, sent } = prioClient([
       file(0),
