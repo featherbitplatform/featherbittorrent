@@ -184,7 +184,12 @@ The `More` menu beside Pause and Remove holds the less common actions for the se
   the move and the page shows its reason. `Moving...` shows beside the menu while a move runs.
 
 A refusal from `Limits...` is shown inside the Limits dialog. A refusal from the other actions, or from a
-move, is shown in the page's banner. Either way it is the server's own words.
+move, is shown in the page's banner, and on a phone also in the torrent's full-screen view, under its
+actions. Either way it is the server's own words. The next action the server accepts clears it.
+
+From the keyboard, `↓`, `Enter` or `Space` on `More` opens the menu, the arrows, `Home` and `End` move
+through it, and `Escape` closes it. `Tab` leaves the menu and closes it, as does moving the focus
+anywhere else.
 
 ## New folder
 
@@ -203,8 +208,8 @@ creates parent folders, and a name that already exists is refused. The server al
 
 ## Settings
 
-The `Settings` button in the header opens the Settings screen; `Back to torrents` returns to the list. It
-has three sections.
+The `Settings` button in the header opens the Settings screen; `Back to torrents` returns to the list, and
+so does the browser's back button or a phone's back gesture. It has three sections.
 
 ### Server
 
@@ -265,5 +270,10 @@ A read-only list of every shortcut, in groups.
 
 ## On a phone
 
-At 640 px wide or less the torrent list is a list of cards. Tapping a card opens that torrent full screen,
-and the browser's back returns to the list.
+At 640 px wide or less the torrent list is a list of cards. The state filters are a row of chips above
+the cards, and under them are the same name filter and sort as the table: a sort choice (`Server order` or
+a column) and a `Reverse` button. The filter and the sort are kept when the window is resized between the
+cards and the table.
+
+Tapping a card opens that torrent full screen, and the browser's back returns to the list. While it is
+open, nothing behind it can be reached; closing it puts the focus back on the card you opened.
