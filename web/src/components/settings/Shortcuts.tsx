@@ -46,9 +46,17 @@ export function Shortcuts({ editable = false, onChange }: Props): JSX.Element {
     const onKey = (event: KeyboardEvent): void => {
       event.preventDefault()
       event.stopImmediatePropagation()
-      if (MODIFIERS.has(event.key)) return
+      if (event.repeat || MODIFIERS.has(event.key)) return
+      if (event.key === 'Escape') {
+        setCapturing(null)
+        return
+      }
       setCapturing(null)
-      if (event.key === 'Escape') return
+      // The handlers ignore modifiers, so a stored Cmd+R would fire on a plain R.
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        setRefusal({ id: capturing, text: 'Use a key without Ctrl, Alt or Cmd' })
+        return
+      }
       const holder = conflictFor(where, action, event.key)
       if (holder !== null) {
         setRefusal({ id: capturing, text: `Already used by ${holder}` })

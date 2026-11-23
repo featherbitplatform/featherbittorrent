@@ -59,22 +59,38 @@ export function effectiveBindings(): readonly KeyBinding[] {
   return effective
 }
 
-/** The action in the same group, other than `action`, that already holds `key`; otherwise null. */
-export function conflictFor(where: KeyBinding['where'], action: string, key: string): string | null {
-  const other = effective.find(
-    (binding) => binding.where === where && binding.action !== action && binding.keys.includes(key),
-  )
+function defaultKeys(where: string, action: string): readonly string[] {
+  return KEY_BINDINGS.find((b) => b.where === where && b.action === action)?.keys ?? []
+}
+
+/** The action in `bindings`, other than `action`, that holds `key` in the group; null when none. */
+function holderIn(bindings: readonly KeyBinding[], where: string, action: string, key: string): string | null {
+  const other = bindings.find((b) => b.where === where && b.action !== action && b.keys.includes(key))
   return other === undefined ? null : other.action
+}
+
+/**
+ * The action in the same group, other than `action`, that already holds `key`; otherwise null. A key
+ * in the action's own default list is never refused: some defaults share keys on purpose (a menu's
+ * ArrowDown opens it and moves to the next option).
+ */
+export function conflictFor(where: KeyBinding['where'], action: string, key: string): string | null {
+  if (defaultKeys(where, action).includes(key)) return null
+  return holderIn(effective, where, action, key)
 }
 
 /**
  * Apply overrides over the defaults. A file can be edited by hand, so anything that does not fit is
  * ignored and that binding keeps its default: an unknown group or action, keys that are not a
- * non-empty list of non-empty strings, a repeated key, or a key another action in the group holds.
+ * non-empty list of non-empty strings, a repeated key, or a key that another action in the group holds
+ * in the final result (two overrides that collide with each other are both dropped). Validation is
+ * against the final set, not entry by entry, so a swap of two keys survives a reload.
  */
 export function setOverrides(overrides: ShortcutOverride[]): void {
-  effective = KEY_BINDINGS.map((binding) => ({ ...binding, keys: [...binding.keys] }))
+  const fresh = (): KeyBinding[] => KEY_BINDINGS.map((binding) => ({ ...binding, keys: [...binding.keys] }))
+  effective = fresh()
   if (!Array.isArray(overrides)) return
+  const wanted = new Map<string, string[]>()
   for (const entry of overrides as unknown[]) {
     if (typeof entry !== 'object' || entry === null) continue
     const { where, action, keys } = entry as Record<string, unknown>
@@ -82,11 +98,28 @@ export function setOverrides(overrides: ShortcutOverride[]): void {
     if (keys.length === 0 || !keys.every((key) => typeof key === 'string' && key.length > 0)) continue
     const list = keys as string[]
     if (new Set(list).size !== list.length) continue
-    const index = effective.findIndex((binding) => binding.where === where && binding.action === action)
-    if (index < 0) continue
-    const target = effective[index] as KeyBinding
-    if (list.some((key) => conflictFor(target.where, target.action, key) !== null)) continue
-    effective = effective.map((binding, at) => (at === index ? { ...binding, keys: list } : binding))
+    if (!KEY_BINDINGS.some((b) => b.where === where && b.action === action)) continue
+    wanted.set(`${where}/${action}`, [...list])
+  }
+  for (;;) {
+    const candidate = fresh().map((binding) => ({
+      ...binding,
+      keys: wanted.get(`${binding.where}/${binding.action}`) ?? binding.keys,
+    }))
+    const bad = candidate.filter(
+      (binding) =>
+        wanted.has(`${binding.where}/${binding.action}`) &&
+        binding.keys.some(
+          (key) =>
+            !defaultKeys(binding.where, binding.action).includes(key) &&
+            holderIn(candidate, binding.where, binding.action, key) !== null,
+        ),
+    )
+    if (bad.length === 0) {
+      effective = candidate
+      return
+    }
+    for (const binding of bad) wanted.delete(`${binding.where}/${binding.action}`)
   }
 }
 

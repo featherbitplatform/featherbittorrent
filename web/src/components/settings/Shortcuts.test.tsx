@@ -93,4 +93,27 @@ describe('the editable Shortcuts section', () => {
     expect(onChange).toHaveBeenCalledWith([])
     expect(matches('Player', 'Full screen', { key: 'f' })).toBe(true)
   })
+
+  it('capture_ignores_key_repeats', () => {
+    stubMedia(() => false)
+    const onChange = vi.fn()
+    const { container } = render(<Shortcuts editable onChange={onChange} />)
+    const row = container.querySelector('[data-shortcut="Player/Full screen"]') as HTMLElement
+    fireEvent.click(row.querySelector('button') as HTMLElement)
+    fireEvent.keyDown(window, { key: 'g', repeat: true })
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.keyDown(window, { key: 'g' })
+    expect(onChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('capture_refuses_modifier_combinations', () => {
+    stubMedia(() => false)
+    const onChange = vi.fn()
+    const { container } = render(<Shortcuts editable onChange={onChange} />)
+    const row = container.querySelector('[data-shortcut="Player/Full screen"]') as HTMLElement
+    fireEvent.click(row.querySelector('button') as HTMLElement)
+    fireEvent.keyDown(window, { key: 'r', metaKey: true })
+    expect(onChange).not.toHaveBeenCalled()
+    expect(container.textContent).toContain('Use a key without Ctrl, Alt or Cmd')
+  })
 })
