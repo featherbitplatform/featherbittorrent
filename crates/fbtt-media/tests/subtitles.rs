@@ -1365,6 +1365,54 @@ fn embedded_movtext_stops_at_the_window_end() {
 }
 
 #[test]
+fn embedded_movtext_cue_at_the_window_end_is_not_returned() {
+    // The window 2600..3200 lies inside the fixture's second cue and closes exactly where its third
+    // one opens: the third cue's sample presents at `to_ticks`, which is the one sample the stop is
+    // decided about, because a sample is either at the window's end or not at it and only `at`
+    // answers "is this the last one the walk may read". `>` instead of `>=` reads it and answers a
+    // cue that starts the moment the window has closed. NoReadAt ends the test on the read of that
+    // sample's bytes, so "not returned" is a fact about the reads and not only about the cues.
+    const FROM_MS: u64 = 2_600;
+    const TO_MS: u64 = 3_200;
+    let bytes = fixture(MP4);
+    let track = mp4::locate(&bytes, 4);
+    let samples = mp4::samples(&bytes, &track);
+    let (from_ticks, to_ticks) = mp4::window_ticks(&track, FROM_MS, TO_MS);
+    let at_the_end = samples
+        .iter()
+        .find(|sample| sample.pts_ticks == to_ticks)
+        .expect("the fixture places one sample exactly at the window's end");
+    assert!(
+        at_the_end.size > 2,
+        "the sample at the window's end holds text, so a walk that read it would answer a cue for it"
+    );
+    let landing = samples
+        .iter()
+        .rfind(|sample| sample.pts_ticks <= from_ticks)
+        .expect("a sample at or before the window's start");
+    assert!(
+        landing.pts_ticks < to_ticks,
+        "the walk has a sample to read before it reaches the window's end"
+    );
+    let cues = embedded_cues(
+        NoReadAt {
+            inner: Cursor::new(bytes),
+            at: at_the_end.offset,
+        },
+        4,
+        FROM_MS,
+        TO_MS,
+    )
+    .expect("a sample presenting at the window's end stops the walk before its bytes are read");
+    assert_eq!(
+        cues,
+        window_cues(FROM_MS, TO_MS),
+        "the cue the window is inside, and no cue that starts where the window closed"
+    );
+    assert_eq!(cues.len(), 1, "the window is inside exactly one cue");
+}
+
+#[test]
 fn embedded_movtext_frame_cap_is_malformed() {
     // `MAX_CUE_SCAN_FRAMES` + 448 samples, every one of them inside one window. The count lives
     // in one `stsz` field: a nonzero `sample_size` says every sample is that long and no entry
