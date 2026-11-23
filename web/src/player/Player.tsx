@@ -946,7 +946,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
               <ChoiceMenu
                 label="Audio"
                 options={audioOptions}
-                selected={audioKey ?? ''}
+                selected={audioKey ?? (choice.audio === null ? '' : String(choice.audio.id))}
                 onChoose={chooseAudio}
                 onMenuChange={setAudioMenuOpen}
               />

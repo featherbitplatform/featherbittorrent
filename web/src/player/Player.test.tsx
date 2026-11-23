@@ -2399,4 +2399,15 @@ describe('the final review fixes', () => {
     expect(calls.at(-1)?.url, 'the release did not seek to where the drag stopped').toContain('start_ms=3000')
   })
 
+  it('the audio menu marks the playing track', async () => {
+    await renderRemux()
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const chosen = screen
+      .getAllByRole('option')
+      .filter((option) => option.getAttribute('aria-selected') === 'true')
+      .map((option) => option.textContent ?? '')
+    expect(chosen, 'the Audio menu did not mark the track that is playing').toEqual(['eng'])
+  })
+
 })
