@@ -446,7 +446,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::time::Duration;
 
-    use fbtt_core::{Config, ServerConfig};
+    use fbtt_core::Config;
     use fbtt_core::scratch::ScratchDir;
     use reqwest::StatusCode;
 
@@ -469,14 +469,13 @@ mod tests {
     async fn running(name: &str) -> Running {
         let dir = ScratchDir::new(name);
         let paths = scratch_paths(&dir);
-        // A server section, so the download folder is an allowed root and a torrent can be added while
-        // the engine is the window's alone.
+        // No `server:` section: the window's own engine still has the download folder as its root, so a
+        // torrent can be added while serving is off (the fresh-library fix).
         let library = paths.library();
-        let mut config = Config::load_for_edit(&library.config_file())
+        let config = Config::load_for_edit(&library.config_file())
             .expect("reads")
             .expect("there");
-        config.server = Some(ServerConfig::default());
-        config.save(&library.config_file()).expect("saves");
+        assert!(config.server.is_none(), "a desktop library names no server");
         let store = SettingsStore::new(paths.settings_file());
         let this = start_offline(&paths).await.expect("This computer starts");
         Running {

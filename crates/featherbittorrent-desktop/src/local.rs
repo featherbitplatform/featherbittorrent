@@ -12,7 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fbtt_core::config::ConfigError;
-use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths};
+use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths, ServerConfig};
 use fbtt_desktop_core::{DesktopPaths, launch_secret};
 use fbtt_server::{DesktopAccess, Server};
 
@@ -93,7 +93,7 @@ pub(crate) async fn start_with(
             ));
         }
     };
-    let config = library_config(&library)?;
+    let config = with_allowed_roots(library_config(&library)?, &library);
     let secret = launch_secret();
     let access = DesktopAccess {
         launch_secret: secret.clone(),
@@ -130,6 +130,17 @@ fn library_config(paths: &Paths) -> Result<Config, String> {
         }
         Err(problem) => Err(problem.to_string()),
     }
+}
+
+/// `config` as the engine runs it: a library whose file names no `server:` section (the desktop's default)
+/// gets one in memory, resolved the way `featherbittorrent serve` resolves an absent one, so the folders
+/// the engine may name are the download folder rather than none at all (every add would be refused as
+/// outside the allowed folders). Nothing is written: the file stays the person's own, with no section.
+fn with_allowed_roots(mut config: Config, paths: &Paths) -> Config {
+    if config.server.is_none() {
+        config.server = Some(ServerConfig::default());
+    }
+    config.resolve(paths)
 }
 
 impl ThisComputer {
@@ -263,6 +274,81 @@ pub(crate) mod tests {
             .expect("This computer starts again");
         assert_ne!(again.endpoint().1, secret);
         again.stop().await;
+    }
+
+    /// Desktop paths in `dir` with nothing written: a library the app has never run on.
+    fn fresh_paths(dir: &ScratchDir) -> DesktopPaths {
+        DesktopPaths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        }
+    }
+
+    /// A first run on a fresh library (no config.yaml, so no `server:` section) can add a magnet into the
+    /// default download folder: the engine's allowed folders are that folder, as `serve` would have them,
+    /// and the config written for the library still names no server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnet_add_on_a_fresh_library_succeeds() {
+        let dir = ScratchDir::new("desktop-local-fresh-add");
+        let paths = fresh_paths(&dir);
+        let library = paths.library();
+        assert!(!library.config_file().exists(), "a fresh library");
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let (base, secret) = this.endpoint();
+
+        let written = Config::load_for_edit(&library.config_file())
+            .expect("the config reads")
+            .expect("the first run wrote one");
+        assert!(written.server.is_none(), "no server section was written");
+        let downloads = written.resolve(&library).download_dir;
+
+        let body = serde_json::json!({
+            "magnet": format!("magnet:?xt=urn:btih:{}", "cd".repeat(20)),
+            "save_path": downloads.to_string_lossy(),
+        });
+        let added = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .post(format!("{base}/api/v1/torrents"))
+                .bearer_auth(&secret)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed");
+        let status = added.status();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            added.text().await.unwrap_or_default()
+        );
+        this.stop().await;
+    }
+
+    /// The folder picker on a fresh library has somewhere to start: its roots list is not empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_folder_roots_are_not_empty_on_a_fresh_library() {
+        let dir = ScratchDir::new("desktop-local-fresh-roots");
+        let paths = fresh_paths(&dir);
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let (base, secret) = this.endpoint();
+        let answer = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .get(format!("{base}/api/v1/fs/roots"))
+                .bearer_auth(&secret)
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed");
+        assert_eq!(answer.status(), StatusCode::OK);
+        let roots: Vec<String> =
+            serde_json::from_str(&answer.text().await.expect("a body")).expect("a list of roots");
+        assert!(!roots.is_empty(), "the download folder is a root");
+        this.stop().await;
     }
 
     /// The desktop's own variables are what the no-home line tells a person to set.
