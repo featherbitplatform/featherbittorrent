@@ -28,7 +28,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react'
-import { api } from '../api/client'
+import { useConnection } from '../connection'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe } from '../format'
 import { matches } from '../keys'
@@ -311,7 +311,10 @@ function IconButton({
   )
 }
 
-export default function Player({ id, file, name, client = api, onClose }: PlayerProps) {
+export default function Player({ id, file, name, client: given, onClose }: PlayerProps) {
+  const connection = useConnection()
+  const client = given ?? connection.api
+  const bearer = connection.endpoint.kind === 'bearer'
   const [probe, setProbe] = useState<MediaProbe | null>(null)
   const [probeError, setProbeError] = useState<string | null>(null)
   const [state, setState] = useState<EngineState>('loading')
@@ -474,6 +477,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
           return null
         },
       },
+      // The browser keeps the engine's own route on the page's origin; the desktop's engine lives at
+      // another address, so the body comes from the client's absolute URL with the token in it.
+      bearer ? { streamUrl: (track, ms) => client.mediaStreamUrl(id, file, track, ms) } : undefined,
     )
     engineRef.current = engine
     engine.onState(setState)
@@ -534,7 +540,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       engine.destroy()
       engineRef.current = null
     }
-  }, [choice, probe, id, file])
+  }, [choice, probe, bearer, client, id, file])
 
   function trackLanguage(trackId: number, probeNow: MediaProbe): string | null {
     return probeNow.tracks.find((track) => track.id === trackId)?.language ?? null

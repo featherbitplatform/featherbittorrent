@@ -25,12 +25,20 @@
  * `401` after the person signed in again is history, and the store drops it; a `401` on the first
  * call under a brand new session is not, and no once-ever flag would know the difference.
  *
+ * All of that is the browser's `sameOrigin` endpoint. The desktop app hands in a `bearer` endpoint
+ * instead, and the three rules change with it: every path is prefixed with the engine's base, every
+ * call carries `Authorization: Bearer <token>` with `credentials: 'omit'` (there is no cookie to ride
+ * along, so there is nothing for a CSRF header to prove), and the stream URLs come back absolute with
+ * the token in the query, because a `<video src>` cannot send a header. The `401` path is the same.
+ *
  * @module api/client
  */
 import type { components, operations } from './schema'
 import { displaySafe } from '../format'
 import { UNREACHABLE_COPY } from '../live'
 import { session } from '../session'
+import { SAME_ORIGIN, resolve, withToken } from '../endpoint'
+import type { Endpoint } from '../endpoint'
 
 /** One torrent, as the list and the detail screens will draw it. */
 export type TorrentInfo = components['schemas']['TorrentInfo']
@@ -217,13 +225,24 @@ type AddTorrentRequest = components['schemas']['AddTorrentRequest']
  * way to ask "which session is the page in right now", and the one action to take when a call finds
  * the session gone, told with the generation that call was sent under. The tests hand it a fake and
  * read the requests back; the page hands it the browser's own and the session store's own answers.
+ * `endpoint` says where the API is (the page's own origin unless told otherwise), and `getToken` is
+ * the bearer token right now, which for a desktop that signs in changes after the client is built.
  */
 export function createClient(
   fetchFn: typeof fetch,
   getCsrf: () => string | null,
   getGeneration: () => number,
   onUnauthorized: (generation: number) => void,
+  endpoint: Endpoint = SAME_ORIGIN,
+  getToken: () => string | null = () => (endpoint.kind === 'bearer' ? endpoint.token : null),
 ): Api {
+  const bearer = endpoint.kind === 'bearer'
+
+  /** A stream address the browser opens on its own (a `<video src>`, a download): absolute and carrying the token for the desktop. */
+  function streamAddress(path: string): string {
+    return bearer ? withToken(resolve(endpoint, path), getToken()) : path
+  }
+
   async function request(
     url: string,
     method: 'GET' | 'POST' | 'PUT' | 'DELETE',
@@ -232,7 +251,10 @@ export function createClient(
   ): Promise<Response> {
     const headers = new Headers()
     if (contentType !== undefined) headers.set('content-type', contentType)
-    if (method !== 'GET') {
+    if (bearer) {
+      const token = getToken()
+      if (token !== null) headers.set('authorization', `Bearer ${token}`)
+    } else if (method !== 'GET') {
       const token = getCsrf()
       if (token !== null) headers.set('x-csrf-token', token)
     }
@@ -240,7 +262,12 @@ export function createClient(
     // must name the session the call left home under, because by the time a slow one arrives the
     // person may already be signed in again.
     const generation = getGeneration()
-    const response = await fetchFn(url, { method, headers, body, credentials: 'same-origin' })
+    const response = await fetchFn(resolve(endpoint, url), {
+      method,
+      headers,
+      body,
+      credentials: bearer ? 'omit' : 'same-origin',
+    })
     if (!response.ok) {
       if (response.status === 401) onUnauthorized(generation)
       throw await errorFrom(response)
@@ -340,10 +367,12 @@ export function createClient(
       if (typeof answer.path !== 'string') {
         throw new Error('the stream token answer had no path')
       }
-      return answer.path
+      return streamAddress(answer.path)
     },
     mediaStreamUrl: (id, file, track, startMs) =>
-      `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(wholeMs(startMs))}`,
+      streamAddress(
+        `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(wholeMs(startMs))}`,
+      ),
     setFilePriorities: (id, priorities) =>
       sendJson(torrentPath(id, '/file-priorities'), 'PUT', { priorities } satisfies components['schemas']['FilePrioritiesRequest']),
     setQueuePosition: (id, position) =>

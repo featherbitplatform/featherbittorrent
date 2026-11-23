@@ -30,19 +30,26 @@
  * person going back. The Torrents screen under Settings is told it is hidden, so its live loop
  * reads at the hidden-page cadence until it is shown again.
  *
+ * The session and the client come from {@link useConnection}: the browser's own unless the page is
+ * rendered under a provider (the desktop app's bearer connection). A desktop session that started
+ * from its launch token has nothing to sign out of, so it gets no Sign out button, as `open` does not.
+ *
  * @module App
  */
 import { useEffect, useRef, useState } from 'react'
 import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
-import { session, useSession } from './session'
+import { useConnection } from './connection'
+import { useSession } from './session'
 import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
 export default function App() {
-  const { state, signIn, signOut, refresh } = useSession()
+  const connection = useConnection()
+  const { session } = connection
+  const { state, signIn, signOut, refresh } = useSession(session)
   const politeRef = useRef<HTMLDivElement>(null)
   const assertiveRef = useRef<HTMLDivElement>(null)
   const live = useRef<LiveAnnouncer | null>(null)
@@ -96,7 +103,7 @@ export default function App() {
       live.current = null
       announcer.stop()
     }
-  }, [])
+  }, [session])
 
   // Going back hands the focus to the button that opened Settings, which is on screen again by then.
   const wasOpen = useRef(false)
@@ -132,6 +139,11 @@ export default function App() {
   }
 
   const signOutError = state.phase === 'signedIn' && state.error !== null ? state.error : null
+  // The launch token is the desktop's own engine letting the page in; there is no sign-in to undo.
+  const launched =
+    connection.endpoint.kind === 'bearer' &&
+    connection.endpoint.token !== null &&
+    session.token() === connection.endpoint.token
   return (
     <>
       <div ref={politeRef} role="status" aria-live="polite" className="sr-only" />
@@ -161,7 +173,7 @@ export default function App() {
             <Torrents
               hidden={settingsOpen}
               onSettings={openSettings}
-              signedIn={state.phase === 'signedIn'}
+              signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}
               onSignOut={() => void signOut()}
             />

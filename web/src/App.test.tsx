@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { UNREACHABLE_COPY } from './live'
 import { SESSION_ENDED, session } from './session'
+import { ConnectionContext, createConnection } from './connection'
 
 // The `api` and `session` singletons read `globalThis.fetch` the moment their modules load,
 // so the controllable fetch must exist before this file's imports run.
@@ -200,6 +201,39 @@ describe('the Settings screen in the page', () => {
     ).toBeNull()
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
     push.mockRestore()
+    world.behavior = null
+  })
+})
+
+describe('the page on a desktop connection', () => {
+  it('app_reads_the_connection_from_context', async () => {
+    const seen: Array<{ url: string; auth: string | null }> = []
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      seen.push({ url, auth: new Headers(init?.headers).get('authorization') })
+      if (url.endsWith('/api/v1/torrents')) return answer([])
+      if (url.endsWith('/api/v1/session')) return answer(SESSION_BODY)
+      return answer({})
+    }) as unknown as typeof fetch
+    const connection = createConnection({ kind: 'bearer', base: 'http://127.0.0.1:53211', token: 'launch-secret' }, fetchFn)
+    world.behavior = (url) => Promise.reject(new Error(`the page used the browser singletons for ${url}`))
+
+    render(
+      <ConnectionContext.Provider value={connection}>
+        <App />
+      </ConnectionContext.Provider>,
+    )
+
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    await waitFor(() => {
+      expect(
+        seen.some((call) => call.url === 'http://127.0.0.1:53211/api/v1/torrents'),
+        'the page never asked the fake base for the torrents',
+      ).toBe(true)
+    })
+    expect(seen.every((call) => call.auth === 'Bearer launch-secret'), 'a desktop call went out without the token').toBe(true)
+    expect(seen.some((call) => call.url.includes('/auth/web-session')), 'the desktop asked about a browser cookie').toBe(false)
+    expect(screen.queryByRole('button', { name: 'Sign out' }), 'the launch-secret desktop offered a sign-out').toBeNull()
     world.behavior = null
   })
 })

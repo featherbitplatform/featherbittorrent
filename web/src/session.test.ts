@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * The session store, against a fake fetch: which states the endpoint's answers move it through, and
  * what the sign-in screen is shown when an answer is a refusal - and, just as much, which answers
@@ -6,8 +7,8 @@
  *
  * @module session.test
  */
-import { expect, it } from 'vitest'
-import { createSessionStore } from './session'
+import { expect, it, vi } from 'vitest'
+import { SESSION_ENDED, createSessionStore } from './session'
 import type { SessionStore } from './session'
 
 function json(status: number, body: string): Response {
@@ -121,4 +122,56 @@ it('a_failed_sign_out_after_the_session_ended_says_nothing', async () => {
     state.phase === 'signedOut' && state.notice === 'Your session ended. Sign in again.' && state.error === null,
     'a sign-out that arrived after its session ended went looking for a screen to complain on',
   ).toBe(true)
+})
+
+const BASE = 'http://127.0.0.1:53211'
+
+it('bearer_sign_in_uses_basic_and_keeps_the_token_in_memory', async () => {
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const cookie = vi.spyOn(document, 'cookie', 'set')
+  const seen: Array<{ url: string; init: RequestInit | undefined }> = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push({ url: String(input), init })
+    return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+  }, { kind: 'bearer', base: BASE, token: null })
+
+  expect(shown(store), 'a bearer connection with no token did not start on the sign-in screen').toEqual({
+    phase: 'signedOut',
+    notice: null,
+    error: null,
+  })
+  expect(await store.signIn('alice', 'pässword'), 'a good password did not sign in').toBe(true)
+
+  expect(seen.length, 'sign-in asked the server more than once').toBe(1)
+  expect(seen[0].url, 'sign-in did not go to the engine').toBe(`${BASE}/api/v1/auth/session`)
+  expect(seen[0].init?.method, 'sign-in was not a POST').toBe('POST')
+  expect(seen[0].init?.credentials, 'sign-in rode cookies along').toBe('omit')
+  const auth = new Headers(seen[0].init?.headers).get('authorization')
+  const expected = btoa(String.fromCharCode(...new TextEncoder().encode('alice:pässword')))
+  expect(auth, 'sign-in did not use Basic with the UTF-8 user and password').toBe(`Basic ${expected}`)
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'alice', 'the answer subject was not the session').toBe(true)
+  expect(store.token(), 'the token the server handed out was not kept').toBe('tok-1')
+  expect(store.csrf(), 'a bearer session claimed a CSRF value').toBeNull()
+  expect(setItem, 'the token was written to web storage').not.toHaveBeenCalled()
+  expect(cookie, 'the token was written to a cookie').not.toHaveBeenCalled()
+  setItem.mockRestore()
+  cookie.mockRestore()
+})
+
+it('bearer_401_returns_to_sign_in_with_session_ended', async () => {
+  const store = createSessionStore(async () => json(401, UNAUTHORIZED), { kind: 'bearer', base: BASE, token: 'launch-secret' })
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'desktop', 'a bearer token did not start signed in as desktop').toBe(true)
+  await store.refresh()
+  expect(store.get().phase, 'refresh moved a desktop session that nothing ended').toBe('signedIn')
+
+  store.endSession(store.generation())
+
+  expect(shown(store), 'a 401 did not return to sign-in with the ended notice').toEqual({
+    phase: 'signedOut',
+    notice: SESSION_ENDED,
+    error: null,
+  })
+  expect(store.token(), 'the ended token was kept').toBeNull()
 })

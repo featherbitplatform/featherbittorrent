@@ -12,7 +12,8 @@
  * @module components/settings/ServerSettings
  */
 import { useEffect, useRef, useState } from 'react'
-import { api, errorMessage } from '../../api/client'
+import { errorMessage } from '../../api/client'
+import { useConnection } from '../../connection'
 import type { Api } from '../../api/client'
 import Banner from '../Banner'
 import Button from '../Button'
@@ -50,7 +51,9 @@ function parse(text: string): number | null {
   return Number.isSafeInteger(value) ? value : null
 }
 
-export default function ServerSettings({ client = api }: { client?: Api }) {
+export default function ServerSettings({ client: given }: { client?: Api }) {
+  const connection = useConnection()
+  const client = given ?? connection.api
   const [queue, setQueue] = useState<Queue | null>(null)
   const [values, setValues] = useState<Values | null>(null)
   const [problem, setProblem] = useState<{ key: Key | null; text: string } | null>(null)
