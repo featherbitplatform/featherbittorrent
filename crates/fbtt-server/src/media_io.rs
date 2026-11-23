@@ -20,7 +20,10 @@
 //! lands where the reader already was. The demuxers ask the stream where it is and how long it is for every
 //! frame (a `stream_position`, a seek to the end and a seek back), and none of that is somewhere to read.
 //! [`BlockingReader`] answers those from its own position and the file's length, and moves the engine
-//! reader only when a read is about to happen somewhere other than where the engine reader stands.
+//! reader only when a read is about to happen somewhere other than where the engine reader stands. The
+//! buffering a media route puts on top of it is [`SeekAwareReader`], which answers the same questions and
+//! keeps the bytes it read across them, so a walk of frames costs one read per buffer of bytes instead of
+//! one per frame.
 //!
 //! A reader built here is used from inside `tokio::task::spawn_blocking` and nowhere else: that is what
 //! makes [`Handle::block_on`] legal here (a blocking thread is not a runtime worker) and what keeps a slow
@@ -183,6 +186,148 @@ impl<R> Seek for BlockingReader<R> {
     }
 }
 
+/// A read buffer for a reader whose caller seeks as often as it reads, and almost always to a place the
+/// buffer already holds.
+///
+/// `std::io::BufReader` gives its buffer up on a seek, which is the right answer for a reader that seeks
+/// because it wants other bytes: there the seek is a promise that what is held is no longer what will be
+/// read. The Matroska demuxer seeks several times a frame and never means that. `ebml::remaining_len`
+/// asks where it stands and where the end of the stream is before it sizes anything, and comes back to
+/// where it was; `next_frame` seeks back to a block's header before reading the block. Behind a
+/// `BufReader` each of those costs the buffer and a fresh fill, so a cue scan pays one 64 KiB read per
+/// frame of a subtitle track whose frames are a couple of hundred bytes.
+///
+/// This one keeps what it read. The questions and the way back are answered from its own bookkeeping:
+/// `stream_position` is a seek to where it already stands, and `SeekFrom::End` is the length it was
+/// opened with plus the delta, the same arithmetic [`BlockingReader`] does. A seek to a byte inside what
+/// is held costs nothing either, so only a read that wants a byte outside it moves `inner` and fills
+/// again. Over a torrent file, where a read is a request to a peer, that is the difference between a
+/// fill per 64 KiB of media and a fill per frame.
+///
+/// `Read` hands out the bytes held, so it can answer with less than a caller asked for: `Read` allows
+/// that, and `read_exact` loops over it. The buffer is all this holds beyond the reader, and it is
+/// allocated once, so its capacity is the most bytes a reader like this costs.
+pub(crate) struct SeekAwareReader<R> {
+    /// The reader behind the buffer, moved and asked for bytes only when the byte wanted is not held.
+    inner: R,
+    /// The file's length, known when the reader was opened: the answer to `SeekFrom::End`, and the place
+    /// after which there is nothing left to hand out.
+    len: u64,
+    /// Where the next read reads from. Reads move it and seeks set it, and `inner` is never asked where it
+    /// stands: this is the position the caller is owed, and the buffer's bytes are placed against it.
+    position: u64,
+    /// The file offset of the first byte held.
+    held_from: u64,
+    /// The bytes held: a run of the file starting at `held_from`, sized to what the last fill read and
+    /// keeping its capacity from fill to fill.
+    bytes: Vec<u8>,
+}
+
+impl<R> SeekAwareReader<R> {
+    /// Wraps any `Read + Seek` `inner`, a file `len` bytes long standing at `at`, with a buffer of
+    /// `capacity` bytes. Nothing is read here: the first read fills.
+    fn over(capacity: usize, inner: R, len: u64, at: u64) -> Self {
+        Self {
+            inner,
+            len,
+            position: at,
+            held_from: at,
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Whether `at` names one of the bytes held.
+    fn holds(&self, at: u64) -> bool {
+        at >= self.held_from
+            && at - self.held_from < u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+}
+
+impl<R: Read + Seek> SeekAwareReader<R> {
+    /// Gives up what is held and reads the next buffer's worth of the file from where the caller stands.
+    ///
+    /// `inner` is moved first: this runs only when the byte the caller wants is outside what was held, and
+    /// a reader that answers its own seeks never told `inner` about the places this one went to. The
+    /// request stops at the file's length, so a fill never reads past the end looking for bytes that are
+    /// not there.
+    fn fill(&mut self) -> io::Result<()> {
+        let at = self.position;
+        self.inner.seek(SeekFrom::Start(at))?;
+        let room = self
+            .bytes
+            .capacity()
+            .min(usize::try_from(self.len - at).unwrap_or(usize::MAX));
+        self.bytes.clear();
+        self.bytes.resize(room, 0_u8);
+        let got = self.inner.read(&mut self.bytes)?;
+        self.bytes.truncate(got);
+        self.held_from = at;
+        if got == 0 {
+            // The file ends short of the length it was opened with. Remember the end that was found, so
+            // every later read answers at once instead of asking `inner` the same question again.
+            self.len = at;
+        }
+        Ok(())
+    }
+}
+
+impl<R> BlockingReader<R> {
+    /// Wraps this reader in a [`SeekAwareReader`] whose buffer holds `capacity` bytes.
+    ///
+    /// The length this reader was opened knowing goes with it, which is what lets the buffer answer a
+    /// question about the end of the file without reaching the engine. See [`SeekAwareReader`] for what
+    /// that buys a route that reads a container frame by frame.
+    pub(crate) fn buffered_across_seeks(self, capacity: usize) -> SeekAwareReader<Self> {
+        let (len, at) = (self.len, self.position);
+        SeekAwareReader::over(capacity, self, len, at)
+    }
+}
+
+impl<R: Read + Seek> Read for SeekAwareReader<R> {
+    /// The bytes held, or one seek and one fill of `inner` and then the bytes held.
+    ///
+    /// A read at or past the end is answered here, the way [`BlockingReader`] answers it, without telling
+    /// the engine anything.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.position >= self.len {
+            return Ok(0);
+        }
+        if !self.holds(self.position) {
+            self.fill()?;
+        }
+        let from = usize::try_from(self.position - self.held_from).unwrap_or(usize::MAX);
+        let give = buf.len().min(self.bytes.len().saturating_sub(from));
+        if give == 0 {
+            // A fill at this place found the end of the file, which is what leaves nothing to hand out
+            // while this reader still believes it has room: the file is shorter than it said.
+            return Ok(0);
+        }
+        buf[..give].copy_from_slice(&self.bytes[from..from + give]);
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(give).unwrap_or(u64::MAX));
+        Ok(give)
+    }
+}
+
+impl<R> Seek for SeekAwareReader<R> {
+    /// Sets where the next read reads from, and nothing else.
+    ///
+    /// The buffer is what makes this free: a seek inside the bytes held is answered from them, and the two
+    /// questions a demuxer asks on the way to a frame (here, and the end) are arithmetic here too. `inner`
+    /// hears about the position only when a fill reads from it.
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(delta) => offset(self.len, delta),
+            SeekFrom::Current(delta) => offset(self.position, delta),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the file start"))?;
+        self.position = target;
+        Ok(target)
+    }
+}
+
 /// `base + delta`, saturating above and `None` below zero: the arithmetic fbt's own reader does for a seek.
 fn offset(base: u64, delta: i64) -> Option<u64> {
     if delta >= 0 {
@@ -209,8 +354,9 @@ fn hung_up() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom};
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
@@ -219,7 +365,7 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::watch;
 
-    use super::BlockingReader;
+    use super::{BlockingReader, SeekAwareReader};
 
     /// One thing the engine would have been told: its reader moved to a place, or read bytes from one.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,8 +484,9 @@ mod tests {
             assert!(fragments > 1, "the video track gave {fragments} fragments");
             assert_moves_only_to_reads("streaming", &told.lock().unwrap(), len);
 
-            // The cue route's path: the same demuxer behind the route's 64 KiB buffer, scanning frames for
-            // the embedded SubRip track.
+            // The cue route's path: the same demuxer behind the route's buffer, scanning frames for
+            // the embedded SubRip track. That buffer answers the demuxer's per-frame questions about
+            // position and length, so the engine should hear about none of them.
             let told = Arc::new(Mutex::new(Vec::new()));
             let (_hold, stop) = watch::channel(());
             let reader = BlockingReader::over(
@@ -353,14 +500,9 @@ mod tests {
                 handle,
                 Duration::from_secs(5),
                 stop,
-            );
-            let cues = fbtt_media::embedded_cues(
-                BufReader::with_capacity(64 * 1024, reader),
-                4,
-                0,
-                10_000,
             )
-            .expect("the embedded cues");
+            .buffered_across_seeks(64 * 1024);
+            let cues = fbtt_media::embedded_cues(reader, 4, 0, 10_000).expect("the embedded cues");
             assert!(!cues.is_empty(), "the fixture's SubRip track has cues");
             assert_moves_only_to_reads("cue scan", &told.lock().unwrap(), len);
         })
@@ -412,6 +554,115 @@ mod tests {
                 Told::Read { at: 202, len: 2 },
             ],
             "one move, to where the first read was, and nothing for the seeks or the read at the end"
+        );
+    }
+
+    /// A file in memory that counts the reads it was asked for: the reader under [`SeekAwareReader`]
+    /// below, where the number worth knowing is how often the buffer had to ask for more bytes.
+    struct Counting {
+        bytes: Vec<u8>,
+        at: u64,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let from = usize::try_from(self.at)
+                .unwrap_or(usize::MAX)
+                .min(self.bytes.len());
+            let give = buf.len().min(self.bytes.len() - from);
+            buf[..give].copy_from_slice(&self.bytes[from..from + give]);
+            self.at += give as u64;
+            Ok(give)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            // The buffer answers every seek it is given, and moves what is under it only to read from
+            // where it stands, so a move is always a place to read from, never a relative question.
+            let SeekFrom::Start(at) = pos else {
+                panic!(
+                    "the reader under the buffer was sent {pos:?}; it only ever needs a place to read from"
+                );
+            };
+            self.at = at;
+            Ok(at)
+        }
+    }
+
+    /// Frames read one at a time cost one read of the file per buffer of them, not one per frame.
+    ///
+    /// The shape is the cue scan's, counted at the reader under the buffer rather than at the engine:
+    /// 40 frames of 3 KiB taken from a 300 KiB file, so 120 KiB of it is read. On the way to each
+    /// frame the walk asks where it stands, asks where the end of the stream is the way
+    /// `ebml::remaining_len` does (a capped reader measures the room for an element from the end, so
+    /// that lands on the end of the file and comes back), and seeks back to the block's header before
+    /// reading the block.
+    ///
+    /// The bytes moved are 120 KiB whatever the buffer does, so what is being measured is how often
+    /// those reads ask the reader underneath for more than they use. Bytes kept across the seeks cost
+    /// one fill per 64 KiB of media; bytes given up at every seek cost one fill per frame, each of
+    /// them a request to a peer for a piece of a film.
+    #[test]
+    fn reading_frame_by_frame_costs_one_read_per_buffer_fill() {
+        /// The cue route's buffer: `HEADER_READ` in `routes::media`.
+        const BUFFER: usize = 64 * 1024;
+        const FRAME: usize = 3 * 1024;
+        const FRAMES: usize = 40;
+        const FILE: usize = 300 * 1024;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut file = SeekAwareReader::over(
+            BUFFER,
+            Counting {
+                bytes: vec![0x41_u8; FILE],
+                at: 0,
+                reads: Arc::clone(&reads),
+            },
+            FILE as u64,
+            0,
+        );
+        let mut frame = vec![0_u8; FRAME];
+        // A header's worth of bytes in front of the first frame, so the first fill does not start on
+        // a round buffer line.
+        file.seek(SeekFrom::Start(4)).expect("past the header");
+        for round in 0..FRAMES {
+            let here = file.stream_position().expect("where the walk stands");
+            // `remaining_len`, and the capped reader's answer to it: where am I, where is the end,
+            // land on the end (the cap is 256 MiB and this file is 300 KiB) and back here.
+            let end = file.seek(SeekFrom::End(0)).expect("where the end is");
+            assert_eq!(
+                end, FILE as u64,
+                "round {round}: the end is the length this reader was opened knowing"
+            );
+            file.seek(SeekFrom::Start(end))
+                .expect("the capped answer lands on the end");
+            file.seek(SeekFrom::Start(here))
+                .expect("and the walk goes back to where it stood");
+            let header = file.stream_position().expect("the block's own start");
+            file.seek(SeekFrom::Start(header))
+                .expect("back to the header to read the block");
+            file.read_exact(&mut frame).expect("the frame's bytes");
+            assert!(
+                frame.iter().all(|byte| *byte == 0x41),
+                "round {round}: the frame is the file's own bytes at the place the walk stood"
+            );
+            file.seek(SeekFrom::Start(here + FRAME as u64))
+                .expect("the next frame follows this one");
+        }
+        let got = reads.load(Ordering::Relaxed);
+        // 120 KiB of frames out of a file is two fills' worth of a 64 KiB buffer, and one more is the
+        // slack for a walk that started mid-buffer. A reader that throws its buffer away at each seek
+        // pays one per frame instead, which is `FRAMES` of them.
+        let fills = (FRAMES * FRAME).div_ceil(BUFFER);
+        assert!(
+            got > 0 && got <= fills + 1,
+            "{FRAMES} frames of {FRAME} bytes read {} of the file through {got} reads of the reader \
+             under the buffer; keeping the buffer is about one read per {BUFFER} of them ({fills} \
+             for these frames), and giving it up at every seek is one per frame ({FRAMES})",
+            FRAMES * FRAME,
         );
     }
 }

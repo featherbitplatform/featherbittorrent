@@ -570,7 +570,11 @@ pub(super) async fn track_cues(
     let (reader, _stop) = open_reader(&shared, &torrent, file).await?;
     let cues = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let file = BufReader::with_capacity(HEADER_READ, reader);
+        // A cue scan is a walk of frames, and the demuxer asks where it is and where the end of the
+        // file is on the way to every one of them. A `std::io::BufReader` answers each of those by
+        // giving its buffer up and filling it again, which makes the scan cost a 64 KiB read per
+        // frame; this buffer answers them itself and keeps the bytes it read.
+        let file = reader.buffered_across_seeks(HEADER_READ);
         let found = media::embedded_cues(file, track, from_ms, to_ms).map_err(media_problem)?;
         Ok::<Vec<Cue>, RouteError>(found)
     })
