@@ -29,6 +29,7 @@ const shell = vi.hoisted(() => ({
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   getShortcuts: vi.fn(() => Promise.resolve([])),
+  startupProblem: vi.fn(() => Promise.resolve({ state: 'fine' } as unknown)),
   finishApply: null as ((problem: string | null) => Promise<void>) | null,
   seen: [] as Connection[],
   mounts: 0,
@@ -48,7 +49,7 @@ vi.mock('./bridge', () => ({
   setTrayInstance: shell.setTrayInstance,
   takeOpened: shell.takeOpened,
   onOpened: () => Promise.resolve(() => {}),
-  startupProblem: () => Promise.resolve(null),
+  startupProblem: shell.startupProblem,
   quitApp: vi.fn(),
   getShortcuts: shell.getShortcuts,
 }))
@@ -145,6 +146,8 @@ afterEach(() => {
   shell.setTrayInstance.mockClear()
   shell.takeOpened.mockReset()
   shell.takeOpened.mockResolvedValue([])
+  shell.startupProblem.mockReset()
+  shell.startupProblem.mockResolvedValue({ state: 'fine' })
   shell.seen.length = 0
   shell.mounts = 0
   shell.hostMounts = 0
@@ -483,4 +486,16 @@ it('a_serving_apply_that_ends_unreachable_reconnects_to_settings_at_serving', as
   })
   await screen.findByText(`workspace ${BASE} restarted`)
   await screen.findByText('settings at settings-desktop-serving')
+})
+
+it('the_startup_problem_wins_over_everything', async () => {
+  shell.startupProblem.mockResolvedValue({ state: 'problem', message: 'featherbittorrent is already running.' })
+  shell.takeOpened.mockResolvedValueOnce([{ kind: 'magnet', uri: 'magnet:?xt=urn:btih:aaaa' }])
+  shell.connect.mockRejectedValue('featherbittorrent is already running.')
+  renderRoot()
+  await screen.findByRole('alertdialog', { name: 'featherbittorrent could not start' })
+  expect(screen.getByText('featherbittorrent is already running.')).toBeTruthy()
+  expect(screen.queryByLabelText('Magnet link'), 'no opened-link dialog over it').toBeNull()
+  expect(screen.queryByText(UNREACHABLE_COPY), 'no screen under it').toBeNull()
+  expect(screen.queryByText('close question ready'), 'no close question over it').toBeNull()
 })

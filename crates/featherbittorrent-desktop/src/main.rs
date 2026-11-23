@@ -76,7 +76,7 @@ fn main() {
         .manage(opened::OpenedState::new())
         // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
-        .manage(serving::Serving::new(paths.clone(), settings_store.clone()))
+        .manage(serving::Serving::new(paths, settings_store.clone()))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
             settings_store.clone(),
@@ -86,7 +86,7 @@ fn main() {
         .manage(lifecycle::Lifecycle::new(settings_store))
         // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
         // be added anywhere: a new step goes into `setup` below, in its place in the order.
-        .setup(move |app| setup(app, &paths, serve))
+        .setup(move |app| setup(app, serve))
         // The app's one page-load hook (`Builder::on_page_load` replaces too): a page that starts loading
         // is not listening for opened links until it asks again.
         .on_page_load(|webview, payload| {
@@ -146,17 +146,19 @@ fn main() {
 /// chrome, then the tray, then how the window starts (which depends on whether there is a tray), then the
 /// quit signals, then what this launch was opened with. This is the only setup function; `Builder::setup`
 /// keeps one.
-fn setup(
-    app: &mut tauri::App,
-    paths: &DesktopPaths,
-    serve: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn setup(app: &mut tauri::App, serve: bool) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
     // 0. This computer, which only the one copy that got past the single-instance plugin starts. It
     //    starts off the main thread, so the event loop keeps running (a second launch's forward is
-    //    answered meanwhile); a failure is kept for the page, which says it with a Quit button.
-    let paths = paths.clone();
-    startup::spawn(handle, async move { local::start(&paths, serve).await });
+    //    answered meanwhile); a failure is kept for the page, which says it with a Quit button. It starts
+    //    through Serve the web UI's own start, so a saved switch that is on serves from the first start,
+    //    and an engine that cannot serve falls back to the window alone with the line kept for Settings.
+    let serving = app.state::<serving::Serving>().inner().clone();
+    startup::spawn(handle, async move {
+        serving
+            .start_this_computer(serve, fbtt_core::Config::session_settings)
+            .await
+    });
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
     //    them before it calls the setup); a missing one is said once and the app goes on without it.
     match handle.get_webview_window(lifecycle::MAIN_WINDOW) {

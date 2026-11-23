@@ -9,9 +9,15 @@
 //! for This computer waits for it ([`Startup::endpoint`], at most [`START_WAIT`]); a quit waits for it too
 //! ([`Startup::take_when_settled`]), so a quit while starting still stops the engine and runs its final
 //! save. A failed start is not said in a native dialog: it is kept ([`StartProblem`]), the window is
-//! shown, and the page asks for it with [`startup_problem`] and draws it with a Quit button. Quitting
-//! then exits with [`StartProblem::exit_code`]: 3 when the library is held by another run, as the
-//! terminal client does, 1 otherwise.
+//! shown, and the page asks for it with [`startup_problem`] (again while the start is still running) and
+//! draws it with a Quit button. Quitting then exits with [`StartProblem::exit_code`]: 3 when the library
+//! is held by another run, as the terminal client does, 1 otherwise; so does a system exit (logout,
+//! shutdown) after a failed start.
+//!
+//! A serving restart ([`crate::lifecycle::Lifecycle::restart_this_computer`]) goes through the same
+//! state: it waits for the first start to settle, takes the engine out ([`Startup::begin_restart`], which
+//! makes the phase starting again so a connect waits for the new engine), and puts the new one in
+//! ([`Startup::finish_restart`]).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -41,7 +47,8 @@ pub struct StartProblem {
 }
 
 impl StartProblem {
-    /// The problem `local::start` reported. The library held by another run is the one with its own code.
+    /// The problem `local::start_with` reported. The library held by another run is the one with its
+    /// own code.
     pub fn from_start_error(message: String) -> Self {
         let exit_code = if message == local::ALREADY_RUNNING {
             local::EXIT_ALREADY_RUNNING
@@ -50,6 +57,17 @@ impl StartProblem {
         };
         StartProblem { message, exit_code }
     }
+}
+
+/// What the page's [`startup_problem`] answers: the start is still under way (ask again), it went fine,
+/// or it failed with the line to show. Serialized as `{ state: "starting" }`, `{ state: "fine" }` or
+/// `{ state: "problem", message }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum StartupStatus {
+    Starting,
+    Fine,
+    Problem { message: String },
 }
 
 enum Phase {
@@ -133,11 +151,26 @@ impl Startup {
     }
 
     /// Why the start failed, once it settled within `limit`; `None` when it runs (or is still starting).
+    /// The tests' view; the page asks [`Startup::status`].
+    #[cfg(test)]
     pub async fn problem(&self, limit: Duration) -> Option<StartProblem> {
         self.settled(limit).await;
         match &*self.lock() {
             Phase::Failed(problem) => Some(problem.clone()),
             _ => None,
+        }
+    }
+
+    /// What the page is told about the start after waiting for it at most `limit`: still starting (the
+    /// page asks again), fine, or the problem. A start that takes longer than one wait is not a problem.
+    pub async fn status(&self, limit: Duration) -> StartupStatus {
+        self.settled(limit).await;
+        match &*self.lock() {
+            Phase::Starting => StartupStatus::Starting,
+            Phase::Failed(problem) => StartupStatus::Problem {
+                message: problem.message.clone(),
+            },
+            Phase::Running(_) | Phase::Stopped => StartupStatus::Fine,
         }
     }
 
@@ -234,12 +267,13 @@ pub fn spawn<R: Runtime>(
     });
 }
 
-/// Why This computer did not start, once its start settled (at most [`START_WAIT`]); null while it runs.
+/// How This computer's start went, after waiting for it at most [`START_WAIT`]: still starting (the page
+/// asks again), fine, or the problem the page shows with Quit.
 #[tauri::command]
 pub async fn startup_problem(
     state: tauri::State<'_, crate::commands::DesktopState>,
-) -> Result<Option<StartProblem>, String> {
-    Ok(state.startup().problem(START_WAIT).await)
+) -> Result<StartupStatus, String> {
+    Ok(state.startup().status(START_WAIT).await)
 }
 
 /// Quits the app: what the page's Quit does on the failed-start screen. The exit code is the failed
@@ -256,7 +290,7 @@ mod tests {
 
     use fbtt_core::scratch::ScratchDir;
 
-    use super::{START_TOO_SLOW, StartProblem, Startup};
+    use super::{START_TOO_SLOW, StartProblem, Startup, StartupStatus};
     use crate::local::tests::{scratch_paths, start_offline};
     use crate::local::{ALREADY_RUNNING, EXIT_ALREADY_RUNNING};
 
@@ -326,6 +360,51 @@ mod tests {
 
         let running = Startup::starting();
         assert!(running.problem(Duration::from_millis(20)).await.is_none());
+    }
+
+    /// The page's question has three answers: still starting after its wait (it asks again rather than
+    /// giving up), fine once it runs, and the problem with its line once a start failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_startup_status_says_starting_fine_or_problem() {
+        let dir = ScratchDir::new("desktop-startup-status");
+        let paths = scratch_paths(&dir);
+        let startup = Startup::starting();
+        assert_eq!(
+            startup.status(Duration::from_millis(20)).await,
+            StartupStatus::Starting
+        );
+        let json = serde_json::to_value(StartupStatus::Starting).expect("serializes");
+        assert_eq!(json, serde_json::json!({ "state": "starting" }));
+
+        let this = start_offline(&paths).await.expect("This computer starts");
+        startup.finish(Ok(this));
+        assert_eq!(startup.status(LONG).await, StartupStatus::Fine);
+        assert_eq!(
+            serde_json::to_value(StartupStatus::Fine).expect("serializes"),
+            serde_json::json!({ "state": "fine" })
+        );
+        startup
+            .take_when_settled(LONG)
+            .await
+            .expect("running")
+            .stop()
+            .await;
+
+        let failed = Startup::starting();
+        failed.finish(Err(StartProblem::from_start_error(
+            ALREADY_RUNNING.to_string(),
+        )));
+        let status = failed.status(LONG).await;
+        assert_eq!(
+            status,
+            StartupStatus::Problem {
+                message: ALREADY_RUNNING.to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(status).expect("serializes"),
+            serde_json::json!({ "state": "problem", "message": ALREADY_RUNNING })
+        );
     }
 
     /// A quit while This computer is starting waits for the start, then gets the engine to stop: its final

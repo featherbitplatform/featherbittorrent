@@ -163,6 +163,9 @@ function Serving({
     await onServingChanged(refused)
   }
 
+  // The page's line from the last apply, or else why this launch could not start serving.
+  const shownProblem = problem ?? state?.problem ?? null
+
   return (
     <form className="flex flex-col gap-3" onSubmit={(event) => void apply(event)}>
       <p className="m-0 text-[13px] text-body" data-serving-status>
@@ -215,7 +218,7 @@ function Serving({
           {busy ? 'Applying...' : 'Apply'}
         </Button>
       </div>
-      {problem !== null && <Banner tone="danger">{problem}</Banner>}
+      {shownProblem !== null && <Banner tone="danger">{shownProblem}</Banner>}
     </form>
   )
 }

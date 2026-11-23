@@ -41,7 +41,7 @@ const LIST = {
   items: [{ id: 'local', name: 'This computer', url: '', saved_password: false }],
 }
 
-const OFF = { enabled: false, bind: '0.0.0.0:8090', user: '', address: null }
+const OFF = { enabled: false, bind: '0.0.0.0:8090', user: '', address: null, problem: null }
 
 function platform(name: 'macos' | 'windows' | 'linux'): void {
   shell.desktopInfo.mockResolvedValue({ version: '0.3.0', platform: name })
@@ -161,6 +161,7 @@ it('serving_is_applied_with_its_login_and_shows_the_address', async () => {
     bind: '0.0.0.0:8090',
     user: 'alice',
     address: 'http://192.168.1.20:8090',
+    problem: null,
   })
   const { onServingChanged } = renderSection()
   await screen.findByText('Off')
@@ -232,4 +233,12 @@ it('the_plain_http_warning_shows_for_a_network_bind', async () => {
   expect(screen.queryByText(PLAIN_HTTP_WARNING)).toBeNull()
   fireEvent.change(screen.getByLabelText('Address to listen on'), { target: { value: '[::]:8090' } })
   expect(screen.getByText(PLAIN_HTTP_WARNING)).toBeTruthy()
+})
+
+it('a_first_start_that_could_not_serve_says_why_in_settings', async () => {
+  const line = 'This computer could not start: the address 0.0.0.0:8090 is in use'
+  shell.servingStatus.mockResolvedValue({ ...OFF, problem: line })
+  renderSection()
+  await screen.findByText(line)
+  expect(screen.getByText('Off')).toBeTruthy()
 })

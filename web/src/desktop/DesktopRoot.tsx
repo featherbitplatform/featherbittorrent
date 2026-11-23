@@ -29,7 +29,8 @@
  * instance, so it answers in every phase and is never remounted by a switch. The tray names the
  * instance on screen by its name in the list, never by its id, in every phase: an instance switched to
  * and found down is still the one the window shows. The links and files the app was opened with
- * ({@link OpenedHost}) sit beside the screens too, so a switch never loses one.
+ * ({@link OpenedHost}) sit beside the screens too, so a switch never loses one. A failed start of This
+ * computer ({@link StartupProblemHost}) replaces all of it.
  *
  * Settings gets the Desktop section through {@link DesktopSettingsContext}. The switcher's `Manage
  * instances` opens Settings at its Instances part (the standalone manager is kept for when no workspace
@@ -166,14 +167,13 @@ function Connected({
   )
 }
 
-/** The screens below, with the first-close question ready whatever phase they are in. */
+/** The screens below, with the first-close question ready whatever phase they are in; a failed start of This computer instead of all of it. */
 export function DesktopRoot() {
   return (
-    <>
+    <StartupProblemHost>
       <DesktopScreens />
       <CloseChoiceHost />
-      <StartupProblemHost />
-    </>
+    </StartupProblemHost>
   )
 }
 

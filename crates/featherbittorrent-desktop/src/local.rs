@@ -72,13 +72,11 @@ impl std::fmt::Debug for ThisComputer {
 /// the Serve the web UI switch: on, the library's `server:` section applies as it does for `serve`; off,
 /// the engine is the window's alone.
 ///
+/// The engine's settings are made from the config by `settings`: [`Config::session_settings`] for real,
+/// and a test keeps the engine on loopback with no DHT and no multicast while everything else runs as it
+/// does for real. The app's own start goes through [`crate::serving::Serving::start_this_computer`].
+///
 /// The error is the line to show. A library another run holds is exactly [`ALREADY_RUNNING`].
-pub async fn start(paths: &DesktopPaths, serve: bool) -> Result<ThisComputer, String> {
-    start_with(paths, serve, Config::session_settings).await
-}
-
-/// [`start`] with the engine settings made from the config by `settings`, which is how a test keeps the
-/// engine on loopback with no DHT and no multicast while everything else runs as it does for real.
 pub(crate) async fn start_with(
     paths: &DesktopPaths,
     serve: bool,

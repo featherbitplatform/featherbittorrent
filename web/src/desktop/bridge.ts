@@ -189,14 +189,12 @@ export async function onOpened(handler: (item: OpenedItem) => void): Promise<() 
   return listen<OpenedItem>(OPENED_EVENT, (event) => handler(event.payload))
 }
 
-/** Why This computer did not start: the shell's line. */
-export interface StartupProblem {
-  message: string
-}
+/** How This computer's start went: still under way (ask again), fine, or why it did not start (the shell's line). */
+export type StartupStatus = { state: 'starting' } | { state: 'fine' } | { state: 'problem'; message: string }
 
-/** Why This computer did not start, once its start finished; null while it runs. Waits for a start under way. */
-export async function startupProblem(): Promise<StartupProblem | null> {
-  return invoke<StartupProblem | null>('startup_problem')
+/** How This computer's start went. Waits a while for a start under way and answers `starting` if it still is. */
+export async function startupProblem(): Promise<StartupStatus> {
+  return invoke<StartupStatus>('startup_problem')
 }
 
 /** Quits the app; after a failed start the exit code says why (3 when another run holds the library). */
@@ -225,12 +223,17 @@ export async function setShortcuts(list: ShortcutOverride[]): Promise<void> {
   await invoke('set_shortcuts', { list })
 }
 
-/** Serve the web UI as the shell has it: the switch, the address and login the config names, and where it is reachable now (null while off). */
+/**
+ * Serve the web UI as the shell has it: the switch, the address and login the config names, where it is
+ * reachable now (null while off), and why serving is off although this launch asked for it (the engine
+ * would not start serving and started for the window alone), null otherwise.
+ */
 export interface ServingState {
   enabled: boolean
   bind: string
   user: string
   address: string | null
+  problem: string | null
 }
 
 /** What turning serving on or off asks for. The password is only needed for a user the config does not have yet. */

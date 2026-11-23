@@ -314,6 +314,14 @@ impl Lifecycle {
     }
 }
 
+/// The code a system exit (logout, shutdown, the last window gone) ends the process with, once This
+/// computer was stopped: `None` for 0, which is what the event loop exits with anyway, or the failed
+/// start's code (3 for a library another run holds, 1 otherwise), as a quit from the page would.
+pub fn system_exit_code(state: &DesktopState) -> Option<i32> {
+    let code = state.startup().exit_code();
+    (code != 0).then_some(code)
+}
+
 /// Shows the main window, brings it out of the Dock or taskbar, and focuses it.
 pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
@@ -344,7 +352,14 @@ pub fn apply_initial_state<R: Runtime>(app: &AppHandle<R>, state: WindowState) {
 
 /// Does what closing the window means now. The close itself has already been held back by the caller,
 /// so the window only goes away through here.
+///
+/// After a failed start of This computer the page shows only the problem and its Quit, so a close is a
+/// quit (with that start's exit code): there is nothing to keep running in the tray and nobody to ask.
 pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
+    if system_exit_code(&app.state::<DesktopState>()).is_some() {
+        quit(app);
+        return;
+    }
     match app.state::<Lifecycle>().close_outcome() {
         CloseOutcome::Quit => quit(app),
         CloseOutcome::HideToTray => {
@@ -418,6 +433,11 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
                     }
                 }
                 ExitAnswer::Nothing => {}
+            }
+            // The process ends when this handler returns, with 0; after a failed start it ends with that
+            // start's code instead, whichever way out was taken.
+            if let Some(code) = system_exit_code(&app.state::<DesktopState>()) {
+                std::process::exit(code);
             }
         }
         _ => {}
@@ -518,6 +538,31 @@ mod tests {
             close,
             ..DesktopSettings::default()
         }
+    }
+
+    /// A system exit (logout, shutdown) after a failed start ends the process with that start's code, as
+    /// the page's Quit does: 3 for a library another run holds, 1 otherwise; a start that went fine leaves
+    /// the event loop's own 0.
+    #[test]
+    fn a_system_exit_after_a_failed_start_keeps_its_code() {
+        use crate::commands::DesktopState;
+        use crate::local::{ALREADY_RUNNING, EXIT_ALREADY_RUNNING};
+        use crate::startup::StartProblem;
+
+        let held = DesktopState::starting();
+        held.startup().finish(Err(StartProblem::from_start_error(
+            ALREADY_RUNNING.to_string(),
+        )));
+        assert_eq!(super::system_exit_code(&held), Some(EXIT_ALREADY_RUNNING));
+
+        let other = DesktopState::starting();
+        other.startup().finish(Err(StartProblem::from_start_error(
+            "This computer could not start: no port".to_string(),
+        )));
+        assert_eq!(super::system_exit_code(&other), Some(1));
+
+        let starting = DesktopState::starting();
+        assert_eq!(super::system_exit_code(&starting), None);
     }
 
     #[test]

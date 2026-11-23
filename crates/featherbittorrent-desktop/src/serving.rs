@@ -8,8 +8,14 @@
 //! `server.auth.users` (the same entry `featherbittorrent user set` writes), and logins are switched on.
 //! Applying restarts This computer through [`Lifecycle::restart_this_computer`], so a quit during the
 //! restart still saves; the page then connects to `local` again, because a new launch has a new secret.
+//!
+//! The app's first start of This computer goes through here too ([`Serving::start_this_computer`]), so a
+//! saved switch that is on starts the engine serving, the same as an apply does; and an engine that will
+//! not start serving falls back to the window alone the same way, with the line kept for the Serving
+//! section ([`ServingView::problem`]) rather than shown as a start that could not run at all.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex};
 
 use fbtt_core::{Config, LibraryLock, LockError, ServerConfig, UserEntry};
 use fbtt_desktop_core::DesktopPaths;
@@ -64,6 +70,9 @@ pub struct ServingView {
     pub bind: String,
     pub user: String,
     pub address: Option<String>,
+    /// Why serving is off although it was asked for at this launch: the saved switch was on and the
+    /// engine would not start serving (the port is taken, say), so it started for the window alone.
+    pub problem: Option<String>,
 }
 
 /// What the serving commands keep: where the library is and the shell's one settings store.
@@ -71,6 +80,8 @@ pub struct ServingView {
 pub struct Serving {
     paths: DesktopPaths,
     settings: SettingsStore,
+    /// The line from a first start that could not serve, until an apply succeeds.
+    problem: Arc<Mutex<Option<String>>>,
 }
 
 /// A request that passed its checks, with the password already hashed.
@@ -85,7 +96,50 @@ struct Change {
 impl Serving {
     /// The serving state for the app's library in `paths`, saving its switch through `settings`.
     pub fn new(paths: DesktopPaths, settings: SettingsStore) -> Self {
-        Serving { paths, settings }
+        Serving {
+            paths,
+            settings,
+            problem: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// This computer's first start of the run, serving when `serve` (the saved switch) is on. An engine
+    /// that will not start serving is started for the window alone, the switch is saved off and the line
+    /// kept for the Serving section, exactly as [`apply`](Self::apply) does it; only a start that cannot
+    /// run at all (the library held by another run, a second failure) is the answer, which the page then
+    /// shows as the startup problem. `settings` makes the engine's settings from the config.
+    pub async fn start_this_computer<S>(
+        &self,
+        serve: bool,
+        settings: S,
+    ) -> Result<ThisComputer, String>
+    where
+        S: Fn(&Config) -> fbt::Settings + Clone,
+    {
+        let problem = match local::start_with(&self.paths, serve, settings.clone()).await {
+            Ok(running) => return Ok(running),
+            Err(problem) if !serve || problem == local::ALREADY_RUNNING => return Err(problem),
+            Err(problem) => problem,
+        };
+        eprintln!("{problem}");
+        let running = local::start_with(&self.paths, false, settings).await?;
+        let _ = self.save_switch(false);
+        self.set_problem(Some(problem));
+        Ok(running)
+    }
+
+    fn set_problem(&self, problem: Option<String>) {
+        *self
+            .problem
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = problem;
+    }
+
+    fn problem(&self) -> Option<String> {
+        self.problem
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The library's config as it is on disk now; `None` when there is none yet or it cannot be read.
@@ -122,6 +176,7 @@ impl Serving {
             bind,
             user,
             address,
+            problem: self.problem(),
         }
     }
 
@@ -247,9 +302,12 @@ impl Serving {
         if self.unchanged(&change, state.serving_addr().is_some()) {
             return Ok(self.view(state.serving_addr(), user.as_deref()));
         }
-        lifecycle
+        let restarted = lifecycle
             .restart_this_computer(state, || self.restart(change, settings))
-            .await?;
+            .await;
+        // Whatever the first start said is old news once serving was applied again.
+        self.set_problem(None);
+        restarted?;
         Ok(self.view(state.serving_addr(), user.as_deref()))
     }
 
@@ -388,8 +446,8 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::time::Duration;
 
-    use fbtt_core::scratch::ScratchDir;
     use fbtt_core::{Config, ServerConfig};
+    use fbtt_core::scratch::ScratchDir;
     use reqwest::StatusCode;
 
     use super::{PASSWORD_NEEDED, Serving, ServingRequest};
@@ -654,6 +712,108 @@ mod tests {
         assert_eq!(refused.err().as_deref(), Some(crate::lifecycle::QUITTING));
         app.lifecycle.stop_for_quit(&app.state).await;
         assert!(app.state.local_addr().is_none(), "the quit stopped it");
+    }
+
+    /// A serving restart asked for while This computer's first start is still under way waits for that
+    /// start, then restarts the engine it started; a connect afterwards answers the new secret, and a quit
+    /// after it stops (and saves) the restarted engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_serving_restart_waits_for_the_initial_start() {
+        let dir = ScratchDir::new("desktop-serving-waits-for-start");
+        let paths = scratch_paths(&dir);
+        let store = SettingsStore::new(paths.settings_file());
+        let serving = Serving::new(paths.clone(), store.clone());
+        let lifecycle = Lifecycle::new(store);
+        let state = DesktopState::starting();
+
+        let restart = serving.apply(
+            &lifecycle,
+            &state,
+            on("127.0.0.1:0", "alice", "hunter2"),
+            offline,
+        );
+        let first = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The restart has not touched the library yet: the first start still gets its lock.
+            let this = start_offline(&paths).await.expect("the first start runs");
+            let secret = this.endpoint().1;
+            assert!(state.startup().finish(Ok(this)).is_none());
+            secret
+        };
+        let (applied, first_secret) =
+            tokio::time::timeout(DEADLINE, async { tokio::join!(restart, first) })
+                .await
+                .expect("both finish in time");
+        let view = applied.expect("serving turns on after the first start");
+        assert!(view.enabled);
+        assert!(view.address.is_some(), "the restarted engine serves");
+
+        let endpoint = crate::commands::connect_to(&state, "local", DEADLINE)
+            .await
+            .expect("local connects");
+        let secret = endpoint.token.expect("a launch secret");
+        assert_ne!(secret, first_secret, "the connect answers the new secret");
+
+        assert!(lifecycle.begin_quit());
+        lifecycle.stop_for_quit(&state).await;
+        assert!(state.local_addr().is_none(), "the quit stopped it");
+        let again = start_offline(&paths)
+            .await
+            .expect("the library was released");
+        again.stop().await;
+    }
+
+    /// With the switch saved on, the app's first start serves at once (the same start a restart uses);
+    /// an engine that cannot serve (its port is taken) starts for the window alone, the switch is saved
+    /// off and the Serving section has the line, while the start itself counts as fine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_start_serves_or_falls_back_to_the_window() {
+        let app = running("desktop-serving-first-start").await;
+        let port = free_loopback_port();
+        let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        app.apply(on(&bind.to_string(), "alice", "hunter2"))
+            .await
+            .expect("serving turns on");
+        let paths = app.serving.paths.clone();
+        let store = app.serving.settings.clone();
+        // The app quits; its scratch directory stays until the end of the test.
+        if let Some(this) = app.state.startup().take_when_settled(DEADLINE).await {
+            this.stop().await;
+        }
+
+        // Next launch: the saved switch is on, the first start serves.
+        let serving = Serving::new(paths.clone(), store.clone());
+        let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
+            .await
+            .expect("in time")
+            .expect("starts serving");
+        assert!(this.exposed());
+        assert_eq!(this.local_addr(), bind);
+        this.stop().await;
+
+        // The port is taken by something else: the window still gets its engine.
+        let squatter = TcpListener::bind(bind).expect("the port is free again");
+        let serving = Serving::new(paths, store);
+        let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
+            .await
+            .expect("in time")
+            .expect("falls back to the window");
+        assert!(!this.exposed(), "the window's engine alone");
+        let state = DesktopState::running(this);
+        let view = serving.view(state.serving_addr(), None);
+        assert!(!view.enabled, "the switch was saved off");
+        assert!(view.address.is_none());
+        assert!(view.problem.is_some(), "the line is kept for Settings");
+        assert_eq!(
+            state.startup().status(DEADLINE).await,
+            crate::startup::StartupStatus::Fine,
+            "not a startup problem"
+        );
+        drop(squatter);
+        if let Some(this) = state.startup().take_when_settled(DEADLINE).await {
+            this.stop().await;
+        }
+        drop(app);
     }
 
     /// Off while already off restarts nothing: the launch secret is the same afterwards.
