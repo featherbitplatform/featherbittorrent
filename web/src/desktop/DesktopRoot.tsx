@@ -20,7 +20,8 @@ import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
-import { connect, LOCAL_ID } from './bridge'
+import { connect, LOCAL_ID, setTrayInstance, THIS_COMPUTER } from './bridge'
+import { CloseChoiceHost } from './CloseChoice'
 
 type Phase =
   | { phase: 'connecting' }
@@ -90,7 +91,17 @@ function Connected({
   )
 }
 
+/** The screens below, with the first-close question ready whatever phase they are in. */
 export function DesktopRoot() {
+  return (
+    <>
+      <DesktopScreens />
+      <CloseChoiceHost />
+    </>
+  )
+}
+
+function DesktopScreens() {
   const [phase, setPhase] = useState<Phase>({ phase: 'connecting' })
   // One connect at a time: a second request while one is out would race it for the last word.
   const pending = useRef<Promise<void> | null>(null)
@@ -120,6 +131,13 @@ export function DesktopRoot() {
 
   const current = phase.phase === 'connecting' ? LOCAL_ID : phase.id
   const onTokenRefused = useCallback((token: string) => void open(current, token), [open, current])
+
+  // The tray names the instance the page is connected to.
+  const connectedId = phase.phase === 'ready' ? phase.id : null
+  useEffect(() => {
+    if (connectedId === null) return
+    setTrayInstance(connectedId === LOCAL_ID ? THIS_COMPUTER : connectedId).catch(() => undefined)
+  }, [connectedId])
 
   if (phase.phase === 'connecting') return <Connecting />
   if (phase.phase === 'unreachable') return <Unreachable onRetry={() => open(phase.id, null)} />

@@ -21,8 +21,13 @@ path = "src/main.rs"
 tauri-build.workspace = true
 
 [dependencies]
-# The window, the webview and the commands the page calls.
-tauri.workspace = true
+# The window, the webview and the commands the page calls; `tray-icon` for the tray (Task 8).
+tauri = { workspace = true, features = ["tray-icon"] }
+# Start at login: the app's own login item, launched with `--background`.
+tauri-plugin-autostart.workspace = true
+# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save. The
+# runtime itself is Tauri's; this only names the feature.
+tokio = { workspace = true, features = ["signal"] }
 # `generate_context!` expands to code that names `serde_json` from the crate that calls it, so it has to
 # be a direct dependency (the Tauri spike's finding).
 serde_json.workspace = true
