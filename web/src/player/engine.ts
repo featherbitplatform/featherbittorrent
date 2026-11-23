@@ -75,6 +75,24 @@ interface Stream {
   buffer: SourceBuffer
   /** The chunk a quota refusal kept: it goes in before any later chunk, when the buffer has room. */
   heldChunk: ArrayBuffer | null
+  /**
+   * The timer that asks for the held chunk again. A held chunk at the playhead is one the element
+   * is waiting on: it fires no `timeupdate` and the buffer no `updateend`, so a timer is the only
+   * thing left to wake the read.
+   */
+  holdTimer: ReturnType<typeof setTimeout> | null
+  /**
+   * The far edge, in media seconds, of the range this body's last append grew: the range the body
+   * feeds. Its end is where the body's data stops, whatever range the playhead sits in. Null until
+   * the body's first append grows a range.
+   */
+  fedTo: number | null
+  /**
+   * The mime an audio switch changes the buffer to before the next body is read. It stays set
+   * until the `changeType` has happened, so a seek that interrupts the switch hands it to the
+   * restart, which fetches the new track rather than bringing the old one back.
+   */
+  pendingType: string | null
   /** True while the current body is one that begins the file's playback, or a restart of it. */
   isStart: boolean
   /** The read gate, one per stream: the two tracks of one file each keep their own answer. */
@@ -144,6 +162,14 @@ const RETRY_DELAYS = [1_000, 2_000, 4_000] as const
 const RETRY_STEADY = 5_000
 /** How close to the end of the file a buffered second counts as the end. */
 const END_WITHIN = 0.5
+/**
+ * How far outside a range a point may sit and still count as in it. The first fragment of a body
+ * rarely starts on the exact millisecond the playhead was put at: a playhead at 1.000 and a range
+ * that starts at 1.020 is the playhead in that range.
+ */
+const IN_RANGE_WITHIN = 0.1
+/** How long a chunk the buffer refused for quota waits before it is offered again. */
+const HOLD_RETRY_MS = 1_000
 
 /**
  * The engine's two edges for a point of the file, said once so the fetch and the element cannot
@@ -193,20 +219,20 @@ function bufferEnd(
   return end
 }
 
-/**
- * The far edge of the range the playhead sits in, or 0 when it sits in none: a range an hour
- * ahead is not one the person is watching, and the retry that fills the playhead's gap must not
- * start past it.
- */
-function rangeEndAtPlayhead(
+/** Whether a point lies in a range, give or take `IN_RANGE_WITHIN` at either edge. */
+function inRange(start: number, end: number, point: number): boolean {
+  return start - IN_RANGE_WITHIN <= point && point <= end + IN_RANGE_WITHIN
+}
+
+/** The far edge of the range a point sits in, or 0 when it sits in none. */
+function rangeEndAt(
   buffered: { length: number; start(i: number): number; end(i: number): number },
-  currentTime: number,
+  point: number,
 ): number {
   let end = 0
   for (let i = 0; i < buffered.length; i += 1) {
-    const start = buffered.start(i)
     const endI = buffered.end(i)
-    if (start <= currentTime && currentTime <= endI) end = Math.max(end, endI)
+    if (inRange(buffered.start(i), endI, point)) end = Math.max(end, endI)
   }
   return end
 }
@@ -224,7 +250,7 @@ function aheadOfPlayhead(
   for (let i = 0; i < buffered.length; i += 1) {
     const start = buffered.start(i)
     const end = buffered.end(i)
-    if (start <= currentTime && currentTime <= end) ahead = Math.max(ahead, end - currentTime)
+    if (inRange(start, end, currentTime)) ahead = Math.max(ahead, end - currentTime)
   }
   return ahead
 }
@@ -316,6 +342,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       track,
       buffer: source.addSourceBuffer(mime) as unknown as Stream['buffer'],
       heldChunk: null,
+      holdTimer: null,
+      fedTo: null,
+      pendingType: null,
       isStart: false,
       gate: createReadGate(),
       abort: null,
@@ -403,6 +432,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     clearRetry(stream)
     stream.atEnd = false
     stream.isStart = true
+    stream.fedTo = null
 
     const abort = new AbortController()
     stream.abort = abort
@@ -415,6 +445,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     void (async () => {
       if (quiescent !== null) await quiescent
       if (destroyed || abort.signal.aborted) return
+      // An audio switch that has not reached its `changeType` yet is finished here, before the
+      // new track's first byte: the switch's own body, or a restart that interrupted it.
+      if (stream.pendingType !== null) {
+        const switched = await switchType(stream, stream.pendingType, mapTimes.toMedia(startMs), abort.signal)
+        if (!switched) return
+      }
       let response: Response
       try {
         response = await full.fetch(url, { signal: abort.signal, credentials: 'same-origin' })
@@ -537,6 +573,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     generation: number,
   ): Promise<boolean> {
     try {
+      const before = ranges(stream.buffer.buffered)
       stream.appending = true
       stream.buffer.appendBuffer(data)
       if (stream.generation !== generation) {
@@ -545,7 +582,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       }
       await appendDone(stream, generation)
       stream.appending = false
-      return stream.generation === generation
+      if (stream.generation !== generation) return false
+      noteFed(stream, before)
+      return true
     } catch (cause) {
       if (stream.generation !== generation) return false
       stream.appending = false
@@ -556,11 +595,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         setState('error')
         return false
       }
-      // The buffer is full: cut what lies far behind the playhead, one range at a time, each
-      // `remove` awaited to its `updateend`, and a `remove` of nothing is skipped.
-      const cut = evictRanges(ranges(stream.buffer.buffered), video.currentTime).filter(
-        ([start, end]) => end > start,
-      )
+      // The buffer is full: cut what lies far behind the playhead, and every range that holds
+      // neither the playhead nor the body's own data, one range at a time, each `remove` awaited
+      // to its `updateend`, and a `remove` of nothing is skipped.
+      const cut = evictionCut(stream)
       for (const [start, end] of cut) {
         if (stream.generation !== generation) return false
         // The buffer may still be finishing the update that ended in the quota error: a `remove`
@@ -580,26 +618,126 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         if (stream.generation !== generation) return false
         await waitNotUpdating(stream.buffer, () => stream.generation !== generation)
         if (stream.generation !== generation) return false
+        const before = ranges(stream.buffer.buffered)
         stream.appending = true
         stream.buffer.appendBuffer(data)
         if (stream.generation !== generation) return false
         await appendDone(stream, generation)
-        return stream.generation === generation
+        stream.appending = false
+        if (stream.generation !== generation) return false
+        noteFed(stream, before)
+        return true
       } catch (cause) {
         // Still full after one eviction. A quota is the buffer saying there is no room yet: the
         // chunk is kept, the read stops, and the same chunk goes in when the buffer makes room
-        // (the next `timeupdate` or `updateend` after the playhead has moved). Any other error
-        // is the buffer saying no for a reason the engine cannot answer, and it is the player's
-        // `error`, not a silent drop of the chunk.
+        // (the next `timeupdate` or `updateend` after the playhead has moved, or the hold timer
+        // when neither comes). Any other error is the buffer saying no for a reason the engine
+        // cannot answer, and it is the player's `error`, not a silent drop of the chunk.
         stream.appending = false
+        if (stream.generation !== generation) return false
         if (isQuotaError(cause)) {
           stream.heldChunk = data
+          armHold(stream, generation)
           return false
         }
         setState('error')
         return false
       }
     }
+  }
+
+  /**
+   * After an append, the range it grew is the range the body feeds: the end that is new, or that
+   * moved, is where the body's data stops now. An append that grew no range (an init segment)
+   * leaves the last answer in place.
+   */
+  function noteFed(stream: Stream, before: [number, number][]): void {
+    let grown: number | null = null
+    for (const [, end] of ranges(stream.buffer.buffered)) {
+      if (!before.some(([, was]) => Math.abs(was - end) < 1e-6)) grown = Math.max(grown ?? end, end)
+    }
+    if (grown !== null) stream.fedTo = grown
+  }
+
+  /**
+   * The far edge of the range the body feeds: the range its last append grew, or before any, the
+   * range its start falls in. 0 when the body has no data in the buffer.
+   */
+  function fedRangeEnd(stream: Stream): number {
+    const buffered = stream.buffer.buffered
+    if (stream.fedTo !== null) {
+      const end = rangeEndAt(buffered, stream.fedTo)
+      if (end > 0) return end
+    }
+    return rangeEndAt(buffered, mapTimes.toMedia(stream.bodyStartMs))
+  }
+
+  /**
+   * What a full buffer gives up: every range that holds neither the playhead nor the body's own
+   * data, whole, and of the ranges that do, what lies far behind the playhead. A buffer full of
+   * ranges the playhead is not in would otherwise refuse the chunk the playhead is waiting on
+   * for good.
+   */
+  function evictionCut(stream: Stream): [number, number][] {
+    const playhead = video.currentTime
+    const fed = stream.fedTo ?? mapTimes.toMedia(stream.bodyStartMs)
+    const cut: [number, number][] = []
+    for (const [start, end] of ranges(stream.buffer.buffered)) {
+      if (inRange(start, end, playhead) || inRange(start, end, fed)) {
+        cut.push(...evictRanges([[start, end]], playhead))
+      } else {
+        cut.push([start, end])
+      }
+    }
+    return cut.filter(([start, end]) => end > start)
+  }
+
+  /** Offer the held chunk again after a while, whether or not the element says anything. */
+  function armHold(stream: Stream, generation: number): void {
+    if (stream.holdTimer !== null) clearTimeout(stream.holdTimer)
+    stream.holdTimer = setTimeout(() => {
+      stream.holdTimer = null
+      if (destroyed || stream.generation !== generation) return
+      pump(stream)
+    }, HOLD_RETRY_MS)
+  }
+
+  /** Drop the held chunk and its timer: the body it came from is gone. */
+  function dropHeld(stream: Stream): void {
+    stream.heldChunk = null
+    if (stream.holdTimer !== null) {
+      clearTimeout(stream.holdTimer)
+      stream.holdTimer = null
+    }
+  }
+
+  /**
+   * Change an audio buffer's type for a new track: cut what it holds from `from` to the end, then
+   * `changeType`, each step awaited until the buffer is not updating. False when the body the
+   * switch was for went away first; the switch stays pending, and the next body finishes it.
+   */
+  async function switchType(stream: Stream, mime: string, from: number, signal: AbortSignal): Promise<boolean> {
+    const gone = (): boolean => destroyed || signal.aborted
+    const end = bufferEnd(stream.buffer.buffered)
+    if (end > from) {
+      await waitNotUpdating(stream.buffer, gone)
+      if (gone()) return false
+      try {
+        stream.buffer.remove(Math.max(from, 0), end)
+      } catch {
+        // A remove the buffer refuses is data it already let go.
+      }
+    }
+    await waitNotUpdating(stream.buffer, gone)
+    if (gone()) return false
+    try {
+      stream.buffer.changeType(mime)
+    } catch {
+      // A buffer that will not change its type is one that is already gone.
+    }
+    stream.pendingType = null
+    await waitNotUpdating(stream.buffer, gone)
+    return !gone()
   }
 
   /** A read loop that is stopped by its gate, woken by a `timeupdate` moving the playhead. */
@@ -611,7 +749,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     // the decoder wants it in.
     if (stream.heldChunk !== null) {
       const held = stream.heldChunk
-      stream.heldChunk = null
+      dropHeld(stream)
       void (async () => {
         // A seek that arrives while the held chunk is being asked for restarts the stream, and
         // the held chunk is the old stream's: it is dropped, and the new stream reads its own.
@@ -663,10 +801,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (destroyed || endedFired) return
     const end = probe.durationMs === null ? null : mapTimes.toMedia(probe.durationMs)
     if (end !== null) {
-      // The end is reached when the range the playhead is in runs to it, not when any range
-      // does: a far range that covers the file's end is not the file being over for a playhead
-      // that sits in a gap behind it.
-      const reached = rangeEndAtPlayhead(stream.buffer.buffered, video.currentTime) >= end - END_WITHIN
+      // The end is reached when the range this body fed runs to it, not when any range does: a
+      // far range that covers the file's end is not this body's data, and the range the playhead
+      // sits in may be an earlier one the body has long since left behind.
+      const reached = fedRangeEnd(stream) >= end - END_WITHIN
       if (reached) {
         // This body ended at the end of the file: it is done, and not to be refetched.
         stream.atEnd = true
@@ -710,12 +848,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         action()
         return
       }
-      // The retry goes from the end of the range the playhead sits in, not from where the fetch
-      // began: the data that made it in is kept, and the server resumes where that range stops.
-      // A range an hour ahead is not where the playhead is, and the retry must not start past
-      // it, or the gap the playhead sits in is never filled. A playhead that sits in no range
-      // resumes from the body's own start, where its data is.
-      const rangeEnd = rangeEndAtPlayhead(stream.buffer.buffered, video.currentTime)
+      // The retry goes from the end of the range the body fed, not from where the fetch began:
+      // the data that made it in is kept, and the server resumes where that range stops. A
+      // range an hour ahead is not this body's, and the retry must not start past it; the range
+      // the playhead sits in may be one the body already left, and refetching it is waste. A
+      // body with no data in the buffer resumes from its own start.
+      const rangeEnd = fedRangeEnd(stream)
       const fromMs = rangeEnd > 0 ? mapTimes.toSource(rangeEnd) : stream.bodyStartMs
       beginStream(stream, fromMs)
     }, delay)
@@ -748,6 +886,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     stream.generation += 1
     stream.isStart = false
     clearRetry(stream)
+    // A chunk held for quota belongs to the body being stopped: appended into the next body, it
+    // would be the old position's (or the old track's) data in the middle of the new one.
+    dropHeld(stream)
     stream.reading = false
     stream.appending = false
     if (stream.reader !== null) {
@@ -774,6 +915,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   function restartAll(fromMs: number): void {
+    // A restart after an error is a fresh start: the streams run again, so an error in them must
+    // stop them again, and the state is the start's, not the old error.
+    errorFired = false
+    if (state === 'error') setState('loading')
     // Every stream stops where it is and starts again at the same point of source time: the
     // fetches abort (and the generation bumps), and the playhead is where the person put it.
     for (const stream of streams) {
@@ -834,72 +979,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (mime === null) return
     // The audio track changes on the buffer it already has: a `SourceBuffer` cannot change its
     // mime in place, but it can `changeType`, and a second `addSourceBuffer` after media data has
-    // arrived is the browser's `QuotaExceededError`. The old fetch stops, the buffer is cut at
-    // the playhead and re-typed, and the new track is asked for at the point the buffer covers.
-    const old = audioStream
-    const cutFrom = video.currentTime
-    const cutEnd = bufferEnd(old.buffer.buffered)
-    const oldTrack = old.track
-    old.track = track
-    // The switch keeps this stream, so it cannot `abortStream` it: that would bump the
-    // generation the switch checks and stop it at once. The stop of the old fetch, the abort of
-    // the buffer, and the wait are done here, and the generation the switch checks is the one
-    // the stream carries after the switch's own bump: a seek during the wait bumps past it, and
-    // the switch stops, the new track being the one the restart asks for. The `beginStream` at
-    // the end of the switch is the one that fetches the new track, at the playhead.
-    const generation = old.generation + 1
-    old.generation = generation
-    clearRetry(old)
-    old.reading = false
-    old.appending = false
-    if (old.reader !== null) {
-      const reader = old.reader
-      old.reader = null
-      void reader.cancel().catch(() => {
-        // A body that will not cancel is a body that is already gone.
-      })
-    }
-    if (old.abort !== null) {
-      old.abort.abort()
-      old.abort = null
-    }
-    try {
-      old.buffer.abort()
-    } catch {
-      // A buffer the source already took away has nothing to stop.
-    }
-    const quiescent = waitNotUpdating(old.buffer, () => destroyed || old.generation !== generation)
-    void (async () => {
-      // The `abort` above left the buffer mid-update: settle it before anything else, the way a
-      // browser's `abort` + `updateend` sequence does. A seek that bumped the generation is the
-      // switch being taken over by a restart: the buffer keeps its old type, and the track the
-      // restart fetches is the one it was made for, not the one the switch was moving to.
-      await quiescent
-      if (destroyed || old.generation !== generation) {
-        old.track = oldTrack
-        return
-      }
-      if (cutEnd > cutFrom) {
-        // Remove from the playhead to the end, awaited to `updateend`: a `changeType` while the
-        // remove is still updating is the browser's `InvalidStateError`, so the wait comes after.
-        try {
-          old.buffer.remove(Math.max(cutFrom, 0), cutEnd)
-        } catch {
-          // A remove the buffer refuses is data it already let go.
-        }
-        await waitNotUpdating(old.buffer, () => destroyed || old.generation !== generation)
-        if (destroyed || old.generation !== generation) {
-          old.track = oldTrack
-          return
-        }
-      }
-      try {
-        old.buffer.changeType(mime)
-      } catch {
-        // A buffer that will not change its type is one that is already gone.
-      }
-      beginStream(old, mapTimes.toSource(cutFrom))
-    })()
+    // arrived is the browser's `QuotaExceededError`. The new body's `beginStream` stops the old
+    // fetch and `abort()`s the buffer, then cuts it from the playhead to the end and re-types it
+    // (`switchType`), then asks for the new track at the playhead. The switch is pending until
+    // the `changeType` has happened: a seek that interrupts it restarts the audio on the new
+    // track, which is the one the player shows as chosen.
+    const stream = audioStream
+    stream.track = track
+    stream.pendingType = mime
+    beginStream(stream, mapTimes.toSource(video.currentTime))
   }
 
   function destroy(): void {
