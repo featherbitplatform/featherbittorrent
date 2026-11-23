@@ -275,6 +275,63 @@ for ext in gz xz zst; do
 done
 echo 'ok: the ar and tar control read works for each compression (gz, xz, zst)'
 
+# 7e. The desktop app's macOS and Windows scripts refuse bad arguments with exit 2 before any platform
+# question, so these run on any OS like the CLI script's refusals above: none of the refusals may be the
+# "runs on macOS only" or "runs on Windows only" line. The PowerShell scripts are run when pwsh is
+# installed (the release workflow's verify job has it); without it they are skipped with a note.
+desktop_refusal() { # <what the message must say> <interpreter> <script> <argument>...
+  local want="$1" interp="$2" script="$3"; shift 3
+  local status=0 out
+  out="$("$interp" "$script" "$@" 2>&1)" || status=$?
+  [[ $status -eq 2 ]] || fail "$script $* exited $status, expected 2: $out"
+  grep -qF -- "$want" <<<"$out" || fail "$script $* did not say '$want': $out"
+  if grep -qE 'runs on (macOS|Windows) only' <<<"$out"; then
+    fail "$script $* asked about the platform before its arguments: $out"
+  fi
+}
+desktop_refusal 'usage' bash dev/package-desktop-macos.sh
+desktop_refusal 'usage' bash dev/package-desktop-macos.sh 0.1.0 extra
+desktop_refusal 'invalid version' bash dev/package-desktop-macos.sh 0.1
+desktop_refusal 'invalid version' bash dev/package-desktop-macos.sh 1.2.3/4
+desktop_refusal 'usage' bash dev/smoke-desktop-macos.sh target/dist
+desktop_refusal 'invalid version' bash dev/smoke-desktop-macos.sh target/dist v0.1.0
+echo 'ok: package-desktop-macos.sh and smoke-desktop-macos.sh refuse bad arguments with exit 2, before any platform check'
+if command -v pwsh >/dev/null; then
+  desktop_refusal 'usage' pwsh -NoProfile -File dev/package-desktop-windows.ps1
+  desktop_refusal 'invalid version' pwsh -NoProfile -File dev/package-desktop-windows.ps1 -Version 0.1
+  desktop_refusal 'invalid version' pwsh -NoProfile -File dev/package-desktop-windows.ps1 -Version '0.1.0 '
+  desktop_refusal 'usage' pwsh -NoProfile -File dev/smoke-desktop-windows.ps1 target/dist
+  desktop_refusal 'invalid version' pwsh -NoProfile -File dev/smoke-desktop-windows.ps1 target/dist 0.1.0.0
+  echo 'ok: package-desktop-windows.ps1 and smoke-desktop-windows.ps1 refuse bad arguments with exit 2, before any platform check'
+  # The .msi's numeric version: the bundler refuses a non-numeric prerelease, so X.Y.Z-pre goes to it as
+  # X.Y.Z.N (N the last numeric identifier of pre, else 0) and a plain X.Y.Z passes through unchanged.
+  wix_version_case() { # <version> <the WiX version it must map to>
+    local status=0 out
+    out="$(pwsh -NoProfile -File dev/package-desktop-windows.ps1 -Version "$1" -PrintWixVersion 2>&1)" || status=$?
+    [[ $status -eq 0 ]] || fail "package-desktop-windows.ps1 -Version $1 -PrintWixVersion exited $status: $out"
+    [[ "$out" == "$2" ]] || fail "package-desktop-windows.ps1 mapped $1 to '$out', expected '$2'"
+  }
+  wix_version_case 0.4.0 0.4.0
+  wix_version_case 0.4.0-rc.1 0.4.0.1
+  wix_version_case 0.4.0-beta 0.4.0.0
+  wix_version_case 1.2.3-rc.2.hotfix 1.2.3.2
+  wix_version_case 0.4.0+build.7 0.4.0
+  desktop_refusal 'over 65535' pwsh -NoProfile -File dev/package-desktop-windows.ps1 -Version 0.4.0-rc.70000 -PrintWixVersion
+  echo 'ok: package-desktop-windows.ps1 maps 0.4.0, 0.4.0-rc.1 and 0.4.0-beta to the .msi versions 0.4.0, 0.4.0.1 and 0.4.0.0'
+else
+  echo 'note: pwsh is not installed, so the desktop PowerShell scripts argument refusals are skipped'
+fi
+
+# 7f. The .msi's UpgradeCode is how Windows Installer finds the installed copy to upgrade, so it is fixed
+# forever: tauri.conf.json and dev/package-desktop-windows.ps1 (which refuses to build on a mismatch)
+# must name the same GUID, and it must be the one the first desktop release shipped with.
+upgrade_code='97828bd2-4932-4d8b-bbb3-84b05ea345e4'
+conf=crates/featherbittorrent-desktop/tauri.conf.json
+grep -qF "\"upgradeCode\": \"$upgrade_code\"" "$conf" || fail "$conf does not pin the UpgradeCode $upgrade_code"
+grep -qF "\$UpgradeCode = '$upgrade_code'" dev/package-desktop-windows.ps1 \
+  || fail "dev/package-desktop-windows.ps1 does not pin the UpgradeCode $upgrade_code"
+echo "ok: tauri.conf.json and package-desktop-windows.ps1 pin the UpgradeCode $upgrade_code"
+
 # 8. The service examples the packages ship as documentation: no package installs, enables or starts a
 # service, so each example is a file a person copies where their own service manager looks.
 status=0; examples_out="$(bash dev/test-service-examples.sh 2>&1)" || status=$?
