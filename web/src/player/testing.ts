@@ -221,6 +221,8 @@ export interface StreamAnswer {
   body?: () => FakeBody
   /** Extra headers, for a `Retry-After` the engine honours as a minimum delay. */
   headers?: Record<string, string>
+  /** A JSON body the answer carries, for the routes that answer JSON rather than a stream. */
+  json?: unknown
 }
 
 /** What the fake `fetch` records for every call it answers. */
@@ -452,7 +454,11 @@ export function fakeFetch(): FetchRecorder {
     }
 
     const defaultText =
-      status === 200 && answer.body === undefined ? JSON.stringify({}) : ''
+      answer.json !== undefined
+        ? JSON.stringify(answer.json)
+        : status === 200 && answer.body === undefined
+          ? JSON.stringify({})
+          : ''
     const response: Response =
       bodyReader === null
         ? (new FakeResponse(null, status, headers, defaultText) as unknown as Response)

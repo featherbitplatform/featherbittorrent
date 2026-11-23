@@ -5,6 +5,7 @@ import Files from '../components/detail/Files'
 import { createClient } from '../api/client'
 import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
 import { createEngine } from './engine'
+import { toSource } from './time'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import {
@@ -272,28 +273,16 @@ describe('the player', () => {
       ...PROBE,
       tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
     }
-    // The player's real `streamToken`, over a fake `fetch`: the probe is answered by the test's
-    // client, and the `Download` click asks the token route through the same fake, which the
-    // test reads back. The session deps are stubbed, so only `fetch` is the page's own.
+    // The player's real `streamToken`, over the fake `fetch`: the probe is answered by the
+    // test's client, and the `Download` click asks the token route through the same fake, which
+    // the test reads back. The token route is answered with the path the anchor follows.
     const recorder = fakeFetch()
-    // The token route is answered with the path the test expects the anchor to follow.
-    recorder.answer('/api/v1/stream-tokens', { status: 200 })
-    // `createClient` reads the token's `path` from the answer's JSON; the recorder's default
-    // answer for the token route is `{}`, so the client is given a fetch that answers the token
-    // route with a `path` and hands the rest to the recorder.
-    const clientFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-      if (url.includes('/api/v1/stream-tokens')) {
-        recorder.calls.push({ url, signal: init?.signal ?? new AbortController().signal, method: init?.method, body: null })
-        return new Response(JSON.stringify({ path: '/api/v1/stream/x?token=abc' }), {
-          status: 200,
-          headers: new Headers(),
-        })
-      }
-      return recorder.fetch(input, init)
-    }) as typeof fetch
+    recorder.answer('/api/v1/stream-tokens', {
+      status: 200,
+      json: { path: '/api/v1/stream/x?token=abc' },
+    })
     const client: Api = {
-      ...(createClient(clientFetch, () => null, () => 0, () => {}) as Api),
+      ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
       probe: async () => unplayable,
       cues: async () => ({ cues: [] }),
       subtitleFile: async () => ({ cues: [] }),
@@ -522,13 +511,16 @@ describe('the player', () => {
     // The engine is waiting, and it will be asked again in a second.
     expect(engine.state(), 'an early end did not move the engine to waiting').toBe('waiting')
     const before = recorder.callsFor('/tracks/1/stream').length
-    // No fetch before the first retry: the engine is waiting on its timer.
+    // No fetch before the first retry: ~900 ms is just under the one-second delay, so the
+    // engine is still waiting on its timer.
+    await new Promise((r) => setTimeout(r, 900))
+    await settle()
     expect(
       recorder.callsFor('/tracks/1/stream').length === before,
       'the engine fetched before the first retry',
     ).toBe(true)
     // The first retry is one second out: the cadence is one, two, four, then five each.
-    await new Promise((r) => setTimeout(r, 1_100))
+    await new Promise((r) => setTimeout(r, 300))
     await settle()
     let after = recorder.callsFor('/tracks/1/stream').length
     expect(after - before === 1, 'the early end was not retried after a second').toBe(true)
@@ -544,11 +536,14 @@ describe('the player', () => {
     firstRetryBody?.end()
     await settle()
     const beforeSecond = recorder.callsFor('/tracks/1/stream').length
+    // No fetch before the second retry: ~1.9 s is just under the two-second delay.
+    await new Promise((r) => setTimeout(r, 1_900))
+    await settle()
     expect(
       recorder.callsFor('/tracks/1/stream').length === beforeSecond,
       'the engine fetched before the second retry',
     ).toBe(true)
-    await new Promise((r) => setTimeout(r, 2_100))
+    await new Promise((r) => setTimeout(r, 300))
     await settle()
     after = recorder.callsFor('/tracks/1/stream').length
     expect(after - beforeSecond === 1, 'the second retry was not two seconds out').toBe(true)
@@ -756,9 +751,11 @@ describe('the player', () => {
     const newBody = recorder.callsFor('/tracks/1/stream').at(-1)?.body
     newBody?.push(new Uint8Array([1]))
     await settle()
-    // Wait past the first retry timer (1 s): the old loop must not have said the file stopped
-    // and scheduled a retry.
-    await new Promise((r) => setTimeout(r, 1_200))
+    // Wait past the retry timers (one, two, four seconds) with fake time: the old loop must not
+    // have said the file stopped and scheduled a retry, at any of the cadence's delays.
+    vi.useFakeTimers()
+    await vi.advanceTimersByTimeAsync(5_000)
+    vi.useRealTimers()
     await settle()
     // The abort is the engine's own: the old loop did not say the file stopped (which would be
     // a `waiting` with no new data) and the stream was not ended. The state is playing, and
@@ -928,11 +925,18 @@ describe('the player', () => {
     // A 503 is a wait, not an error: the engine is waiting, and it is not the permanent `error`.
     expect(engine.state(), 'a 503 was treated as a permanent error').toBe('waiting')
     expect(engine.state() === 'error', 'a 503 became an error').toBe(false)
-    // No refetch before the Retry-After: the 503's `Retry-After: 1` is the minimum delay.
+    // No refetch before the Retry-After: the 503's `Retry-After: 1` is the minimum delay, and
+    // ~900 ms is just under it, so the engine is still waiting.
     const before = recorder.callsFor('/tracks/1/stream').length
-    expect(before, 'the engine refetched before the Retry-After').toBe(1)
+    expect(before, 'the initial fetch did not happen').toBe(1)
+    await new Promise((r) => setTimeout(r, 900))
+    await settle()
+    expect(
+      recorder.callsFor('/tracks/1/stream').length === before,
+      'the engine refetched before the Retry-After',
+    ).toBe(true)
     // The refetch is at 1000 ms: the Retry-After's second, the minimum delay.
-    await new Promise((r) => setTimeout(r, 1_100))
+    await new Promise((r) => setTimeout(r, 300))
     await settle()
     const after = recorder.callsFor('/tracks/1/stream').length
     expect(
@@ -1038,9 +1042,13 @@ describe('the player', () => {
       'changing audio did not ask for the new track',
     ).toBe(true)
     const newAudioCall = recorder.callsFor('/tracks/3/stream')[0]
+    // The new track is fetched exactly at `toSource(currentTime)`: the point the playhead is
+    // at, mapped into source time, is where the new track's data begins.
+    const expectedStartMs = toSource(video.currentTime, 1000)
     expect(
-      newAudioCall !== undefined && newAudioCall.url.includes('start_ms='),
-      'the new audio track was not asked for at a specific point',
+      newAudioCall !== undefined &&
+        newAudioCall.url.includes(`start_ms=${expectedStartMs}`),
+      `the new audio track was not asked for at toSource(currentTime) (got ${newAudioCall?.url}, wanted start_ms=${expectedStartMs})`,
     ).toBe(true)
     engine.destroy()
     document.body.removeChild(video)
@@ -1243,7 +1251,9 @@ describe('the player', () => {
     recorder2.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
     recorder2.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
     const { client: client2 } = probeClient(longProbe)
-    render(<Player id="a" file={0} name="movie.mkv" client={client2} onClose={() => {} } />)
+    const { container: container2 } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client2} onClose={() => {} } />,
+    )
     await settle()
     await settle()
     // The position is still in localStorage: the reopen did not clear it.
@@ -1251,13 +1261,63 @@ describe('the player', () => {
       localStorage.getItem('fbtt.position.a.0') === '12',
       'the reopen cleared the stored position',
     ).toBe(true)
-    // The engine started the file: the fetch was asked for, and the playhead is at the body's
-    // start. The restart is at the saved position, through the player's re-read.
+    // The engine started the file at the saved point: the reopen fetch is at source 12000 ms,
+    // the position the player re-read from `localStorage`, and the playhead is at the matching
+    // media time (12000 ms of source plus the 1000 ms offset is 13 s of media).
+    const reopenUrl = recorder2.callsFor('/tracks/1/stream')[0]?.url ?? ''
     expect(
-      recorder2.callsFor('/tracks/1/stream').length === 1,
-      'the reopen did not start the file',
+      reopenUrl.includes('start_ms=12000'),
+      `the reopen did not fetch from the saved position (got ${reopenUrl})`,
+    ).toBe(true)
+    expect(
+      Math.abs((container2.querySelector('video') as HTMLVideoElement).currentTime - 13) < 0.5,
+      `the playhead is not at the saved position's media time`,
     ).toBe(true)
     // Clear the stored position.
+    localStorage.removeItem('fbtt.position.a.0')
+  })
+
+  it('a finished file starts from the beginning', async () => {
+    // A file the person watched to within 30 s of the end is done: its position is cleared,
+    // and a reopen starts at the beginning, not where the person left off. The probe is a
+    // 120 s file, so a position at 95 s is within the 30 s `FINISHED_WITHIN` and above the
+    // 10 s minimum that would otherwise keep it.
+    const probe: MediaProbe = { ...PROBE, duration_ms: 120_000 }
+    localStorage.removeItem('fbtt.position.a.0')
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    recorder.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient(probe)
+    const { container, unmount } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {} } />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // Play to 96 s of media: source 95000 ms (96 s of media minus the 1 s offset), which is 95
+    // source seconds, within 30 s of the 120 s end.
+    video.currentTime = 96
+    unmount()
+    // The position was within 30 s of the end, so it was cleared: nothing is stored.
+    expect(
+      localStorage.getItem('fbtt.position.a.0') === null,
+      'a position within 30 s of the end was not cleared',
+    ).toBe(true)
+    // Reopen: the file starts from the beginning, not from the cleared position.
+    const recorder2 = fakeFetch()
+    vi.stubGlobal('fetch', recorder2.fetch)
+    recorder2.answer('/tracks/1/stream', { startMs: 0, body: () => new FakeBody() })
+    recorder2.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client: client2 } = probeClient(probe)
+    render(<Player id="a" file={0} name="movie.mkv" client={client2} onClose={() => {} } />)
+    await settle()
+    await settle()
+    // The reopen fetch is from the start: no `start_ms`, or `start_ms=0`.
+    const reopenUrl = recorder2.callsFor('/tracks/1/stream')[0]?.url ?? ''
+    expect(
+      !reopenUrl.includes('start_ms') || reopenUrl.includes('start_ms=0'),
+      `a finished file did not start from the beginning (got ${reopenUrl})`,
+    ).toBe(true)
     localStorage.removeItem('fbtt.position.a.0')
   })
 
@@ -1348,10 +1408,22 @@ describe('the player', () => {
     // One chunk: the buffer is [0, 1], the playhead at 0, the gate open, the read running.
     videoBody.push(new Uint8Array([1]))
     await settle()
-    // The playhead leaves the range into the gap behind it: the buffer is [1, 131], and the
-    // playhead at 0 sits in no range. The far end of everything buffered is 131 ahead, past
-    // the gate's stop line, and a held chunk is waiting.
-    ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[1, 131]]
+    // The buffer runs far ahead and the playhead sits in it: [0, 131], the playhead at media 1
+    // (the element's start, `toMedia(0)`), 130 seconds ahead, past the gate's stop line. The
+    // read is held at the gate.
+    ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[0, 131]]
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    const appendsAtGate = buf?.log.appends.length ?? 0
+    // The held chunk did not land: the gate said stop, and the read is waiting.
+    expect(
+      (buf?.log.appends.length ?? 0) === appendsAtGate,
+      'the gate did not hold the read over a far-ahead range',
+    ).toBe(true)
+    // The playhead leaves the range into the gap behind it: the buffer is [2, 132], and the
+    // playhead at media 1 sits in no range. The far end of everything buffered is still 131
+    // ahead, but the range the playhead sits in is none, so the gate re-measures to 0 and lifts.
+    ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[2, 132]]
     videoBody.push(new Uint8Array([1]))
     const appendsBefore = buf?.log.appends.length ?? 0
     // The `timeupdate` is the element's word for the move, and it is what wakes the read: the
@@ -1366,6 +1438,73 @@ describe('the player', () => {
       appendsAfter > appendsBefore,
       'the gate stayed shut over a range the playhead does not sit in: the read did not resume',
     ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('a retry after seeking back fills the gap', async () => {
+    // A buffer that runs far ahead of the playhead, in a range the playhead has left: when the
+    // body ends early, the retry goes from the end of the range the playhead sits in (or the
+    // body's own start, when it sits in none), not from the far end of everything buffered.
+    // Before the fix, the retry started past the far range, so the playhead's gap was never
+    // filled, and a far range that reached the file's end ended the stream early.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const firstBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => firstBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+
+    const engine = createEngine(
+      video,
+      { id: 'a', file: 0 },
+      {
+        offsetMs: 1000,
+        durationMs: 4000,
+        video: PROBE.tracks[0] as MediaTrack,
+        videoMime: 'video/mp4; codecs="avc1.64000A"',
+        audio: PROBE.tracks[1] as MediaTrack,
+        audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+        mimeFor: () => null,
+      },
+      fakeDeps(source, recorder),
+    )
+    source.open()
+    await settle()
+    const buf = source.activeSourceBuffers[0]
+    expect(buf !== undefined, 'no source buffer').toBe(true)
+    // The body ends after its init segment: one chunk, then done. The buffer is far ahead of
+    // the playhead, in a range the playhead does not sit in.
+    firstBody.push(new Uint8Array([1]))
+    await settle()
+    ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[5, 200]]
+    // The playhead is at media 1, outside [5, 200]: it sits in no range.
+    firstBody.end()
+    await settle()
+    // The body ended early: the engine is waiting, and it schedules a retry. The retry goes
+    // from the body's own start (the playhead sits in no range), not from the far end of the
+    // buffer (200).
+    expect(engine.state(), 'an early end was not a wait').toBe('waiting')
+    // Advance past the first retry delay (1 s): the retry fetch is at the body's start, not
+    // past the far range.
+    const callsBefore = recorder.callsFor('/tracks/1/stream').length
+    await new Promise((r) => setTimeout(r, 1_100))
+    await settle()
+    const retryCall = recorder.callsFor('/tracks/1/stream').at(-1)
+    expect(
+      recorder.callsFor('/tracks/1/stream').length - callsBefore === 1,
+      'the early end did not schedule a retry',
+    ).toBe(true)
+    // The retry is from the body's own start (source 0), not from the far end of the buffer
+    // (which would be source 199000, past the playhead's gap).
+    expect(
+      retryCall !== undefined && (retryCall.url.includes('start_ms=0') || !retryCall.url.includes('start_ms')),
+      `the retry did not start from the playhead's range (got ${retryCall?.url})`,
+    ).toBe(true)
+    // The stream did not end: the far range did not reach the file's end on the playhead's
+    // behalf, so `endOfStream` was not called.
+    expect(source.endOfStreamCalls.length, 'a far range ended the stream').toBe(0)
     engine.destroy()
     document.body.removeChild(video)
   })
