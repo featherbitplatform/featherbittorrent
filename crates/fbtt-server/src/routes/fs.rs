@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use fbtt_core::fs_list::{self, ListingError, inside_lexically};
@@ -85,6 +85,159 @@ pub(super) async fn list(
     Ok(Json(Listing { path: asked, dirs }))
 }
 
+/// The longest folder name [`mkdir`] takes, in bytes: what the common file systems (ext4, APFS, NTFS by
+/// UTF-16 unit, which is never more than its UTF-8 bytes) allow for one component.
+pub(super) const MAX_NAME_BYTES: usize = 255;
+
+/// The most a `POST /api/v1/fs/mkdir` body may be: a parent path and one name, with room to spare. With
+/// logins off this route answers whoever reaches the address, so a megabyte of JSON naming one folder is
+/// not something worth buffering.
+pub(super) const MAX_MKDIR_BODY: usize = 16 * 1024;
+
+/// `POST /api/v1/fs/mkdir` with `{parent, name}`: create the one folder `name` directly inside `parent`,
+/// answering `201 {path}` with the new folder spelled the way [`list`] spells paths (the parent as it was
+/// given, joined with the name).
+///
+/// This writes to the server's disk over the network, so it is held to everything [`list`] is held to and
+/// then some. The name is one path component and nothing else ([`name_problem`]): `400`. The parent has to
+/// be inside a root by its spelling, checked before the disk is touched, and again once every link in it is
+/// resolved ([`fs_list::resolve_folder`], the same rule the listing uses), so a link inside a root that leads
+/// out of it is `403` like any other path outside. The folder is then made inside the *resolved* parent, with
+/// `create_dir` and never `create_dir_all`, so nothing but the one folder is ever created, and an entry that
+/// is already there under that name - a folder, a file, or a link, which `mkdir` does not follow - is `409`.
+pub(super) async fn mkdir(
+    State(shared): State<Arc<Shared>>,
+    given: Result<Json<MkdirBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Created>), RouteError> {
+    // A body that is not this shape comes back in this API's error shape rather than axum's plain-text one.
+    let Json(body) = given?;
+    if let Some(problem) = name_problem(&body.name) {
+        return Err(RouteError::invalid_request(problem));
+    }
+    let asked = body.parent;
+    // A NUL byte is where a path stops; one in the middle is no path at all, said at once rather than
+    // however this operating system's error for it reads.
+    if asked.contains('\0') {
+        return Err(RouteError::invalid_request(format!(
+            "invalid path {}",
+            clean(&asked),
+        )));
+    }
+    // Lexical first, so a parent this server would refuse anyway costs a comparison and not a stat.
+    if !inside_lexically(&shared.roots, Path::new(&asked)) {
+        return Err(RouteError::path_not_allowed(&asked));
+    }
+    let roots = Arc::clone(&shared.roots);
+    let parent = PathBuf::from(&asked);
+    let name = body.name.clone();
+    tokio::task::spawn_blocking(move || create_inside(&roots, &parent, &name))
+        .await
+        .map_err(|problem| {
+            RouteError::internal(format!("the folder could not be created ({problem})"))
+        })??;
+    let path = Path::new(&asked).join(&body.name);
+    Ok((
+        StatusCode::CREATED,
+        Json(Created {
+            path: path.to_string_lossy().into_owned(),
+        }),
+    ))
+}
+
+/// Creates `name` directly inside `parent`, once `parent` has been resolved and found inside a root. Runs on
+/// the blocking pool: it asks the file system twice. The errors it logs carry the kind of failure only,
+/// never a path, because a path here is the client's text.
+fn create_inside(roots: &[Root], parent: &Path, name: &str) -> Result<(), RouteError> {
+    let resolved = fs_list::resolve_folder(roots, parent).map_err(|problem| match problem {
+        // A `500` logs its message, and the listing's says which path it could not check: this route logs
+        // no path, so the server's own failure is said without one.
+        ListingError::CannotCheck { .. } | ListingError::CannotRead { .. } => {
+            RouteError::internal("the parent folder could not be checked")
+        }
+        problem => route_problem(problem),
+    })?;
+    let shown = clean(name);
+    match std::fs::create_dir(resolved.join(name)) {
+        Ok(()) => Ok(()),
+        Err(problem) => {
+            let kind = problem.kind();
+            tracing::debug!(?kind, "a folder could not be created");
+            Err(match kind {
+                std::io::ErrorKind::AlreadyExists => {
+                    RouteError::already_exists(format!("{shown} is already there"))
+                }
+                // The parent went away between the check and the create.
+                std::io::ErrorKind::NotFound => {
+                    RouteError::not_found(format!("no folder {}", clean(&parent.to_string_lossy())))
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    RouteError::forbidden(format!("{shown} cannot be created here"))
+                }
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidFilename => {
+                    RouteError::invalid_request(format!("invalid folder name {shown}"))
+                }
+                // Logged as it is answered, so it names no folder: the kind above is what says why.
+                _ => RouteError::internal("the folder could not be created"),
+            })
+        }
+    }
+}
+
+/// What is wrong with `name` as the name of one new folder, or `None` when it is one: a single, ordinary
+/// path component. Not empty, `.` or `..`; no `/` or `\` (either platform's separator, whichever this is
+/// running on, so a name means the same thing on every server); no NUL or other control character; at most
+/// [`MAX_NAME_BYTES`] bytes. And it has to parse as exactly one normal component on this platform, which is
+/// what refuses whatever else a platform reads as more than a name - a drive prefix such as `C:` on Windows,
+/// which `join` would otherwise take as a whole new path.
+pub(super) fn name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a folder name cannot be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Some(format!("{name} is not a folder name"));
+    }
+    if name.contains(['/', '\\']) {
+        return Some(format!(
+            "a folder name cannot contain a separator: {}",
+            clean(name)
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Some(format!(
+            "a folder name cannot contain a control character: {}",
+            clean(name),
+        ));
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Some(format!(
+            "a folder name is at most {MAX_NAME_BYTES} bytes, this one is {}",
+            name.len(),
+        ));
+    }
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(part)), None) if part == name
+    ) {
+        return Some(format!("{} is not one folder name", clean(name)));
+    }
+    None
+}
+
+/// The body of `POST /api/v1/fs/mkdir`: the folder to create in, and the one new name to create there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MkdirBody {
+    parent: String,
+    name: String,
+}
+
+/// What `POST /api/v1/fs/mkdir` answers: the folder it created.
+#[derive(Debug, Serialize)]
+pub(super) struct Created {
+    path: String,
+}
+
 /// The directories inside `path`, in this API's answer for them. [`fbtt_core::fs_list::list_dirs`] does the
 /// work and says what went wrong in the words every featherbittorrent listing uses - only the status and
 /// code a client of this API reads are picked here. Runs on the blocking pool because it reads a directory.
@@ -133,7 +286,7 @@ pub(super) struct Listing {
 
 #[cfg(test)]
 mod tests {
-    use super::{Root, inside_lexically, list_dirs};
+    use super::{MAX_NAME_BYTES, Root, inside_lexically, list_dirs, name_problem};
     use axum::http::StatusCode;
     use fbtt_core::fs_list::MAX_DIRS;
     use fbtt_core::scratch::ScratchDir;
@@ -184,6 +337,50 @@ mod tests {
         fn list(&self, path: &Path) -> Vec<String> {
             let roots = self.roots();
             list_dirs(&roots, path).expect("a listing")
+        }
+    }
+
+    /// A folder name is one ordinary path component: anything that would name another place, or no place,
+    /// or that no person typed on purpose, is refused before the parent is even looked at.
+    #[test]
+    fn a_folder_name_is_one_component() {
+        let longest = "a".repeat(MAX_NAME_BYTES);
+        // Multi-byte text is measured in bytes: 85 three-byte characters is 255 bytes, one more is too many.
+        let wide = "\u{3042}".repeat(85);
+        for good in [
+            "New Show",
+            "Season 1",
+            "a.b",
+            "...",
+            ".hidden",
+            "caf\u{e9}",
+            longest.as_str(),
+            wide.as_str(),
+        ] {
+            assert_eq!(name_problem(good), None, "{good:?} is one folder name");
+        }
+
+        let too_long = "a".repeat(MAX_NAME_BYTES + 1);
+        let too_wide = "\u{3042}".repeat(86);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "\\etc",
+            "../x",
+            "x/..",
+            "x\u{0}y",
+            "x\ny",
+            "x\ty",
+            "x\u{7f}y",
+            "x\u{85}y",
+            too_long.as_str(),
+            too_wide.as_str(),
+        ] {
+            assert!(name_problem(bad).is_some(), "{bad:?} is refused");
         }
     }
 
