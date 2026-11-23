@@ -52,6 +52,7 @@ import type { ReactNode } from 'react'
 import { ArrowDown, ArrowUp } from 'lucide-react'
 import { displaySafe, filledPercent, formatPercent, formatRate } from '../format'
 import type { RowState, TorrentRow } from '../live'
+import { matches } from '../keys'
 
 export interface TorrentTableProps {
   /** The rows the screen's filters left standing, in the order the server listed them. */
@@ -416,12 +417,15 @@ export default function TorrentTable({
                   aria-selected={selected ? true : undefined}
                   onClick={onPick === undefined ? undefined : () => pick(row.id)}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
+                    if (matches('Torrent list', 'Select the focused torrent', event)) {
                       event.preventDefault()
                       pick(row.id)
-                    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                    } else if (matches('Torrent list', 'Move to the next torrent', event)) {
                       event.preventDefault()
-                      moveSelection(event.key === 'ArrowDown' ? 1 : -1)
+                      moveSelection(1)
+                    } else if (matches('Torrent list', 'Move to the previous torrent', event)) {
+                      event.preventDefault()
+                      moveSelection(-1)
                     }
                   }}
                   className={

@@ -44,6 +44,7 @@ import Pieces from './detail/Pieces'
 import Trackers from './detail/Trackers'
 import Peers from './detail/Peers'
 import { ApiError } from '../api/client'
+import { matches } from '../keys'
 import type { Api, FileInfo, PeerInfo, PiecesInfo, TrackerInfo } from '../api/client'
 import { displaySafe } from '../format'
 import { announcePolite, TORRENT_REMOVED_COPY } from '../live'
@@ -226,10 +227,10 @@ export default function DetailPane({
     const order = TABS.map((item) => item.key)
     const current = order.indexOf(tab)
     let next: Tab | null = null
-    if (event.key === 'ArrowRight') next = order[(current + 1) % order.length]
-    else if (event.key === 'ArrowLeft') next = order[(current - 1 + order.length) % order.length]
-    else if (event.key === 'Home') next = order[0]
-    else if (event.key === 'End') next = order[order.length - 1]
+    if (matches('Detail tabs', 'Next tab', event)) next = order[(current + 1) % order.length]
+    else if (matches('Detail tabs', 'Previous tab', event)) next = order[(current - 1 + order.length) % order.length]
+    else if (matches('Detail tabs', 'First tab', event)) next = order[0]
+    else if (matches('Detail tabs', 'Last tab', event)) next = order[order.length - 1]
     if (next === null) return
     event.preventDefault()
     setTab(next)

@@ -21,6 +21,7 @@ import {
   makeVideoSeekable,
 } from './testing'
 import { FOCUSABLE_SELECTOR } from '../modal'
+import { KEY_BINDINGS } from '../keys'
 
 
 installDialogShim()
@@ -687,6 +688,206 @@ describe('the player', () => {
       'Escape did not reach the dialog close handler and prevent the element closing itself',
     ).toBe(true)
     expect(closeCalls === 1, 'Escape did not close through onClose').toBe(true)
+  })
+
+  it("every handler's key is in the list: player", async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const dialog = container.querySelector('dialog') as HTMLDialogElement
+    const video = container.querySelector('video') as HTMLVideoElement
+    makeVideoPlayable(video)
+    makeVideoSeekable(video)
+    let fullscreenCalls = 0
+    Object.defineProperty(dialog, 'requestFullscreen', {
+      value: () => {
+        fullscreenCalls += 1
+        return Promise.resolve()
+      },
+      configurable: true,
+    })
+    const press = async (key: string): Promise<boolean> => {
+      const left = fireEvent.keyDown(dialog, { key })
+      await settle()
+      return left === false
+    }
+    const openSubtitles = async (): Promise<string> => {
+      fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }))
+      await settle()
+      const chosen = screen
+        .getByRole('listbox', { name: 'Subtitles' })
+        .querySelector('[role="option"][aria-selected="true"]')
+      const text = chosen?.textContent ?? ''
+      fireEvent.keyDown(screen.getByRole('listbox', { name: 'Subtitles' }), { key: 'Escape' })
+      await settle()
+      return text
+    }
+    // Each action's effect, read back from the element or the engine. The first line of each case
+    // puts the state where the key's effect is visible and in one direction only.
+    const cases: Record<string, (key: string) => Promise<void>> = {
+      'Play or pause': async (key) => {
+        video.pause()
+        await press(key)
+        expect(video.paused, `${JSON.stringify(key)} did not play`).toBe(false)
+        await press(key)
+        expect(video.paused, `${JSON.stringify(key)} did not pause`).toBe(true)
+      },
+      'Seek back': async (key) => {
+        video.currentTime = 3
+        await press(key)
+        expect(video.currentTime < 3, `${JSON.stringify(key)} did not seek back`).toBe(true)
+      },
+      'Seek forward': async (key) => {
+        video.currentTime = 3
+        await press(key)
+        expect(video.currentTime > 3, `${JSON.stringify(key)} did not seek forward`).toBe(true)
+      },
+      'Volume up': async (key) => {
+        video.volume = 0.5
+        await press(key)
+        expect(video.volume > 0.5, `${JSON.stringify(key)} did not raise the volume`).toBe(true)
+      },
+      'Volume down': async (key) => {
+        video.volume = 0.5
+        await press(key)
+        expect(video.volume < 0.5, `${JSON.stringify(key)} did not lower the volume`).toBe(true)
+      },
+      'Full screen': async (key) => {
+        const before = fullscreenCalls
+        await press(key)
+        expect(fullscreenCalls - before === 1, `${JSON.stringify(key)} did not ask for full screen`).toBe(true)
+      },
+      'Mute or unmute': async (key) => {
+        video.muted = false
+        await press(key)
+        expect(video.muted, `${JSON.stringify(key)} did not mute`).toBe(true)
+        await press(key)
+        expect(video.muted, `${JSON.stringify(key)} did not unmute`).toBe(false)
+      },
+      'Next audio track': async (key) => {
+        const before = recorder.callsFor('/tracks/3/stream').length
+        await press(key)
+        expect(
+          recorder.callsFor('/tracks/3/stream').length - before === 1,
+          `${JSON.stringify(key)} did not switch the audio`,
+        ).toBe(true)
+      },
+      'Next subtitle track': async (key) => {
+        const before = await openSubtitles()
+        await press(key)
+        const after = await openSubtitles()
+        expect(after !== before, `${JSON.stringify(key)} did not move the subtitle choice (${before})`).toBe(true)
+      },
+    }
+    const covered = new Set<string>()
+    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Player')) {
+      const run = cases[binding.action]
+      expect(run !== undefined, `no effect check for ${binding.action}`).toBe(true)
+      for (const key of binding.keys) await (run as (key: string) => Promise<void>)(key)
+      covered.add(binding.action)
+    }
+    expect(covered.size === Object.keys(cases).length, 'a case has no binding in the list').toBe(true)
+    // A key the list does not give the player is left alone.
+    expect(fireEvent.keyDown(dialog, { key: 'q' }), 'the player took a key that is not in the list').toBe(true)
+  })
+
+  it("every handler's key is in the list: menus", async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    const button = screen.getByRole('button', { name: 'Subtitles' })
+    const options = (): HTMLElement[] =>
+      Array.from(screen.getByRole('listbox', { name: 'Subtitles' }).querySelectorAll<HTMLElement>('[role="option"]:not([disabled])'))
+    const isOpen = (): boolean => button.getAttribute('aria-expanded') === 'true'
+    const press = async (target: HTMLElement, key: string): Promise<void> => {
+      fireEvent.keyDown(target, { key })
+      await settle()
+    }
+    const open = async (): Promise<void> => {
+      fireEvent.click(button)
+      await settle()
+    }
+    const closeIt = async (): Promise<void> => {
+      if (isOpen()) await press(document.activeElement as HTMLElement, 'Escape')
+    }
+    const cases: Record<string, (key: string) => Promise<void>> = {
+      'Open the menu': async (key) => {
+        button.focus()
+        await press(button, key)
+        expect(isOpen(), `${JSON.stringify(key)} did not open the menu`).toBe(true)
+        await closeIt()
+      },
+      'Close the menu': async (key) => {
+        await open()
+        await press(document.activeElement as HTMLElement, key)
+        expect(isOpen(), `${JSON.stringify(key)} did not close the menu`).toBe(false)
+      },
+      'Next option': async (key) => {
+        await open()
+        const items = options()
+        items[0]?.focus()
+        await press(items[0] as HTMLElement, key)
+        expect(document.activeElement === items[1], `${JSON.stringify(key)} did not move to the next option`).toBe(true)
+        await closeIt()
+      },
+      'Previous option': async (key) => {
+        await open()
+        const items = options()
+        items[1]?.focus()
+        await press(items[1] as HTMLElement, key)
+        expect(document.activeElement === items[0], `${JSON.stringify(key)} did not move to the previous option`).toBe(true)
+        await closeIt()
+      },
+      'First option': async (key) => {
+        await open()
+        const items = options()
+        items[1]?.focus()
+        await press(items[1] as HTMLElement, key)
+        expect(document.activeElement === items[0], `${JSON.stringify(key)} did not move to the first option`).toBe(true)
+        await closeIt()
+      },
+      'Last option': async (key) => {
+        await open()
+        const items = options()
+        items[0]?.focus()
+        await press(items[0] as HTMLElement, key)
+        expect(
+          document.activeElement === items[items.length - 1],
+          `${JSON.stringify(key)} did not move to the last option`,
+        ).toBe(true)
+        await closeIt()
+      },
+      'Choose the focused option': async (key) => {
+        await open()
+        const items = options()
+        const wanted = items[1] as HTMLElement
+        wanted.focus()
+        await press(wanted, key)
+        expect(isOpen(), `${JSON.stringify(key)} did not close the menu after choosing`).toBe(false)
+        await open()
+        expect(
+          options().findIndex((item) => item.getAttribute('aria-selected') === 'true') === 1,
+          `${JSON.stringify(key)} did not choose the focused option`,
+        ).toBe(true)
+        // Back to Off for the next key.
+        const off = options()[0] as HTMLElement
+        off.focus()
+        await press(off, 'Enter')
+      },
+    }
+    const listed = KEY_BINDINGS.filter((entry) => entry.where === 'Menus')
+    expect(listed.length === Object.keys(cases).length, 'a case has no binding in the list').toBe(true)
+    for (const binding of listed) {
+      const run = cases[binding.action]
+      expect(run !== undefined, `no effect check for ${binding.action}`).toBe(true)
+      for (const key of binding.keys) await (run as (key: string) => Promise<void>)(key)
+    }
   })
 
   it('closing the audio menu keeps the subtitle menu open', async () => {
