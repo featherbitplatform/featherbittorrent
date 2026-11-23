@@ -751,7 +751,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         onDialogKey(event)
         onKeyDown(event)
       }}
-      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body"
+      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0"
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-4 py-2.5">
         <span className="min-w-0 truncate text-[13px] text-strong">{displaySafe(name)}</span>
@@ -802,7 +802,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       {probe !== null && choice?.kind === 'remux' && (
         <>
           <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
-            <video ref={videoRef} className="max-h-full max-w-full" />
+            <video ref={videoRef} className="h-full w-full max-h-full max-w-full object-contain" />
             {waiting && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>
@@ -828,7 +828,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 // The bar is in source time: the value is source seconds, mapped to the element.
                 video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
               }}
-              className="h-1.5 min-w-40 flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             <span className="font-mono text-[12px] text-strong">
               {clock(time / 1000)} / {clock(durationSourceSec)}
@@ -864,7 +864,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 video.volume = Number(event.target.value)
                 if (video.volume > 0 && video.muted) video.muted = false
               }}
-              className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 w-20 min-[420px]:w-24 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             {audioOptions.length > 0 && (
               <ChoiceMenu
