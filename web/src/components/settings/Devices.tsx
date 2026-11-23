@@ -11,7 +11,8 @@
  * @module components/settings/Devices
  */
 import { useEffect, useId, useRef, useState } from 'react'
-import { api, ApiError, errorMessage } from '../../api/client'
+import { ApiError, errorMessage } from '../../api/client'
+import { useConnection } from '../../connection'
 import type { Api, DeviceRow } from '../../api/client'
 import { displaySafe } from '../../format'
 import { PHONE_FULLSCREEN, useModalDialog } from '../../modal'
@@ -102,7 +103,9 @@ function ConfirmRemove({
   )
 }
 
-export default function Devices({ client = api }: { client?: Api }) {
+export default function Devices({ client: given }: { client?: Api }) {
+  const connection = useConnection()
+  const client = given ?? connection.api
   const [load, setLoad] = useState<Load>({ phase: 'loading' })
   const [rows, setRows] = useState<DeviceRow[]>([])
   const [name, setName] = useState('')

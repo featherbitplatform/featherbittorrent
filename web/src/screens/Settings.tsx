@@ -9,7 +9,7 @@
  */
 import { useEffect, useRef } from 'react'
 import { ArrowLeft } from 'lucide-react'
-import { api } from '../api/client'
+import { useConnection } from '../connection'
 import type { Api } from '../api/client'
 import Button from '../components/Button'
 import Devices from '../components/settings/Devices'
@@ -21,7 +21,9 @@ export interface SettingsProps {
   onBack(): void
 }
 
-export function Settings({ client = api, onBack }: SettingsProps) {
+export function Settings({ client: given, onBack }: SettingsProps) {
+  const connection = useConnection()
+  const client = given ?? connection.api
   const heading = useRef<HTMLHeadingElement>(null)
   // Opening replaces the screen the focus was on, so it starts at the new screen's title.
   useEffect(() => {
