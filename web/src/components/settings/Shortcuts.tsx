@@ -4,6 +4,7 @@
  *
  * @module components/settings/Shortcuts
  */
+import type { JSX } from 'react'
 import { KEY_BINDINGS } from '../../keys'
 import type { KeyBinding } from '../../keys'
 
