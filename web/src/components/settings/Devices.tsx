@@ -20,6 +20,7 @@ import Button from '../Button'
 import TextField from '../TextField'
 
 export const LOGINS_OFF_COPY = "Device logins need the server's logins on."
+export const PRIVATE_KEY_COPY = 'This is a private key. Paste the public key line instead.'
 export const SAVED_ON_SERVER_COPY = "Changes are saved in the server's config.yaml."
 
 type Load = { phase: 'loading' } | { phase: 'off' } | { phase: 'failed'; text: string } | { phase: 'ready' }
@@ -50,6 +51,12 @@ function ConfirmRemove({
     try {
       await client.removeDevice(name)
     } catch (cause) {
+      // Already removed elsewhere: the row is gone either way, so drop it instead of leaving it.
+      if (cause instanceof ApiError && cause.status === 404) {
+        onRemoved()
+        onClose()
+        return
+      }
       setError(errorMessage(cause))
       busyRef.current = false
       setBusy(false)
@@ -101,7 +108,7 @@ export default function Devices({ client = api }: { client?: Api }) {
   const [adding, setAdding] = useState(false)
   const addingRef = useRef(false)
   const [removing, setRemoving] = useState<string | null>(null)
-  const listId = useId()
+  const errorId = useId()
 
   useEffect(() => {
     let cancelled = false
@@ -127,11 +134,17 @@ export default function Devices({ client = api }: { client?: Api }) {
 
   async function add(): Promise<void> {
     if (addingRef.current) return
+    // A private key must never leave the page, least of all over plain HTTP.
+    if (/-----BEGIN|PRIVATE KEY/.test(key)) {
+      setKey('')
+      setAddError(PRIVATE_KEY_COPY)
+      return
+    }
     addingRef.current = true
     setAdding(true)
     setAddError(null)
     try {
-      const row = await client.addDevice(name.trim(), key.trim())
+      const row = await client.addDevice(name, key)
       setRows((current) => [...current.filter((r) => r.name !== row.name), row])
       setName('')
       setKey('')
@@ -154,10 +167,10 @@ export default function Devices({ client = api }: { client?: Api }) {
         <p className="text-[13px] text-muted">No devices yet.</p>
       ) : (
         <ul className="flex flex-col divide-y divide-rule rounded-control border border-rule">
-          {rows.map((row, index) => (
+          {rows.map((row) => (
             <li key={row.name} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
               <div className="flex min-w-0 flex-col">
-                <span id={`${listId}-${index}`} className="break-all text-[13px] text-strong">
+                <span className="break-all text-[13px] text-strong">
                   {displaySafe(row.name)}
                 </span>
                 <span className="break-all font-mono text-[12px] text-muted">
@@ -167,7 +180,7 @@ export default function Devices({ client = api }: { client?: Api }) {
               <Button
                 variant="secondary"
                 size="sm"
-                aria-describedby={`${listId}-${index}`}
+                aria-label={`Remove ${displaySafe(row.name)}`}
                 onClick={() => {
                   setRemoving(row.name)
                 }}
@@ -187,6 +200,10 @@ export default function Devices({ client = api }: { client?: Api }) {
       >
         <TextField
           label="Name"
+ autoComplete="off"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
           value={name}
           onChange={(event) => {
             setName(event.target.value)
@@ -194,6 +211,12 @@ export default function Devices({ client = api }: { client?: Api }) {
         />
         <TextField
           label="Public key"
+ autoComplete="off"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          aria-invalid={addError !== null}
+          aria-describedby={addError !== null ? errorId : undefined}
           className="font-mono"
           placeholder="ssh-ed25519 AAAA... comment"
           value={key}
@@ -202,7 +225,7 @@ export default function Devices({ client = api }: { client?: Api }) {
           }}
         />
         {addError !== null && (
-          <p role="alert" className="text-[13px] text-error">
+          <p id={errorId} role="alert" className="text-[13px] text-error">
             {addError}
           </p>
         )}

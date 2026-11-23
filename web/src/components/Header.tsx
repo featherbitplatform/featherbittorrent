@@ -108,7 +108,7 @@ export default function Header({
           <Plus className="h-4 w-4" aria-hidden="true" />
           Add torrent
         </Button>
-        <Button variant="secondary" onClick={onSettings}>
+        <Button variant="secondary" data-settings-opener onClick={onSettings}>
           <Settings className="h-4 w-4" aria-hidden="true" />
           Settings
         </Button>

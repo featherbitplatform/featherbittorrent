@@ -164,4 +164,23 @@ describe('the Settings screen in the page', () => {
     ).toBe('true')
     world.behavior = null
   })
+
+  it('focus moves into Settings and back', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    const opener = screen.getByRole('button', { name: 'Settings' })
+    opener.focus()
+    fireEvent.click(opener)
+    expect(document.activeElement, 'focus did not move to the Settings title').toBe(
+      screen.getByRole('heading', { name: 'Settings' }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => {
+      expect(document.activeElement, 'focus did not return to the Settings button').toBe(
+        screen.getByRole('button', { name: 'Settings' }),
+      )
+    })
+    world.behavior = null
+  })
 })

@@ -281,9 +281,17 @@ export default function TorrentTable({
   // selected row - with `preventScroll`, because the box's position is this component's business:
   // the browser's own "scroll it into view" nudge would fight the explicit `scrollTop` above and
   // the sticky header over it. State never moves here - it moves through this file's event handlers.
+  //
+  // The scroll half also re-runs when the box is measured again: a table hidden with `display:none`
+  // (behind the Settings screen) reports height 0 and the browser may reset its `scrollTop`, and
+  // nothing else would put it back when it is shown.
   useEffect(() => {
     const box = boxRef.current
     if (box !== null && box.scrollTop !== effectiveScroll) box.scrollTop = effectiveScroll
+  }, [effectiveScroll, measured])
+
+  useEffect(() => {
+    const box = boxRef.current
     if (selectedId === null) return
     const row = box?.querySelector<HTMLElement>(`[data-row="${CSS.escape(selectedId)}"]`)
     if (row !== null && row !== undefined && row !== document.activeElement) {

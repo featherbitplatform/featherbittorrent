@@ -56,6 +56,15 @@ export default function App() {
     }
   }, [])
 
+  // Going back hands the focus to the button that opened Settings, which is on screen again by then.
+  const wasOpen = useRef(false)
+  useEffect(() => {
+    if (wasOpen.current && !settingsOpen) {
+      document.querySelector<HTMLElement>('[data-settings-opener]')?.focus()
+    }
+    wasOpen.current = settingsOpen
+  }, [settingsOpen])
+
   // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
   const workspace = state.phase === 'signedIn' || state.phase === 'open'
   if (!workspace && settingsOpen) setSettingsOpen(false)
@@ -102,7 +111,7 @@ export default function App() {
               }}
             />
           )}
-          {/* Hidden, not unmounted: the filter, the selection and the scroll position are still there on the way back. */}
+          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
           <div hidden={settingsOpen}>
             <Torrents
               onSettings={() => {

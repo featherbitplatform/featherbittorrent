@@ -31,7 +31,6 @@ const FIELDS = [
 type Key = (typeof FIELDS)[number]['key']
 type Values = Record<Key, string>
 
-/** Nothing typed is 0 (unlimited); otherwise digits only, and a safe integer so no precision is lost on the wire. */
 interface Base {
   down: number
   up: number
@@ -42,6 +41,7 @@ interface Base {
 /** KiB/s for display, rounded up so a limit that is not zero never reads as 0 (which means unlimited). */
 const kib = (bytes: number): string => String(Math.ceil(bytes / 1024))
 
+/** Nothing typed is 0 (unlimited); otherwise digits only, and a safe integer so no precision is lost on the wire. */
 function parse(text: string): number | null {
   const trimmed = text.trim()
   if (trimmed === '') return 0

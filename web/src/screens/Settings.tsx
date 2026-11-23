@@ -8,6 +8,7 @@
  *
  * @module screens/Settings
  */
+import { useEffect, useRef } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { api } from '../api/client'
 import type { Api } from '../api/client'
@@ -21,6 +22,11 @@ export interface SettingsProps {
 }
 
 export function Settings({ client = api, onBack }: SettingsProps) {
+  const heading = useRef<HTMLHeadingElement>(null)
+  // Opening replaces the screen the focus was on, so it starts at the new screen's title.
+  useEffect(() => {
+    heading.current?.focus()
+  }, [])
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-3xl flex-col gap-8 px-4 py-6">
       <div className="flex flex-wrap items-center gap-4">
@@ -28,7 +34,7 @@ export function Settings({ client = api, onBack }: SettingsProps) {
           <ArrowLeft className="h-4 w-4" aria-hidden="true" />
           Back to torrents
         </Button>
-        <h1 className="text-lg font-semibold text-strong">Settings</h1>
+        <h1 ref={heading} tabIndex={-1} className="text-lg font-semibold text-strong outline-none">Settings</h1>
       </div>
       <section aria-labelledby="settings-server" className="flex flex-col gap-3">
         <h2 id="settings-server" className="text-base font-medium text-strong">

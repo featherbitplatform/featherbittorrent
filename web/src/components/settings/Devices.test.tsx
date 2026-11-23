@@ -54,7 +54,7 @@ describe('the Devices section', () => {
   it('removing asks first', async () => {
     const { removeDevice } = await open()
     await screen.findByText('phone')
-    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove phone' }))
     expect(removeDevice, 'removed without asking').not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Remove device' }))
     await waitFor(() => {
@@ -92,5 +92,71 @@ describe('the Devices section', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('not an ed25519 key')
     expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('laptop')
     expect((screen.getByLabelText('Public key') as HTMLInputElement).value).toBe('junk')
+  })
+
+  it('a private key is never sent', async () => {
+    const { addDevice } = await open()
+    await screen.findByText('phone')
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'laptop' } })
+    fireEvent.change(screen.getByLabelText('Public key'), {
+      target: { value: '-----BEGIN OPENSSH PRIVATE KEY-----' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'This is a private key. Paste the public key line instead.',
+    )
+    expect(addDevice, 'a private key was sent to the server').not.toHaveBeenCalled()
+    expect((screen.getByLabelText('Public key') as HTMLInputElement).value).toBe('')
+  })
+
+  it('the key field refuses autofill and autocorrect', async () => {
+    await open()
+    await screen.findByText('phone')
+    for (const label of ['Name', 'Public key']) {
+      const input = screen.getByLabelText(label)
+      expect(input.getAttribute('autocomplete')).toBe('off')
+      expect(input.getAttribute('autocapitalize')).toBe('off')
+      expect(input.getAttribute('autocorrect')).toBe('off')
+      expect(input.getAttribute('spellcheck')).toBe('false')
+    }
+  })
+
+  it('the name and key are sent as typed', async () => {
+    const { addDevice } = await open()
+    await screen.findByText('phone')
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: ' laptop ' } })
+    fireEvent.change(screen.getByLabelText('Public key'), { target: { value: ` ${LINE} ` } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await waitFor(() => {
+      expect(addDevice).toHaveBeenCalledWith(' laptop ', ` ${LINE} `)
+    })
+  })
+
+  it('removing a device already gone drops the row', async () => {
+    const fake = fakeClient({
+      removeDevice: () => Promise.reject(new ApiError(404, 'not_found', 'no such device')),
+    })
+    await open(fake)
+    await screen.findByText('phone')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove phone' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove device' }))
+    await waitFor(() => {
+      expect(screen.queryByText('SHA256:aaa')).toBeNull()
+    })
+  })
+
+  it('a refused add is tied to the key field', async () => {
+    const fake = fakeClient({
+      addDevice: () => Promise.reject(new ApiError(400, 'invalid_key', 'bad key')),
+    })
+    await open(fake)
+    await screen.findByText('phone')
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'laptop' } })
+    fireEvent.change(screen.getByLabelText('Public key'), { target: { value: 'junk' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    const alert = await screen.findByRole('alert')
+    const key = screen.getByLabelText('Public key')
+    expect(key.getAttribute('aria-invalid')).toBe('true')
+    expect(key.getAttribute('aria-describedby')).toBe(alert.id)
   })
 })
