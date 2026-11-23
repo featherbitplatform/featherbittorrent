@@ -80,7 +80,7 @@ where it is served, in setups 1 and 3, it signs in at the server.
 
 ## Streaming in the browser
 
-Streaming and playing video in the browser are provided by Playing video below.
+Streaming and playing video in the browser are provided by Playing media below.
 
 ## Playing media
 
@@ -113,18 +113,75 @@ files). Image-based subtitles like PGS or VobSub are shown disabled with the mes
 playable audio track; `c` cycles through subtitles including Off; `f` enters fullscreen;
 `Escape` closes the player.
 
+### Player modes
+
+The player can open a file in one of three ways, each with its own HTML element and controls:
+
+- **Native path**: the browser plays the file on its own. The file appears in a `<video>
+  element with its `src` set to a 60-second token signed by the server (player/Player.tsx:769-773). The
+  browser's own controls are on screen, or none when the element is `controls`-less, and the keys do
+  nothing. The browser must report it can play the file's mime (player/tracks.ts:100); otherwise the
+  browser shifts to the unplayable mode.
+
+- **Remux path**: the player remuxes the file into a single MP4 stream the browser's `ManagedMediaSource`
+  (or `MediaSource`) understands (player/tracks.ts:81-97), and the `SourceBuffer`s it fills from the
+  server feed the video element. The player draws its own controls around it, and the keys work.
+
+- **Unplayable**: when neither path can play the file, the player shows the sentence
+  `This browser cannot play <codec> video.` and offers a `Download` button to save the file.
+  The codec shown is the first track's codec if any, else `unknown` (player/tracks.ts:76-80).
+
+### Controls
+
+The remux path's own controls are:
+
+- `Seek`: a range input with the `aria-label` of `Seek` that jumps to a point in the file.
+- `Play` / `Pause`: an icon button whose `aria-label` changes between `Play` and `Pause` that starts and
+  stops playback.
+- `Back 5 seconds`: an icon button with the `aria-label` `Back 5 seconds` that moves the playhead 5
+  seconds back.
+- `Forward 5 seconds`: an icon button with the `aria-label` `Forward 5 seconds` that moves the playhead
+  5 seconds forward.
+- `Mute` / `Unmute`: an icon button whose `aria-label` toggles between `Mute` and `Unmute` and sets
+  audio volume to 0.
+- `Volume`: a range input with the `aria-label` `Volume` that sets volume from 0 to 1 in steps of 0.05.
+- `Fullscreen`: an icon button with the `aria-label` `Fullscreen` that toggles fullscreen mode.
+- `Audio`: a menu labeled `Audio` listing playable audio tracks; a track the browser cannot play is
+  labeled with `: not playable here`.
+- `Subtitles`: a menu labeled `Subtitles` listing the subtitle tracks; image-based subtitles like PGS
+  appear disabled with the text `<name>: Image subtitles cannot be shown here.`
+
+Keys affect the remux path only. When focus is in a range input or an open menu, the keys do nothing
+(player/Player.tsx:654-662). A keypress of `f` toggles fullscreen (player/Player.tsx:592-597) in any
+mode.
+
+### Keys
+
+While the remux path has focus, the keys are:
+
+`Space` or `k` toggles the player; `ArrowLeft` or `ArrowRight` moves the playhead 5 seconds;
+`ArrowUp` or `ArrowDown` changes the volume by 0.1; `m` toggles mute; `a` switches to the next
+playable audio track; `c` cycles through subtitles including Off; `f` toggles fullscreen.
+
+### Position and state
+
+Play positions are saved every 5 seconds and on close, first after 10 seconds have elapsed, cleared
+within 30 seconds of the file end, and are restored only when shorter than the file's duration
+(player/positions.ts, player/Player.tsx:333-334).
+
 ### Engine states
 
 - `loading`: the player is starting up.
 - `waiting`: playback reaches a part of the file that has not arrived yet. The player shows
 `Waiting for data...`, keeps trying again from the end of what it already has, until the data is
-there. Playback can start even while the torrent is still downloading.
+there. The engine could not continue.
 - `playing`: the media is playing.
-- `error`: the engine has reached a fatal state; the player shows the message
-`Playback failed.` and the file can be downloaded.
+- `error`: the engine ran into a state it cannot recover from; the player shows only
+`Playback failed.` with no way to recover.
 
 ### Unplayable message
 
-When the browser cannot play a video track, the player shows
+When the browser cannot play a file, the player shows
 `This browser cannot play <codec> video.` and a button with an `aria-label` of `Download` that,
-when clicked, saves the file to your computer. The codec is filled in from the media.
+when clicked, saves the file to your computer. The codec is the first track's codec if any, else
+`unknown`.
