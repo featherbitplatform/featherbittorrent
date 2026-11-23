@@ -325,6 +325,7 @@ export default function DetailPane({
 
       {playing !== null && (
         <Player
+          key={`${id}:${playing.file}`}
           id={id}
           file={playing.file}
           name={playing.name}

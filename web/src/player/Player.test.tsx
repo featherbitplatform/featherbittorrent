@@ -104,6 +104,15 @@ beforeEach(() => {
         held.push(cue)
       },
     } as unknown as TextTrack
+    // The browser's `TextTrack.id` is a getter with no setter: writing it throws, the way a
+    // module (strict mode) throws on a read-only property. The fake is at least as strict, so a
+    // player that keys its tracks by `id` is caught here the way a browser would catch it.
+    Object.defineProperty(track, 'id', {
+      get(): string {
+        return ''
+      },
+      configurable: true,
+    })
     tracks.push(track)
     element._tracks = tracks
     return track
@@ -838,6 +847,189 @@ describe('the player', () => {
     document.body.removeChild(video)
   })
 
+  it('the default fetch is called on the window', async () => {
+    // The engine's default deps take `window.fetch` itself. The browser's `fetch` refuses a call
+    // it is not invoked as `window.fetch` (an `Illegal invocation`), so the recorder below stands
+    // in for `window.fetch` the way the browser is strict: it throws when its `this` is not the
+    // `window`. The engine makes no deps at all - the default path - and the stream request must
+    // still get out, and the state must not sit in the `waiting` the unbound call would have left.
+    const source = new FakeMediaSource()
+    const calls: string[] = []
+    // The recorder answers like the rest of the fakes: a 200 with the stream's start header and
+    // a fresh body for each call, the way the rest of the fakes build one. It is strict where
+    // the browser is strict: it throws when its `this` is not the `window`, which is what an
+    // unbound `window.fetch` call gets.
+    const strictWindowFetch = function (this: unknown, input: RequestInfo | URL): Promise<unknown> {
+      if (this !== window) throw new TypeError('Illegal invocation')
+      calls.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      const body = new FakeBody()
+      const headers = new Headers({ 'x-fbtt-start-ms': '0' })
+      const reader = body.getReader()
+      const response = {
+        ok: true,
+        status: 200,
+        headers,
+        body: { getReader: () => reader },
+      }
+      return Promise.resolve(response)
+    } as unknown as typeof fetch
+    const originalFetch = window.fetch
+    window.fetch = strictWindowFetch
+    try {
+      const video = fakeVideo()
+      document.body.appendChild(video)
+      const engine = createEngine(
+        video,
+        { id: 'a', file: 0 },
+        {
+          offsetMs: 1000,
+          durationMs: 4000,
+          video: PROBE.tracks[0] as MediaTrack,
+          videoMime: 'video/mp4; codecs="avc1.64000A"',
+          audio: null,
+          audioMime: null,
+          mimeFor: () => null,
+        },
+        // No `fetch` in the deps: the default path, which reads `window.fetch`. The `MediaSource`
+        // and `managed` are given only to keep the fake source in reach; the `fetch` stays the
+        // browser's.
+        {
+          MediaSource: fakeDeps(source, fakeFetch()).MediaSource,
+          managed: false,
+        },
+      )
+      source.open()
+      await settle()
+      await settle()
+      // One more for the append's `updateend`: the engine reads the body's end after it has put
+      // the chunk in, and that end is what settles the engine's state.
+      await settle()
+      expect(
+        calls.some((url) => url.includes('/tracks/1/stream')),
+        'the default path never asked for a stream (an unbound fetch throws instead)',
+      ).toBe(true)
+      // The data has landed, and a data-arrived state is the one the person sees: `loading`
+      // before the first byte, `playing` with data, and never the `waiting` the unbound call
+      // would have left.
+      expect(
+        engine.state() !== 'waiting',
+        `the unbound fetch was taken for a network wait (state ${engine.state()})`,
+      ).toBe(true)
+      engine.destroy()
+      document.body.removeChild(video)
+    } finally {
+      window.fetch = originalFetch
+    }
+  })
+
+  it('opening the player starts playback', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // The stream the engine reads: one body, held open, so the test can feed data after it lands.
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // The element the test reads `play()` back from: the open asks it once, and the ask is
+    // counted here.
+    let playCalls = 0
+    video.play = (): Promise<void> => {
+      playCalls += 1
+      return Promise.resolve()
+    }
+
+    // The first data arrives: the engine appends it, the element can play, and the open's one
+    // play happens.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(playCalls, 'the open did not start playback').toBe(1)
+
+    // Later data does not ask again: the open plays once, not once per chunk.
+    videoBody.push(new Uint8Array([2]))
+    await settle()
+    await settle()
+    expect(playCalls, 'later data asked for playback again').toBe(1)
+
+    // `canplay` on later data does not ask either: the element saying it can play is not the
+    // open asking to play a second time.
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(playCalls, 'a later canplay asked for playback again').toBe(1)
+  })
+
+  it('a pause before the first data is kept', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    let playCalls = 0
+    video.play = (): Promise<void> => {
+      playCalls += 1
+      return Promise.resolve()
+    }
+
+    // The viewer pauses before any data arrives: that is their word for what they want, and it
+    // must be kept.
+    video.dispatchEvent(new Event('pause'))
+    await settle()
+
+    // Data arrives and the element can play: the autoplay must not override the viewer's pause.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    await settle()
+    expect(playCalls, 'the autoplay overrode the viewer\'s pause').toBe(0)
+  })
+
+  it('a refused autoplay leaves the player paused', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    const videoBody = new FakeBody()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => videoBody }))
+    recorder.answer('/tracks/2/stream', { status: 500 })
+    const { client } = probeClient()
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    // The browser refuses the autoplay: `play()` rejects, the way an autoplay policy does.
+    video.play = (): Promise<void> => Promise.reject(new Error('NotAllowedError'))
+
+    // Data arrives and the element can play: the autoplay is refused.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
+    video.dispatchEvent(new Event('canplay'))
+    await settle()
+    await settle()
+    // The refusal is not an error: the Play control shows, so the person can play when they
+    // choose. The autoplay's own error state is not one a person sees (the element's `play`
+    // promise is caught), so no unhandled rejection leaks into the test either.
+    expect(
+      video.paused === true,
+      'a refused autoplay did not leave the player paused',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Play' }) !== null,
+      'the Play control did not show after a refused autoplay',
+    ).toBe(true)
+  })
+
   it('reading pauses at the gate', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
@@ -1178,6 +1370,41 @@ describe('the player', () => {
     }
     const showingAfter = Array.from(video.textTracks).filter((t) => t.mode === 'showing').length
     expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
+  })
+
+  it('a chosen subtitle shows its cues', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // The chosen subtitle's window answers with two cues: the track the player makes for the key
+    // must be the one shown, and the cues it is given must be on it. The fake `TextTrack` keeps
+    // the browser's strictness: its `id` is a getter with no setter, so a player that writes it
+    // is caught here the way a browser would catch it.
+    const { client } = probeClient(
+      PROBE,
+      [
+        { start_ms: 1000, end_ms: 2000, text: 'hello' },
+        { start_ms: 2000, end_ms: 3000, text: 'world' },
+      ],
+    )
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+
+    // Choose the first subtitle track: one `c` takes it, and its cues arrive from the window.
+    fireEvent.keyDown(container.querySelector('dialog') as HTMLElement, { key: 'c' })
+    await settle()
+    const tracks = Array.from(video.textTracks)
+    expect(tracks.length >= 1, 'the chosen subtitle made no track').toBe(true)
+    const shown = tracks.filter((track) => track.mode === 'showing')
+    expect(shown.length === 1, 'a chosen subtitle did not show its track').toBe(true)
+    const shownCues = (shown[0] as unknown as { cues: unknown[] }).cues
+    const texts = shownCues.map((cue) => (cue as { text: string }).text)
+    expect(
+      texts.includes('hello') && texts.includes('world'),
+      `the chosen subtitle did not hold its cues (got ${JSON.stringify(texts)})`,
+    ).toBe(true)
   })
 
   it('a subtitle language without a name is shown through displaySafe', async () => {

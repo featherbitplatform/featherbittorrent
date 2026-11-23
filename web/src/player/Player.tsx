@@ -288,12 +288,19 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   // The cues each track has already been given: a window fetched again for the same second must
   // not double the cues the `TextTrack` already shows.
   const cueKeysRef = useRef<Map<string, Set<string>>>(new Map())
+  // The `TextTrack` each subtitle key is kept under: the browser's `TextTrack.id` is read-only,
+  // so the key lives here, not on the track, and every lookup goes through the map.
+  const subtitleTracksRef = useRef<Map<string, TextTrack>>(new Map())
   // The cue windows each embedded track has already been asked for.
   const fetchedRef = useRef<Map<number, [number, number][]>>(new Map())
   // The external files fetched once, by their index.
   const externalDoneRef = useRef<Set<number>>(new Set())
   // The position the probe's answer will start at, in source seconds, decided once per probe.
   const startRef = useRef(0)
+  // True once the open has asked the element to play: the open plays once, and later data or
+  // events do not ask it again. Opening a file starts playback, so a second press is not needed;
+  // an autoplay the browser refuses leaves the Play control showing, the person's own choice.
+  const autoPlayedRef = useRef(false)
 
   const offsetMs = probe?.time_offset_ms ?? 0
   const durationMs = probe?.duration_ms ?? null
@@ -352,6 +359,39 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     }
   }, [choice, client, id, file])
 
+  // The native path's transport: the open asks the element to play once its data can play, the
+  // way the remux path does, and a refused autoplay leaves the Play control (the element's own
+  // `controls`) showing. The viewer's own play or pause (the element's `controls`) wins: once they
+  // have said what they want, the autoplay never overrides it.
+  useEffect(() => {
+    if (choice?.kind !== 'native' || nativeSrc === null) return
+    const video = videoRef.current
+    if (video === null) return
+    const onCanPlay = (): void => {
+      if (autoPlayedRef.current) return
+      autoPlayedRef.current = true
+      void video.play().catch(() => {
+        // An autoplay the browser refuses is not an error: the element's own Play control stays.
+      })
+    }
+    // A play or pause the viewer makes through the element's controls is their word for what they
+    // want: mark the open handled so the autoplay does not override it.
+    const onPlay = (): void => {
+      autoPlayedRef.current = true
+    }
+    const onPause = (): void => {
+      autoPlayedRef.current = true
+    }
+    video.addEventListener('canplay', onCanPlay)
+    video.addEventListener('play', onPlay)
+    video.addEventListener('pause', onPause)
+    return () => {
+      video.removeEventListener('canplay', onCanPlay)
+      video.removeEventListener('play', onPlay)
+      video.removeEventListener('pause', onPause)
+    }
+  }, [choice, nativeSrc])
+
   // The engine, for the remux. It owns the source and the buffers; the element's transport events
   // are read here, and the position is saved on its clock.
   useEffect(() => {
@@ -385,8 +425,16 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     engine.onState(setState)
     engine.seek(startMs)
 
-    const onPlay = (): void => setPaused(false)
-    const onPause = (): void => setPaused(true)
+    // A play or pause the viewer makes (Space or `k`, or the Play control) is their word for what
+    // they want: mark the open handled so the autoplay on the first `canplay` does not override it.
+    const onPlay = (): void => {
+      autoPlayedRef.current = true
+      setPaused(false)
+    }
+    const onPause = (): void => {
+      autoPlayedRef.current = true
+      setPaused(true)
+    }
     // The display is in source time, the clock the probe answers and the person thinks in: the
     // element's media time mapped back through the offset.
     const onTime = (): void => setTime(toSource(video.currentTime, probe.time_offset_ms))
@@ -394,10 +442,21 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       setVolume(video.volume)
       setMuted(video.muted)
     }
+    // The open's own word for "there is data to play": the element can play. The ask happens here,
+    // once, so a `canplay` that fires for later data does not ask a second time.
+    const onCanPlay = (): void => {
+      if (autoPlayedRef.current) return
+      autoPlayedRef.current = true
+      void video.play().catch(() => {
+        // An autoplay the browser refuses (its policy, or the element's) is not an error: the
+        // Play control stays showing, and the person's own press is the one that plays.
+      })
+    }
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('volumechange', onVolume)
+    video.addEventListener('canplay', onCanPlay)
 
     // The position is saved every five seconds, and on the way out. It is remembered in source
     // seconds, the clock `positions` keeps: the duration is converted to the same clock, so the
@@ -412,6 +471,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       video.removeEventListener('pause', onPause)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('volumechange', onVolume)
+      video.removeEventListener('canplay', onCanPlay)
       save()
       engine.destroy()
       engineRef.current = null
@@ -442,18 +502,12 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (video === null) return
     const label = subtitleLabel(key)
     // The track is kept under its own key, not its label: two tracks named "English" are two
-    // tracks, and the key is what tells them apart.
-    let found: TextTrack | null = null
-    for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
-      if (candidate !== undefined && candidate.id === `subtitle:${key}`) {
-        found = candidate
-        break
-      }
-    }
+    // tracks, and the key is what tells them apart. The key lives in the map, not on the
+    // `TextTrack`, whose `id` is read-only in a browser.
+    let found = subtitleTracksRef.current.get(key) ?? null
     if (found === null) {
       found = video.addTextTrack('subtitles', label, langOf(language))
-      ;(found as TextTrack & { id?: string }).id = `subtitle:${key}`
+      subtitleTracksRef.current.set(key, found)
     }
     const seen = cueKeysRef.current.get(key) ?? new Set<string>()
     cueKeysRef.current.set(key, seen)
@@ -477,16 +531,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   function applySubtitleModes(): void {
     const video = videoRef.current
     if (video === null) return
-    const chosen = `subtitle:${subtitleKey}`
-    for (let i = 0; i < video.textTracks.length; i += 1) {
-      const candidate = video.textTracks[i] as (TextTrack & { id?: string }) | undefined
-      if (candidate === undefined) continue
-      // The track's key, or its label when it was made before the key was: the chosen track is
-      // the one shown, and the rest are not.
-      const isChosen = candidate.id !== undefined
-        ? candidate.id === chosen
-        : candidate.label === subtitleLabel(subtitleKey)
-      candidate.mode = isChosen ? 'showing' : 'disabled'
+    // Every track the player made is in the map; the chosen key's track is the one shown, and
+    // the rest are not. A key that is not the chosen one, including `off`, is a track not shown.
+    for (const [key, track] of subtitleTracksRef.current) {
+      track.mode = key === subtitleKey ? 'showing' : 'disabled'
     }
   }
 
@@ -724,7 +772,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         onDialogKey(event)
         onKeyDown(event)
       }}
-      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body"
+      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0"
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-4 py-2.5">
         <span className="min-w-0 truncate text-[13px] text-strong">{displaySafe(name)}</span>
@@ -775,7 +823,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       {probe !== null && choice?.kind === 'remux' && (
         <>
           <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
-            <video ref={videoRef} className="max-h-full max-w-full" />
+            <video ref={videoRef} className="h-full w-full max-h-full max-w-full object-contain" />
             {waiting && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>
@@ -788,6 +836,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
             )}
           </div>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-ink-700 px-3 py-2.5">
+            {/* The Seek bar gets its own full-width row on a phone, above the other controls:
+                sharing the row with the buttons and the volume slider squeezed it to ~30 px, so
+                it could not be used. The time text and the buttons stay on the controls row. */}
             <input
               type="range"
               aria-label="Seek"
@@ -801,7 +852,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 // The bar is in source time: the value is source seconds, mapped to the element.
                 video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
               }}
-              className="h-1.5 min-w-40 flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 w-full shrink-0 min-[641px]:w-auto min-[641px]:min-w-0 min-[641px]:shrink flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent max-[640px]:order-first max-[640px]:flex-none"
             />
             <span className="font-mono text-[12px] text-strong">
               {clock(time / 1000)} / {clock(durationSourceSec)}
@@ -837,7 +888,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 video.volume = Number(event.target.value)
                 if (video.volume > 0 && video.muted) video.muted = false
               }}
-              className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 w-20 min-[420px]:w-24 max-[640px]:hidden cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             {audioOptions.length > 0 && (
               <ChoiceMenu

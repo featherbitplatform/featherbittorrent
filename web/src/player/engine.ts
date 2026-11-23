@@ -208,7 +208,10 @@ function defaultDeps(): EngineDeps {
     return instance
   } as unknown as typeof MediaSource
   return {
-    fetch: window.fetch,
+    // The browser's `fetch` refuses a call it is not invoked as `window.fetch` (an `Illegal
+    // invocation`), so the engine keeps the `window` as its `this` rather than handing the method
+    // out unbound.
+    fetch: (input, init) => window.fetch(input, init),
     MediaSource: Ctor,
     managed: managedCtor !== undefined,
   }
