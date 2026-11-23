@@ -674,7 +674,9 @@ impl RouteError {
 
 impl From<JsonRejection> for RouteError {
     fn from(problem: JsonRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // serde's message quotes what the client sent (an unknown field's name, a string it could not read),
+        // so it is remote text like any other on its way into a response.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 

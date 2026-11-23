@@ -3179,3 +3179,146 @@ async fn mkdir_needs_a_session_and_the_csrf_token() {
 
     served.stop().await;
 }
+
+/// A stream token opens one file's stream and nothing else: presented to `fs/mkdir` as a bearer header or in
+/// the query, it is not a session, and nothing is created.
+#[tokio::test]
+async fn mkdir_refuses_a_stream_token() {
+    let served = Served::start("mkdir-stream-token", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let session = log_in_with_password(&served, "alice", "hunter2").await;
+    let payload = write_file(served.root(), "payload.bin", &sample(64));
+    let id = seed_torrent(&served, Some(&session), &payload).await;
+    let address = stream_address(&served, Some(&session), &id, 0).await;
+    let (_, stream_token) = address
+        .split_once("?token=")
+        .unwrap_or_else(|| panic!("a stream address with a token in it: {address}"));
+    let root = served.root().to_path_buf();
+
+    let (status, code) =
+        error_of(mkdir(&served, &root, "as-bearer", Some(stream_token)).await).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token as a bearer header is not a session",
+    );
+    assert_eq!(code, "unauthorized");
+
+    let response = within(
+        http()
+            .post(served.url("/api/v1/fs/mkdir"))
+            .query(&[("token", stream_token)])
+            .json(&serde_json::json!({ "parent": root.to_string_lossy(), "name": "as-query" }))
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stream token in the query is not a session",
+    );
+    assert_eq!(code, "unauthorized");
+
+    assert!(
+        !root.join("as-bearer").exists() && !root.join("as-query").exists(),
+        "a refused request created nothing",
+    );
+
+    served.stop().await;
+}
+
+/// With logins off, `fs/mkdir` answers whoever reaches the address, so the name the request came to and the
+/// place it came from are all that stand between a rebinding page and the disk: a foreign `Host` or a
+/// foreign `Origin` is `403 forbidden` and creates nothing, and the server's own name with no origin goes
+/// through.
+#[tokio::test]
+async fn mkdir_with_logins_off_checks_host_and_origin() {
+    let served = Served::start("mkdir-auth-off", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(false))
+    })
+    .await;
+    let client = http();
+    let root = served.root().to_path_buf();
+    let url = served.url("/api/v1/fs/mkdir");
+    let own = format!("127.0.0.1:{}", served.server.local_addr().port());
+    let request = |host: &str, origin: Option<&str>, name: &str| {
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::HOST, host)
+            .json(&serde_json::json!({ "parent": root.to_string_lossy(), "name": name }));
+        if let Some(origin) = origin {
+            request = request.header(reqwest::header::ORIGIN, origin);
+        }
+        request
+    };
+
+    let response = within(request("evil.example", None, "from-host").send())
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Host is refused");
+    assert_eq!(code, "forbidden");
+
+    let response = within(request(&own, Some("http://evil.example"), "from-origin").send())
+        .await
+        .expect("the server answered");
+    let (status, code) = error_of(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Origin is refused");
+    assert_eq!(code, "forbidden");
+
+    assert!(
+        !root.join("from-host").exists() && !root.join("from-origin").exists(),
+        "a refused request created nothing",
+    );
+
+    let response = within(request(&own, None, "from-here").send())
+        .await
+        .expect("the server answered");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the server's own name goes through",
+    );
+    assert!(root.join("from-here").is_dir());
+
+    served.stop().await;
+}
+
+/// The body is a path and a name, so it has a cap of its own far below fbt-api's room for a `.torrent`: a
+/// body over it is `413 body_too_large`, whatever is in it.
+#[tokio::test]
+async fn mkdir_refuses_a_body_over_the_limit() {
+    let served = Served::start("mkdir-body", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let token = log_in_with_password(&served, "alice", "hunter2").await;
+    let root = served.root().to_path_buf();
+    // 20 KiB of padding in a field the route does not take: over the 16 KiB cap, and nothing a folder name
+    // could be.
+    let response = post_json(
+        &http(),
+        &served.url("/api/v1/fs/mkdir"),
+        serde_json::json!({
+            "parent": root.to_string_lossy(),
+            "name": "padded",
+            "padding": "x".repeat(20 * 1024),
+        }),
+        Some(&token),
+    )
+    .await;
+    let (status, code) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the body is over the cap"
+    );
+    assert_eq!(code, "body_too_large");
+    assert!(!root.join("padded").exists(), "nothing was created");
+
+    served.stop().await;
+}
