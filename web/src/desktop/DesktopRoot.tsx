@@ -49,6 +49,7 @@ import type { InstancesList, Probe } from './bridge'
 import { CloseChoiceHost } from './CloseChoice'
 import { InstanceSwitcher } from './InstanceSwitcher'
 import { OpenedHost } from './OpenedAdd'
+import { StartupProblemHost } from './StartupProblem'
 import { Instances } from './Instances'
 
 type Phase =
@@ -151,6 +152,7 @@ export function DesktopRoot() {
     <>
       <DesktopScreens />
       <CloseChoiceHost />
+      <StartupProblemHost />
     </>
   )
 }

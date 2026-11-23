@@ -19,6 +19,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::DesktopState;
 use crate::settings_store::SettingsStore;
+use crate::startup::START_WAIT;
 
 /// The argument the login item launches the app with: start without showing the window.
 pub const BACKGROUND_FLAG: &str = "--background";
@@ -300,7 +301,9 @@ pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// Quits the app: the window goes away at once, This computer stops (its final save), then the process
-/// exits. A second quit while the first is stopping does nothing, so it cannot exit before the save.
+/// exits. A second quit while the first is stopping does nothing, so it cannot exit before the save. A
+/// quit while This computer is still starting waits for the start, then stops it. The exit code is 0, or
+/// a failed start's (`startup::StartProblem::exit_code`).
 pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     if !app.state::<Lifecycle>().begin_quit() {
         return;
@@ -310,13 +313,15 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let this_computer = app.state::<DesktopState>().take();
+        let startup = app.state::<DesktopState>();
+        let this_computer = startup.startup().take_when_settled(START_WAIT).await;
         if let Some(this_computer) = this_computer {
             this_computer.stop().await;
         }
+        let code = startup.startup().exit_code();
         // Stopped before the exit, so the exit request it causes is let through.
         app.state::<Lifecycle>().finish_quit();
-        app.exit(0);
+        app.exit(code);
     });
 }
 
@@ -341,9 +346,13 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
             match on_exit(lifecycle.phase()) {
                 ExitAnswer::StopHere => {
                     if lifecycle.begin_quit() {
-                        if let Some(this_computer) = app.state::<DesktopState>().take() {
-                            tauri::async_runtime::block_on(this_computer.stop());
-                        }
+                        let startup = app.state::<DesktopState>();
+                        tauri::async_runtime::block_on(async {
+                            let taken = startup.startup().take_when_settled(START_WAIT).await;
+                            if let Some(this_computer) = taken {
+                                this_computer.stop().await;
+                            }
+                        });
                         lifecycle.finish_quit();
                     } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
                         eprintln!("The final save did not finish in time; quitting without it.");

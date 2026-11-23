@@ -110,7 +110,8 @@ function clientKey(client: Api): number {
 }
 
 export interface AddTorrentProps {
-  client: Api
+  /** The server to add to; null while the desktop app has no connection to the picked instance (then `signIn` says why). */
+  client: Api | null
   /** The magnet link or the `.torrent` the dialog starts with (the desktop app's opened links and files). */
   initial?: InitialSource
   /** The desktop app's instance picker, drawn above the folder tree. */
@@ -139,7 +140,7 @@ export default function AddTorrent({
   const initialFile = initial?.kind === 'file' ? initial.file : null
   const [source, setSource] = useState<Source>(initialFile === null ? 'magnet' : 'file')
   // The folder belongs to the client it was picked on: a folder another server named is no folder here.
-  const [picked, setPicked] = useState<{ client: Api; path: string }>({ client, path: '' })
+  const [picked, setPicked] = useState<{ client: Api | null; path: string }>({ client, path: '' })
   const path = signIn === undefined && picked.client === client ? picked.path : ''
   const [file, setFile] = useState<File | null>(initialFile)
   const [startPaused, setStartPaused] = useState(false)
@@ -206,6 +207,7 @@ export default function AddTorrent({
   async function add(): Promise<void> {
     if (submittingRef.current || busy || path === '') return
     const magnet = (magnetRef.current?.value ?? '').trim()
+    if (client === null) return
     const picked = source === 'file' ? file : null
     if (source === 'magnet' && !looksLikeMagnet(magnet)) {
       setRefusal(NOT_A_MAGNET_COPY)
@@ -361,9 +363,10 @@ export default function AddTorrent({
 
         {instancePicker}
 
-        {signIn ?? (
-          <FolderPicker key={clientKey(client)} client={client} value={path} onPathChange={onPathChange} />
-        )}
+        {signIn ??
+          (client !== null && (
+            <FolderPicker key={clientKey(client)} client={client} value={path} onPathChange={onPathChange} />
+          ))}
 
         {refusal !== null && <Banner tone="danger">{refusal}</Banner>}
 

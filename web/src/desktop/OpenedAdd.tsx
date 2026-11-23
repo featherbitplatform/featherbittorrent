@@ -151,12 +151,11 @@ function OpenedDialog({
   const [chosen, setChosen] = useState(shown.id)
   const pickerId = useId()
   const { connection, error } = useConnectionFor(chosen, shown)
-  const session = connection ?? shown.connection
   const state = useSyncExternalStore(
-    session?.session.subscribe ?? noSubscribe,
-    session?.session.get ?? noState,
+    connection?.session.subscribe ?? noSubscribe,
+    connection?.session.get ?? noState,
   )
-  if (initial === null || session === null) return null
+  if (initial === null) return null
 
   let inPlace = undefined
   if (error !== null) inPlace = <Banner tone="danger">{error}</Banner>
@@ -187,7 +186,7 @@ function OpenedDialog({
 
   return (
     <AddTorrent
-      client={(connection ?? session).api}
+      client={connection?.api ?? null}
       initial={initial}
       instancePicker={picker}
       signIn={inPlace}

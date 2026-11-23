@@ -237,3 +237,24 @@ it('an_opened_file_is_picked_and_a_refused_one_is_said', async () => {
   await waitFor(() => expect(adds()).toHaveLength(1))
   expect(adds()[0]?.url).toContain(`${LOCAL}/api/v1/torrents?`)
 })
+
+it('a_failed_connect_still_shows_the_dialog_with_cancel', async () => {
+  shell.connect.mockImplementation((id: string) =>
+    id === 'pi' ? Promise.reject('Pi at home gives no answer.') : Promise.resolve({ kind: 'bearer', base: LOCAL, token: 'x' }),
+  )
+  shell.takeOpened.mockResolvedValueOnce([{ kind: 'magnet', uri: MAGNET }])
+  // The window shows the Pi, which is down: the dialog connects on its own and is refused.
+  render(<OpenedHost instances={INSTANCES} shown={{ id: 'pi', connection: null }} />)
+  await screen.findByText('Pi at home gives no answer.')
+  expect(screen.getByText('Add torrent')).toBeTruthy()
+  expect(magnetField().value).toBe(MAGNET)
+  expect(addButton().disabled).toBe(true)
+
+  // Another instance can be picked from there.
+  fireEvent.change(screen.getByLabelText('Add to'), { target: { value: 'local' } })
+  await screen.findByText('/downloads')
+  expect(screen.queryByText('Pi at home gives no answer.')).toBeNull()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() => expect(screen.queryByText('Add torrent')).toBeNull())
+})

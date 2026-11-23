@@ -15,6 +15,7 @@ mod lifecycle;
 mod local;
 mod opened;
 mod settings_store;
+mod startup;
 mod tray;
 mod window;
 
@@ -69,6 +70,7 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![lifecycle::BACKGROUND_FLAG]),
         ))
+        .manage(DesktopState::starting())
         .manage(opened::OpenedState::new())
         .manage(settings_store.clone())
         .manage(window::ChromeState::new(settings_store.clone()))
@@ -81,6 +83,16 @@ fn main() {
         // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
         // be added anywhere: a new step goes into `setup` below, in its place in the order.
         .setup(move |app| setup(app, &paths, serve))
+        // The app's one page-load hook (`Builder::on_page_load` replaces too): a page that starts loading
+        // is not listening for opened links until it asks again.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview
+                    .app_handle()
+                    .state::<opened::OpenedState>()
+                    .page_gone();
+            }
+        })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -104,7 +116,9 @@ fn main() {
             lifecycle::tray_available,
             lifecycle::set_start_at_login,
             tray::set_tray_instance,
-            opened::take_opened
+            opened::take_opened,
+            startup::startup_problem,
+            startup::quit_app
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {
@@ -128,19 +142,12 @@ fn setup(
     paths: &DesktopPaths,
     serve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 0. This computer, which only the one copy that got past the single-instance plugin starts. Its
-    //    window is still invisible, so a refusal here is the native message alone.
-    let this_computer =
-        tauri::async_runtime::block_on(local::start(paths, serve)).unwrap_or_else(|problem| {
-            let code = if problem == local::ALREADY_RUNNING {
-                local::EXIT_ALREADY_RUNNING
-            } else {
-                EXIT_PROBLEM
-            };
-            refuse(&problem, code)
-        });
-    app.manage(DesktopState::new(this_computer));
     let handle = app.handle();
+    // 0. This computer, which only the one copy that got past the single-instance plugin starts. It
+    //    starts off the main thread, so the event loop keeps running (a second launch's forward is
+    //    answered meanwhile); a failure is kept for the page, which says it with a Quit button.
+    let paths = paths.clone();
+    startup::spawn(handle, async move { local::start(&paths, serve).await });
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
     //    them before it calls the setup); a missing one is said once and the app goes on without it.
     match handle.get_webview_window(lifecycle::MAIN_WINDOW) {
@@ -169,7 +176,9 @@ fn setup(
 }
 
 /// Says `message` in a native message box (and on stderr, for a run from a terminal), then exits with
-/// `code`. Used only before the window exists, when there is no page to say it in.
+/// `code`. Used only before the event loop runs (no home directory, a window that could not be made), when
+/// there is no page to say it in; never from inside the loop, where on Linux the box would wait on the
+/// loop it blocks. A failed start of This computer is said by the page instead (`startup`).
 fn refuse(message: &str, code: i32) -> ! {
     eprintln!("{message}");
     rfd::MessageDialog::new()

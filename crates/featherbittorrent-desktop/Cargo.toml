@@ -34,9 +34,10 @@ tauri-plugin-deep-link.workspace = true
 base64.workspace = true
 # The file URLs macOS hands an app that was opened with a `.torrent`.
 url.workspace = true
-# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save. The
-# runtime itself is Tauri's; this only names the feature.
-tokio = { workspace = true, features = ["signal"] }
+# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save; and
+# the wait on This computer's start (`startup.rs`: a notify, a timeout, `pin!`). The runtime itself is
+# Tauri's; this only names the features.
+tokio = { workspace = true, features = ["signal", "sync", "time", "macros"] }
 # `generate_context!` expands to code that names `serde_json` from the crate that calls it, so it has to
 # be a direct dependency (the Tauri spike's finding).
 serde_json.workspace = true

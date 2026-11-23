@@ -44,6 +44,8 @@ vi.mock('./bridge', () => ({
   setTrayInstance: shell.setTrayInstance,
   takeOpened: shell.takeOpened,
   onOpened: () => Promise.resolve(() => {}),
+  startupProblem: () => Promise.resolve(null),
+  quitApp: vi.fn(),
 }))
 vi.mock('./CloseChoice', () => ({
   CloseChoiceHost: function FakeCloseChoiceHost() {

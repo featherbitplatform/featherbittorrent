@@ -84,15 +84,24 @@ impl OpenedState {
     }
 
     /// Hands `items` to the page if it is listening, or keeps them for [`OpenedState::take`]. An item the
-    /// page could not be handed is kept too, for the next time it asks.
+    /// page could not be handed is kept too, and handed over again, ahead of the new ones, the next time
+    /// something arrives or the page asks.
     pub fn deliver(&self, items: Vec<OpenedItem>, page: &impl Page) {
         if items.is_empty() {
             return;
         }
-        let listening = self.lock().page_listening;
+        let (listening, earlier) = {
+            let mut inner = self.lock();
+            let earlier: Vec<OpenedItem> = if inner.page_listening {
+                inner.pending.drain(..).collect()
+            } else {
+                Vec::new()
+            };
+            (inner.page_listening, earlier)
+        };
         let mut missed = Vec::new();
         if listening {
-            for item in items {
+            for item in earlier.into_iter().chain(items) {
                 if let Err(problem) = page.emit(&item) {
                     eprintln!("The page could not be handed what was opened: {problem}");
                     missed.push(item);
@@ -113,7 +122,14 @@ impl OpenedState {
         }
     }
 
-    /// Everything kept so far, oldest first, and from now on items go to the page as they arrive.
+    /// The page started loading (a first load or a reload): it is not listening until it asks again, so
+    /// what arrives meanwhile is kept for that [`OpenedState::take`] rather than emitted into nothing.
+    pub fn page_gone(&self) {
+        self.lock().page_listening = false;
+    }
+
+    /// Everything kept so far, oldest first, and from now on items go to the page as they arrive. Every
+    /// page load asks once.
     pub fn take(&self) -> Vec<OpenedItem> {
         let mut inner = self.lock();
         inner.page_listening = true;
@@ -371,10 +387,61 @@ mod tests {
         );
         assert_eq!(page.emitted.borrow().len(), 1, "and opens nothing");
 
+        // A reload: the page is not listening until it asks again, and what arrives meanwhile is kept
+        // for that ask rather than emitted into nothing.
+        state.page_gone();
+        on_second_launch(
+            &state,
+            vec![
+                "featherbittorrent-desktop".to_string(),
+                "magnet:?xt=urn:btih:bbb".to_string(),
+            ],
+            &cwd,
+            &page,
+        );
+        assert_eq!(
+            page.emitted.borrow().len(),
+            1,
+            "not emitted to a page that is loading"
+        );
+        assert_eq!(
+            state.take(),
+            vec![OpenedItem::Magnet {
+                uri: "magnet:?xt=urn:btih:bbb".to_string()
+            }]
+        );
+
         // An open-URL event with nothing this app opens shows nothing and hands over nothing.
         on_open_urls(&state, vec!["https://example.com/".to_string()], &page);
-        assert_eq!(page.shown.get(), 3);
+        assert_eq!(page.shown.get(), 4);
         assert_eq!(page.emitted.borrow().len(), 1);
+    }
+
+    /// An item the page could not be handed is kept, and handed over first the next time something
+    /// arrives.
+    #[test]
+    fn a_missed_item_is_handed_over_again() {
+        struct Flaky(Cell<bool>, RefCell<Vec<OpenedItem>>);
+        impl Page for Flaky {
+            fn emit(&self, item: &OpenedItem) -> Result<(), String> {
+                if self.0.replace(false) {
+                    return Err("the page is gone".to_string());
+                }
+                self.1.borrow_mut().push(item.clone());
+                Ok(())
+            }
+            fn show(&self) {}
+        }
+        let magnet = |hash: &str| OpenedItem::Magnet {
+            uri: format!("magnet:?xt=urn:btih:{hash}"),
+        };
+        let state = OpenedState::new();
+        assert!(state.take().is_empty());
+        let page = Flaky(Cell::new(true), RefCell::new(Vec::new()));
+        state.deliver(vec![magnet("a")], &page);
+        assert!(page.1.borrow().is_empty());
+        state.deliver(vec![magnet("b")], &page);
+        assert_eq!(*page.1.borrow(), vec![magnet("a"), magnet("b")]);
     }
 
     /// A `.torrent` over the bound goes to the page as a refusal naming it, not as bytes; one at the
