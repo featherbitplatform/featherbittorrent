@@ -27,7 +27,9 @@
  *
  * The first-close question ({@link CloseChoiceHost}) sits beside the screens, outside anything keyed by
  * instance, so it answers in every phase and is never remounted by a switch. The tray names the
- * connected instance by its name in the list, never by its id.
+ * instance on screen by its name in the list, never by its id, in every phase: an instance switched to
+ * and found down is still the one the window shows. The links and files the app was opened with
+ * ({@link OpenedHost}) sit beside the screens too, so a switch never loses one.
  *
  * @module desktop/DesktopRoot
  */
@@ -46,6 +48,8 @@ import { connect, listInstances, LOCAL_ID, probeInstance, savePassword, setTrayI
 import type { InstancesList, Probe } from './bridge'
 import { CloseChoiceHost } from './CloseChoice'
 import { InstanceSwitcher } from './InstanceSwitcher'
+import { OpenedHost } from './OpenedAdd'
+import { StartupProblemHost } from './StartupProblem'
 import { Instances } from './Instances'
 
 type Phase =
@@ -148,6 +152,7 @@ export function DesktopRoot() {
     <>
       <DesktopScreens />
       <CloseChoiceHost />
+      <StartupProblemHost />
     </>
   )
 }
@@ -280,14 +285,14 @@ function DesktopScreens() {
     if (fresh !== null && !fresh.items.some((item) => item.id === current)) void open(LOCAL_ID, null)
   }, [reload, open, current])
 
-  // The tray names the instance the page is connected to, by the name the switcher shows.
-  const connectedName = phase.phase === 'ready' ? trayName(list, phase.id) : null
+  // The tray names the instance on screen, by the name the switcher shows, whatever phase it is in.
+  const shownName = trayName(list, phase.id)
   useEffect(() => {
-    if (connectedName === null) return
-    setTrayInstance(connectedName).catch((cause: unknown) => {
+    if (shownName === null) return
+    setTrayInstance(shownName).catch((cause: unknown) => {
       console.warn('The tray could not name the connected instance:', cause)
     })
-  }, [connectedName])
+  }, [shownName])
 
   const offer: SavePasswordOffer | null =
     current === LOCAL_ID
@@ -348,6 +353,10 @@ function DesktopScreens() {
           </Button>
         </div>
       )}
+      <OpenedHost
+        instances={list.items}
+        shown={{ id: phase.id, connection: phase.phase === 'ready' ? phase.connection : null }}
+      />
       <div className="relative flex min-h-0 flex-1 flex-col overflow-auto">
         <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
       </div>

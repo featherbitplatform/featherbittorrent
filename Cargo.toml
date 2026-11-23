@@ -213,6 +213,12 @@ rfd = { version = "=0.17.2", default-features = false }
 # runtime (a LaunchAgent on macOS, the Run key on Windows, an XDG autostart entry on Linux), launched with
 # `--background`. Pinned to the spike's version, which needs tauri ^2.12 like the rest.
 tauri-plugin-autostart = "=2.7.0"
+# A second launch hands its arguments (a `magnet:` link, a `.torrent` file) to the copy already running
+# and exits (Task 9). Pinned to the spike's version.
+tauri-plugin-single-instance = "=2.5.5"
+# The `magnet:` scheme: registered with the system from `plugins.deep-link` in `tauri.conf.json` when the
+# app is bundled, and the links the system hands the running app (Task 9). Pinned to the spike's version.
+tauri-plugin-deep-link = "=2.6.3"
 # The Linux tray check (Task 8): whether a StatusNotifier host owns `org.kde.StatusNotifierWatcher` on the
 # session bus, since the tray builder succeeds without one. Already in the tree through keyring's Linux
 # store, at its default features (async-io and the blocking API), so this adds no crates.
