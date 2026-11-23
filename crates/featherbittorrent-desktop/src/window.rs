@@ -253,7 +253,8 @@ mod tests {
         assert_eq!(main["titleBarStyle"], "Overlay");
         assert_eq!(main["hiddenTitle"], true);
         assert_eq!(main["trafficLightPosition"]["x"], 16);
-        assert_eq!(main["trafficLightPosition"]["y"], 34);
+        // y was set by eye against the owner's macOS screenshot (buttons centred in the 48 px bar).
+        assert_eq!(main["trafficLightPosition"]["y"], 26);
     }
 
     /// Windows and Linux open undecorated from the first frame. Tauri merges the platform file as a
