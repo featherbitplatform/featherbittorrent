@@ -706,7 +706,13 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     // iPhone Safari has no `requestFullscreen` on elements: the video's own fullscreen player is
     // the one fullscreen there is.
     const video = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null
-    if (typeof video?.webkitEnterFullscreen === 'function') video.webkitEnterFullscreen()
+    if (typeof video?.webkitEnterFullscreen === 'function') {
+      try {
+        video.webkitEnterFullscreen()
+      } catch {
+        // Before the video has its metadata, Safari refuses with `InvalidStateError`.
+      }
+    }
   }
 
   /** Move the playhead to a point of the Seek bar, in source seconds. */
