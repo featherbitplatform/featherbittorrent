@@ -400,10 +400,10 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     video.addEventListener('volumechange', onVolume)
 
     // The position is saved every five seconds, and on the way out. It is remembered in source
-    // seconds, the clock `positions` keeps, and the duration is in its own milliseconds: the
-    // conversion is the one at the boundary, not a mix of the two clocks.
+    // seconds, the clock `positions` keeps: the duration is converted to the same clock, so the
+    // "finished within" clear at the end of the file can see it.
     const save = (): void =>
-      savePosition(id, file, toSource(video.currentTime, probe.time_offset_ms) / 1000, probe.duration_ms)
+      savePosition(id, file, toSource(video.currentTime, probe.time_offset_ms) / 1000, probe.duration_ms / 1000)
     const saveTimer = setInterval(save, 5_000)
 
     return () => {
