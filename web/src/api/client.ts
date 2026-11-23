@@ -50,6 +50,12 @@ export interface DirectoryListing {
   dirs: string[]
 }
 
+/** One paired device, as `GET /api/v1/auth/devices` lists it (this product's own route, not in the OpenAPI document). */
+export interface DeviceRow {
+  name: string
+  fingerprint: string
+}
+
 /** The kind of track a file carries, as the media probe says it. */
 export type MediaTrackKind = 'video' | 'audio' | 'subtitle'
 
@@ -174,11 +180,25 @@ export interface Api {
   subtitleFile(id: string, file: number, sub: number): Promise<{ cues: Cue[] }>
   streamToken(id: string, file: number): Promise<string>
   mediaStreamUrl(id: string, file: number, track: number, startMs: number): string
+  setFilePriorities(id: string, priorities: Array<components['schemas']['PriorityDto']>): Promise<void>
+  setQueuePosition(id: string, position: number): Promise<void>
+  recheck(id: string): Promise<void>
+  reannounce(id: string): Promise<void>
+  setTorrentLimits(id: string, downloadBps: number | null, uploadBps: number | null): Promise<void>
+  moveStorage(id: string, path: string): Promise<void>
+  setSessionLimits(downloadBps: number | null, uploadBps: number | null): Promise<void>
+  queueSettings(): Promise<components['schemas']['QueueSettingsDto']>
+  setQueueSettings(settings: components['schemas']['QueueSettingsDto']): Promise<void>
+  devices(): Promise<DeviceRow[]>
+  addDevice(name: string, publicKey: string): Promise<DeviceRow>
+  removeDevice(name: string): Promise<void>
+  mkdir(parent: string, name: string): Promise<string>
 }
 
 const TORRENTS = '/api/v1/torrents'
 const MEDIA = '/api/v1/media'
 const STREAM_TOKENS = '/api/v1/stream-tokens'
+const DEVICES = '/api/v1/auth/devices'
 
 /**
  * A time the query string carries, in whole source milliseconds: the wire names them as non-negative
@@ -206,7 +226,7 @@ export function createClient(
 ): Api {
   async function request(
     url: string,
-    method: 'GET' | 'POST' | 'DELETE',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     body?: BodyInit,
     contentType?: string,
   ): Promise<Response> {
@@ -246,15 +266,20 @@ export function createClient(
 
   async function json<T>(
     url: string,
-    method: 'GET' | 'POST' | 'DELETE',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     body?: BodyInit,
     contentType?: string,
   ): Promise<T> {
     return (await (await request(url, method, body, contentType)).json()) as T
   }
 
-  async function nothing(url: string, method: 'POST' | 'DELETE'): Promise<void> {
+  async function nothing(url: string, method: 'POST' | 'PUT' | 'DELETE'): Promise<void> {
     await request(url, method)
+  }
+
+  /** A change that carries a JSON body and answers with nothing worth reading. */
+  async function sendJson(url: string, method: 'POST' | 'PUT', body: unknown): Promise<void> {
+    await request(url, method, JSON.stringify(body), 'application/json')
   }
 
   /** One torrent, addressed: the id is remote text and a raw slash would be somebody else's path. */
@@ -319,6 +344,28 @@ export function createClient(
     },
     mediaStreamUrl: (id, file, track, startMs) =>
       `${MEDIA}/${encodeURIComponent(id)}/${encodeURIComponent(file)}/tracks/${encodeURIComponent(track)}/stream?start_ms=${encodeURIComponent(wholeMs(startMs))}`,
+    setFilePriorities: (id, priorities) =>
+      sendJson(torrentPath(id, '/file-priorities'), 'PUT', { priorities } satisfies components['schemas']['FilePrioritiesRequest']),
+    setQueuePosition: (id, position) =>
+      sendJson(torrentPath(id, '/queue-position'), 'PUT', { position } satisfies components['schemas']['QueuePositionRequest']),
+    recheck: (id) => nothing(torrentPath(id, '/recheck'), 'POST'),
+    reannounce: (id) => nothing(torrentPath(id, '/reannounce'), 'POST'),
+    setTorrentLimits: (id, downloadBps, uploadBps) =>
+      sendJson(torrentPath(id, '/limits'), 'PUT', { download: downloadBps, upload: uploadBps }),
+    moveStorage: (id, path) =>
+      sendJson(torrentPath(id, '/move'), 'POST', { path, mode: 'fail_if_exists' }),
+    setSessionLimits: (downloadBps, uploadBps) =>
+      sendJson('/api/v1/session/limits', 'PUT', { download: downloadBps, upload: uploadBps }),
+    queueSettings: () => json('/api/v1/session/queue', 'GET'),
+    setQueueSettings: (settings) => sendJson('/api/v1/session/queue', 'PUT', settings),
+    devices: () => json(DEVICES, 'GET'),
+    addDevice: (name, publicKey) =>
+      json(DEVICES, 'POST', JSON.stringify({ name, public_key: publicKey }), 'application/json'),
+    removeDevice: (name) => nothing(`${DEVICES}/${encodeURIComponent(name)}`, 'DELETE'),
+    mkdir: async (parent, name) => {
+      const answer = (await json('/api/v1/fs/mkdir', 'POST', JSON.stringify({ parent, name }), 'application/json')) as { path: string }
+      return answer.path
+    },
   }
 }
 
