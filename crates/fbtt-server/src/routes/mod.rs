@@ -674,25 +674,30 @@ impl RouteError {
 
 impl From<JsonRejection> for RouteError {
     fn from(problem: JsonRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // serde's message quotes what the client sent (an unknown field's name, a string it could not read),
+        // so it is remote text like any other on its way into a response.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<BytesRejection> for RouteError {
     fn from(problem: BytesRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<QueryRejection> for RouteError {
     fn from(problem: QueryRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
 impl From<PathRejection> for RouteError {
     fn from(problem: PathRejection) -> Self {
-        Self::rejection(problem.status(), problem.body_text())
+        // Remote text, like the JSON rejection's: it can quote what the client sent.
+        Self::rejection(problem.status(), clean(&problem.body_text()))
     }
 }
 
@@ -853,6 +858,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/api/v1/auth/devices/{name}", delete(devices::remove))
         .route("/api/v1/fs/roots", get(fs::roots))
         .route("/api/v1/fs/list", get(fs::list))
+        // The one route here that writes to the server's disk on a client's say-so: one folder, inside the
+        // allowed folders, behind the same login and CSRF check as every other change. Its body is a path
+        // and a name, so it gets a cap of its own rather than fbt-api's room for a `.torrent`.
+        .route(
+            "/api/v1/fs/mkdir",
+            post(fs::mkdir).layer(DefaultBodyLimit::max(fs::MAX_MKDIR_BODY)),
+        )
         // The one route here that hands out a credential, so it needs a session exactly like everything else
         // that is not a login. Its body is two short fields and fbt-api's 32 MiB is room for uploading a
         // `.torrent`, so it gets a cap of its own, which the route reads with in [`read_capped`]: with logins
