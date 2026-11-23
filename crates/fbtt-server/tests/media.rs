@@ -365,6 +365,13 @@ async fn wait_until_known(served: &Served, token: Option<&str>, id: &str) {
 /// over, every piece that hashed right is verified and reads of it answer at once. With a hole no
 /// peer holds, the pass ends with the torrent at `downloading` - it will never reach `seeding` -
 /// and that settled state is exactly the moment pieces zero to two can be played from.
+///
+/// The state on its own does not prove the pass is over, so the answer is asked twice over. The
+/// engine reports `checking_progress` in one state only, the checking one, and nothing else about a
+/// torrent says how far its pass has got; a torrent that has been added and has not started its pass
+/// says `queued_for_checking`, and one whose metadata has not arrived has nothing checked at all. So
+/// the wait is over once the report carries the metadata, carries no check progress, and names a
+/// state that is neither a check nor a wait for one.
 async fn wait_until_checked(served: &Served, token: Option<&str>, id: &str) {
     let client = http();
     let until = Instant::now() + DEADLINE;
@@ -375,25 +382,24 @@ async fn wait_until_checked(served: &Served, token: Option<&str>, id: &str) {
             token,
         )
         .await;
-        let state = if response.status().is_success() {
-            body(response).await["state"]
-                .as_str()
-                .map(|state| state.to_string())
+        let info = if response.status().is_success() {
+            body(response).await
         } else {
-            None
+            Value::Null
         };
-        match state.as_deref() {
-            Some("downloading") | Some("seeding") => return,
-            Some(other) if Instant::now() >= until => panic!(
-                "torrent {id} sat in state {other} for {} seconds",
-                DEADLINE.as_secs()
-            ),
-            _ => {}
+        let checked = info["has_metadata"].as_bool() == Some(true)
+            && info["checking_progress"].is_null()
+            && matches!(
+                info["state"].as_str(),
+                Some("downloading") | Some("seeding")
+            );
+        if checked {
+            return;
         }
         if Instant::now() >= until {
             panic!(
-                "torrent {id} never finished its check pass within {} seconds",
-                DEADLINE.as_secs()
+                "torrent {id} never reported its check pass over within {} seconds: {info}",
+                DEADLINE.as_secs(),
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
