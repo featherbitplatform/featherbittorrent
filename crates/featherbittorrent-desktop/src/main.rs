@@ -14,6 +14,8 @@ mod keychain;
 mod lifecycle;
 mod local;
 mod opened;
+mod preferences;
+mod serving;
 mod settings_store;
 mod startup;
 mod tray;
@@ -72,7 +74,9 @@ fn main() {
         ))
         .manage(DesktopState::starting())
         .manage(opened::OpenedState::new())
+        // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
+        .manage(serving::Serving::new(paths.clone(), settings_store.clone()))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
             settings_store.clone(),
@@ -118,7 +122,12 @@ fn main() {
             tray::set_tray_instance,
             opened::take_opened,
             startup::startup_problem,
-            startup::quit_app
+            startup::quit_app,
+            preferences::desktop_preferences,
+            preferences::get_shortcuts,
+            preferences::set_shortcuts,
+            serving::serving_status,
+            serving::set_serving
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|problem| {

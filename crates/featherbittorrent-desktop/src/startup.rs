@@ -141,6 +141,42 @@ impl Startup {
         }
     }
 
+    /// `read` applied to the engine while it runs; `None` while it starts, restarts, failed or stopped.
+    pub fn with_running<T>(&self, read: impl FnOnce(&ThisComputer) -> T) -> Option<T> {
+        match &*self.lock() {
+            Phase::Running(this) => Some(read(this)),
+            _ => None,
+        }
+    }
+
+    /// The start of a restart (Serve the web UI changed): the running engine is taken out to be stopped
+    /// and the phase is starting again, so a connect meanwhile waits for the new engine rather than
+    /// answering the old secret. `None` when there was no engine to take (a restart that could not start
+    /// one before). A failed first start is not restarted: its line is the answer. The caller has waited
+    /// for the first start to settle and holds the engine lock ([`crate::lifecycle::Lifecycle`]).
+    pub fn begin_restart(&self) -> Result<Option<ThisComputer>, String> {
+        let mut phase = self.lock();
+        match std::mem::replace(&mut *phase, Phase::Starting) {
+            Phase::Running(this) => Ok(Some(this)),
+            Phase::Stopped => Ok(None),
+            Phase::Failed(problem) => {
+                let message = problem.message.clone();
+                *phase = Phase::Failed(problem);
+                Err(message)
+            }
+            Phase::Starting => Err(START_TOO_SLOW.to_string()),
+        }
+    }
+
+    /// The end of a restart: the new engine runs, or there is none (stopped). Wakes everything waiting.
+    pub fn finish_restart(&self, running: Option<ThisComputer>) {
+        *self.lock() = match running {
+            Some(this) => Phase::Running(this),
+            None => Phase::Stopped,
+        };
+        self.settled.notify_waiters();
+    }
+
     /// Takes This computer out to stop it, waiting for a start under way (at most `limit`): a quit while
     /// starting still stops the engine and saves. `None` when there is none to stop. The code the app
     /// exits with is [`Startup::exit_code`], which a take leaves as it was.

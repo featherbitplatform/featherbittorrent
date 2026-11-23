@@ -34,9 +34,10 @@ tauri-plugin-deep-link.workspace = true
 base64.workspace = true
 # The file URLs macOS hands an app that was opened with a `.torrent`.
 url.workspace = true
-# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save; and
-# the wait on This computer's start (`startup.rs`: a notify, a timeout, `pin!`). The runtime itself is
-# Tauri's; this only names the features.
+# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save; the
+# wait on This computer's start (`startup.rs`: a notify, a timeout, `pin!`); and the async lock that keeps
+# a start or restart of This computer and a quit from overlapping (`sync`). The runtime itself is Tauri's;
+# this only names the features.
 tokio = { workspace = true, features = ["signal", "sync", "time", "macros"] }
 # `generate_context!` expands to code that names `serde_json` from the crate that calls it, so it has to
 # be a direct dependency (the Tauri spike's finding).
@@ -47,8 +48,10 @@ serde.workspace = true
 fbtt-desktop-core.workspace = true
 # This computer's library: its config and its lock.
 fbtt-core.workspace = true
-# This computer's engine, served on loopback with the launch secret (`Server::start_desktop`).
-fbtt-server.workspace = true
+# This computer's engine, served on loopback with the launch secret (`Server::start_desktop`). `web-ui`:
+# with Serve the web UI on, the engine serves the browser page to other machines as the full build does
+# (the app needs `web/dist` built anyway, for its own window).
+fbtt-server = { workspace = true, features = ["web-ui"] }
 # The engine's own settings type, which `Server::start_desktop` takes beside the config.
 fbt.workspace = true
 # Saved instance passwords, in the system keychain (`keychain.rs`).

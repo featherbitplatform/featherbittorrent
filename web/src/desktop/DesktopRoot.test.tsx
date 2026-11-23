@@ -15,6 +15,8 @@ import { TitleBarSlotsContext } from '../components/titleBarSlots'
 import type { TitleBarSlots } from '../components/titleBarSlots'
 import { useConnection } from '../connection'
 import { useSavePassword } from '../savePassword'
+import { useDesktopSettings } from '../desktopSettings'
+import { effectiveBindings, KEY_BINDINGS, setOverrides } from '../keys'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
 import { installDialogShim } from '../dialog-shim'
@@ -26,6 +28,8 @@ const shell = vi.hoisted(() => ({
   savePassword: vi.fn(),
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
+  getShortcuts: vi.fn(() => Promise.resolve([])),
+  finishApply: null as ((problem: string | null) => Promise<void>) | null,
   seen: [] as Connection[],
   mounts: 0,
   hostMounts: 0,
@@ -46,6 +50,35 @@ vi.mock('./bridge', () => ({
   onOpened: () => Promise.resolve(() => {}),
   startupProblem: () => Promise.resolve(null),
   quitApp: vi.fn(),
+  getShortcuts: shell.getShortcuts,
+}))
+vi.mock('./DesktopSettings', () => ({
+  INSTANCES_SECTION: 'settings-desktop-instances',
+  SERVING_SECTION: 'settings-desktop-serving',
+  DesktopSettings: function FakeDesktopSettings({
+    onServingApplying,
+    onServingChanged,
+  }: {
+    onServingApplying(): void
+    onServingChanged(problem: string | null): Promise<void>
+  }) {
+    return (
+      <>
+        <button type="button" onClick={() => void onServingChanged(null)}>
+          serving applied
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onServingApplying()
+            shell.finishApply = onServingChanged
+          }}
+        >
+          start apply
+        </button>
+      </>
+    )
+  },
 }))
 vi.mock('./CloseChoice', () => ({
   CloseChoiceHost: function FakeCloseChoiceHost() {
@@ -64,8 +97,12 @@ vi.mock('../App', () => ({
     }, [])
     const endpoint = connection.endpoint
     const offer = useSavePassword()
+    const desktop = useDesktopSettings()
+    const request = desktop?.request ?? null
     return (
       <div>
+        {request !== null && <div>settings at {request.section}</div>}
+        {desktop?.sections}
         <div>
           workspace {endpoint.kind === 'bearer' ? `${endpoint.base} ${endpoint.token ?? 'signed out'}` : ''}
         </div>
@@ -362,4 +399,88 @@ it('an_opened_link_survives_a_switch', async () => {
   switchTo(/Pi at home/)
   await screen.findByText(`workspace ${PI} session`)
   expect((screen.getByLabelText('Magnet link') as HTMLInputElement).value).toBe(magnet)
+})
+
+it('manage_instances_opens_settings_at_the_instances_section', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: /^Instance:/ }))
+  fireEvent.click(screen.getByRole('menuitem', { name: 'Manage instances' }))
+  await screen.findByText('settings at settings-desktop-instances')
+  expect(screen.queryByRole('heading', { name: 'Instances', level: 1 }), 'the standalone manager opened').toBeNull()
+})
+
+it('a_serving_change_reconnects_this_computer_at_once', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+  expect(shell.connect).toHaveBeenCalledTimes(2)
+})
+
+it('a_serving_change_that_kept_the_secret_does_not_remount', async () => {
+  shell.connect.mockResolvedValue(bearer('same'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} same`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await waitFor(() => expect(shell.connect).toHaveBeenCalledTimes(2))
+  expect(shell.mounts).toBe(1)
+})
+
+it('the_saved_shortcuts_are_applied_at_start', async () => {
+  const binding = KEY_BINDINGS.find((b) => b.where === 'Torrent list')!
+  shell.getShortcuts.mockResolvedValueOnce([{ where: binding.where, action: binding.action, keys: ['F9'] }] as never)
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await waitFor(() =>
+    expect(effectiveBindings().find((b) => b.where === binding.where && b.action === binding.action)?.keys).toEqual([
+      'F9',
+    ]),
+  )
+  setOverrides([])
+})
+
+it('a_failed_request_during_a_serving_apply_ends_on_settings_at_serving', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'start apply' }))
+  // The old engine is down: a request fails, and the new one refuses the old secret.
+  vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))))
+  fireEvent.click(screen.getByRole('button', { name: 'read torrents' }))
+  rejectToken(shell.seen[shell.seen.length - 1]!)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(shell.connect, 'no reconnect while the apply runs').toHaveBeenCalledTimes(1)
+  await act(async () => {
+    await shell.finishApply!(null)
+  })
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
+  expect(screen.queryByText(UNREACHABLE_COPY)).toBeNull()
+})
+
+it('a_serving_apply_that_ends_unreachable_reconnects_to_settings_at_serving', async () => {
+  shell.connect
+    .mockResolvedValueOnce(bearer('first'))
+    .mockResolvedValueOnce(bearer('first'))
+    .mockRejectedValueOnce('This computer is not running.')
+    .mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'start apply' }))
+  const finish = shell.finishApply!
+  // Another answer clears the apply (same secret: nothing to do), then the window lands on Cannot
+  // reach the server, and only then does the first apply answer.
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await waitFor(() => expect(shell.connect).toHaveBeenCalledTimes(2))
+  rejectToken(shell.seen[shell.seen.length - 1]!)
+  await screen.findByText(UNREACHABLE_COPY)
+  await act(async () => {
+    await finish('The address is in use.')
+  })
+  await screen.findByText(`workspace ${BASE} restarted`)
+  await screen.findByText('settings at settings-desktop-serving')
 })

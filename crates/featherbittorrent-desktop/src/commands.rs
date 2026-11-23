@@ -28,9 +28,32 @@ impl DesktopState {
         }
     }
 
-    /// This computer's start, which connect and quit wait on.
+    /// The state of a run whose engine already runs: what a test starts from.
+    #[cfg(test)]
+    pub fn running(this_computer: crate::local::ThisComputer) -> Self {
+        let state = DesktopState::starting();
+        state.startup.finish(Ok(this_computer));
+        state
+    }
+
+    /// This computer's start, which connect, quit and a serving restart wait on.
     pub fn startup(&self) -> &Startup {
         &self.startup
+    }
+
+    /// The address This computer listens on, while it runs (served to others or not). The tests' view.
+    #[cfg(test)]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.startup
+            .with_running(crate::local::ThisComputer::local_addr)
+    }
+
+    /// The address This computer serves other machines on: only while it runs and was started with Serve
+    /// the web UI on. A window-only engine (loopback, launch secret only) is never an address to give out.
+    pub fn serving_addr(&self) -> Option<std::net::SocketAddr> {
+        self.startup
+            .with_running(|this| this.exposed().then(|| this.local_addr()))
+            .flatten()
     }
 }
 

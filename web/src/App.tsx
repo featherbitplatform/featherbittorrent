@@ -36,11 +36,12 @@
  *
  * @module App
  */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
 import { useConnection } from './connection'
+import { useDesktopSettings } from './desktopSettings'
 import { useSession } from './session'
 import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
@@ -58,6 +59,9 @@ export default function App() {
   // Whether Settings owns a history entry, and the number of the last one it pushed.
   const settingsPushed = useRef(false)
   const settingsToken = useRef(0)
+  // The desktop app asks for Settings at a section (Manage instances, or after This computer restarted).
+  const desktop = useDesktopSettings()
+  const [settingsSection, setSettingsSection] = useState<string | null>(null)
 
   useEffect(() => {
     const onPop = (event: PopStateEvent): void => {
@@ -74,14 +78,15 @@ export default function App() {
     }
   }, [])
 
-  function openSettings(): void {
+  const openSettings = useCallback((section: string | null = null): void => {
+    setSettingsSection(section)
     if (!settingsPushed.current) {
       settingsToken.current += 1
       window.history.pushState({ fbttSettings: settingsToken.current }, '')
       settingsPushed.current = true
     }
     setSettingsOpen(true)
-  }
+  }, [])
 
   /** Back to torrents: through the history when Settings owns an entry, so the entry is consumed. */
   function closeSettings(): void {
@@ -116,6 +121,17 @@ export default function App() {
 
   // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
   const workspace = state.phase === 'signedIn' || state.phase === 'open'
+
+  // A desktop request is answered once the workspace is on screen, and then handed back as done.
+  const request = desktop?.request ?? null
+  const onOpened = desktop?.onOpened
+  const answered = useRef<number | null>(null)
+  useEffect(() => {
+    if (!workspace || request === null || answered.current === request.seq) return
+    answered.current = request.seq
+    openSettings(request.section)
+    onOpened?.(request.seq)
+  }, [workspace, request, onOpened, openSettings])
   if (!workspace && settingsOpen) setSettingsOpen(false)
   // ...and the entry Settings pushed goes back with it.
   useEffect(() => {
@@ -166,13 +182,13 @@ export default function App() {
       ) : (
         <>
           {settingsOpen && (
-            <Settings onBack={closeSettings} />
+            <Settings onBack={closeSettings} section={settingsSection} />
           )}
           {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
           <div hidden={settingsOpen}>
             <Torrents
               hidden={settingsOpen}
-              onSettings={openSettings}
+              onSettings={() => openSettings()}
               signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}
               onSignOut={() => void signOut()}

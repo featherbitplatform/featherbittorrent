@@ -8,6 +8,11 @@
 //! down) reaches [`handle_run_event`] as `RunEvent::Exit` with nothing before it, and the process ends
 //! when that handler returns: so the handler stops This computer itself when no quit has started, and
 //! waits for the save of the quit that has ([`on_exit`], [`QUIT_WAIT`]).
+//!
+//! This computer is also stopped and started again while the app runs, when Serve the web UI changes
+//! ([`Lifecycle::restart_this_computer`]). A restart and a quit take the same engine lock, so they never
+//! overlap: a quit that arrives during a restart waits for it and then stops (and saves) whatever engine
+//! the restart left, and a restart that finds a quit under way does not start a new engine at all.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -18,6 +23,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::DesktopState;
+use crate::local::ThisComputer;
 use crate::settings_store::SettingsStore;
 use crate::startup::START_WAIT;
 
@@ -177,7 +183,12 @@ pub struct Lifecycle {
     tray_available: AtomicBool,
     phase: Mutex<QuitPhase>,
     stopped: Condvar,
+    /// Held by whatever stops or starts This computer: a quit's final stop and a restart. One at a time.
+    engine: tokio::sync::Mutex<()>,
 }
+
+/// What a restart answers when the app is already quitting: nothing is started again.
+pub const QUITTING: &str = "featherbittorrent is quitting.";
 
 impl Lifecycle {
     /// The lifecycle of a run whose settings live in `settings`. No tray until [`set_tray_available`]
@@ -190,6 +201,7 @@ impl Lifecycle {
             tray_available: AtomicBool::new(false),
             phase: Mutex::new(QuitPhase::Running),
             stopped: Condvar::new(),
+            engine: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -218,7 +230,7 @@ impl Lifecycle {
 
     /// Moves from running to quitting. True the first time, false every time after: one quit runs, the
     /// rest wait for it.
-    fn begin_quit(&self) -> bool {
+    pub(crate) fn begin_quit(&self) -> bool {
         let mut phase = self
             .phase
             .lock()
@@ -251,6 +263,54 @@ impl Lifecycle {
             .wait_timeout_while(phase, limit, |phase| *phase == QuitPhase::Quitting)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *phase != QuitPhase::Quitting
+    }
+
+    /// The quit's stop: waits for any restart in progress, and for This computer's first start when it is
+    /// still under way (at most [`START_WAIT`]), then takes the engine out and stops it (its final save).
+    /// Nothing to stop is not a problem: a failed start, or a restart that found the quit under way and
+    /// started no new engine. The code to exit with is then [`crate::startup::Startup::exit_code`].
+    pub async fn stop_for_quit(&self, state: &DesktopState) {
+        let _engine = self.engine.lock().await;
+        if let Some(this_computer) = state.startup().take_when_settled(START_WAIT).await {
+            this_computer.stop().await;
+        }
+    }
+
+    /// Stops This computer and starts it again with `start`, under the engine lock, so a quit never sees
+    /// it half way. A restart asked for while the first start is still under way waits for it (at most
+    /// [`START_WAIT`]); one after a failed first start answers that start's line and starts nothing.
+    /// `start` runs with the old engine stopped and the library free (it may change the library's config
+    /// before it starts the new one); it answers the engine to keep running, if any, and the answer for
+    /// the caller. Meanwhile a connect for This computer waits for the new engine. A quit that began
+    /// before the lock was taken, or while the old engine was stopping, means no new engine is started
+    /// and the answer is [`QUITTING`].
+    pub async fn restart_this_computer<T, F, Fut>(
+        &self,
+        state: &DesktopState,
+        start: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = (Option<ThisComputer>, Result<T, String>)>,
+    {
+        let _engine = self.engine.lock().await;
+        if self.phase() != QuitPhase::Running {
+            return Err(QUITTING.to_string());
+        }
+        let startup = state.startup();
+        if !startup.settled(START_WAIT).await {
+            return Err(crate::startup::START_TOO_SLOW.to_string());
+        }
+        if let Some(old) = startup.begin_restart()? {
+            old.stop().await;
+        }
+        if self.phase() != QuitPhase::Running {
+            startup.finish_restart(None);
+            return Err(QUITTING.to_string());
+        }
+        let (running, answer) = start().await;
+        startup.finish_restart(running);
+        answer
     }
 }
 
@@ -313,12 +373,10 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let startup = app.state::<DesktopState>();
-        let this_computer = startup.startup().take_when_settled(START_WAIT).await;
-        if let Some(this_computer) = this_computer {
-            this_computer.stop().await;
-        }
-        let code = startup.startup().exit_code();
+        let lifecycle = app.state::<Lifecycle>();
+        let state = app.state::<DesktopState>();
+        lifecycle.stop_for_quit(&state).await;
+        let code = state.startup().exit_code();
         // Stopped before the exit, so the exit request it causes is let through.
         app.state::<Lifecycle>().finish_quit();
         app.exit(code);
@@ -346,13 +404,9 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
             match on_exit(lifecycle.phase()) {
                 ExitAnswer::StopHere => {
                     if lifecycle.begin_quit() {
-                        let startup = app.state::<DesktopState>();
-                        tauri::async_runtime::block_on(async {
-                            let taken = startup.startup().take_when_settled(START_WAIT).await;
-                            if let Some(this_computer) = taken {
-                                this_computer.stop().await;
-                            }
-                        });
+                        tauri::async_runtime::block_on(
+                            lifecycle.stop_for_quit(&app.state::<DesktopState>()),
+                        );
                         lifecycle.finish_quit();
                     } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
                         eprintln!("The final save did not finish in time; quitting without it.");

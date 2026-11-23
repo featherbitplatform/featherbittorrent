@@ -4,9 +4,9 @@
  *
  * @module components/settings/Shortcuts
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import type { JSX } from 'react'
-import { conflictFor, currentOverrides, effectiveBindings, setOverrides } from '../../keys'
+import { conflictFor, currentOverrides, effectiveBindings, setOverrides, subscribeOverrides } from '../../keys'
 import type { KeyBinding, ShortcutOverride } from '../../keys'
 
 const GROUPS: readonly KeyBinding['where'][] = ['Player', 'Torrent list', 'Detail tabs', 'Menus', 'Dialogs']
@@ -32,7 +32,6 @@ interface Props {
 }
 
 export function Shortcuts({ editable = false, onChange }: Props): JSX.Element {
-  const [, setVersion] = useState(0)
   const [capturing, setCapturing] = useState<string | null>(null)
   const [refusal, setRefusal] = useState<{ id: string; text: string } | null>(null)
 
@@ -66,14 +65,14 @@ export function Shortcuts({ editable = false, onChange }: Props): JSX.Element {
       next.push({ where, action, keys: [event.key] })
       setOverrides(next)
       setRefusal(null)
-      setVersion((v) => v + 1)
       onChange?.(currentOverrides())
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [capturing, onChange])
 
-  const bindings = effectiveBindings()
+  // Follows every change to the overrides, including ones applied from outside this list.
+  const bindings = useSyncExternalStore(subscribeOverrides, effectiveBindings)
   return (
     <div className="flex flex-col gap-4">
       {onPhone() && <p className="text-[13px] text-muted">For a keyboard.</p>}
@@ -138,7 +137,6 @@ export function Shortcuts({ editable = false, onChange }: Props): JSX.Element {
               setCapturing(null)
               setRefusal(null)
               setOverrides([])
-              setVersion((v) => v + 1)
               onChange?.([])
             }}
           >

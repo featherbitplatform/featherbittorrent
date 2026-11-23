@@ -3,6 +3,9 @@
  * instance the app can switch to, This computer first, with a mark on the connected one and a
  * `Manage instances` entry at the end.
  *
+ * The open menu opts out of the title bar's window dragging (`data-tauri-drag-region="false"`): it
+ * hangs below the bar inside the bar's "deep" drag group, and its padding and separator are not bar.
+ *
  * It is self-contained: it takes the list and says what was picked, and owns nothing but whether its
  * menu is open, so the title bar can place it wherever it has room.
  *
@@ -74,6 +77,9 @@ export function InstanceSwitcher({ instances, current, onSwitch, onManage }: Ins
           id={menuId}
           role="menu"
           aria-label="Instances"
+          // The title bar's group around the switcher drags the window from anywhere inside it ("deep");
+          // the open menu is not part of the bar, so pressing its padding or separator must not drag.
+          data-tauri-drag-region="false"
           className="absolute left-0 top-full z-50 mt-1 flex w-72 flex-col gap-0.5 rounded-overlay border border-rule bg-raised p-1 shadow-lg"
         >
           {ordered.map((item) => (

@@ -50,3 +50,9 @@ it('escape_closes_the_menu', () => {
   fireEvent.keyDown(document, { key: 'Escape' })
   expect(screen.queryByRole('menu')).toBeNull()
 })
+
+it('the_open_menu_does_not_drag_the_window', () => {
+  render(<InstanceSwitcher instances={ITEMS} current="local" onSwitch={vi.fn()} onManage={vi.fn()} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Instance: This computer' }))
+  expect(screen.getByRole('menu').getAttribute('data-tauri-drag-region')).toBe('false')
+})

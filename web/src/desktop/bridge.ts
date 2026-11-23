@@ -14,6 +14,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { Window } from '@tauri-apps/api/window'
 import { normaliseBase } from '../endpoint'
 import type { Endpoint } from '../endpoint'
+import type { ShortcutOverride } from '../keys'
 
 /** The shell's id for This computer, the app's own engine, and the instance the page opens on until saved instances arrive. */
 export const LOCAL_ID = 'local'
@@ -201,4 +202,55 @@ export async function startupProblem(): Promise<StartupProblem | null> {
 /** Quits the app; after a failed start the exit code says why (3 when another run holds the library). */
 export async function quitApp(): Promise<void> {
   await invoke('quit_app')
+}
+
+/** What closing the window does now (`ask` until the first answer) and whether the app starts at login. */
+export interface DesktopPreferences {
+  close: 'ask' | 'quit' | 'tray'
+  start_at_login: boolean
+}
+
+/** The Desktop section's switches as the shell's settings file has them. */
+export async function desktopPreferences(): Promise<DesktopPreferences> {
+  return invoke<DesktopPreferences>('desktop_preferences')
+}
+
+/** The keyboard shortcuts a person changed, as saved in the shell's settings file. */
+export async function getShortcuts(): Promise<ShortcutOverride[]> {
+  return invoke<ShortcutOverride[]>('get_shortcuts')
+}
+
+/** Saves the changed shortcuts; rejects with the shell's line when they cannot be saved. */
+export async function setShortcuts(list: ShortcutOverride[]): Promise<void> {
+  await invoke('set_shortcuts', { list })
+}
+
+/** Serve the web UI as the shell has it: the switch, the address and login the config names, and where it is reachable now (null while off). */
+export interface ServingState {
+  enabled: boolean
+  bind: string
+  user: string
+  address: string | null
+}
+
+/** What turning serving on or off asks for. The password is only needed for a user the config does not have yet. */
+export interface ServingRequest {
+  enabled: boolean
+  bind: string
+  user: string
+  password: string
+}
+
+/** Serve the web UI as it is now. */
+export async function servingStatus(): Promise<ServingState> {
+  return invoke<ServingState>('serving_status')
+}
+
+/**
+ * Turns Serve the web UI on or off, which restarts This computer: its launch secret changes, so the page
+ * connects to `local` again afterwards. Rejects with the shell's line (a missing password, an address
+ * that is taken).
+ */
+export async function setServing(request: ServingRequest): Promise<ServingState> {
+  return invoke<ServingState>('set_serving', { request })
 }

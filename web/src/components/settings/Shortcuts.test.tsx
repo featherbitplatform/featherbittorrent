@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { KEY_BINDINGS, matches, setOverrides } from '../../keys'
 import { Shortcuts } from './Shortcuts'
@@ -115,5 +115,18 @@ describe('the editable Shortcuts section', () => {
     fireEvent.keyDown(window, { key: 'r', metaKey: true })
     expect(onChange).not.toHaveBeenCalled()
     expect(container.textContent).toContain('Use a key without Ctrl, Alt or Cmd')
+  })
+})
+
+describe('overrides applied from outside', () => {
+  it('the list follows setOverrides', () => {
+    stubMedia(() => false)
+    const binding = KEY_BINDINGS.find((b) => b.where === 'Torrent list') ?? KEY_BINDINGS[0]!
+    const { container } = render(<Shortcuts />)
+    const row = () => container.querySelector(`[data-shortcut="${binding.where}/${binding.action}"]`)
+    act(() => setOverrides([{ where: binding.where, action: binding.action, keys: ['F9'] }]))
+    expect(row()?.textContent).toContain('F9')
+    act(() => setOverrides([]))
+    expect(row()?.textContent).not.toContain('F9')
   })
 })
