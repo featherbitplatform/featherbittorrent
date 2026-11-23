@@ -10,12 +10,18 @@
  * zero-length file counts as whole, as `share` does in `fbtt-tui/src/view/detail.rs`. Paths are
  * remote text and go through `displaySafe` before they are drawn.
  *
+ * A row whose path ends in one of the playable video extensions gets a `Play` button, the way
+ * milestone 2 can act on it: the button opens the player, and the player decides what the browser
+ * will do with the file. The extensions are matched case-insensitively, and a pad file never gets
+ * one, because a pad file is padding and not a file.
+ *
  * Rows are the pane's 28 px height with the table's own windowing shrunk to the pane (see
  * `window.ts`), because a torrent can hold thousands of files and the pane must not render them all.
  *
  * @module components/detail/Files
  */
 import { useMemo } from 'react'
+import { Play } from 'lucide-react'
 import type { FileInfo } from '../../api/client'
 import { displaySafe, formatBytes, formatPercent } from '../../format'
 import { DETAIL_ROW_HEIGHT, DETAIL_ROW_RULE, useRowWindow } from './window'
@@ -24,9 +30,22 @@ export interface FilesProps {
   files: FileInfo[]
   /** The scroll box's height in pixels. Given by tests because jsdom lays nothing out. */
   viewportHeight?: number
+  /** The torrent the files belong to, addressed the way every other call addresses it. */
+  id?: string
+  /** Open the player on a file. Only called for a file the player can open. */
+  onPlay?: (index: number) => void
 }
 
-export default function Files({ files, viewportHeight }: FilesProps) {
+/** The path endings the player offers to play, matched case-insensitively. */
+const PLAYABLE_SUFFIXES = ['.mkv', '.mp4', '.m4v', '.webm', '.mov']
+
+/** Whether a path is one the player opens, the way the Files tab offers to play it. */
+function isPlayablePath(path: string): boolean {
+  const lower = path.toLowerCase()
+  return PLAYABLE_SUFFIXES.some((suffix) => lower.endsWith(suffix))
+}
+
+export default function Files({ files, viewportHeight, id, onPlay }: FilesProps) {
   const shown = useMemo(() => files.filter((file) => !file.pad), [files])
   const { boxRef, onScroll, start, end, padTop, padBottom } = useRowWindow(
     shown.length,
@@ -51,12 +70,15 @@ export default function Files({ files, viewportHeight }: FilesProps) {
             <th scope="col" className="px-3 py-2 text-left font-medium">
               Priority
             </th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">
+              <span className="sr-only">Play</span>
+            </th>
           </tr>
         </thead>
         <tbody>
           {padTop > 0 && (
             <tr data-spacer="top" aria-hidden="true" style={{ height: padTop }}>
-              <td colSpan={4} />
+              <td colSpan={5} />
             </tr>
           )}
           {shown.slice(start, end).map((file) => {
@@ -87,19 +109,33 @@ export default function Files({ files, viewportHeight }: FilesProps) {
                 >
                   {file.priority}
                 </td>
+                <td className={`box-border h-7 px-3 text-right ${DETAIL_ROW_RULE}`}>
+                  {id !== undefined && onPlay !== undefined && !file.pad && isPlayablePath(file.path) && (
+                    <button
+                      type="button"
+                      aria-label="Play"
+                      onClick={() => {
+                        onPlay(file.index)
+                      }}
+                      className="inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-control text-muted hover:bg-ink-700 hover:text-strong"
+                    >
+                      <Play className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                  )}
+                </td>
               </tr>
             )
           })}
           {shown.length === 0 && (
             <tr>
-              <td colSpan={4} className="px-5 py-3 text-[12px] text-muted">
+              <td colSpan={5} className="px-5 py-3 text-[12px] text-muted">
                 No files.
               </td>
             </tr>
           )}
           {padBottom > 0 && (
             <tr data-spacer="bottom" aria-hidden="true" style={{ height: padBottom }}>
-              <td colSpan={4} />
+              <td colSpan={5} />
             </tr>
           )}
         </tbody>
