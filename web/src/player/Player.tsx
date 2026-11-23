@@ -836,6 +836,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
             )}
           </div>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-ink-700 px-3 py-2.5">
+            {/* The Seek bar gets its own full-width row on a phone, above the other controls:
+                sharing the row with the buttons and the volume slider squeezed it to ~30 px, so
+                it could not be used. The time text and the buttons stay on the controls row. */}
             <input
               type="range"
               aria-label="Seek"
@@ -849,7 +852,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 // The bar is in source time: the value is source seconds, mapped to the element.
                 video.currentTime = toMedia(Number(event.target.value) * 1000, probe?.time_offset_ms ?? 0)
               }}
-              className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 w-full shrink-0 min-[641px]:w-auto min-[641px]:min-w-0 min-[641px]:shrink flex-1 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent max-[640px]:order-first max-[640px]:flex-none"
             />
             <span className="font-mono text-[12px] text-strong">
               {clock(time / 1000)} / {clock(durationSourceSec)}
@@ -885,7 +888,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
                 video.volume = Number(event.target.value)
                 if (video.volume > 0 && video.muted) video.muted = false
               }}
-              className="h-1.5 w-20 min-[420px]:w-24 cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
+              className="h-1.5 w-20 min-[420px]:w-24 max-[640px]:hidden cursor-pointer appearance-none rounded-full bg-ink-600 accent-accent"
             />
             {audioOptions.length > 0 && (
               <ChoiceMenu
