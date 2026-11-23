@@ -136,7 +136,9 @@ function DesktopScreens() {
   const connectedId = phase.phase === 'ready' ? phase.id : null
   useEffect(() => {
     if (connectedId === null) return
-    setTrayInstance(connectedId === LOCAL_ID ? THIS_COMPUTER : connectedId).catch(() => undefined)
+    setTrayInstance(connectedId === LOCAL_ID ? THIS_COMPUTER : connectedId).catch((cause: unknown) => {
+      console.warn('The tray could not name the connected instance:', cause)
+    })
   }, [connectedId])
 
   if (phase.phase === 'connecting') return <Connecting />

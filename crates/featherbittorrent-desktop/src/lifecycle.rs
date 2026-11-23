@@ -3,15 +3,19 @@
 //! The decisions are pure functions ([`on_close_requested`], [`initial_window_state`]) tested without a
 //! webview; the rest of this file applies them to the app. Every way out of the app ends in [`quit`],
 //! which stops This computer (the engine's final save) before the process exits: the tray's Quit, a close
-//! that means quit, the page's own answer to the first-close question, and a quit signal on Unix. The
-//! system's own quit request (Cmd+Q, logging out, shutting down) reaches `main.rs` as `RunEvent::Exit`,
-//! which stops This computer there if nothing has yet.
+//! that means quit, the page's own answer to the first-close question, a quit signal on Unix, and an exit
+//! request Tauri reports while This computer runs. The system's own quit (Cmd+Q, logging out, shutting
+//! down) reaches [`handle_run_event`] as `RunEvent::Exit` with nothing before it, and the process ends
+//! when that handler returns: so the handler stops This computer itself when no quit has started, and
+//! waits for the save of the quit that has ([`on_exit`], [`QUIT_WAIT`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use fbtt_desktop_core::{CloseAction, DesktopSettings};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::DesktopState;
@@ -110,12 +114,67 @@ fn current_settings(path: &Path) -> DesktopSettings {
     })
 }
 
+/// The longest the system's exit waits for a quit's final save before it lets the process end anyway.
+pub const QUIT_WAIT: Duration = Duration::from_secs(30);
+
+/// Where the app is on its way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitPhase {
+    /// This computer runs; nothing has asked to quit.
+    Running,
+    /// A quit has taken This computer out and is waiting for its final save.
+    Quitting,
+    /// The final save is done (or there was nothing to save): the process may end.
+    Stopped,
+}
+
+/// What an exit request (`RunEvent::ExitRequested`) gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitRequestAnswer {
+    /// Hold it back and start the app's own quit, which ends in the exit once the save is done.
+    HoldAndQuit,
+    /// Hold it back: a quit is already saving and will exit when it is done.
+    Hold,
+    /// Let it through: it is the quit's own final exit.
+    Allow,
+}
+
+/// What an exit request gets in `phase`.
+pub fn on_exit_requested(phase: QuitPhase) -> ExitRequestAnswer {
+    match phase {
+        QuitPhase::Running => ExitRequestAnswer::HoldAndQuit,
+        QuitPhase::Quitting => ExitRequestAnswer::Hold,
+        QuitPhase::Stopped => ExitRequestAnswer::Allow,
+    }
+}
+
+/// What the event loop's last event (`RunEvent::Exit`) does before the process ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAnswer {
+    /// Nothing has stopped This computer: stop it here, and wait for the save.
+    StopHere,
+    /// A quit is saving: wait for it (at most [`QUIT_WAIT`]).
+    WaitForQuit,
+    /// The save is done.
+    Nothing,
+}
+
+/// What the last event does in `phase`.
+pub fn on_exit(phase: QuitPhase) -> ExitAnswer {
+    match phase {
+        QuitPhase::Running => ExitAnswer::StopHere,
+        QuitPhase::Quitting => ExitAnswer::WaitForQuit,
+        QuitPhase::Stopped => ExitAnswer::Nothing,
+    }
+}
+
 /// What the shell keeps for closing and quitting.
 #[derive(Debug)]
 pub struct Lifecycle {
     settings_file: PathBuf,
     tray_available: AtomicBool,
-    quitting: AtomicBool,
+    phase: Mutex<QuitPhase>,
+    stopped: Condvar,
 }
 
 impl Lifecycle {
@@ -127,7 +186,8 @@ impl Lifecycle {
         Lifecycle {
             settings_file,
             tray_available: AtomicBool::new(false),
-            quitting: AtomicBool::new(false),
+            phase: Mutex::new(QuitPhase::Running),
+            stopped: Condvar::new(),
         }
     }
 
@@ -149,9 +209,49 @@ impl Lifecycle {
         )
     }
 
-    /// True the first time it is called, false every time after: one quit runs, the rest wait for it.
+    /// Where the app is on its way out.
+    pub fn phase(&self) -> QuitPhase {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Moves from running to quitting. True the first time, false every time after: one quit runs, the
+    /// rest wait for it.
     fn begin_quit(&self) -> bool {
-        !self.quitting.swap(true, Ordering::SeqCst)
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *phase != QuitPhase::Running {
+            return false;
+        }
+        *phase = QuitPhase::Quitting;
+        true
+    }
+
+    /// The final save is done: wakes every exit waiting for it.
+    fn finish_quit(&self) {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = QuitPhase::Stopped;
+        self.stopped.notify_all();
+    }
+
+    /// Waits until a quit in progress has finished its save, for at most `limit`. True when it finished
+    /// (or none was in progress), false when the wait ran out.
+    fn wait_for_quit(&self, limit: Duration) -> bool {
+        let phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (phase, _) = self
+            .stopped
+            .wait_timeout_while(phase, limit, |phase| *phase == QuitPhase::Quitting)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *phase != QuitPhase::Quitting
     }
 }
 
@@ -216,8 +316,51 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
         if let Some(this_computer) = this_computer {
             this_computer.stop().await;
         }
+        // Stopped before the exit, so the exit request it causes is let through.
+        app.state::<Lifecycle>().finish_quit();
         app.exit(0);
     });
+}
+
+/// The app's answer to the event loop's own events: exit requests, the last event, and the Dock icon.
+pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
+    match event {
+        RunEvent::ExitRequested { api, .. } => {
+            match on_exit_requested(app.state::<Lifecycle>().phase()) {
+                ExitRequestAnswer::HoldAndQuit => {
+                    api.prevent_exit();
+                    quit(app);
+                }
+                ExitRequestAnswer::Hold => api.prevent_exit(),
+                ExitRequestAnswer::Allow => {}
+            }
+        }
+        // The Dock icon clicked while the window is hidden in the tray.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_window(app),
+        RunEvent::Exit => {
+            let lifecycle = app.state::<Lifecycle>();
+            match on_exit(lifecycle.phase()) {
+                ExitAnswer::StopHere => {
+                    if lifecycle.begin_quit() {
+                        if let Some(this_computer) = app.state::<DesktopState>().take() {
+                            tauri::async_runtime::block_on(this_computer.stop());
+                        }
+                        lifecycle.finish_quit();
+                    } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
+                        eprintln!("The final save did not finish in time; quitting without it.");
+                    }
+                }
+                ExitAnswer::WaitForQuit => {
+                    if !lifecycle.wait_for_quit(QUIT_WAIT) {
+                        eprintln!("The final save did not finish in time; quitting without it.");
+                    }
+                }
+                ExitAnswer::Nothing => {}
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Turns a quit signal (SIGTERM, SIGINT, SIGHUP) into [`quit`], so a stop by `kill` or a session ending
@@ -297,12 +440,17 @@ pub fn set_start_at_login(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use fbtt_core::scratch::ScratchDir;
     use fbtt_desktop_core::{CloseAction, DesktopSettings};
 
     use super::{
-        CloseOutcome, Lifecycle, WindowState, initial_window_state, on_close_requested,
-        parse_close_action, update_settings,
+        CloseOutcome, ExitAnswer, ExitRequestAnswer, Lifecycle, QuitPhase, WindowState,
+        initial_window_state, on_close_requested, on_exit, on_exit_requested, parse_close_action,
+        update_settings,
     };
 
     fn closing(close: CloseAction) -> DesktopSettings {
@@ -417,5 +565,75 @@ mod tests {
         let lifecycle = Lifecycle::new("unused.yaml".into());
         assert!(lifecycle.begin_quit());
         assert!(!lifecycle.begin_quit());
+        lifecycle.finish_quit();
+        assert!(
+            !lifecycle.begin_quit(),
+            "a finished quit does not start again"
+        );
+    }
+
+    /// Exit requests are held back while This computer runs or saves, and only the quit's own final
+    /// exit, after the save, goes through.
+    #[test]
+    fn exit_requests_are_held_until_the_save_is_done() {
+        assert_eq!(
+            on_exit_requested(QuitPhase::Running),
+            ExitRequestAnswer::HoldAndQuit
+        );
+        assert_eq!(
+            on_exit_requested(QuitPhase::Quitting),
+            ExitRequestAnswer::Hold
+        );
+        assert_eq!(
+            on_exit_requested(QuitPhase::Stopped),
+            ExitRequestAnswer::Allow
+        );
+        assert_eq!(on_exit(QuitPhase::Running), ExitAnswer::StopHere);
+        assert_eq!(on_exit(QuitPhase::Quitting), ExitAnswer::WaitForQuit);
+        assert_eq!(on_exit(QuitPhase::Stopped), ExitAnswer::Nothing);
+    }
+
+    /// The tray's Quit has started and is saving; Cmd+Q (the system's exit, with no request first)
+    /// arrives: the exit waits for the save and only then lets the process end.
+    #[test]
+    fn a_system_exit_during_a_quit_waits_for_the_save() {
+        let lifecycle = Arc::new(Lifecycle::new("unused.yaml".into()));
+        assert!(lifecycle.begin_quit(), "the tray's Quit starts");
+        assert_eq!(on_exit(lifecycle.phase()), ExitAnswer::WaitForQuit);
+
+        let saved = Arc::new(AtomicBool::new(false));
+        let saver = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let saved = Arc::clone(&saved);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                saved.store(true, Ordering::SeqCst);
+                lifecycle.finish_quit();
+            })
+        };
+        assert!(lifecycle.wait_for_quit(Duration::from_secs(10)));
+        assert!(
+            saved.load(Ordering::SeqCst),
+            "the exit went on before the save finished"
+        );
+        assert_eq!(
+            on_exit_requested(lifecycle.phase()),
+            ExitRequestAnswer::Allow,
+            "the quit's own final exit goes through"
+        );
+        saver.join().expect("the saver thread");
+    }
+
+    /// A save that never finishes does not hold the exit forever.
+    #[test]
+    fn the_wait_for_a_save_is_bounded() {
+        let lifecycle = Lifecycle::new("unused.yaml".into());
+        assert!(
+            lifecycle.wait_for_quit(Duration::from_millis(10)),
+            "no quit, no wait"
+        );
+        assert!(lifecycle.begin_quit());
+        assert!(!lifecycle.wait_for_quit(Duration::from_millis(50)));
+        assert_eq!(lifecycle.phase(), QuitPhase::Quitting);
     }
 }

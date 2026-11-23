@@ -1,7 +1,10 @@
 //! The tray: the app's icon while the window is hidden, with Show, the connected instance, and Quit.
 //!
-//! Whether there is a tray at all is what the tray builder says: a Linux desktop without an
-//! AppIndicator host refuses it, and then closing the window quits and the tray answer is not offered
+//! Whether there is a tray at all is what the tray builder says, and on Linux also whether anything will
+//! show it: the builder succeeds on a desktop with no StatusNotifier host (stock GNOME without the
+//! AppIndicator extension), where a window hidden to the tray could never come back. So on Linux the tray
+//! counts only when [`STATUS_NOTIFIER_WATCHER`] has an owner on the session bus, asked once at startup.
+//! Without a tray, closing the window quits and the tray answer is not offered
 //! ([`crate::lifecycle::Lifecycle::set_tray_available`]).
 
 use std::sync::Mutex;
@@ -24,6 +27,58 @@ pub const DEFAULT_INSTANCE: &str = "This computer";
 const SHOW_ID: &str = "show";
 const INSTANCE_ID: &str = "instance";
 const QUIT_ID: &str = "quit";
+
+// Asked only on Linux; the other systems always have a tray.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+/// The session bus name a StatusNotifier host (the thing that draws tray icons on Linux) owns.
+pub const STATUS_NOTIFIER_WATCHER: &str = "org.kde.StatusNotifierWatcher";
+
+// Asked only on Linux; the other systems always have a tray.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+/// Whether the answer to "does [`STATUS_NOTIFIER_WATCHER`] have an owner" means a tray will show. Only a
+/// clear yes does: no owner, no session bus, or a bus that could not be asked all mean no tray, and each
+/// is said on stderr.
+pub fn host_present(answer: Result<bool, String>) -> bool {
+    match answer {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!("No tray host on this desktop ({STATUS_NOTIFIER_WATCHER} has no owner).");
+            false
+        }
+        Err(problem) => {
+            eprintln!(
+                "No tray host on this desktop (the session bus could not be asked: {problem})."
+            );
+            false
+        }
+    }
+}
+
+/// Asks the session bus whether [`STATUS_NOTIFIER_WATCHER`] has an owner.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn ask_session_bus() -> Result<bool, String> {
+    let connection =
+        zbus::blocking::Connection::session().map_err(|problem| problem.to_string())?;
+    let bus =
+        zbus::blocking::fdo::DBusProxy::new(&connection).map_err(|problem| problem.to_string())?;
+    let name = zbus::names::BusName::try_from(STATUS_NOTIFIER_WATCHER)
+        .map_err(|problem| problem.to_string())?;
+    bus.name_has_owner(name)
+        .map_err(|problem| problem.to_string())
+}
+
+/// Whether this system will show a tray icon. macOS and Windows always have a tray; Linux has one when a
+/// StatusNotifier host runs.
+fn system_has_tray_host() -> bool {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        host_present(ask_session_bus())
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        true
+    }
+}
 
 /// The instance line in the tray menu, when there is a tray.
 pub struct TrayState<R: Runtime> {
@@ -52,6 +107,11 @@ pub fn instance_line(name: &str) -> String {
 /// Builds the tray and manages its state. True when the system gave the app a tray; false (said on
 /// stderr) when the builder refused, and the app runs without one.
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if !system_has_tray_host() {
+        eprintln!("Closing the window quits, since nothing on this desktop would show the tray.");
+        app.manage(TrayState::<R>::new(None));
+        return false;
+    }
     match build(app) {
         Ok(instance) => {
             app.manage(TrayState::new(Some(instance)));
@@ -126,7 +186,17 @@ pub fn set_tray_instance(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_INSTANCE, instance_line};
+    use super::{DEFAULT_INSTANCE, host_present, instance_line};
+
+    /// Only a clear "the watcher has an owner" counts as a tray: no owner, and no bus, are no tray.
+    #[test]
+    fn a_tray_needs_a_status_notifier_host() {
+        assert!(host_present(Ok(true)));
+        assert!(!host_present(Ok(false)));
+        assert!(!host_present(Err(
+            "no session bus address in the environment".to_string()
+        )));
+    }
 
     #[test]
     fn the_instance_line_is_the_name_made_safe() {

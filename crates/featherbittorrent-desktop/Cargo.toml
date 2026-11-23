@@ -53,6 +53,8 @@ rfd = { workspace = true, features = ["common-controls-v6"] }
 
 [target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
 rfd = { workspace = true, features = ["gtk3"] }
+# Whether the session bus has a tray host: the tray builder succeeds on a desktop without one.
+zbus.workspace = true
 
 [dev-dependencies]
 # `fbtt_core::scratch`: each test runs This computer on a library of its own.

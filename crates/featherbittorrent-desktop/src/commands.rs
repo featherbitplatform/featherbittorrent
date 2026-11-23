@@ -36,14 +36,6 @@ impl DesktopState {
             .take()
     }
 
-    /// Whether This computer still runs: not yet taken out to stop.
-    pub fn is_running(&self) -> bool {
-        self.this_computer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-    }
-
     /// This computer's base address and secret, while it runs.
     fn local_endpoint(&self) -> Option<(String, String)> {
         self.this_computer

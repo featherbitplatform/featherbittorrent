@@ -213,3 +213,7 @@ rfd = { version = "=0.17.2", default-features = false }
 # runtime (a LaunchAgent on macOS, the Run key on Windows, an XDG autostart entry on Linux), launched with
 # `--background`. Pinned to the spike's version, which needs tauri ^2.12 like the rest.
 tauri-plugin-autostart = "=2.7.0"
+# The Linux tray check (Task 8): whether a StatusNotifier host owns `org.kde.StatusNotifierWatcher` on the
+# session bus, since the tray builder succeeds without one. Already in the tree through keyring's Linux
+# store, at its default features (async-io and the blocking API), so this adds no crates.
+zbus = "5.19"

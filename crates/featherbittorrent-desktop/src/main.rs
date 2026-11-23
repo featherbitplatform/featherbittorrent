@@ -14,7 +14,7 @@ mod local;
 mod tray;
 
 use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{Manager, WindowEvent};
 
 use crate::commands::DesktopState;
 
@@ -58,17 +58,9 @@ fn main() {
         ))
         .manage(DesktopState::new(this_computer))
         .manage(lifecycle::Lifecycle::new(paths.settings_file()))
-        .setup(|app| {
-            let tray_available = tray::install(app.handle());
-            app.state::<lifecycle::Lifecycle>()
-                .set_tray_available(tray_available);
-            lifecycle::apply_initial_state(
-                app.handle(),
-                lifecycle::initial_window_state(std::env::args(), tray_available),
-            );
-            lifecycle::quit_on_signals(app.handle());
-            Ok(())
-        })
+        // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
+        // be added anywhere: a new step goes into `setup` below, in its place in the order.
+        .setup(setup)
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -92,25 +84,29 @@ fn main() {
             )
         });
 
-    app.run(|handle, event| match event {
-        // A quit the system asks for while This computer still runs goes through the app's own quit, so
-        // the final save completes before the exit it ends in (that exit finds the engine gone).
-        RunEvent::ExitRequested { api, .. } if handle.state::<DesktopState>().is_running() => {
-            api.prevent_exit();
-            lifecycle::quit(handle);
-        }
-        // The Dock icon clicked while the window is hidden in the tray.
-        #[cfg(target_os = "macos")]
-        RunEvent::Reopen { .. } => lifecycle::show_window(handle),
-        // The last stop on every path: Cmd+Q, logging out and shutting down on macOS arrive here with
-        // nothing before them.
-        RunEvent::Exit => {
-            if let Some(this_computer) = handle.state::<DesktopState>().take() {
-                tauri::async_runtime::block_on(this_computer.stop());
-            }
-        }
-        _ => {}
-    });
+    // Exit requests, the last event (where Cmd+Q, logging out and shutting down arrive on macOS) and the
+    // Dock icon: every way out waits for This computer's final save.
+    app.run(lifecycle::handle_run_event);
+}
+
+/// Everything that needs the app built and its window made, in a fixed order: the window's chrome, then
+/// the tray, then how the window starts (which depends on whether there is a tray), then the quit signals.
+/// This is the only setup function; `Builder::setup` keeps one.
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = app.handle();
+    // 1. The window's chrome: `window::apply_chrome` (Task 6) goes here, before the window is shown.
+    // 2. The tray, and whether this system shows one.
+    let tray_available = tray::install(handle);
+    app.state::<lifecycle::Lifecycle>()
+        .set_tray_available(tray_available);
+    // 3. Show, hide or minimize the window (it starts invisible, `tauri.conf.json`).
+    lifecycle::apply_initial_state(
+        handle,
+        lifecycle::initial_window_state(std::env::args(), tray_available),
+    );
+    // 4. A quit by signal runs the final save too.
+    lifecycle::quit_on_signals(handle);
+    Ok(())
 }
 
 /// Says `message` in a native message box (and on stderr, for a run from a terminal), then exits with
