@@ -430,6 +430,16 @@ pub struct FbttAuth {
     /// the routes because the guard that lets a stream request through and the route that hands its token out
     /// have to agree about which tokens this server issued - the same reason they share the session store.
     stream_tokens: Arc<StreamTokens>,
+    /// The secret the desktop app made when it started this engine ([`crate::DesktopAccess`]), or `None` on
+    /// a server nobody launched that way. It is a credential like a session token - a bearer header, or the
+    /// query token on the routes that take one - but no route issues it, it never expires, and it is asked
+    /// before anything else, so neither the Host guard of a server without logins nor an `Origin` rule
+    /// stands between it and the API.
+    launch_secret: Option<String>,
+    /// Whether the launch secret is the only way in: the desktop app's own engine that was not asked to
+    /// serve anybody else. Then no login route is mounted, so no session or cookie can exist to be checked,
+    /// and nothing that stands in for a credential (the Host guard) applies either.
+    secret_only: bool,
 }
 
 impl FbttAuth {
@@ -450,12 +460,56 @@ impl FbttAuth {
             limiter: limiter::LoginLimiter::with_clock(clock.clone()),
             challenge_limiter: limiter::ChallengeLimiter::with_clock(clock.clone()),
             stream_tokens: Arc::new(StreamTokens::with_clock(STREAM_TOKEN_CAP, clock.clone())),
+            launch_secret: None,
+            secret_only: false,
         }
+    }
+
+    /// The same authenticator, also accepting the desktop app's launch `secret`; with `only`, accepting
+    /// nothing else that a client could present (stream tokens, which only a holder of the secret can be
+    /// issued, still open their one file). `only` turns logins on, because the Host guard that stands in for
+    /// a credential with logins off is no substitute for the secret.
+    pub(crate) fn with_launch_secret(mut self, secret: String, only: bool) -> Self {
+        self.launch_secret = Some(secret);
+        self.secret_only = only;
+        if only {
+            self.on = true;
+        }
+        self
+    }
+
+    /// Whether the credential this request offers - the bearer header, or with no header at all the query
+    /// token on the routes fbt-api gives one for - is the launch secret, compared in constant time.
+    fn offers_launch_secret(&self, request: &AuthRequest<'_>) -> bool {
+        let Some(secret) = self.launch_secret.as_deref() else {
+            return false;
+        };
+        let token = match request.headers.get(header::AUTHORIZATION) {
+            Some(_) => bearer(request.headers),
+            None => request.query_token,
+        };
+        token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
+    }
+
+    /// Whether this request is a player's stream token on the file-stream route, for the path it was issued
+    /// for, with no header for it to answer behind. See [`Authenticator::authorize`] for why only there.
+    fn offers_stream_token(&self, request: &AuthRequest<'_>) -> bool {
+        !request.headers.contains_key(header::AUTHORIZATION)
+            && request.query_token.is_some_and(|token| {
+                stream_route(request.method, request.matched_path)
+                    && self.stream_tokens.check(token, request.path)
+            })
     }
 
     /// Whether anyone has to sign in here at all.
     pub fn auth_on(&self) -> bool {
         self.on
+    }
+
+    /// Whether the desktop launch secret is the only way in, which is also whether the login routes are
+    /// left unmounted ([`crate::routes::router`]).
+    pub(crate) fn secret_only(&self) -> bool {
+        self.secret_only
     }
 
     /// When a browser session cookie carries `Secure`: what `server.cookie_secure` said, which only the
@@ -660,12 +714,29 @@ impl fmt::Debug for FbttAuth {
             .field("limiter", &self.limiter)
             .field("challenge_limiter", &self.challenge_limiter)
             .field("stream_tokens", &self.stream_tokens)
+            .field("launch_secret", &self.launch_secret.is_some())
+            .field("secret_only", &self.secret_only)
             .finish()
     }
 }
 
 impl Authenticator for FbttAuth {
     fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        // The desktop app's launch secret is asked first: it is the strongest credential this server knows,
+        // and a client holding it is the app that started the engine, whatever name or origin it came from.
+        if self.offers_launch_secret(request) {
+            return Ok(());
+        }
+        if self.secret_only {
+            // Nothing else is a credential here. A request that matched no route goes on to its `404`: there
+            // is nothing behind it to protect, and a page or a login that is not mounted should say so rather
+            // than ask for a credential. A stream token still opens its one file, because only a holder of
+            // the secret could have been issued it.
+            if request.matched_path.is_none() || self.offers_stream_token(request) {
+                return Ok(());
+            }
+            return Err(AuthRejection::Unauthorized);
+        }
         if !self.on {
             // Nobody needs a token here, so the name the request carries is the only thing left to check.
             return self.guard_local(request);
@@ -691,11 +762,7 @@ impl Authenticator for FbttAuth {
         // bearer header, which would make it a second way to be anybody rather than a way to fetch one file.
         // Behind it stays the session check below, so a web page that puts its own session token in the query
         // still works.
-        if !request.headers.contains_key(header::AUTHORIZATION)
-            && let Some(token) = request.query_token
-            && stream_route(request.method, request.matched_path)
-            && self.stream_tokens.check(token, request.path)
-        {
+        if self.offers_stream_token(request) {
             return Ok(());
         }
         // The header, or the query parameter on the routes fbt-api says take one (the file streams and
@@ -797,6 +864,89 @@ mod tests {
         headers: &'a HeaderMap,
     ) -> fbt_api::AuthRequest<'a> {
         fbt_api::AuthRequest::new(method, matched_path, headers, None, None)
+    }
+
+    /// The desktop launch secret: asked before the Host and Origin guard of a server without logins, so the
+    /// app's webview gets in from its own origin; beside sessions on an exposed server; and alone on the app's
+    /// own engine, where neither the Host guard nor a session stands in for it.
+    #[test]
+    fn the_launch_secret_is_asked_first_and_alone_when_it_is_the_only_way_in() {
+        const SECRET: &str = "the-launch-secret";
+        let with_secret = |host: &str, origin: Option<&str>, token: &str| {
+            let mut headers = headers(host, origin);
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("a header value"),
+            );
+            headers
+        };
+        let get = Method::GET;
+        let torrents = Some("/api/v1/torrents");
+
+        // Exposed, logins off: the secret passes where the guard would refuse the origin, and a request with
+        // no secret is still the guard's.
+        let exposed = FbttAuth::new(&server(false)).with_launch_secret(SECRET.to_string(), false);
+        let from_webview = with_secret("127.0.0.1:8090", Some("tauri://localhost"), SECRET);
+        assert!(
+            exposed
+                .authorize(&request(&get, torrents, &from_webview))
+                .is_ok()
+        );
+        let wrong = with_secret("127.0.0.1:8090", Some("tauri://localhost"), "nope");
+        assert!(matches!(
+            exposed.authorize(&request(&get, torrents, &wrong)),
+            Err(AuthRejection::Forbidden)
+        ));
+        let plain = headers("127.0.0.1:8090", None);
+        assert!(exposed.authorize(&request(&get, torrents, &plain)).is_ok());
+
+        // Exposed, logins on: the secret and a session both open the API.
+        let closed = FbttAuth::new(&server(true)).with_launch_secret(SECRET.to_string(), false);
+        let (session, _) = closed.sessions().issue("alice".to_string());
+        let by_session = with_secret("127.0.0.1:8090", None, &session);
+        assert!(
+            closed
+                .authorize(&request(&get, torrents, &by_session))
+                .is_ok()
+        );
+        let by_secret = with_secret("127.0.0.1:8090", None, SECRET);
+        assert!(
+            closed
+                .authorize(&request(&get, torrents, &by_secret))
+                .is_ok()
+        );
+
+        // The app's own engine: on even though the config says off, the secret alone, a session token is
+        // no credential, and the query token works only where fbt-api offers it.
+        let only = FbttAuth::new(&server(false)).with_launch_secret(SECRET.to_string(), true);
+        assert!(only.auth_on());
+        assert!(only.authorize(&request(&get, torrents, &by_secret)).is_ok());
+        assert!(matches!(
+            only.authorize(&request(&get, torrents, &plain)),
+            Err(AuthRejection::Unauthorized)
+        ));
+        let (forged, _) = only.sessions().issue("alice".to_string());
+        let by_forged = with_secret("127.0.0.1:8090", None, &forged);
+        assert!(matches!(
+            only.authorize(&request(&get, torrents, &by_forged)),
+            Err(AuthRejection::Unauthorized)
+        ));
+        let events =
+            fbt_api::AuthRequest::new(&get, Some("/api/v1/events"), &plain, Some(SECRET), None);
+        assert!(only.authorize(&events).is_ok());
+        let near_miss = fbt_api::AuthRequest::new(
+            &get,
+            Some("/api/v1/events"),
+            &plain,
+            Some("the-launch-secreT"),
+            None,
+        );
+        assert!(matches!(
+            only.authorize(&near_miss),
+            Err(AuthRejection::Unauthorized)
+        ));
+        // A path no route matched goes on to its `404` rather than asking for a credential.
+        assert!(only.authorize(&request(&get, None, &plain)).is_ok());
     }
 
     /// Auth off lets every request through; auth on opens only the two login routes and otherwise

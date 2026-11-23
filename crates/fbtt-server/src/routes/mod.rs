@@ -155,20 +155,26 @@ impl Shared {
     /// `roots` are those folders as canonicalised directories - the same list
     /// [`fbt_api::ApiConfig::allowed_roots`] is handed - and `dummy_password_hash` is the hash computed
     /// once at startup for the accounts this config has, or `None` when it has none worth hiding behind.
-    /// `session` is the engine's own session, cloned: what the torrent routes answer about.
+    /// `session` is the engine's own session, cloned: what the torrent routes answer about. `launch` is the
+    /// desktop app's launch secret and whether it is the only way in, for an engine the app started
+    /// ([`crate::DesktopAccess`]), and `None` for any other server.
     pub(crate) fn new(
         config: Config,
         paths: Paths,
         roots: Vec<fs::Root>,
         dummy_password_hash: Option<String>,
         session: fbt::Session,
+        launch: Option<(String, bool)>,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
         // what `Server::build` serves on in the same case.
         let server = config.server.clone().unwrap_or_default();
         let devices = Mutex::new(DeviceTable::build(&server.auth.devices));
         Shared {
-            auth: Arc::new(FbttAuth::new(&server)),
+            auth: Arc::new(match launch {
+                Some((secret, only)) => FbttAuth::new(&server).with_launch_secret(secret, only),
+                None => FbttAuth::new(&server),
+            }),
             users: server.auth.users.clone(),
             devices,
             changing_devices: tokio::sync::Mutex::new(()),
@@ -820,6 +826,9 @@ struct ErrorDetail {
 ///
 /// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
 /// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
+///
+/// On the desktop app's own engine that serves nobody else, the login routes are not mounted at all: the
+/// launch secret is the only credential there, so no session can be asked for and those paths answer `404`.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
     // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
@@ -849,6 +858,11 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
                 .delete(web_session::sign_out)
                 .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
         );
+    let logins = if shared.auth.secret_only() {
+        Router::new()
+    } else {
+        logins
+    };
     Router::new()
         .merge(logins)
         .route(

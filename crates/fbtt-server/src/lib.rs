@@ -20,4 +20,4 @@ mod server;
 mod web;
 
 pub use auth::{Clock, FbttAuth, LOGIN_NAMESPACE};
-pub use server::{Server, ServerError};
+pub use server::{DesktopAccess, Server, ServerError};

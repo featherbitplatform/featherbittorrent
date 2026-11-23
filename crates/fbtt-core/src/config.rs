@@ -258,6 +258,14 @@ pub struct ServerConfig {
     /// When the browser session cookie carries the `Secure` flag. See [`CookieSecure`].
     #[serde(default, skip_serializing_if = "CookieSecure::is_auto")]
     pub cookie_secure: CookieSecure,
+    /// The origins of clients served from somewhere else that may call this API from a browser engine:
+    /// the desktop app's webview (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on
+    /// Windows) is the one this is for. Each entry is a whole origin, scheme included, and is handed to
+    /// fbt-api's CORS layer as it is. Being on this list changes nothing about credentials: a listed
+    /// origin still has to sign in, and the browser session cookie keeps its own origin rule. Empty, the
+    /// default, means no cross-origin caller at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -273,6 +281,7 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             web_ui: None,
             cookie_secure: CookieSecure::default(),
+            cors_origins: Vec::new(),
         }
     }
 }
