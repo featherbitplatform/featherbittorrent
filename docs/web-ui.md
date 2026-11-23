@@ -166,8 +166,7 @@ an empty stream, so the player shows `Waiting for data...` there.
 ## File priorities
 
 The Files tab has a `Priority` column. Each row's priority is a select with `skip`, `low`, `normal`
-and `high`. Choosing one sends the change to the server, and the server's file list follows it.
-`skip` stops that file from downloading; the others set how soon its pieces are asked for.
+and `high`. `skip` means the file is not downloaded.
 
 ## Torrent actions
 
@@ -184,7 +183,8 @@ The `More` menu beside Pause and Remove holds the less common actions for the se
   move never overwrites: if the destination already holds a file of the same name, the server refuses
   the move and the page shows its reason. `Moving...` shows beside the menu while a move runs.
 
-A refusal of any action is shown in the page in the server's own words.
+A refusal from `Limits...` is shown inside the Limits dialog. A refusal from the other actions, or from a
+move, is shown in the page's banner. Either way it is the server's own words.
 
 ## New folder
 
@@ -194,9 +194,9 @@ creates parent folders, and a name that already exists is refused. The server al
 
 - an empty name, `.` and `..`;
 - a name with a slash or a backslash;
-- a name with any character Windows forbids in a file name: `<`, `>`, `:`, `"`, `|`, `?` or `*`;
+- a name with one of `<`, `>`, `:`, `"`, `|`, `?` or `*`;
 - a name that starts with a dot;
-- a name with control or invisible characters, or with leading, trailing or doubled spaces;
+- a name with control or invisible characters, or with leading, trailing or repeated spaces;
 - a name that ends in a dot or a space;
 - a Windows device name such as `CON`, `NUL`, `COM1` or `LPT1`, with or without an extension;
 - a name over 255 bytes.
@@ -216,13 +216,13 @@ The five server settings are `Download limit KiB/s`, `Upload limit KiB/s`, `Acti
 
 Devices are the SSH keys the TUI signs in with. To add one, give it a `Name`, paste an `ssh-ed25519`
 public key line into `Public key` and press `Add`; the new device is listed with its fingerprint. A
-private key is refused in the page and never sent. `Remove device` takes a device's key away, so it
-can no longer sign in. Changes are saved in the server's `config.yaml`. With logins off, the section
+private key is refused in the page and never sent. Each device row has a `Remove` button, which asks
+for confirmation in a `Remove device` dialog; a removed device can no longer sign in. Changes are saved in the server's `config.yaml`. With logins off, the section
 says `Device logins need the server's logins on.` instead.
 
 ### Keyboard shortcuts
 
-A read-only list of every shortcut, in groups. Changing shortcuts will come with the desktop app.
+A read-only list of every shortcut, in groups.
 
 **Player**
 
@@ -265,5 +265,5 @@ A read-only list of every shortcut, in groups. Changing shortcuts will come with
 
 ## On a phone
 
-Below 640 px wide the torrent list is a list of cards. Tapping a card opens that torrent full screen,
+At 640 px wide or less the torrent list is a list of cards. Tapping a card opens that torrent full screen,
 and the browser's back returns to the list.
