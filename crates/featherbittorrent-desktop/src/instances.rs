@@ -96,7 +96,9 @@ impl Instances {
             .timeout(ANSWER_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            .expect(
+                "the HTTP client for remote instances builds with its timeouts and no redirects",
+            );
         Instances::with_client(settings_file, keychain, origin, client)
     }
 
@@ -200,8 +202,22 @@ impl Instances {
         if id == LOCAL_ID {
             return Err("This computer cannot be removed.".to_string());
         }
+        // Only a listed instance: the core removes every entry with this id, and a hand-edited entry that
+        // is never listed (an empty id, a duplicate of a listed one) is not the person's to lose by a
+        // click on another row.
+        self.usable(id)?;
         self.change(|settings| {
-            settings.remove(id);
+            // The listed entry is the first with this id (`usable` skips later ones), so that one goes
+            // and nothing else; the default then falls back as the core's own `remove` has it.
+            let listed = settings
+                .instances
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| "That instance was removed.".to_string())?;
+            settings.instances.remove(listed);
+            if settings.default_instance == id {
+                settings.default_instance = LOCAL_ID.to_string();
+            }
             Ok(())
         })?;
         self.keychain.delete(id);
@@ -247,6 +263,7 @@ impl Instances {
 
     /// Forgets the saved password for `id`: out of the keychain, and the file no longer asks for it.
     pub fn forget_password(&self, id: &str) -> Result<(), String> {
+        self.usable(id)?;
         self.keychain.delete(id);
         self.change(|settings| {
             if let Some(entry) = settings.instances.iter_mut().find(|entry| entry.id == id) {
@@ -298,7 +315,7 @@ impl Instances {
         struct Session {
             token: String,
         }
-        let Ok(bytes) = response.bytes().await else {
+        let Some(bytes) = bounded_body(response).await else {
             return Ok(None);
         };
         Ok(serde_json::from_slice::<Session>(&bytes)
@@ -341,6 +358,29 @@ impl Instances {
         });
         Ok(ProbeDto { reachable, cors_ok })
     }
+}
+
+/// The most bytes the shell reads of any answer from a remote server: a sign-in answer is a token and a
+/// subject, well under this, and a server that sends more is not one to hold in memory for.
+const MAX_ANSWER_BYTES: usize = 8 * 1024;
+
+/// The body of `response`, or `None` when it says or turns out to be longer than [`MAX_ANSWER_BYTES`] or
+/// breaks off: read chunk by chunk, so a body that never ends costs at most the cap.
+async fn bounded_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ANSWER_BYTES as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
 }
 
 /// An address in the spelling every request is built on: no surrounding space and no trailing slash, as
@@ -526,6 +566,127 @@ mod tests {
         assert_eq!(listed.items[0].name, LOCAL_NAME);
         assert_eq!(listed.default, "local", "the default falls back");
         assert!(instances.remove("local").is_err());
+    }
+
+    /// The listed `pi` and the hand-edited entries the list never shows: an empty id, and a second `pi`
+    /// whose address cannot be dialled. Removing or forgetting the listed one leaves the others as they
+    /// were, and the unlisted ids cannot be acted on at all.
+    #[test]
+    fn remove_leaves_invalid_hand_edited_entries_alone() {
+        let dir = ScratchDir::new("desktop-instances-remove-hand-edited");
+        let file = dir.path().join("desktop.yaml");
+        let entry = |id: &str, name: &str, url: &str| fbtt_desktop_core::Instance {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+            save_password: true,
+            user: Some(USER.to_string()),
+        };
+        let settings = DesktopSettings {
+            instances: vec![
+                entry("pi", "Pi", "http://pi.local:8090"),
+                entry("pi", "Pi again", "ftp://pi.local"),
+                entry("", "Nameless", "http://nameless.local"),
+            ],
+            ..DesktopSettings::default()
+        };
+        settings.save(&file).expect("write the hand-edited file");
+        let instances = store(&dir, Arc::new(MemoryKeychain::new()));
+
+        assert!(instances.remove("").is_err(), "an empty id is never listed");
+        assert!(instances.forget_password("").is_err());
+        assert!(instances.forget_password("nowhere").is_err());
+        assert_eq!(
+            DesktopSettings::load(&file).expect("reads").instances,
+            settings.instances,
+            "a refused change writes nothing"
+        );
+
+        instances.forget_password("pi").expect("the listed pi");
+        instances.remove("pi").expect("the listed pi");
+        let left = DesktopSettings::load(&file).expect("reads").instances;
+        assert_eq!(
+            left.iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pi again", "Nameless"],
+            "only the listed entry went"
+        );
+        assert!(left.iter().all(|entry| entry.save_password), "{left:?}");
+    }
+
+    /// A loopback server that answers every request with a `200` whose JSON body carries a token but is
+    /// longer than the cap: once with an honest `Content-Length`, once chunked with no length at all.
+    async fn oversized_server(chunked: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let body = format!(
+                        "{{\"token\":\"{}\",\"subject\":\"alice\"}}",
+                        "t".repeat(4 * super::MAX_ANSWER_BYTES)
+                    );
+                    let head = if chunked {
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n".to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        )
+                    };
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if chunked {
+                        for piece in body.as_bytes().chunks(1024) {
+                            let frame = format!("{:x}\r\n", piece.len());
+                            if socket.write_all(frame.as_bytes()).await.is_err()
+                                || socket.write_all(piece).await.is_err()
+                                || socket.write_all(b"\r\n").await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = socket.write_all(b"0\r\n\r\n").await;
+                    } else {
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_sign_in_answer_is_refused() {
+        for chunked in [false, true] {
+            let dir = ScratchDir::new("desktop-instances-oversized");
+            let base = oversized_server(chunked).await;
+            let instances = store(&dir, Arc::new(MemoryKeychain::new()));
+            let remote = instances.add("Big", &base).expect("the add");
+            instances
+                .save_password(&remote.id, USER, SECRET)
+                .expect("saved");
+            let endpoint = within(instances.connect(&remote.id))
+                .await
+                .expect("an answer is not an unreachable server");
+            assert_eq!(
+                endpoint.token, None,
+                "an answer over the cap is no token (chunked: {chunked})"
+            );
+        }
     }
 
     #[test]

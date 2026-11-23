@@ -77,7 +77,7 @@ export default function SignIn({ state, onSignIn }: SignInProps) {
       const signedIn = await onSignIn(user, password)
       // Saved only once the server took it: a wrong password kept would fail every launch.
       if (signedIn && keep && offer?.keychain === true) {
-        void offer.save(user, password).catch(() => {})
+        void offer.save(user, password)
       }
     } finally {
       // A sign-in that worked replaced this screen under React's feet; saying the attempt is over

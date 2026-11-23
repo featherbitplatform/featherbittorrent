@@ -10,6 +10,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { useEffect } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { useConnection } from '../connection'
+import { useSavePassword } from '../savePassword'
 import type { Connection } from '../connection'
 import { UNREACHABLE_COPY } from '../live'
 
@@ -40,6 +41,7 @@ vi.mock('../App', () => ({
       shell.mounts += 1
     }, [])
     const endpoint = connection.endpoint
+    const offer = useSavePassword()
     return (
       <div>
         <div>
@@ -48,6 +50,11 @@ vi.mock('../App', () => ({
         <button type="button" onClick={() => void connection.api.torrents().catch(() => {})}>
           read torrents
         </button>
+        {offer !== null && (
+          <button type="button" onClick={() => void offer.save('alice', 'hunter2')}>
+            keep password
+          </button>
+        )}
       </div>
     )
   },
@@ -214,4 +221,17 @@ it('a_failed_request_to_a_server_that_still_answers_keeps_the_workspace', async 
   fireEvent.click(screen.getByRole('button', { name: 'read torrents' }))
   await waitFor(() => expect(shell.probeInstance).toHaveBeenCalledTimes(2))
   expect(screen.getByText(`workspace ${PI} session`)).toBeTruthy()
+})
+
+it('failed_password_save_is_shown', async () => {
+  shell.listInstances.mockResolvedValue(list('pi'))
+  shell.connect.mockResolvedValueOnce({ kind: 'bearer', base: PI, token: null })
+  shell.savePassword.mockRejectedValueOnce('The keychain did not save the password: locked')
+  render(<DesktopRoot />)
+  await screen.findByText(`workspace ${PI} signed out`)
+  fireEvent.click(screen.getByRole('button', { name: 'keep password' }))
+  await screen.findByText('The keychain did not save the password: locked')
+  expect(shell.savePassword).toHaveBeenCalledWith('pi', 'alice', 'hunter2')
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+  expect(screen.queryByText('The keychain did not save the password: locked')).toBeNull()
 })

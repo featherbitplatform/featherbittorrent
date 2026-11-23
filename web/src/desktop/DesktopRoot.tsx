@@ -28,6 +28,7 @@
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import App from '../App'
+import Banner from '../components/Banner'
 import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
@@ -54,6 +55,9 @@ const LOCAL_ONLY: InstancesList = {
 
 /** The line naming the origin a server has to list, verbatim from the plan with the origin after it. */
 export const CORS_HINT = "Add this to the server's cors_origins: "
+
+/** What a refused save says when the shell gave no line of its own. */
+const PASSWORD_NOT_SAVED = 'The password was not saved.'
 
 /** The token a connection started with, when it is a launch token for This computer. */
 function launchToken(connection: Connection, id: string): string | null {
@@ -134,6 +138,8 @@ export function DesktopRoot() {
   const [phase, setPhase] = useState<Phase>({ phase: 'connecting', id: LOCAL_ID })
   const [list, setList] = useState<InstancesList>(LOCAL_ONLY)
   const [managing, setManaging] = useState(false)
+  // A saved password the shell could not keep: said above the page, which by then is the workspace.
+  const [saveFailed, setSaveFailed] = useState<string | null>(null)
   // One connect per instance at a time: a second request for the same one while it is out would race
   // it for the last word. A connect to another instance supersedes it.
   const pending = useRef<{ id: string; promise: Promise<void> } | null>(null)
@@ -235,6 +241,7 @@ export function DesktopRoot() {
   const onSwitch = useCallback(
     (id: string) => {
       setManaging(false)
+      setSaveFailed(null)
       if (id === current && phase.phase === 'ready') return
       void open(id, null)
     },
@@ -253,7 +260,12 @@ export function DesktopRoot() {
       : {
           keychain: list.keychain,
           save: async (user, password) => {
-            await savePassword(current, user, password)
+            try {
+              await savePassword(current, user, password)
+              setSaveFailed(null)
+            } catch (cause) {
+              setSaveFailed(typeof cause === 'string' && cause !== '' ? cause : PASSWORD_NOT_SAVED)
+            }
             await reload()
           },
         }
@@ -289,6 +301,16 @@ export function DesktopRoot() {
           onManage={() => setManaging(true)}
         />
       </div>
+      {saveFailed !== null && (
+        <div className="flex shrink-0 items-start gap-2 px-3 pt-3">
+          <Banner tone="danger" className="flex-1">
+            {saveFailed}
+          </Banner>
+          <Button variant="secondary" size="sm" onClick={() => setSaveFailed(null)}>
+            Dismiss
+          </Button>
+        </div>
+      )}
       <div className="relative min-h-0 flex-1 overflow-auto [&_.h-dvh]:h-full [&_.min-h-dvh]:min-h-full">
         <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
       </div>

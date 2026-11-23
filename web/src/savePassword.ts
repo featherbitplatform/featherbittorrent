@@ -15,7 +15,11 @@ export const NO_KEYCHAIN = 'This system has no keychain, so passwords are not sa
 export interface SavePasswordOffer {
   /** Whether this system has a keychain to save in. */
   keychain: boolean
-  /** Keep this password for the instance being signed in to. Called only after the sign-in worked. */
+  /**
+   * Keep this password for the instance being signed in to. Called only after the sign-in worked, when
+   * the sign-in screen is already on its way out, so it never rejects: a save that did not take is
+   * shown by the page that made the offer, where the person still sees it.
+   */
   save(user: string, password: string): Promise<void>
 }
 
