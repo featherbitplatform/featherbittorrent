@@ -1032,6 +1032,58 @@ describe('the player', () => {
     expect(showingAfter === 0, 'Off left a subtitle track showing').toBe(true)
   })
 
+  it('two subtitle tracks with the same label stay separate', async () => {
+    const recorder = fakeFetch()
+    vi.stubGlobal('fetch', recorder.fetch)
+    // Two text tracks, both with the language `eng` and no name: `trackLabel` falls back to the
+    // language, so both `TextTrack`s are made with the label `eng`. The player keys the tracks
+    // by their own key, so each keeps its own cues.
+    const probe: MediaProbe = {
+      ...PROBE,
+      tracks: PROBE.tracks.map((t) =>
+        t.id === 4 || t.id === 5
+          ? { ...t, language: 'eng', text: true, codec: 'srt' }
+          : t,
+      ),
+    }
+    const { client } = probeClient(
+      probe,
+      [
+        { start_ms: 0, end_ms: 1000, text: 'first' },
+        { start_ms: 1000, end_ms: 2000, text: 'second' },
+      ],
+    )
+    const { container } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const video = container.querySelector('video') as HTMLVideoElement
+    const dialog = container.querySelector('dialog') as HTMLElement
+
+    // The choices are Off, the two text tracks, and the external file, so one `c` takes the
+    // first track and two more `c` presses take the second.
+    fireEvent.keyDown(dialog, { key: 'c' })
+    await settle()
+    const tracksAfterFirst = Array.from(video.textTracks).length
+    expect(tracksAfterFirst >= 1, 'the first track was not made').toBe(true)
+
+    fireEvent.keyDown(dialog, { key: 'c' })
+    await settle()
+    fireEvent.keyDown(dialog, { key: 'c' })
+    await settle()
+    const tracks = Array.from(video.textTracks)
+    expect(
+      tracks.length >= 2,
+      `the two tracks were merged into one (label lookup: ${tracks.map((t) => t.label).join(', ')})`,
+    ).toBe(true)
+    const byLabel = new Map<string, number>()
+    for (const t of tracks) byLabel.set(t.label, (byLabel.get(t.label) ?? 0) + 1)
+    expect(
+      (byLabel.get('eng') ?? 0) >= 2,
+      'two tracks are not kept under the same label',
+    ).toBe(true)
+  })
+
   it('a position is saved and restored', async () => {
     // The player saves the position in source seconds and restores it on reopen. Play to a
     // position, unmount, reopen the same file, and the restart fetch and the playhead are at
