@@ -430,12 +430,19 @@ describe('the player', () => {
     // the 4 s of content).
     expect(source.duration === 5, 'the source did not take the probe duration').toBe(true)
 
-    // Feed the two bodies enough that the buffers reach the end, then end them: the source
-    // says so once, and only once.
+    // Feed the two bodies enough that the buffers reach the end, and move the playhead with
+    // them: the end is measured on the range the playhead sits in, and the source is told once.
+    // The playhead moves with the buffer the way playback does: the end is measured on the
+    // range the playhead sits in, and the read keeps feeding that range.
     for (let i = 0; i < 40; i += 1) {
       videoBody.push(new Uint8Array([1]))
       audioBody.push(new Uint8Array([1]))
       await settle()
+      if (i >= 3) {
+        video.currentTime = 5
+        video.dispatchEvent(new Event('timeupdate'))
+        await settle()
+      }
     }
     videoBody.end()
     audioBody.end()
@@ -846,26 +853,43 @@ describe('the player', () => {
     await settle()
     const buffer = source.activeSourceBuffers[0]
     expect(buffer !== undefined, 'the video buffer was not made').toBe(true)
-    // Feed a few chunks so the buffer has ranges: 5 chunks is 5 media seconds.
-    for (let i = 0; i < 5; i += 1) {
+    // Feed chunks so the buffer runs to media 100: the playhead at 70 sits inside it, and the
+    // 60 seconds behind it (media 0 to 10) lie past the eviction's keep line.
+    for (let i = 0; i < 100; i += 1) {
       videoBody.push(new Uint8Array([1]))
       await settle()
     }
-    // Move the playhead to media 70: the buffered range [0, 5] lies 65 seconds behind, past the
-    // 60 the eviction keeps, so the eviction has something to cut.
+    // Move the playhead to media 70: the range [0, 10] lies 60 seconds behind, past the keep
+    // line, so the eviction has something to cut, and the playhead stays inside the buffer.
     video.currentTime = 70
     await settle()
-    // The next chunk (the one that will fail): make the next append throw quota. The engine
-    // evicts the ranges behind the playhead, and the chunk that did not fit is not lost: the
-    // read stops, and the engine waits for the buffer to make room.
-    buffer.makeNextAppendThrowQuota()
+    // The next chunk (A) will hit the quota: the buffer is full, and the next two appends are
+    // refused, the way a buffer that cannot make room for a chunk refuses it a second time,
+    // even after the eviction has cut what it can.
+    buffer.makeNextAppendThrowQuota(2)
     videoBody.push(new Uint8Array([1]))
     await settle()
-    // The eviction removed the ranges behind the playhead, and the engine is waiting for the
-    // buffer to make room: the chunk that did not fit is not lost, and the read stops.
+    // The refused A is not appended, and the eviction cut the ranges behind the playhead.
+    expect(buffer.log.appends.length === 100, 'the refused chunk was appended').toBe(true)
     expect(buffer.log.removes.length > 0, 'the eviction did not remove any range').toBe(true)
-    // The engine is waiting for the buffer to make room: the chunk that did not fit is not
-    // dropped, and the read is stopped at the gate.
+    expect(buffer.log.quotas === 2, 'the eviction did not make room for the chunk').toBe(true)
+    // B follows in the body, and it does not land: the held A is not appended before the read
+    // is woken, so B is not reordered ahead of the retried A. B is a different size than A, so
+    // the order of the appends is readable back from the log.
+    videoBody.push(new Uint8Array([1, 2]))
+    await settle()
+    expect(buffer.log.appends.length === 100, 'the chunk after the held one was appended first').toBe(true)
+    // The playhead advances a second (a `timeupdate`, not a seek: 71 is still inside the
+    // buffer), and the read is woken: the held A goes in, before B, the way a browser's
+    // buffer makes room as the playhead moves.
+    video.currentTime = 71
+    video.dispatchEvent(new Event('timeupdate'))
+    await settle()
+    // The held A (1 byte) went in before B (2 bytes): the order of the appends is the order
+    // the decoder wants it in, and the retried A is not reordered behind the data that follows.
+    expect(buffer.log.appends.length === 102, 'the held chunk and the one after it were not both appended').toBe(true)
+    expect(buffer.log.appends[100]?.byteLength === 1, 'the retried A did not go in before B').toBe(true)
+    expect(buffer.log.appends[101]?.byteLength === 2, 'the chunk after the held one did not go in after A').toBe(true)
     // The state is not an error: the chunk that did not fit is not dropped, and the engine is
     // not in the permanent `error` state.
     expect(
@@ -952,21 +976,42 @@ describe('the player', () => {
     await settle()
     const buffersAtStart = source.activeSourceBuffers.length
     const audioBuffer = source.activeSourceBuffers[1]
-    // Feed the audio a chunk so the buffer has ranges to remove on the switch.
-    const audioBody = recorder.callsFor('/tracks/2/stream')[0]?.body
-    audioBody?.push(new Uint8Array([1]))
-    await settle()
+    // Wait until the audio fetch has happened and handed out a body: the engine starts the
+    // audio stream when the source opens, and the body is what the test feeds chunks through.
+    let audioBody: FakeBody | null = null
+    for (let i = 0; i < 40 && audioBody === null; i += 1) {
+      audioBody = recorder.callsFor('/tracks/2/stream')[0]?.body ?? null
+      if (audioBody === null) await settle()
+    }
+    expect(audioBody !== null, 'the audio stream was not fetched').toBe(true)
+    const body = audioBody as FakeBody
+    // Feed the audio a chunk so the buffer has ranges to remove on the switch, and wait for it
+    // to land before feeding the next: a fixed settle is the window a flaky run lands in, with
+    // the read loop still between reads.
+    body.push(new Uint8Array([1]))
+    for (let i = 0; i < 40 && (audioBuffer.ranges[0]?.[1] ?? 0) < 1; i += 1) {
+      await settle()
+    }
+    expect((audioBuffer.ranges[0]?.[1] ?? 0) >= 1, 'the first audio chunk did not land').toBe(true)
     // Feed the audio a second chunk: the buffer runs to media 2, and the playhead at 1 is
     // inside it, so the switch has a range behind the playhead to remove and a point the new
     // track fetches from.
-    audioBody?.push(new Uint8Array([1]))
-    await settle()
+    body.push(new Uint8Array([1]))
+    // Wait until the buffer actually holds the second chunk (runs to media 2): the switch's
+    // remove is only legal once the buffer runs past the playhead.
+    for (let i = 0; i < 40 && (audioBuffer.ranges[0]?.[1] ?? 0) < 2; i += 1) {
+      await settle()
+    }
+    expect((audioBuffer.ranges[0]?.[1] ?? 0) >= 2, 'the second audio chunk did not land before the switch').toBe(true)
     // Switch the audio: the engine reuses the audio buffer with `changeType`, not a new one.
     engine.setAudio(PROBE.tracks[2] as MediaTrack)
     // The switch is async: the abort, the wait, the remove, the changeType, and the fetch each
-    // take a macrotask, so a few settles let them all land.
-    for (let i = 0; i < 6; i += 1) {
+    // take a macrotask. `settle` is two macrotasks, and the switch's own waits run off the
+    // buffer's `updateend`s, so the test settles past the whole chain and once more while the
+    // buffer is still settling one, which is the window a flaky run lands in.
+    for (let i = 0; i < 8; i += 1) {
       await settle()
+      if (audioBuffer !== undefined && audioBuffer.updating) await settle()
     }
     expect(
       source.activeSourceBuffers.length === buffersAtStart,

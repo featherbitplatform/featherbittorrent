@@ -60,12 +60,17 @@ export class FakeSourceBuffer extends EventTarget {
     this.mimeType = mimeType
     this.currentMimeType = mimeType
     this.appendBufferOriginal = (data: ArrayBuffer | ArrayBufferView): void => {
-      this.appendBuffer(data)
+      FakeSourceBuffer.prototype.appendBuffer.call(this, data)
     }
   }
 
   get buffered(): TimeRanges {
     return rangesOf(this._buffered)
+  }
+
+  /** The ranges as pairs: the shape a test reads back, without the `TimeRanges` interface. */
+  get ranges(): [number, number][] {
+    return this._buffered.map(([s, e]) => [s, e] as [number, number])
   }
 
   get updating(): boolean {
@@ -121,18 +126,18 @@ export class FakeSourceBuffer extends EventTarget {
   }
 
   /**
-   * A one-shot `QuotaExceededError` on the next append: the browser's quota is a property of the
-   * buffer's contents, and a test drives the engine's quota branch by making the next append
-   * refuse, once, the way a full buffer would.
+   * A `QuotaExceededError` on the next `count` appends: the browser's quota is a property of the
+   * buffer's contents, and a test drives the engine's quota branch by making the next appends
+   * refuse, the way a full buffer would. With `count` of 2 the eviction's re-append is refused
+   * too, which is the way a buffer that cannot make room for the chunk refuses it a second time.
    */
-  makeNextAppendThrowQuota(): void {
-    // The next append refuses, once, the way a full buffer would. The refusal is recorded and
-    // the chunk is not appended; the following append goes through, and the buffer is not
-    // left busy: in a browser the refused append never started an update.
-    let once = true
+  makeNextAppendThrowQuota(count = 1): void {
+    // Each refusal is recorded and the chunk is not appended; the following appends go through,
+    // and the buffer is not left busy: in a browser the refused append never started an update.
+    let left = count
     this.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
-      if (once) {
-        once = false
+      if (left > 0) {
+        left -= 1
         this.log.quotas += 1
         throw new DOMException('quota', 'QuotaExceededError')
       }
@@ -197,8 +202,13 @@ export class FakeMediaSource extends EventTarget {
   /** The test's side of the element's `load`: the source says it is open. */
   open(): void {
     if (this._open) return
-    this._open = true
-    queueMicrotask(() => this.dispatchEvent(new Event('sourceopen')))
+    // A browser stays `closed` until the async `sourceopen`: the `readyState` flips in the same
+    // task that fires the event, not before it, so an `addSourceBuffer` in between is the
+    // `InvalidStateError` a real element would throw.
+    queueMicrotask(() => {
+      this._open = true
+      this.dispatchEvent(new Event('sourceopen'))
+    })
   }
 }
 
