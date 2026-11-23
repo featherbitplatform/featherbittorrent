@@ -78,16 +78,13 @@ and fail; the gateway-only setup is the one where the two do not collide. Setups
 bearer and device-key logins working through the gateway. The web UI never signs in at the gateway:
 where it is served, in setups 1 and 3, it signs in at the server.
 
-## Streaming in the browser
-
-Streaming and playing video in the browser are provided by Playing media below.
-
 ## Playing media
 
-Files that show a `Play` button in the Files tab are those whose path ends with `.mkv`, `.mp4`,
-`.m4v`, `.webm` or `.mov` (case-insensitive); padding files have no `Play` button. Pressing the
-button opens the player modal and starts playback immediately; a torrent's pieces can still be
-downloading when playback begins.
+The web UI plays video files in the browser, with no media player to install. Files that show a
+`Play` button in the Files tab are those whose path ends with `.mkv`, `.mp4`, `.m4v`, `.webm` or
+`.mov` (case-insensitive); padding files have no `Play` button. Pressing the button opens the
+player modal and starts playback immediately; a torrent's pieces can still be downloading when
+playback begins.
 
 ### How a file is played
 
@@ -100,16 +97,18 @@ The player tries one of three ways in the order listed below:
 2. **Remuxed**: every other file whose video the browser can play. The server repackages its
    tracks, and the player's own controls, menus and keys are used.
 
-3. **Unplayable**: when the file has no video track, or the browser cannot play any codec of the
-   video track, the player shows the sentence `This browser cannot play <codec> video.` and a
-   `Download` button. The codec shown is the video track's codec; if the file has no video track
-   it is the first track's codec or `unknown`.
+3. **Unplayable**: when the browser cannot play any codec of the video track, the player shows the
+   sentence `This browser cannot play <codec> video.`, naming the video track's codec, and a
+   `Download` button. A file with no video track at all, such as an audio file, is not played
+   either: the player shows `This file has no video track to play.` and the same `Download`
+   button.
 
 ### Controls
 
 The remuxed player shows the following controls by their exact labels:
 
-- `Seek`: a range input that moves the playhead to any point in the file.
+- `Seek`: a range input that moves the playhead to any point in the file. While you drag it, it
+  shows where you are going, and the playhead moves once, when you let go.
 - `Play` and `Pause`: a toggle that starts and stops playback.
 - `Back 5 seconds` and `Forward 5 seconds`: icon buttons that move the playhead 5 seconds back and
   forward.
@@ -119,7 +118,8 @@ The remuxed player shows the following controls by their exact labels:
   disabled with the suffix `: not playable here`.
 - `Subtitles`: a menu that lists the available subtitles; `Off` turns subtitles off, and image
   subtitles appear disabled with the text `<name>: Image subtitles cannot be shown here.`
-- `Fullscreen`: an icon button that toggles fullscreen mode.
+- `Fullscreen`: an icon button that toggles fullscreen mode. On an iPhone, which has no
+  fullscreen for the page, it opens the video in the browser's own fullscreen player.
 - `Close player`: a button that closes the modal and stops playback.
 
 `Audio` appears whenever the file has at least one audio track. `Subtitles` always appears and
@@ -135,8 +135,11 @@ fullscreen; `Escape` closes the player.
 Play and pause, the arrow-key seek, `a` and `c` work only for a remuxed file; the volume keys,
 `m` and `f` also work for a native file.
 
-Keys do nothing while an input, such as the `Seek` or `Volume` slider, or an open menu has focus,
-except `Escape`, which still closes the player.
+Keys do nothing while an input, such as the `Seek` or `Volume` slider, has focus, except `Escape`,
+which still closes the player. While the `Audio` or `Subtitles` menu is open, the keys are the
+menu's: the arrows move through its choices, `Enter` or `Space` picks one, and `Escape` closes
+only the menu, not the player. A press outside an open menu closes it too. For a native file, the
+browser's own controls keep `Space` and the arrow keys when they have focus.
 
 ### Remembered position
 
@@ -151,3 +154,8 @@ provided it is before the end of the file or the file's length is unknown.
   busy or the connection dropped; the player retries by itself.
 
 - `Playback failed.`: the engine could not continue; changing the audio track restarts playback.
+
+### Known limits
+
+Seeking into the last part of a file that has no cue index (a live recording, for example) can give
+an empty stream, so the player shows `Waiting for data...` there.
