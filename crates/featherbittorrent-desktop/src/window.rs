@@ -1,22 +1,26 @@
 //! The window's chrome: which title bar the window wears, and the commands that read and change it.
 //!
 //! The app draws its own title bar (the page's `TitleBar`). On macOS the system's title strip is made
-//! transparent and its title hidden, so the native traffic lights sit on the page's own bar (the
-//! `titleBarStyle`, `hiddenTitle` and `trafficLightPosition` keys in `tauri.conf.json` set that up when
-//! the window is made, and [`apply_chrome`] says it again). On Windows and Linux the window has no system
-//! decorations and the page draws Minimize, Maximize and Close itself, unless the person asked for the
-//! system title bar (`system_title_bar` in the desktop settings): then the system's decorations come
-//! back and the page draws no controls. macOS has no such fallback: its traffic lights are the system's
-//! own already.
+//! transparent and its title hidden, so the native traffic lights sit on the page's own bar: the
+//! `titleBarStyle`, `hiddenTitle` and `trafficLightPosition` keys in `tauri.conf.json`. On Windows and
+//! Linux the window has no system decorations from its first frame (`"decorations": false` in
+//! `tauri.windows.conf.json` and `tauri.linux.conf.json`, which Tauri merges over `tauri.conf.json` on
+//! that platform) and the page draws Minimize, Maximize and Close itself.
 //!
-//! [`apply_chrome`] runs before the event loop first draws the window, so a window that appeared with
-//! decorations and lost them a moment later does not flash.
+//! The one fallback is Linux's: with `system_title_bar` on in the desktop settings ("Use the system
+//! title bar", design spec 2.4), [`apply_chrome`] turns the system's decorations back on and the page
+//! draws no controls. Windows always draws its own bar, as macOS always keeps its traffic lights, so on
+//! both the setting does nothing.
+//!
+//! The per-platform conf files repeat the whole window entry, because Tauri merges them as a JSON merge
+//! patch, which replaces arrays: `platform_confs_are_the_main_window_undecorated` keeps them equal to
+//! `tauri.conf.json`'s entry apart from `decorations`.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use fbtt_desktop_core::DesktopSettings;
-use tauri::{Emitter, TitleBarStyle, WebviewWindow};
+use tauri::{Emitter, WebviewWindow};
 
 use crate::commands::Platform;
 
@@ -30,38 +34,44 @@ pub enum Chrome {
     /// macOS: the system's title strip, transparent and untitled, with the native traffic lights kept
     /// and drawn over the page's own bar.
     Overlay,
-    /// Windows and Linux: no system decorations; the page draws the bar and the window controls.
+    /// Windows, and Linux by default: no system decorations; the page draws the bar and the controls.
     Drawn,
-    /// Windows and Linux with `system_title_bar` on: the system's own title bar and controls.
+    /// Linux with `system_title_bar` on: the system's own title bar and controls.
     System,
 }
 
-/// The chrome for `platform` when the setting says `system_title_bar`.
+/// The chrome for `platform` when the setting says `system_title_bar`. Only Linux reads the setting.
 pub fn chrome_for(platform: Platform, system_title_bar: bool) -> Chrome {
     match platform {
         Platform::Macos => Chrome::Overlay,
-        Platform::Windows | Platform::Linux if system_title_bar => Chrome::System,
-        Platform::Windows | Platform::Linux => Chrome::Drawn,
+        Platform::Windows => Chrome::Drawn,
+        Platform::Linux if system_title_bar => Chrome::System,
+        Platform::Linux => Chrome::Drawn,
     }
 }
 
-/// Whether the page draws a bare toolbar under the system's title bar. Never on macOS, where the
-/// setting is not offered and the bar is always the app's own.
+/// Whether the page draws a bare toolbar under the system's title bar: Linux with the setting on.
 pub fn uses_system_title_bar(platform: Platform, system_title_bar: bool) -> bool {
     chrome_for(platform, system_title_bar) == Chrome::System
 }
 
-/// Puts the chrome [`chrome_for`] names on `window`. A refusal from the window system is said on stderr
-/// and otherwise ignored: a window with the wrong decorations is still a window that works.
+/// The decorations [`apply_chrome`] has to set at runtime, or `None` when the conf files already gave
+/// the window the right ones. Only Linux changes anything: on, under the system title bar; off again
+/// when the setting is switched back while the app runs.
+pub fn runtime_decorations(platform: Platform, system_title_bar: bool) -> Option<bool> {
+    match platform {
+        Platform::Linux => Some(chrome_for(platform, system_title_bar) == Chrome::System),
+        Platform::Macos | Platform::Windows => None,
+    }
+}
+
+/// Puts the decorations [`runtime_decorations`] names on `window`. Called first thing once the window
+/// exists, before it is shown. A refusal from the window system is said on stderr and otherwise
+/// ignored: a window with the wrong decorations is still a window that works.
 pub fn apply_chrome(window: &WebviewWindow, platform: Platform, system_title_bar: bool) {
-    let result = match chrome_for(platform, system_title_bar) {
-        Chrome::Overlay => window
-            .set_decorations(true)
-            .and_then(|()| window.set_title_bar_style(TitleBarStyle::Overlay)),
-        Chrome::Drawn => window.set_decorations(false),
-        Chrome::System => window.set_decorations(true),
-    };
-    if let Err(problem) = result {
+    if let Some(decorations) = runtime_decorations(platform, system_title_bar)
+        && let Err(problem) = window.set_decorations(decorations)
+    {
         eprintln!("The window's title bar could not be set: {problem}");
     }
 }
@@ -113,17 +123,22 @@ pub fn system_title_bar(state: tauri::State<'_, ChromeState>) -> bool {
     uses_system_title_bar(Platform::current(), state.get())
 }
 
-/// Saves the title bar setting, puts the matching chrome on the window, and tells the page (the
-/// [`SYSTEM_TITLE_BAR_EVENT`] event) so its bar follows. Answers what [`system_title_bar`] now answers.
+/// On Linux: saves the title bar setting, puts the matching decorations on the window, and tells the
+/// page (the [`SYSTEM_TITLE_BAR_EVENT`] event) so its bar follows. On Windows and macOS it does nothing
+/// and answers `false`. Answers what [`system_title_bar`] now answers.
 #[tauri::command]
 pub fn set_system_title_bar(
     on: bool,
     window: WebviewWindow,
     state: tauri::State<'_, ChromeState>,
 ) -> Result<bool, String> {
+    let platform = Platform::current();
+    // Windows and macOS always draw the app's own bar: the setting is not offered there.
+    if platform != Platform::Linux {
+        return Ok(false);
+    }
     save_system_title_bar(&state.settings_file, on)?;
     state.set(on);
-    let platform = Platform::current();
     apply_chrome(&window, platform, on);
     let system = uses_system_title_bar(platform, on);
     if let Err(problem) = window.emit(SYSTEM_TITLE_BAR_EVENT, system) {
@@ -137,7 +152,9 @@ mod tests {
     use fbtt_core::scratch::ScratchDir;
     use fbtt_desktop_core::{CloseAction, DesktopSettings};
 
-    use super::{Chrome, chrome_for, save_system_title_bar, uses_system_title_bar};
+    use super::{
+        Chrome, chrome_for, runtime_decorations, save_system_title_bar, uses_system_title_bar,
+    };
     use crate::commands::Platform;
 
     #[test]
@@ -149,16 +166,27 @@ mod tests {
             "macOS has no system title bar fallback"
         );
         assert!(!uses_system_title_bar(Platform::Macos, true));
+        assert_eq!(runtime_decorations(Platform::Macos, true), None);
+    }
+
+    /// Design spec 2.4: the fallback is Linux's. Windows always draws its own bar.
+    #[test]
+    fn windows_always_draws_its_own_bar() {
+        assert_eq!(chrome_for(Platform::Windows, false), Chrome::Drawn);
+        assert_eq!(chrome_for(Platform::Windows, true), Chrome::Drawn);
+        assert!(!uses_system_title_bar(Platform::Windows, true));
+        assert_eq!(runtime_decorations(Platform::Windows, true), None);
+        assert_eq!(runtime_decorations(Platform::Windows, false), None);
     }
 
     #[test]
-    fn windows_and_linux_draw_their_own_bar_unless_the_setting_says_otherwise() {
-        for platform in [Platform::Windows, Platform::Linux] {
-            assert_eq!(chrome_for(platform, false), Chrome::Drawn);
-            assert_eq!(chrome_for(platform, true), Chrome::System);
-            assert!(!uses_system_title_bar(platform, false));
-            assert!(uses_system_title_bar(platform, true));
-        }
+    fn linux_decorations_come_back_only_under_the_system_title_bar() {
+        assert_eq!(chrome_for(Platform::Linux, false), Chrome::Drawn);
+        assert_eq!(chrome_for(Platform::Linux, true), Chrome::System);
+        assert!(uses_system_title_bar(Platform::Linux, true));
+        assert!(!uses_system_title_bar(Platform::Linux, false));
+        assert_eq!(runtime_decorations(Platform::Linux, true), Some(true));
+        assert_eq!(runtime_decorations(Platform::Linux, false), Some(false));
     }
 
     #[test]
@@ -198,17 +226,54 @@ mod tests {
         );
     }
 
-    /// On macOS the title strip is the overlay with no title and the traffic lights placed on the bar. An unknown `titleBarStyle` would silently be `Visible`, so the exact
-    /// spelling is pinned here.
+    fn conf(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("the conf parses")
+    }
+
+    /// On macOS the title strip is the overlay with no title and the traffic lights placed on the bar.
+    /// An unknown `titleBarStyle` would silently be `Visible`, so the exact spelling is pinned here.
     #[test]
     fn tauri_conf_hides_the_mac_title() {
-        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
-            .expect("tauri.conf.json parses");
+        let conf = conf(include_str!("../tauri.conf.json"));
         let main = &conf["app"]["windows"][0];
         assert_eq!(main["label"], "main");
         assert_eq!(main["titleBarStyle"], "Overlay");
         assert_eq!(main["hiddenTitle"], true);
-        assert!(main["trafficLightPosition"]["x"].is_number());
-        assert!(main["trafficLightPosition"]["y"].is_number());
+        assert_eq!(main["trafficLightPosition"]["x"], 16);
+        assert_eq!(main["trafficLightPosition"]["y"], 34);
+    }
+
+    /// Windows and Linux open undecorated from the first frame. Tauri merges the platform file as a
+    /// JSON merge patch, which replaces the whole `windows` array, so each platform file must be the
+    /// base window entry with `decorations: false` and nothing else changed: a key added to the base
+    /// entry (and not to these) would silently be lost on that platform.
+    #[test]
+    fn platform_confs_are_the_main_window_undecorated() {
+        let base = conf(include_str!("../tauri.conf.json"));
+        let mut expected = base["app"]["windows"].clone();
+        expected[0]["decorations"] = serde_json::Value::Bool(false);
+        for (name, text) in [
+            (
+                "tauri.windows.conf.json",
+                include_str!("../tauri.windows.conf.json"),
+            ),
+            (
+                "tauri.linux.conf.json",
+                include_str!("../tauri.linux.conf.json"),
+            ),
+        ] {
+            let platform = conf(text);
+            assert_eq!(platform["app"]["windows"], expected, "{name}");
+            assert_eq!(
+                platform.as_object().map(|o| o.len()),
+                Some(1),
+                "{name} sets only app.windows"
+            );
+            assert_eq!(
+                platform["app"].as_object().map(|o| o.len()),
+                Some(1),
+                "{name}"
+            );
+        }
     }
 }

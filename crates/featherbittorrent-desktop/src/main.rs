@@ -70,13 +70,17 @@ fn main() {
             )
         });
 
-    // The title bar goes on the window before the event loop first draws it. This belongs as the first
-    // step of the app's single setup function once there is one: `Builder::setup` replaces, never chains.
-    if let Some(main) = app.get_webview_window("main") {
-        window::apply_chrome(&main, Platform::current(), settings.system_title_bar);
-    }
-
-    app.run(|handle, event| {
+    let system_title_bar = settings.system_title_bar;
+    app.run(move |handle, event| {
+        // The config's windows exist from `Ready` on. The title bar's decorations must go on before the
+        // window is first shown: when the app gets its single setup function, this is its first step,
+        // ahead of any `show()` (`Builder::setup` replaces, never chains, so it cannot be a second one).
+        if let RunEvent::Ready = event {
+            match handle.get_webview_window("main") {
+                Some(main) => window::apply_chrome(&main, Platform::current(), system_title_bar),
+                None => eprintln!("The main window was not there to put its title bar on."),
+            }
+        }
         if let RunEvent::Exit = event
             && let Some(this_computer) = handle.state::<DesktopState>().take()
         {

@@ -16,12 +16,17 @@ const win = vi.hoisted(() => ({
   onResized: vi.fn(() => Promise.resolve(() => {})),
 }))
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => win }))
+// No shell behind the page: every command and every listen fails, as if `desktop_info` never answered.
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.reject(new Error('no shell'))) }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(() => Promise.reject(new Error('no shell'))) }))
 
-import { TitleBar } from './TitleBar'
+import { useEffect } from 'react'
+import { DesktopChrome, TitleBar } from './TitleBar'
 
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  vi.restoreAllMocks()
 })
 
 const CONTROLS = ['Minimize', 'Maximize', 'Close']
@@ -95,4 +100,47 @@ it('a_maximized_window_offers_restore', async () => {
   await renderBar('windows')
   screen.getByRole('button', { name: 'Restore' })
   expect(screen.queryByRole('button', { name: 'Maximize' })).toBeNull()
+})
+
+it('the_toolbar_is_named_window', async () => {
+  await renderBar('windows')
+  screen.getByRole('toolbar', { name: 'Window' })
+})
+
+it('system_title_bar_has_no_drag_region', async () => {
+  const { container } = await renderBar('linux', true)
+  expect(container.querySelector('[data-tauri-drag-region]')).toBeNull()
+})
+
+it('switching_the_system_title_bar_keeps_the_slots_mounted', async () => {
+  const mounts = vi.fn()
+  function Probe() {
+    useEffect(() => {
+      mounts()
+    }, [])
+    return <span>probe</span>
+  }
+  const bar = (system: boolean) => (
+    <TitleBar platform="linux" systemTitleBar={system} instanceSwitcher={<Probe />} actions={null} />
+  )
+  const { rerender } = render(bar(false))
+  await act(async () => {})
+  rerender(bar(true))
+  rerender(bar(false))
+  await act(async () => {})
+  expect(mounts).toHaveBeenCalledTimes(1)
+})
+
+it('without_desktop_info_the_bar_still_draws_its_controls', async () => {
+  vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/131.0',
+  )
+  render(
+    <DesktopChrome>
+      <div>page</div>
+    </DesktopChrome>,
+  )
+  await act(async () => {})
+  for (const name of CONTROLS) screen.getByRole('button', { name })
+  screen.getByText('page')
 })

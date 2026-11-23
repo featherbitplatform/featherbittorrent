@@ -51,12 +51,12 @@ export async function desktopInfo(): Promise<DesktopInfo> {
   return invoke<DesktopInfo>('desktop_info')
 }
 
-/** Whether the page draws a bare toolbar under the system's title bar rather than its own bar with window controls. Never on macOS. */
+/** Whether the page draws a bare toolbar under the system's title bar rather than its own bar with window controls. Only on Linux. */
 export async function systemTitleBar(): Promise<boolean> {
   return invoke<boolean>('system_title_bar')
 }
 
-/** Saves the "Use the system title bar" setting and puts the matching chrome on the window; answers what {@link systemTitleBar} now answers. */
+/** Saves the "Use the system title bar" setting and puts the matching chrome on the window; answers what {@link systemTitleBar} now answers. On Windows and macOS it does nothing and answers `false`. */
 export async function setSystemTitleBar(on: boolean): Promise<boolean> {
   return invoke<boolean>('set_system_title_bar', { on })
 }

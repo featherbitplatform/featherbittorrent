@@ -6,9 +6,9 @@
  * 78px free for them. On Windows and Linux this bar draws Minimize, Maximize (Restore when the window
  * is maximized) and Close on the right. Empty bar space carries `data-tauri-drag-region`: pressing
  * there moves the window, and a double click maximizes or restores it (zooms, on macOS), which Tauri's
- * own drag script does. With the system title bar switched on (Windows and Linux only) the bar is a
- * plain toolbar: the switcher and the actions, no controls and no dragging, which the system's own
- * title bar above it does.
+ * own drag script does. With the system title bar switched on (Linux only: Windows always draws its
+ * own) the bar is a plain toolbar: the switcher and the actions, no controls and no dragging, which
+ * the system's own title bar above it does.
  *
  * {@link DesktopChrome} is the frame: the bar on top, the page below in the space that is left, and
  * the bar's slots handed to the page through {@link TitleBarSlotsContext}, so the header can put its
@@ -118,20 +118,21 @@ function WindowControls() {
 }
 
 export function TitleBar({ platform, systemTitleBar, instanceSwitcher, actions }: TitleBarProps) {
-  if (systemTitleBar) {
-    return (
-      <div role="toolbar" className="flex h-12 shrink-0 items-center gap-4 border-b border-rule bg-sunken px-4">
-        <div className="flex min-w-0 items-center gap-4">{instanceSwitcher}</div>
-        <div data-title-bar-spacer className="h-full min-w-4 flex-1" />
-        <div className="flex shrink-0 items-center gap-4">{actions}</div>
-      </div>
-    )
-  }
-  const mac = platform === 'macos'
+  // One tree for both modes: switching the system title bar changes attributes and the edge pieces,
+  // never the elements around `instanceSwitcher` and `actions`, so what is portalled into them (an open
+  // switcher menu, say) stays mounted.
+  const drawn = !systemTitleBar
+  const mac = drawn && platform === 'macos'
+  const drag = drawn ? '' : undefined
   return (
     <div
-      data-tauri-drag-region
-      className={`flex h-12 shrink-0 select-none items-center border-b border-rule bg-sunken ${mac ? 'pr-4' : 'pl-4'}`}
+      role="toolbar"
+      aria-label="Window"
+      data-tauri-drag-region={drag}
+      className={
+        'flex h-12 shrink-0 select-none items-center border-b border-rule bg-sunken ' +
+        (!drawn ? 'gap-4 px-4' : mac ? 'pr-4' : 'pl-4')
+      }
     >
       {mac && (
         <div
@@ -141,12 +142,12 @@ export function TitleBar({ platform, systemTitleBar, instanceSwitcher, actions }
           style={{ width: `${TRAFFIC_LIGHTS_INSET}px` }}
         />
       )}
-      <div data-tauri-drag-region="deep" className="flex min-w-0 items-center gap-4">
+      <div data-tauri-drag-region={drawn ? 'deep' : undefined} className="flex min-w-0 items-center gap-4">
         {instanceSwitcher}
       </div>
-      <div data-title-bar-spacer data-tauri-drag-region className="h-full min-w-4 flex-1" />
+      <div data-title-bar-spacer data-tauri-drag-region={drag} className="h-full min-w-4 flex-1" />
       <div className="flex shrink-0 items-center gap-4">{actions}</div>
-      {!mac && (
+      {drawn && !mac && (
         <>
           <div data-tauri-drag-region className="h-full w-3 shrink-0" />
           <WindowControls />
@@ -182,11 +183,23 @@ function useSystemTitleBar(): boolean {
 }
 
 /**
+ * The system this page runs on, read from the user agent: what the bar is drawn for until the shell's
+ * `desktop_info` answers, and for good if it never does, so an undecorated window always has its
+ * controls and somewhere to drag.
+ */
+function guessPlatform(): DesktopInfo['platform'] {
+  const agent = typeof navigator === 'undefined' ? '' : navigator.userAgent
+  if (/Mac/.test(agent)) return 'macos'
+  if (/Windows/.test(agent)) return 'windows'
+  return 'linux'
+}
+
+/**
  * The bar above `children`, with the bar's slots provided to them. `children` gets the rest of the
  * window: a screen that sizes itself to the viewport (`h-dvh`, `min-h-dvh`) is sized to that space.
  */
 export function DesktopChrome({ children }: { children: ReactNode }) {
-  const [platform, setPlatform] = useState<DesktopInfo['platform'] | null>(null)
+  const [platform, setPlatform] = useState<DesktopInfo['platform']>(guessPlatform)
   const system = useSystemTitleBar()
   const [switcher, setSwitcher] = useState<HTMLElement | null>(null)
   const [lead, setLead] = useState<HTMLElement | null>(null)
@@ -208,19 +221,17 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
   return (
     <TitleBarSlotsContext.Provider value={slots}>
       <div className="flex h-dvh flex-col overflow-hidden bg-canvas">
-        {platform !== null && (
-          <TitleBar
-            platform={platform}
-            systemTitleBar={system}
-            instanceSwitcher={
-              <>
-                <div ref={setSwitcher} className="contents" />
-                <div ref={setLead} className="contents" />
-              </>
-            }
-            actions={<div ref={setActions} className="contents" />}
-          />
-        )}
+        <TitleBar
+          platform={platform}
+          systemTitleBar={system}
+          instanceSwitcher={
+            <>
+              <div ref={setSwitcher} className="contents" />
+              <div ref={setLead} className="contents" />
+            </>
+          }
+          actions={<div ref={setActions} className="contents" />}
+        />
         <div className="relative flex min-h-0 flex-1 flex-col overflow-auto [&_.h-dvh]:h-full [&_.min-h-dvh]:min-h-full">
           {children}
         </div>
