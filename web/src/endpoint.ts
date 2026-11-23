@@ -6,7 +6,8 @@
  * session cookie, a CSRF header on changes. The desktop app talks to an engine at an address of its
  * own (`bearer`): absolute URLs, an `Authorization: Bearer` header, and no cookie at all. `EventSource`
  * and a `<video src>` cannot set a header, so the routes behind them take the same token as a `token`
- * query parameter, and {@link withToken} is how it gets there.
+ * query parameter, and {@link withToken} is how it gets there. {@link isOwnUrl} is the check that
+ * keeps that token on this endpoint's own server.
  *
  * This lives apart from `connection.ts` so the client and the session store can read it without
  * importing the module that builds them.
@@ -53,4 +54,20 @@ export function withToken(url: string, token: string | null): string {
 /** Whether a URL names its own origin: such a request carries no cookie of this page's. */
 export function isAbsolute(url: string): boolean {
   return /^[a-z][a-z0-9+.-]*:/i.test(url)
+}
+
+/**
+ * Whether a URL belongs to this endpoint and may carry its token: a relative path always does; an
+ * absolute URL only when it sits on the endpoint's own base, at a path boundary - `http://host:1x`
+ * is not this connection's `http://host:1`. A URL that names somebody else's server must not take
+ * this session's token with it.
+ */
+export function isOwnUrl(endpoint: Endpoint, url: string): boolean {
+  if (endpoint.kind !== 'bearer') return true
+  if (!isAbsolute(url)) return true
+  const base = normaliseBase(endpoint.base)
+  if (base === '') return false
+  if (url.slice(0, base.length).toLowerCase() !== base.toLowerCase()) return false
+  const rest = url.slice(base.length)
+  return rest === '' || rest.startsWith('/') || rest.startsWith('?') || rest.startsWith('#')
 }

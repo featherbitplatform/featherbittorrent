@@ -40,7 +40,9 @@
  * differences. A token handed in at launch is a session from the start (`signedIn` as `desktop`,
  * nothing to ask the server); with none, the page starts on the sign-in screen and a sign-in is
  * `POST /api/v1/auth/session` with `Authorization: Basic`, whose answer's token lives in this closure
- * only, for the same reasons the CSRF value does. A `401` ends it exactly as it ends a cookie session.
+ * only, for the same reasons the CSRF value does. Two sign-ins sent before either answer arrives
+ * share one post, so a token the server minted is never left orphaned there. A `401` ends it exactly
+ * as it ends a cookie session.
  *
  * @module session
  */
@@ -344,6 +346,10 @@ function createBearerStore(
       ? { phase: 'signedOut', notice: null, error: null }
       : { phase: 'signedIn', subject: DESKTOP_SUBJECT, csrf: '', error: null }
   const listeners = new Set<() => void>()
+  // The sign-in in flight, shared the way the cookie store shares one refresh. Every accepted post
+  // mints its own token on the server, so two taps before either answer arrives must share one post:
+  // two posts would leave the first token valid there while the page only ever kept the second.
+  let signingIn: Promise<boolean> | null = null
 
   function set(next: SessionState): void {
     state = next
@@ -355,7 +361,7 @@ function createBearerStore(
     set({ phase: 'signedOut', notice, error })
   }
 
-  async function signIn(user: string, password: string): Promise<boolean> {
+  async function attemptSignIn(user: string, password: string): Promise<boolean> {
     const notice = state.phase === 'signedOut' ? state.notice : null
     let response: Response
     try {
@@ -411,7 +417,14 @@ function createBearerStore(
     // Nothing to ask: a launch token is a session and no token is the sign-in screen, both known
     // before any answer could arrive.
     refresh: async () => {},
-    signIn,
+    // One sign-in in flight at a time: a second caller while the first post is out gets that post's
+    // answer rather than sending its own, so no minted token is left orphaned on the server.
+    signIn: (user, password) => {
+      signingIn ??= attemptSignIn(user, password).finally(() => {
+        signingIn = null
+      })
+      return signingIn
+    },
     // The same rule as the cookie store: the server ends the session, because the token has already
     // travelled in query strings and forgetting it here would leave it good until it expires. A 2xx
     // or a 401 means it is over; anything else left it alive, so the page stays signed in and says so.

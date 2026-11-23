@@ -160,6 +160,31 @@ it('bearer_sign_in_uses_basic_and_keeps_the_token_in_memory', async () => {
   cookie.mockRestore()
 })
 
+it('bearer_sign_in_twice_at_once_posts_once', async () => {
+  // Two taps before either answer arrives must share one post, the way the cookie store shares one
+  // refresh: every accepted post mints its own token on the server, so two posts would leave the
+  // first token sitting valid there while the page only ever kept the second one.
+  const { promise, release } = held()
+  const seen: string[] = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push(`${init?.method ?? 'GET'} ${String(input)}`)
+    return promise.then(() => json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}'))
+  }, { kind: 'bearer', base: BASE, token: null })
+
+  const first = store.signIn('alice', 'hunter2')
+  const second = store.signIn('bob', 'hunter3')
+  release()
+  const answers = await Promise.all([first, second])
+
+  expect(answers, 'the second overlapping sign-in did not take the shared answer').toEqual([true, true])
+  expect(seen, 'two sign-ins sent at once asked the engine more than once').toEqual([
+    `POST ${BASE}/api/v1/auth/session`,
+  ])
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'alice', 'the shared answer was not the engine answer').toBe(true)
+  expect(store.token(), 'the shared sign-in did not keep the token it was given').toBe('tok-1')
+})
+
 it('bearer_401_returns_to_sign_in_with_session_ended', async () => {
   const store = createSessionStore(async () => json(401, UNAUTHORIZED), { kind: 'bearer', base: BASE, token: 'launch-secret' })
   const state = store.get()

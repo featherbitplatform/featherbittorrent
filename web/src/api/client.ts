@@ -37,7 +37,7 @@ import type { components, operations } from './schema'
 import { displaySafe } from '../format'
 import { UNREACHABLE_COPY } from '../live'
 import { session } from '../session'
-import { SAME_ORIGIN, resolve, withToken } from '../endpoint'
+import { SAME_ORIGIN, isOwnUrl, resolve, withToken } from '../endpoint'
 import type { Endpoint } from '../endpoint'
 
 /** One torrent, as the list and the detail screens will draw it. */
@@ -238,9 +238,11 @@ export function createClient(
 ): Api {
   const bearer = endpoint.kind === 'bearer'
 
-  /** A stream address the browser opens on its own (a `<video src>`, a download): absolute and carrying the token for the desktop. */
+  /** A stream address the browser opens on its own (a `<video src>`, a download): absolute and carrying the token for the desktop. The token goes only to this connection's own server: an answer that names somebody else's keeps it to itself. */
   function streamAddress(path: string): string {
-    return bearer ? withToken(resolve(endpoint, path), getToken()) : path
+    if (!bearer) return path
+    const url = resolve(endpoint, path)
+    return isOwnUrl(endpoint, url) ? withToken(url, getToken()) : url
   }
 
   async function request(
