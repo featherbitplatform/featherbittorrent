@@ -986,7 +986,7 @@ describe('what the pane shares with the table', () => {
       session: async () => SCREEN_SESSION,
     } as unknown as Api
     const { container } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
     )
     await flush()
     expect(pane(container) === null, 'the pane was drawn when nothing was selected').toBe(true)

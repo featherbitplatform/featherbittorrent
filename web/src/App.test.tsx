@@ -135,3 +135,52 @@ describe('the page as a whole', () => {
     world.behavior = null
   })
 })
+
+describe('the Settings screen in the page', () => {
+  it('settings_replaces_the_torrents_and_back_returns', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(screen.getByRole('heading', { name: 'Server' }) !== null, 'Settings did not open').toBe(true)
+    expect(screen.queryByRole('button', { name: 'Add torrent' }), 'the table stayed under Settings').toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    expect(screen.queryByRole('heading', { name: 'Server' }), 'Settings stayed after Back').toBeNull()
+    world.behavior = null
+  })
+
+  it('the filter survives a trip to Settings', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: /^Paused/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^Paused/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => screen.getByRole('button', { name: /^Paused/ }))
+    expect(
+      screen.getByRole('button', { name: /^Paused/ }).getAttribute('aria-pressed'),
+      'the filter was reset by the trip',
+    ).toBe('true')
+    world.behavior = null
+  })
+
+  it('focus moves into Settings and back', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    const opener = screen.getByRole('button', { name: 'Settings' })
+    opener.focus()
+    fireEvent.click(opener)
+    expect(document.activeElement, 'focus did not move to the Settings title').toBe(
+      screen.getByRole('heading', { name: 'Settings' }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
+    await waitFor(() => {
+      expect(document.activeElement, 'focus did not return to the Settings button').toBe(
+        screen.getByRole('button', { name: 'Settings' }),
+      )
+    })
+    world.behavior = null
+  })
+})

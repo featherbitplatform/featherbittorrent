@@ -30,6 +30,7 @@ import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
 import { session, useSession } from './session'
+import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
@@ -39,6 +40,7 @@ export default function App() {
   const assertiveRef = useRef<HTMLDivElement>(null)
   const live = useRef<LiveAnnouncer | null>(null)
   const [trying, setTrying] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   // The announcer writes into the two nodes above and follows the store. The regions are React's;
   // this only ever sets their text, and React never gives them children to fight over.
@@ -53,6 +55,19 @@ export default function App() {
       announcer.stop()
     }
   }, [])
+
+  // Going back hands the focus to the button that opened Settings, which is on screen again by then.
+  const wasOpen = useRef(false)
+  useEffect(() => {
+    if (wasOpen.current && !settingsOpen) {
+      document.querySelector<HTMLElement>('[data-settings-opener]')?.focus()
+    }
+    wasOpen.current = settingsOpen
+  }, [settingsOpen])
+
+  // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
+  const workspace = state.phase === 'signedIn' || state.phase === 'open'
+  if (!workspace && settingsOpen) setSettingsOpen(false)
 
   async function retry(): Promise<void> {
     setTrying(true)
@@ -88,11 +103,26 @@ export default function App() {
           <h1 className="mt-4 text-base font-medium tracking-wide text-strong">featherbittorrent</h1>
         </main>
       ) : (
-        <Torrents
-          signedIn={state.phase === 'signedIn'}
-          signOutError={signOutError}
-          onSignOut={() => void signOut()}
-        />
+        <>
+          {settingsOpen && (
+            <Settings
+              onBack={() => {
+                setSettingsOpen(false)
+              }}
+            />
+          )}
+          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
+          <div hidden={settingsOpen}>
+            <Torrents
+              onSettings={() => {
+                setSettingsOpen(true)
+              }}
+              signedIn={state.phase === 'signedIn'}
+              signOutError={signOutError}
+              onSignOut={() => void signOut()}
+            />
+          </div>
+        </>
       )}
     </>
   )

@@ -465,7 +465,7 @@ describe('phone width', () => {
       session: async () => SESSION_BODY,
     } as unknown as Api
     const { container } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
     )
     // Let the mount effects' reads land before looking at anything.
     await act(async () => {
@@ -506,5 +506,60 @@ describe('phone width', () => {
         (container.querySelector('table')?.getAttribute('class') ?? '').includes('min-w-[760px]'),
       'the table has no floor width to scroll sideways down to',
     ).toBe(true)
+  })
+})
+
+describe('a table hidden and shown again', () => {
+  it('scroll is restored when the table is measured again', () => {
+    let boxHeight = 300
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => boxHeight,
+    })
+    try {
+      const { container } = render(<TorrentTable rows={rowsOf(2_000)} selectedId={null} />)
+      const box = setScrollTop(container, 4_000)
+      fireEvent.scroll(box)
+      // Hidden: the box reports nothing, and the browser throws its scroll position away.
+      boxHeight = 0
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      ;(box as unknown as { scrollTop: number }).scrollTop = 0
+      // Shown again: the position must come back.
+      boxHeight = 300
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(box.scrollTop, 'the scroll position was lost across hide and show').toBe(4_000)
+    } finally {
+      if (original !== undefined) Object.defineProperty(HTMLElement.prototype, 'clientHeight', original)
+      else Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight')
+    }
+  })
+
+  it('a resize mid-scroll does not move the scroll position', () => {
+    let boxHeight = 300
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => boxHeight,
+    })
+    try {
+      const { container } = render(<TorrentTable rows={rowsOf(2_000)} selectedId={null} />)
+      const box = setScrollTop(container, 4_000)
+      fireEvent.scroll(box)
+      // The reader's finger is still moving: the box is somewhere else than the last scroll event said.
+      ;(box as unknown as { scrollTop: number }).scrollTop = 3_900
+      boxHeight = 350
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(box.scrollTop, 'a resize fought the reader mid-scroll').toBe(3_900)
+    } finally {
+      if (original !== undefined) Object.defineProperty(HTMLElement.prototype, 'clientHeight', original)
+      else Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight')
+    }
   })
 })
