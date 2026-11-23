@@ -53,8 +53,8 @@
 //! (or, for the cue, as a stream that ends with nothing to play), never as
 //! a panic and never as a hang.
 use fbtt_media::{
-    FragmentStream, MAX_MP4_SAMPLES, MOOV_CAP, MediaError, Sample, TIME_OFFSET_MS, open_track,
-    probe,
+    FragmentStream, MAX_MP4_SAMPLES, MAX_SAMPLE_BYTES, MOOV_CAP, MediaError, Sample,
+    TIME_OFFSET_MS, open_track, probe,
 };
 use matroska_demuxer::{Frame, MatroskaFile};
 use serde_json::Value;
@@ -912,10 +912,34 @@ struct CountCalls<R> {
     calls: Arc<AtomicU64>,
 }
 
+/// A reader that remembers the biggest buffer it was ever asked to fill.
+///
+/// A source allocates the buffer it reads a sample into before it hands it over (see
+/// `mp4in::read_sample_bytes`), so the widest request is how these tests tell a refusal that came
+/// from a declared size apart from one that came after the bytes were paid for.
+struct WidestRequest<R> {
+    inner: R,
+    widest: Arc<AtomicU64>,
+}
+
 impl<R: Read> Read for CountCalls<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.read(buf)
+    }
+}
+
+impl<R: Read> Read for WidestRequest<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let asked = u64::try_from(buf.len()).expect("a buffer's length fits a u64");
+        self.widest.fetch_max(asked, Ordering::Relaxed);
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for WidestRequest<R> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, IoError> {
+        self.inner.seek(pos)
     }
 }
 
@@ -3823,5 +3847,154 @@ fn mp4_fragmented_input_is_unsupported() {
             "a top level moof says as much about a file as a moov carrying mvex: {message}"
         ),
         other => panic!("a fragmented MP4 input is Unsupported, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One frame's worth of bytes: `MAX_SAMPLE_BYTES`. The two containers say it
+// differently - an MP4 states a sample's size in its tables before any byte of
+// it is read, and a Matroska frame's size is only known once the demuxer has
+// filled its buffer - so the two tests below ask where each refusal lands and
+// what it costs. Both are about the crafted file the cap exists for: one frame
+// that is bigger than the fragments, the queue and the eight streams it can be
+// queued in, put there by a number rather than by a film.
+// ---------------------------------------------------------------------------
+
+/// A track whose `stsz` states one sample of 16 MiB plus one is refused at the open, with none of
+/// those bytes asked for.
+///
+/// The claim is a number in a table, not media in the file: this 57 KB fixture's first video sample
+/// gets an entry the cap plus one, and a reader that trusted it would be handed a buffer that size to
+/// fill with bytes the file does not hold. The element cap (256 MiB) trusts that number, so the
+/// widest buffer this open ever asks for is what tells the two caps apart: a header's reads, or a
+/// 16 MiB one.
+#[test]
+fn mp4_oversized_sample_is_refused() {
+    let mut bytes = fixture_bytes(FASTSTART);
+    let size = u64::try_from(bytes.len()).expect("a fixture size fits a u64");
+    let stsz = box_at(&bytes, b"stsz");
+    assert_eq!(
+        u32_at(&bytes, stsz + 4),
+        0,
+        "the fixture sizes its video samples one by one, so one entry is one sample"
+    );
+    assert_eq!(
+        u32_at(&bytes, stsz + 8),
+        40,
+        "and this track has 40 of them to size"
+    );
+    let claim = u32::try_from(MAX_SAMPLE_BYTES + 1).expect("the cap plus one fits a size field");
+    put_u32(&mut bytes, stsz + 12, claim);
+
+    let widest = Arc::new(AtomicU64::new(0));
+    let reader = WidestRequest {
+        inner: Cursor::new(bytes),
+        widest: Arc::clone(&widest),
+    };
+    let verdict = open_track(reader, 1, 0)
+        .expect_err("a sample claiming the cap plus one is not a sample this remuxes");
+    let asked = widest.load(Ordering::Relaxed);
+    match verdict {
+        MediaError::Malformed(message) => assert!(
+            message.contains(&MAX_SAMPLE_BYTES.to_string()),
+            "the refusal names the cap the claim broke: {message}"
+        ),
+        other => panic!("a sample over the cap is Malformed, got {other:?}"),
+    }
+    assert!(
+        asked < 1024 * 1024,
+        "the refusal is a table entry checked at the open: the widest buffer anyone was handed was \
+         {asked} bytes, against the {claim} this entry claims for one sample of a {size} byte file"
+    );
+}
+
+/// The same claim made the other way `stsz` can make it: one length for every sample, which is the
+/// shape with no entry array to point at.
+///
+/// The uniform box states 16 MiB plus one for all 40 samples of a 57 KB file at once, in the eight
+/// bytes where `mp4-atom` reads the length and stops looking for entries (the rewrite
+/// `mp4_huge_sample_count_is_refused` runs, with the count left at the fixture's own 40). Both shapes
+/// of one lie get the same verdict, because both are the size the buffer for a sample is sized from.
+#[test]
+fn mp4_oversized_uniform_sample_is_refused() {
+    let mut bytes = fixture_bytes(FASTSTART);
+    let stsz = box_at(&bytes, b"stsz");
+    let claim = u32::try_from(MAX_SAMPLE_BYTES + 1).expect("the cap plus one fits a size field");
+    // Into the uniform shape: a nonzero `sample_size` says there are no per-entry sizes to read, so
+    // the 160 bytes of entries come out, and every box whose declared length covers them shrinks by
+    // the same amount.
+    let around: Vec<usize> = [b"stbl", b"minf", b"mdia", b"trak", b"moov"]
+        .iter()
+        .map(|name| box_at(&bytes, name) - 8)
+        .collect();
+    put_u32(&mut bytes, stsz - 8, 20);
+    put_u32(&mut bytes, stsz + 4, claim);
+    put_u32(&mut bytes, stsz + 8, 40);
+    bytes.splice(stsz + 12..stsz + 172, []);
+    for field in around {
+        let size = u32_at(&bytes, field);
+        put_u32(&mut bytes, field, size - 160);
+    }
+
+    let verdict = open_track(Cursor::new(bytes), 1, 0)
+        .expect_err("40 samples of the cap plus one are not a track this remuxes");
+    match verdict {
+        MediaError::Malformed(message) => assert!(
+            message.contains(&MAX_SAMPLE_BYTES.to_string()) && message.contains(&claim.to_string()),
+            "the refusal names the length the box states and the cap it broke: {message}"
+        ),
+        other => panic!("a track of oversized samples is Malformed, got {other:?}"),
+    }
+}
+
+/// A `SimpleBlock` whose frame is 16 MiB plus one is refused where the stream takes the frame's
+/// bytes, before the sample, the fragment and the queue behind it are built from them.
+///
+/// The demuxer sizes the buffer for a frame from the block's own declaration, so a Matroska frame's
+/// size is first visible on the other side of `next_frame`: what this crate can still refuse is the
+/// copy out of that buffer, which is what a sample, a fragment and a queued fragment are made of. The
+/// frame here is real bytes rather than a claim, because a block declaring more than the file holds is
+/// the demuxer's own verdict about a stream that ended, and this is the crate's verdict about a frame
+/// that is too big to be a frame. It is the file's only frame, and a keyframe, so nothing else ends
+/// the stream on the way to it.
+#[test]
+fn remux_oversized_frame_is_refused() {
+    let tracks = ebml(
+        &TRACKS,
+        &[track_element(
+            1,
+            1,
+            H264_ID,
+            Some(avcc().as_slice()),
+            None,
+            Some((640, 360)),
+            None,
+            None,
+        )]
+        .concat(),
+    );
+    let payload = vec![0x41_u8; MAX_SAMPLE_BYTES as usize + 1];
+    let clusters = vec![cluster(0, &[simple_block(1, 0, true, &payload)])];
+    let file = matroska_file(&indexed_segment(&tracks, 1_000_000, &clusters));
+
+    let mut stream = open_track(Cursor::new(file), 1, 0)
+        .expect("the header of a file with one big frame is a header this crate reads");
+    for round in 0..2 {
+        match stream.next_fragment() {
+            Err(MediaError::Malformed(message)) => assert!(
+                message.contains(&MAX_SAMPLE_BYTES.to_string())
+                    && message.contains(&(MAX_SAMPLE_BYTES + 1).to_string()),
+                "round {round}: the refusal names the frame and the cap it broke: {message}"
+            ),
+            Err(other) => panic!("round {round}: a frame over the cap is Malformed, got {other:?}"),
+            Ok(got) => panic!(
+                "round {round}: a frame over the cap was streamed anyway ({}), and the whole point \
+                 of the cap is that it is never streamed",
+                match got {
+                    Some(fragment) => format!("a {} byte fragment", fragment.len()),
+                    None => "a clean end of stream".to_string(),
+                }
+            ),
+        }
     }
 }

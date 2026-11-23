@@ -35,7 +35,7 @@ use crate::probe::{TrackInfo, matroska_audio_rate, matroska_error, matroska_kind
 use crate::source::{
     Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource, mp4_mime,
 };
-use crate::{ELEMENT_CAP, MAX_SKIPPED_FRAMES, MediaError};
+use crate::{ELEMENT_CAP, MAX_SAMPLE_BYTES, MAX_SKIPPED_FRAMES, MediaError};
 use matroska_demuxer::{
     ContentCompAlgo, ContentEncAlgo, ContentEncoding, ContentEncodingValue, Frame, MatroskaFile,
     TrackEntry,
@@ -155,6 +155,14 @@ struct PendingFrame {
 /// right track, empty". Zero is the one value no real `TrackNumber` has, so
 /// "the slot still says track 0" is how callers tell a filled frame from a
 /// stale one.
+///
+/// A frame that arrives bigger than [`MAX_SAMPLE_BYTES`] is refused here, before
+/// any caller copies it out: the demuxer sizes its own buffer from the block's
+/// declaration inside `next_frame`, so the frame's size is first visible on the
+/// other side of that call, and this is the earliest point that still stops the
+/// copy into a sample, into a fragment and into the queue behind it. An empty
+/// `BlockGroup` leaves the slot holding the frame before it, which this check
+/// has already looked at.
 pub(crate) fn guarded_next<R: Read + Seek>(
     file: &mut MatroskaFile<CappedLen<R>>,
     slot: &mut Frame,
@@ -162,7 +170,16 @@ pub(crate) fn guarded_next<R: Read + Seek>(
 ) -> Result<bool, MediaError> {
     slot.track = 0;
     match catch_unwind(AssertUnwindSafe(|| file.next_frame(slot))) {
-        Ok(Ok(got)) => Ok(got),
+        Ok(Ok(got)) => {
+            if got && slot.data.len() > MAX_SAMPLE_BYTES as usize {
+                return Err(MediaError::Malformed(format!(
+                    "a frame of {} bytes is more than the {MAX_SAMPLE_BYTES} bytes one frame may \
+                     hold",
+                    slot.data.len()
+                )));
+            }
+            Ok(got)
+        }
         Ok(Err(error)) => Err(matroska_error(error)),
         Err(_) => Err(MediaError::Malformed(format!(
             "matroska demuxer panicked reading {what}"

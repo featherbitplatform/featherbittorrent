@@ -23,8 +23,9 @@
 //! allocated for the container's own entries and nothing this module adds. Nothing here is expanded
 //! per sample: no `Vec` of samples, no `Vec` of times, no second copy of the sizes.
 //!
-//! [`MAX_MP4_SAMPLES`] is what a count is trusted up to, and [`ELEMENT_CAP`] is what one sample's
-//! declared size is trusted up to, because the sample's bytes are read into a buffer that size.
+//! [`MAX_MP4_SAMPLES`] is what a count is trusted up to, and [`MAX_SAMPLE_BYTES`] is what one
+//! sample's declared size is trusted up to, because the sample's bytes are read into a buffer that
+//! size.
 //!
 //! # What is not read
 //!
@@ -63,7 +64,9 @@ use crate::probe;
 use crate::source::{
     Sample, SourceError, SourceResult, StoredError, TrackConfig, TrackSource, mp4_mime,
 };
-use crate::{ELEMENT_CAP, MAX_CUE_SCAN_FRAMES, MAX_MP4_SAMPLES, MediaError, SUBTITLE_FILE_CAP};
+use crate::{
+    MAX_CUE_SCAN_FRAMES, MAX_MP4_SAMPLES, MAX_SAMPLE_BYTES, MediaError, SUBTITLE_FILE_CAP,
+};
 use mp4_atom::{CttsEntry, Stbl, StscEntry, StszSamples, SttsEntry};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -595,17 +598,21 @@ fn validate(tables: &Tables) -> Result<(), MediaError> {
             "track {track} has no samples"
         )));
     }
-    // Sizes, and so the size of the buffer one sample's bytes go into.
-    let over_cap = |size: u32| u64::from(size) > ELEMENT_CAP;
+    // Sizes, and so the size of the buffer one sample's bytes go into. `MAX_SAMPLE_BYTES`, not
+    // `crate::ELEMENT_CAP`: this is media, which is copied out of the demuxer's buffer into a
+    // fragment and queued a second time, and the number `stsz` states is the only place this size is
+    // known before a buffer of it exists (see [`read_sample_bytes`]).
+    let over_cap = |size: u32| u64::from(size) > MAX_SAMPLE_BYTES;
     match &tables.sizes {
         Sizes::Identical { size } if over_cap(*size) => {
             return Err(MediaError::Malformed(format!(
-                "track {track}'s samples claim {size} bytes each, more than {ELEMENT_CAP}"
+                "track {track}'s samples claim {size} bytes each, more than the \
+                 {MAX_SAMPLE_BYTES} bytes one sample may hold"
             )));
         }
         Sizes::Different(sizes) if sizes.iter().any(|size| over_cap(*size)) => {
             return Err(MediaError::Malformed(format!(
-                "a sample of track {track} claims more than {ELEMENT_CAP} bytes"
+                "a sample of track {track} claims more than {MAX_SAMPLE_BYTES} bytes"
             )));
         }
         _ => {}
@@ -997,6 +1004,10 @@ fn ticks_for(ms: u64, timescale: u32, ceil: bool) -> Result<i128, MediaError> {
 }
 
 /// The bytes at one sample's offset: seek to it, and read exactly the size `stsz` gave it.
+///
+/// That size is bounded before this runs: [`validate`] refused a track with a sample over
+/// [`MAX_SAMPLE_BYTES`], so the buffer here is at most that big, and no reader is ever asked for a
+/// frame-sized copy of something a hostile header invented.
 ///
 /// A stream that ends short of that is an `Io` verdict, keeping the reader's own error kind,
 /// because a file whose tail has not arrived yet is not a file that lied about this sample. This

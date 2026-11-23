@@ -10,8 +10,8 @@
 //!
 //! Everything a file claims is treated as untrusted: sizes are bounded by [`CappedLen`] and
 //! [`ELEMENT_CAP`] - with [`MOOV_CAP`] tighter for an MP4 `moov`, which is read whole - the calls a
-//! header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], and a file that lies about itself
-//! yields a [`MediaError`], never a panic.
+//! header can cost by [`ReadBudget`] and [`MAX_HEADER_OPS`], one sample or frame by
+//! [`MAX_SAMPLE_BYTES`], and a file that lies about itself yields a [`MediaError`], never a panic.
 
 #![forbid(unsafe_code)]
 
@@ -89,6 +89,20 @@ pub const ELEMENT_CAP: u64 = 256 * 1024 * 1024;
 /// [`MAX_MP4_SAMPLES`], which bounds the walk over them), and 64 MiB of entries is 16 million
 /// samples, dozens of times past what a file worth streaming declares.
 pub const MOOV_CAP: u64 = 64 * 1024 * 1024;
+
+/// The most room one sample or frame's bytes may be given, whatever the container element holding it
+/// declares.
+///
+/// [`ELEMENT_CAP`] is the right bound on a header element: one open reads it once, a
+/// `Vec::with_capacity` and then a parse. Media is paid for more than once. The buffer the demuxer
+/// fills for a frame, the copy that prepends the stripped header the container took off it, the
+/// `mdat` a fragment is written into, and the fragment that queue is held in are each that frame's
+/// size again, and the server queues four fragments for every stream it allows eight of: a file
+/// claiming one 256 MiB frame is inside the element cap and costs about 1.5 GiB on one stream of it.
+/// A frame therefore gets its own bound, one far above any real one (raw 4K YUV 4:2:0 is just under
+/// 12 MiB, and a codec's keyframe of that picture is a fraction of it), where a bigger claim is a
+/// file lying about its media rather than a header this crate needs room to read.
+pub const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The most of a sidecar subtitle file is read: a caption track nobody can scroll is not worth
 /// unbounded memory.
