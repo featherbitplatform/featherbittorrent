@@ -194,6 +194,7 @@ creates parent folders, and a name that already exists is refused. The server al
 
 - an empty name, `.` and `..`;
 - a name with a slash or a backslash;
+- a name with any character Windows forbids in a file name: `<`, `>`, `:`, `"`, `|`, `?` or `*`;
 - a name that starts with a dot;
 - a name with control or invisible characters, or with leading, trailing or doubled spaces;
 - a name that ends in a dot or a space;
