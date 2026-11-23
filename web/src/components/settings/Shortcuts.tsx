@@ -25,10 +25,7 @@ function onPhone(): boolean {
 
 export function Shortcuts(): JSX.Element {
   return (
-    <section aria-labelledby="settings-shortcuts" className="flex flex-col gap-4">
-      <h2 id="settings-shortcuts" className="text-[14px] font-medium text-strong">
-        Shortcuts
-      </h2>
+    <div className="flex flex-col gap-4">
       {onPhone() && <p className="text-[13px] text-muted">For a keyboard.</p>}
       {GROUPS.map((where) => (
         <div key={where} className="flex flex-col gap-1">
@@ -56,6 +53,6 @@ export function Shortcuts(): JSX.Element {
           </ul>
         </div>
       ))}
-    </section>
+    </div>
   )
 }

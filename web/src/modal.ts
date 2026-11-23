@@ -32,6 +32,15 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import type { KeyboardEvent, RefObject } from 'react'
 
+/**
+ * The classes that make a modal `<dialog>` fill a phone screen at 640 px and below. Chrome caps a
+ * modal's `max-width` and `max-height` at `calc(100% - 6px - 2em)` and Tailwind's preflight does not
+ * reset it, so every one of them carries these; the body scrolls inside when it is taller than the
+ * screen. Above 640 px nothing changes.
+ */
+export const PHONE_FULLSCREEN =
+  'max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0 max-[640px]:overflow-y-auto'
+
 /** What a dialog component needs from this hook: the element to attach to, and its `onKeyDown`. */
 export interface ModalDialog {
   ref: RefObject<HTMLDialogElement | null>

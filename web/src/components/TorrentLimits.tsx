@@ -11,7 +11,7 @@ import { useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { Api } from '../api/client'
-import { useModalDialog } from '../modal'
+import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
 import Banner from './Banner'
 import Button from './Button'
 import TextField from './TextField'
@@ -81,7 +81,7 @@ export default function TorrentLimits({ id, client, onClose }: TorrentLimitsProp
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="torrent-limits-title"
-      className="w-[min(420px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72"
+      className={`w-[min(420px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
     >
       <div className="flex items-start justify-between gap-3 border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="torrent-limits-title" className="text-[16px] font-semibold text-strong">

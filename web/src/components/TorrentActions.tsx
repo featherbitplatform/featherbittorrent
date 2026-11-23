@@ -17,7 +17,7 @@ import { MoreHorizontal } from 'lucide-react'
 import { errorMessage } from '../api/client'
 import type { KeyboardEvent } from 'react'
 import type { Api, TorrentInfo } from '../api/client'
-import { useModalDialog } from '../modal'
+import { PHONE_FULLSCREEN, useModalDialog } from '../modal'
 import Button from './Button'
 import FolderPicker from './FolderPicker'
 import TorrentLimits from './TorrentLimits'
@@ -78,7 +78,7 @@ function MoveDialog({
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="move-files-title"
-      className="w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72"
+      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
     >
       <div className="border-b border-ink-700 px-5.5 py-4.5">
         <h2 id="move-files-title" className="text-[16px] font-semibold text-strong">
