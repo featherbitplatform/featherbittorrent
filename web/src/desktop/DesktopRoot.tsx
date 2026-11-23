@@ -1,6 +1,7 @@
 /**
  * The desktop page: {@link App} on a connection the shell hands out, instead of the browser's own, with
- * the instance switcher above it.
+ * the instance switcher in the title bar's switcher slot and the first-close question ready in every
+ * phase.
  *
  * At startup it asks the shell for the instance list and connects to the default instance (This
  * computer, `local`, unless another one was made the default), then renders `App` under that
@@ -24,14 +25,20 @@
  * origin to put in the server's `cors_origins`. The switcher stays on screen through all of it, so a
  * default instance that is down at startup is one click away from This computer.
  *
+ * The first-close question ({@link CloseChoiceHost}) sits beside the screens, outside anything keyed by
+ * instance, so it answers in every phase and is never remounted by a switch. The tray names the
+ * connected instance by its name in the list, never by its id.
+ *
  * @module desktop/DesktopRoot
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { createPortal } from 'react-dom'
 import App from '../App'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
+import { useTitleBarSlots } from '../components/titleBarSlots'
 import { UNREACHABLE_COPY } from '../live'
 import { SavePasswordContext } from '../savePassword'
 import type { SavePasswordOffer } from '../savePassword'
@@ -50,7 +57,7 @@ type Phase =
 /** The list before the shell has answered, and if it never does: This computer alone. */
 const LOCAL_ONLY: InstancesList = {
   default: LOCAL_ID,
-  items: [{ id: LOCAL_ID, name: 'This computer', url: '', saved_password: false }],
+  items: [{ id: LOCAL_ID, name: THIS_COMPUTER, url: '', saved_password: false }],
   keychain: false,
 }
 
@@ -145,7 +152,15 @@ export function DesktopRoot() {
   )
 }
 
+/** The name the tray shows for instance `id`: its name in the list, This computer's own for `local`. */
+function trayName(list: InstancesList, id: string): string | null {
+  const name = list.items.find((item) => item.id === id)?.name
+  if (name !== undefined) return name
+  return id === LOCAL_ID ? THIS_COMPUTER : null
+}
+
 function DesktopScreens() {
+  const slots = useTitleBarSlots()
   const [phase, setPhase] = useState<Phase>({ phase: 'connecting', id: LOCAL_ID })
   const [list, setList] = useState<InstancesList>(LOCAL_ONLY)
   const [managing, setManaging] = useState(false)
@@ -265,14 +280,14 @@ function DesktopScreens() {
     if (fresh !== null && !fresh.items.some((item) => item.id === current)) void open(LOCAL_ID, null)
   }, [reload, open, current])
 
-  // The tray names the instance the page is connected to.
-  const connectedId = phase.phase === 'ready' ? phase.id : null
+  // The tray names the instance the page is connected to, by the name the switcher shows.
+  const connectedName = phase.phase === 'ready' ? trayName(list, phase.id) : null
   useEffect(() => {
-    if (connectedId === null) return
-    setTrayInstance(connectedId === LOCAL_ID ? THIS_COMPUTER : connectedId).catch((cause: unknown) => {
+    if (connectedName === null) return
+    setTrayInstance(connectedName).catch((cause: unknown) => {
       console.warn('The tray could not name the connected instance:', cause)
     })
-  }, [connectedId])
+  }, [connectedName])
 
   const offer: SavePasswordOffer | null =
     current === LOCAL_ID
@@ -308,19 +323,21 @@ function DesktopScreens() {
     )
   }
 
-  // Until the title bar takes the switcher (it places it itself), a plain bar above the page holds it.
-  // The screens below size themselves to the window (`h-dvh`, `min-h-dvh`); under the bar they size to
-  // what is left instead.
+  // The switcher goes into the title bar's slot; until the bar has mounted it there is nowhere to draw
+  // it. The save-failure banner sits under the bar, above the page, which fills the rest of the window
+  // (the frame sizes `h-dvh` screens to the space it leaves them).
   return (
-    <div className="flex h-dvh flex-col">
-      <div className="flex h-10 shrink-0 items-center border-b border-rule bg-sunken px-2">
-        <InstanceSwitcher
-          instances={list.items}
-          current={current}
-          onSwitch={onSwitch}
-          onManage={() => setManaging(true)}
-        />
-      </div>
+    <>
+      {slots?.switcher != null &&
+        createPortal(
+          <InstanceSwitcher
+            instances={list.items}
+            current={current}
+            onSwitch={onSwitch}
+            onManage={() => setManaging(true)}
+          />,
+          slots.switcher,
+        )}
       {saveFailed !== null && (
         <div className="flex shrink-0 items-start gap-2 px-3 pt-3">
           <Banner tone="danger" className="flex-1">
@@ -331,9 +348,9 @@ function DesktopScreens() {
           </Button>
         </div>
       )}
-      <div className="relative min-h-0 flex-1 overflow-auto [&_.h-dvh]:h-full [&_.min-h-dvh]:min-h-full">
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-auto">
         <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
       </div>
-    </div>
+    </>
   )
 }

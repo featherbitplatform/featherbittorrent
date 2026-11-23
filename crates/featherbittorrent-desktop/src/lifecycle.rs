@@ -9,7 +9,6 @@
 //! when that handler returns: so the handler stops This computer itself when no quit has started, and
 //! waits for the save of the quit that has ([`on_exit`], [`QUIT_WAIT`]).
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -19,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::DesktopState;
+use crate::settings_store::SettingsStore;
 
 /// The argument the login item launches the app with: start without showing the window.
 pub const BACKGROUND_FLAG: &str = "--background";
@@ -93,22 +93,23 @@ pub fn parse_close_action(action: &str) -> Result<CloseAction, String> {
     }
 }
 
-/// Changes one thing in the settings file at `path` and saves it, keeping everything else in the file as
-/// it is on disk now (other screens save their own settings into the same file). A file that cannot be
-/// read is left alone and the change is refused with its line.
+/// Changes one thing in the settings file through the shell's one settings store, keeping everything
+/// else in the file as it is on disk now (other screens save their own settings into the same file). A
+/// file that cannot be read is left alone and the change is refused with its line.
 pub fn update_settings(
-    path: &Path,
+    settings: &SettingsStore,
     change: impl FnOnce(&mut DesktopSettings),
 ) -> Result<(), String> {
-    let mut settings = DesktopSettings::load(path).map_err(|problem| problem.to_string())?;
-    change(&mut settings);
-    settings.save(path).map_err(|problem| problem.to_string())
+    settings.change(|settings| {
+        change(settings);
+        Ok(())
+    })
 }
 
 /// The settings closing the window reads: the file as it is now, or the defaults when it cannot be read
 /// (which ask, or quit without a tray).
-fn current_settings(path: &Path) -> DesktopSettings {
-    DesktopSettings::load(path).unwrap_or_else(|problem| {
+fn current_settings(settings: &SettingsStore) -> DesktopSettings {
+    settings.read().unwrap_or_else(|problem| {
         eprintln!("{problem}");
         DesktopSettings::default()
     })
@@ -171,20 +172,20 @@ pub fn on_exit(phase: QuitPhase) -> ExitAnswer {
 /// What the shell keeps for closing and quitting.
 #[derive(Debug)]
 pub struct Lifecycle {
-    settings_file: PathBuf,
+    settings: SettingsStore,
     tray_available: AtomicBool,
     phase: Mutex<QuitPhase>,
     stopped: Condvar,
 }
 
 impl Lifecycle {
-    /// The lifecycle of a run whose settings live at `settings_file`. No tray until [`set_tray_available`]
+    /// The lifecycle of a run whose settings live in `settings`. No tray until [`set_tray_available`]
     /// says one was built.
     ///
     /// [`set_tray_available`]: Lifecycle::set_tray_available
-    pub fn new(settings_file: PathBuf) -> Self {
+    pub fn new(settings: SettingsStore) -> Self {
         Lifecycle {
-            settings_file,
+            settings,
             tray_available: AtomicBool::new(false),
             phase: Mutex::new(QuitPhase::Running),
             stopped: Condvar::new(),
@@ -203,10 +204,7 @@ impl Lifecycle {
 
     /// What closing the window does now.
     pub fn close_outcome(&self) -> CloseOutcome {
-        on_close_requested(
-            &current_settings(&self.settings_file),
-            self.tray_available(),
-        )
+        on_close_requested(&current_settings(&self.settings), self.tray_available())
     }
 
     /// Where the app is on its way out.
@@ -402,7 +400,7 @@ pub fn quit_on_signals<R: Runtime>(_app: &AppHandle<R>) {}
 #[tauri::command]
 pub fn set_close_action(action: String, state: tauri::State<'_, Lifecycle>) -> Result<(), String> {
     let action = parse_close_action(&action)?;
-    update_settings(&state.settings_file, |settings| settings.close = action)
+    update_settings(&state.settings, |settings| settings.close = action)
 }
 
 /// Closes the window the way the saved choice says: what the page calls once it has saved an answer.
@@ -433,9 +431,7 @@ pub fn set_start_at_login(
         autolaunch.disable()
     };
     changed.map_err(|problem| format!("Start at login could not be changed: {problem}"))?;
-    update_settings(&state.settings_file, |settings| {
-        settings.start_at_login = on
-    })
+    update_settings(&state.settings, |settings| settings.start_at_login = on)
 }
 
 #[cfg(test)]
@@ -452,6 +448,7 @@ mod tests {
         initial_window_state, on_close_requested, on_exit, on_exit_requested, parse_close_action,
         update_settings,
     };
+    use crate::settings_store::SettingsStore;
 
     fn closing(close: CloseAction) -> DesktopSettings {
         DesktopSettings {
@@ -536,12 +533,13 @@ mod tests {
         };
         before.save(&path).expect("write the settings");
 
-        let lifecycle = Lifecycle::new(path.clone());
+        let store = SettingsStore::new(path.clone());
+        let lifecycle = Lifecycle::new(store.clone());
         assert_eq!(lifecycle.close_outcome(), CloseOutcome::Quit, "no tray yet");
         lifecycle.set_tray_available(true);
         assert_eq!(lifecycle.close_outcome(), CloseOutcome::AskPage);
 
-        update_settings(&path, |settings| settings.close = CloseAction::Tray).expect("saves");
+        update_settings(&store, |settings| settings.close = CloseAction::Tray).expect("saves");
         assert_eq!(lifecycle.close_outcome(), CloseOutcome::HideToTray);
         let after = DesktopSettings::load(&path).expect("reads");
         assert!(after.system_title_bar, "the other settings were kept");
@@ -553,7 +551,12 @@ mod tests {
         let dir = ScratchDir::new("desktop-close-unreadable");
         let path = dir.path().join("desktop.yaml");
         std::fs::write(&path, "close: [not, a, choice\n").expect("write");
-        assert!(update_settings(&path, |settings| settings.close = CloseAction::Quit).is_err());
+        assert!(
+            update_settings(&SettingsStore::new(path.clone()), |settings| {
+                settings.close = CloseAction::Quit
+            })
+            .is_err()
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             "close: [not, a, choice\n"
@@ -562,7 +565,7 @@ mod tests {
 
     #[test]
     fn only_the_first_quit_runs() {
-        let lifecycle = Lifecycle::new("unused.yaml".into());
+        let lifecycle = Lifecycle::new(SettingsStore::new("unused.yaml".into()));
         assert!(lifecycle.begin_quit());
         assert!(!lifecycle.begin_quit());
         lifecycle.finish_quit();
@@ -597,7 +600,7 @@ mod tests {
     /// arrives: the exit waits for the save and only then lets the process end.
     #[test]
     fn a_system_exit_during_a_quit_waits_for_the_save() {
-        let lifecycle = Arc::new(Lifecycle::new("unused.yaml".into()));
+        let lifecycle = Arc::new(Lifecycle::new(SettingsStore::new("unused.yaml".into())));
         assert!(lifecycle.begin_quit(), "the tray's Quit starts");
         assert_eq!(on_exit(lifecycle.phase()), ExitAnswer::WaitForQuit);
 
@@ -627,7 +630,7 @@ mod tests {
     /// A save that never finishes does not hold the exit forever.
     #[test]
     fn the_wait_for_a_save_is_bounded() {
-        let lifecycle = Lifecycle::new("unused.yaml".into());
+        let lifecycle = Lifecycle::new(SettingsStore::new("unused.yaml".into()));
         assert!(
             lifecycle.wait_for_quit(Duration::from_millis(10)),
             "no quit, no wait"

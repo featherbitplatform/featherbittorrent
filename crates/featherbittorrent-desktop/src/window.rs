@@ -16,13 +16,10 @@
 //! patch, which replaces arrays: `platform_confs_are_the_main_window_undecorated` keeps them equal to
 //! `tauri.conf.json`'s entry apart from `decorations`.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-use fbtt_desktop_core::DesktopSettings;
 use tauri::{Emitter, WebviewWindow};
 
 use crate::commands::Platform;
+use crate::settings_store::SettingsStore;
 
 /// The event the shell emits after the title bar setting changed, carrying whether the page should now
 /// draw a bare toolbar under the system's title bar (`true`) or its own bar with window controls.
@@ -76,56 +73,48 @@ pub fn apply_chrome(window: &WebviewWindow, platform: Platform, system_title_bar
     }
 }
 
-/// What the chrome commands keep: where the settings file is, and the setting as this run knows it.
-#[derive(Debug)]
+/// What the chrome commands keep: the settings store. The setting itself is read from the file each
+/// time, never cached here, because the file is the one place every writer agrees on.
+#[derive(Debug, Clone)]
 pub struct ChromeState {
-    settings_file: PathBuf,
-    system_title_bar: Mutex<bool>,
+    settings: SettingsStore,
 }
 
 impl ChromeState {
-    /// The state for a run whose settings live at `settings_file` and say `system_title_bar`.
-    pub fn new(settings_file: PathBuf, system_title_bar: bool) -> Self {
-        ChromeState {
-            settings_file,
-            system_title_bar: Mutex::new(system_title_bar),
-        }
+    /// The state for a run whose settings live in `settings`.
+    pub fn new(settings: SettingsStore) -> Self {
+        ChromeState { settings }
     }
 
-    /// The setting as this run knows it.
+    /// The saved setting; off when the file cannot be read.
     pub fn saved(&self) -> bool {
-        self.get()
-    }
-
-    fn get(&self) -> bool {
-        *self
-            .system_title_bar
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn set(&self, on: bool) {
-        *self
-            .system_title_bar
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = on;
+        read_system_title_bar(&self.settings)
     }
 }
 
-/// Writes `system_title_bar = on` into the settings file at `path`, keeping every other setting as the
-/// file has it now (it is read again first, so a change saved by another part of the app since startup
-/// is not undone). A file that cannot be read is left alone and the refusal says why.
-pub fn save_system_title_bar(path: &std::path::Path, on: bool) -> Result<(), String> {
-    let mut settings = DesktopSettings::load(path).map_err(|problem| problem.to_string())?;
-    settings.system_title_bar = on;
-    settings.save(path).map_err(|problem| problem.to_string())
+/// The `system_title_bar` setting as the file says now; off when the file cannot be read (the app's
+/// own bar is the default, and a broken file is reported where it is written).
+pub fn read_system_title_bar(settings: &SettingsStore) -> bool {
+    settings
+        .read()
+        .map(|settings| settings.system_title_bar)
+        .unwrap_or(false)
+}
+
+/// Writes `system_title_bar = on` through the settings store, keeping every other setting as the file
+/// has it now. A file that cannot be read is left alone and the refusal says why.
+pub fn save_system_title_bar(settings: &SettingsStore, on: bool) -> Result<(), String> {
+    settings.change(|settings| {
+        settings.system_title_bar = on;
+        Ok(())
+    })
 }
 
 /// Whether the page should draw a bare toolbar under the system's title bar: the setting, on a system
 /// where it applies.
 #[tauri::command]
 pub fn system_title_bar(state: tauri::State<'_, ChromeState>) -> bool {
-    uses_system_title_bar(Platform::current(), state.get())
+    uses_system_title_bar(Platform::current(), state.saved())
 }
 
 /// On Linux: saves the title bar setting, puts the matching decorations on the window, and tells the
@@ -142,8 +131,7 @@ pub fn set_system_title_bar(
     if platform != Platform::Linux {
         return Ok(false);
     }
-    save_system_title_bar(&state.settings_file, on)?;
-    state.set(on);
+    save_system_title_bar(&state.settings, on)?;
     apply_chrome(&window, platform, on);
     let system = uses_system_title_bar(platform, on);
     if let Err(problem) = window.emit(SYSTEM_TITLE_BAR_EVENT, system) {
@@ -158,9 +146,11 @@ mod tests {
     use fbtt_desktop_core::{CloseAction, DesktopSettings};
 
     use super::{
-        Chrome, chrome_for, runtime_decorations, save_system_title_bar, uses_system_title_bar,
+        Chrome, ChromeState, chrome_for, runtime_decorations, save_system_title_bar,
+        uses_system_title_bar,
     };
     use crate::commands::Platform;
+    use crate::settings_store::SettingsStore;
 
     #[test]
     fn mac_keeps_the_traffic_lights_on_an_overlay_bar() {
@@ -198,6 +188,7 @@ mod tests {
     fn set_system_title_bar_saves_and_keeps_the_other_settings() {
         let dir = ScratchDir::new("desktop-title-bar-setting");
         let path = dir.path().join("desktop.yaml");
+        let store = SettingsStore::new(path.clone());
         let before = DesktopSettings {
             close: CloseAction::Tray,
             start_at_login: true,
@@ -205,13 +196,13 @@ mod tests {
         };
         before.save(&path).expect("the settings save");
 
-        save_system_title_bar(&path, true).expect("the setting saves");
+        save_system_title_bar(&store, true).expect("the setting saves");
         let after = DesktopSettings::load(&path).expect("the settings load");
         assert!(after.system_title_bar);
         assert_eq!(after.close, CloseAction::Tray);
         assert!(after.start_at_login);
 
-        save_system_title_bar(&path, false).expect("the setting saves");
+        save_system_title_bar(&store, false).expect("the setting saves");
         assert!(
             !DesktopSettings::load(&path)
                 .expect("loads")
@@ -224,11 +215,28 @@ mod tests {
         let dir = ScratchDir::new("desktop-title-bar-unparsable");
         let path = dir.path().join("desktop.yaml");
         std::fs::write(&path, "close: [not, a, choice").expect("the file writes");
-        assert!(save_system_title_bar(&path, true).is_err());
+        assert!(save_system_title_bar(&SettingsStore::new(path.clone()), true).is_err());
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads"),
             "close: [not, a, choice"
         );
+    }
+
+    /// The title bar setting is read from the file each time, never cached: a change another writer
+    /// saved through the store is what the next read answers.
+    #[test]
+    fn the_title_bar_setting_is_read_through_the_store() {
+        let dir = ScratchDir::new("desktop-title-bar-read-through");
+        let store = SettingsStore::new(dir.path().join("desktop.yaml"));
+        let state = ChromeState::new(store.clone());
+        assert!(!state.saved());
+        store
+            .change(|settings| {
+                settings.system_title_bar = true;
+                Ok(())
+            })
+            .expect("saves");
+        assert!(state.saved());
     }
 
     fn conf(text: &str) -> serde_json::Value {
@@ -269,6 +277,11 @@ mod tests {
         ] {
             let platform = conf(text);
             assert_eq!(platform["app"]["windows"], expected, "{name}");
+            // The window starts hidden on every platform: the setup shows it once its chrome is on.
+            assert_eq!(
+                platform["app"]["windows"][0]["visible"], false,
+                "{name} starts hidden"
+            );
             assert_eq!(
                 platform.as_object().map(|o| o.len()),
                 Some(1),

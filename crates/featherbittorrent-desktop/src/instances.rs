@@ -8,12 +8,11 @@
 //! which tells a server that is down from one that is up but does not list this app's origin in its
 //! `server.cors_origins`: the webview sees both as the same network error.
 //!
-//! The settings file is read again before every change and written straight after, so a change made
-//! elsewhere in the app (the close choice, the title bar switch) is never overwritten with an older copy,
-//! and a file that cannot be read is never written over.
+//! Every change goes through the shell's one [`SettingsStore`], which re-reads the file inside the lock
+//! every writer shares, so a change made elsewhere in the app (the close choice, the title bar switch) is
+//! never overwritten with an older copy, and a file that cannot be read is never written over.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fbtt_desktop_core::{DesktopSettings, Instance, LOCAL_ID};
@@ -22,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::commands::EndpointDto;
 use crate::keychain::{Keychain, NO_KEYCHAIN};
+use crate::settings_store::SettingsStore;
 
 /// The name the switcher shows for the app's own engine.
 pub const LOCAL_NAME: &str = "This computer";
@@ -69,28 +69,26 @@ pub struct ProbeDto {
 
 /// The saved instances, their passwords, and the HTTP client the shell speaks to them with.
 pub struct Instances {
-    settings_file: PathBuf,
+    settings: SettingsStore,
     keychain: Arc<dyn Keychain>,
     client: reqwest::Client,
     /// The origin this app's webview sends, which a remote server has to list.
     origin: String,
-    /// One change to the settings file at a time.
-    writing: Mutex<()>,
 }
 
 impl std::fmt::Debug for Instances {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Instances")
-            .field("settings_file", &self.settings_file)
+            .field("settings_file", &self.settings.path())
             .field("keychain", &self.keychain.available())
             .finish_non_exhaustive()
     }
 }
 
 impl Instances {
-    /// The instances in `settings_file`, with passwords in `keychain`, for a webview whose origin is
+    /// The instances in `settings`, with passwords in `keychain`, for a webview whose origin is
     /// `origin`.
-    pub fn new(settings_file: PathBuf, keychain: Arc<dyn Keychain>, origin: &str) -> Self {
+    pub fn new(settings: SettingsStore, keychain: Arc<dyn Keychain>, origin: &str) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(ANSWER_TIMEOUT)
@@ -99,44 +97,35 @@ impl Instances {
             .expect(
                 "the HTTP client for remote instances builds with its timeouts and no redirects",
             );
-        Instances::with_client(settings_file, keychain, origin, client)
+        Instances::with_client(settings, keychain, origin, client)
     }
 
     fn with_client(
-        settings_file: PathBuf,
+        settings: SettingsStore,
         keychain: Arc<dyn Keychain>,
         origin: &str,
         client: reqwest::Client,
     ) -> Self {
         Instances {
-            settings_file,
+            settings,
             keychain,
             client,
             origin: origin.to_string(),
-            writing: Mutex::new(()),
         }
     }
 
     /// The settings as the file says now. A file that cannot be read lists only This computer.
     fn read(&self) -> Result<DesktopSettings, String> {
-        DesktopSettings::load(&self.settings_file).map_err(|problem| problem.to_string())
+        self.settings.read()
     }
 
-    /// Reads the file, applies `change`, and writes it back; nothing is written when either fails.
+    /// Reads the file, applies `change`, and writes it back under the shell's one settings lock; nothing
+    /// is written when either fails.
     fn change<T>(
         &self,
         change: impl FnOnce(&mut DesktopSettings) -> Result<T, String>,
     ) -> Result<T, String> {
-        let _one = self
-            .writing
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut settings = self.read()?;
-        let answer = change(&mut settings)?;
-        settings
-            .save(&self.settings_file)
-            .map_err(|problem| problem.to_string())?;
-        Ok(answer)
+        self.settings.change(change)
     }
 
     /// The saved instance `id`, when it is one the app may dial.
@@ -482,6 +471,7 @@ mod tests {
 
     use super::{Instances, LOCAL_NAME, UNREACHABLE};
     use crate::keychain::{Keychain, MemoryKeychain, NO_KEYCHAIN};
+    use crate::settings_store::SettingsStore;
 
     const DEADLINE: Duration = Duration::from_secs(60);
     const ORIGIN: &str = "tauri://localhost";
@@ -502,7 +492,12 @@ mod tests {
     }
 
     fn store(dir: &ScratchDir, keychain: Arc<dyn Keychain>) -> Instances {
-        Instances::with_client(dir.path().join("desktop.yaml"), keychain, ORIGIN, client())
+        Instances::with_client(
+            SettingsStore::new(dir.path().join("desktop.yaml")),
+            keychain,
+            ORIGIN,
+            client(),
+        )
     }
 
     /// A featherbittorrent server on loopback with logins on, one user, and `cors` as its origins.

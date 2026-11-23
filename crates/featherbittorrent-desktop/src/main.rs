@@ -13,6 +13,7 @@ mod instances;
 mod keychain;
 mod lifecycle;
 mod local;
+mod settings_store;
 mod tray;
 mod window;
 
@@ -20,6 +21,7 @@ use fbtt_desktop_core::{DesktopPaths, DesktopSettings};
 use tauri::{Manager, WindowEvent};
 
 use crate::commands::{DesktopState, Platform};
+use crate::settings_store::SettingsStore;
 
 /// The exit code for anything else that stops the app before its window opens.
 const EXIT_PROBLEM: i32 = 1;
@@ -38,7 +40,9 @@ fn main() {
         .unwrap_or_else(|problem| refuse(&local::paths_problem(&problem), EXIT_PROBLEM));
     // A settings file that cannot be read is left as it is, and this run uses the defaults: nothing is
     // served, which is the safe reading of a switch nobody can see.
-    let settings = DesktopSettings::load(&paths.settings_file()).unwrap_or_else(|problem| {
+    // Every part of the shell that reads or saves `desktop.yaml` does it through this one store and its lock.
+    let settings_store = SettingsStore::new(paths.settings_file());
+    let settings = settings_store.read().unwrap_or_else(|problem| {
         eprintln!("{problem}");
         DesktopSettings::default()
     });
@@ -60,16 +64,14 @@ fn main() {
             Some(vec![lifecycle::BACKGROUND_FLAG]),
         ))
         .manage(DesktopState::new(this_computer))
-        .manage(window::ChromeState::new(
-            paths.settings_file(),
-            settings.system_title_bar,
-        ))
+        .manage(settings_store.clone())
+        .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
-            paths.settings_file(),
+            settings_store.clone(),
             std::sync::Arc::new(keychain::SystemKeychain::probe()),
             local::desktop_origin(),
         ))
-        .manage(lifecycle::Lifecycle::new(paths.settings_file()))
+        .manage(lifecycle::Lifecycle::new(settings_store))
         // The app's one setup. `Builder::setup` replaces rather than chains, so no second `.setup` may
         // be added anywhere: a new step goes into `setup` below, in its place in the order.
         .setup(setup)
@@ -115,14 +117,13 @@ fn main() {
 /// This is the only setup function; `Builder::setup` keeps one.
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
-    let system_title_bar = app.state::<window::ChromeState>().saved();
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes
     //    them before it calls the setup); a missing one is said once and the app goes on without it.
     match handle.get_webview_window(lifecycle::MAIN_WINDOW) {
         Some(main) => window::apply_chrome(
             &main,
             Platform::current(),
-            system_title_bar,
+            app.state::<window::ChromeState>().saved(),
         ),
         None => eprintln!("The main window was not there to put its title bar on."),
     }
