@@ -351,11 +351,11 @@ export function createClient(
     recheck: (id) => nothing(torrentPath(id, '/recheck'), 'POST'),
     reannounce: (id) => nothing(torrentPath(id, '/reannounce'), 'POST'),
     setTorrentLimits: (id, downloadBps, uploadBps) =>
-      sendJson(torrentPath(id, '/limits'), 'PUT', { download: downloadBps, upload: uploadBps }),
+      sendJson(torrentPath(id, '/limits'), 'PUT', { download: downloadBps, upload: uploadBps } satisfies components['schemas']['LimitsRequest']),
     moveStorage: (id, path) =>
-      sendJson(torrentPath(id, '/move'), 'POST', { path, mode: 'fail_if_exists' }),
+      sendJson(torrentPath(id, '/move'), 'POST', { path, mode: 'fail_if_exists' } satisfies components['schemas']['MoveRequest']),
     setSessionLimits: (downloadBps, uploadBps) =>
-      sendJson('/api/v1/session/limits', 'PUT', { download: downloadBps, upload: uploadBps }),
+      sendJson('/api/v1/session/limits', 'PUT', { download: downloadBps, upload: uploadBps } satisfies components['schemas']['LimitsRequest']),
     queueSettings: () => json('/api/v1/session/queue', 'GET'),
     setQueueSettings: (settings) => sendJson('/api/v1/session/queue', 'PUT', settings),
     devices: () => json(DEVICES, 'GET'),
@@ -363,7 +363,8 @@ export function createClient(
       json(DEVICES, 'POST', JSON.stringify({ name, public_key: publicKey }), 'application/json'),
     removeDevice: (name) => nothing(`${DEVICES}/${encodeURIComponent(name)}`, 'DELETE'),
     mkdir: async (parent, name) => {
-      const answer = (await json('/api/v1/fs/mkdir', 'POST', JSON.stringify({ parent, name }), 'application/json')) as { path: string }
+      const answer = (await json('/api/v1/fs/mkdir', 'POST', JSON.stringify({ parent, name }), 'application/json')) as { path?: string }
+      if (typeof answer.path !== 'string') throw new Error('the mkdir answer had no path')
       return answer.path
     },
   }

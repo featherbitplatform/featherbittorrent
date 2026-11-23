@@ -402,8 +402,8 @@ it('each call sends its method, path and body', async () => {
     { run: (c) => c.setTorrentLimits(ID, 100, null), method: 'PUT', url: `/api/v1/torrents/${ID}/limits`, body: { download: 100, upload: null }, status: 204, answer: '' },
     { run: (c) => c.moveStorage(ID, '/data/x'), method: 'POST', url: `/api/v1/torrents/${ID}/move`, body: { path: '/data/x', mode: 'fail_if_exists' }, status: 204, answer: '' },
     { run: (c) => c.setSessionLimits(null, 5), method: 'PUT', url: '/api/v1/session/limits', body: { download: null, upload: 5 }, status: 204, answer: '' },
-    { run: (c) => c.queueSettings(), method: 'GET', url: '/api/v1/session/queue', body: undefined, answer: '{"max_active_downloads":1}' },
-    { run: (c) => c.setQueueSettings({ active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1 } as never), method: 'PUT', url: '/api/v1/session/queue', body: { active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1 }, status: 204, answer: '' },
+    { run: (c) => c.queueSettings(), method: 'GET', url: '/api/v1/session/queue', body: undefined, answer: '{"active_downloads":1}' },
+    { run: (c) => c.setQueueSettings({ active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1, interval: 30, startup_grace: 60 }), method: 'PUT', url: '/api/v1/session/queue', body: { active_downloads: 2, dont_count_slow_torrents: true, inactive_down_rate: 1, inactive_up_rate: 1, interval: 30, startup_grace: 60 }, status: 204, answer: '' },
     { run: (c) => c.devices(), method: 'GET', url: '/api/v1/auth/devices', body: undefined, answer: `[${device}]` },
     { run: (c) => c.addDevice('phone', 'KEY'), method: 'POST', url: '/api/v1/auth/devices', body: { name: 'phone', public_key: 'KEY' }, status: 201, answer: device },
     { run: (c) => c.removeDevice('phone'), method: 'DELETE', url: '/api/v1/auth/devices/phone', body: undefined, status: 204, answer: '' },
@@ -439,4 +439,9 @@ it('an error answer keeps its code', async () => {
   const failure = await client.devices().catch((e: unknown) => e)
   expect(failure).toBeInstanceOf(ApiError)
   expect((failure as ApiError).code).toBe('forbidden')
+})
+
+it('a mkdir answer without a path is an error', async () => {
+  const { client } = clientFor(201, '{}')
+  await expect(client.mkdir('/data', 'new')).rejects.toThrow()
 })
