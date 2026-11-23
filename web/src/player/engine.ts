@@ -750,17 +750,29 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     if (stream.heldChunk !== null) {
       const held = stream.heldChunk
       dropHeld(stream)
+      // The re-append is the read loop's turn: `reading` stays true until it is over, so an
+      // `updateend` from its own eviction does not start a read of the next chunk in the middle
+      // of it. The read resumes from here, after the held chunk is in.
+      stream.reading = true
       void (async () => {
         // A seek that arrives while the held chunk is being asked for restarts the stream, and
         // the held chunk is the old stream's: it is dropped, and the new stream reads its own.
+        // The new stream owns `reading` then, so the old turn leaves it alone.
         const generation = stream.generation
         const appended = await appendChunk(stream, held, generation)
         if (stream.generation !== generation) return
-        if (appended) {
-          if (state === 'waiting') setState('playing')
-          stream.retries = 0
+        if (!appended) {
+          // Held again (its timer is armed), or the buffer refused it for good (the `error`).
+          stream.reading = false
+          return
         }
-        pump(stream)
+        if (state === 'waiting') setState('playing')
+        stream.retries = 0
+        if (stream.reader === null) {
+          stream.reading = false
+          return
+        }
+        void readStream(stream)
       })()
       return
     }

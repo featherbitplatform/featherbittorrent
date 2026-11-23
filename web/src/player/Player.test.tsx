@@ -1766,4 +1766,40 @@ describe('the player', () => {
     ])
     t.close()
   })
+
+  it('a held chunk that hits quota again stays ahead of the next', async () => {
+    // A (3 bytes) is held for quota and B (2 bytes) waits in the body. When the timer offers A
+    // again, the buffer refuses it once more and evicts a range to make room; the `updateend` of
+    // that eviction must not start a read of B in the middle of A's turn. A goes in, then B,
+    // once each, and nothing is an error.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 3; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.video.currentTime = 20
+    await settle()
+    t.videoBuffer.makeNextAppendThrowQuota(2)
+    t.body(1).push(new Uint8Array([7, 7, 7]))
+    await settle()
+    t.body(1).push(new Uint8Array([8, 8]))
+    await settle()
+    expect(t.videoBuffer.log.appends.length, 'A or B went in while A was held').toBe(3)
+    // A range away from the playhead for the second eviction to cut, and one more refusal.
+    setRanges(t.videoBuffer, [[50, 60]])
+    t.videoBuffer.makeNextAppendThrowQuota(1)
+    const opsBefore = t.videoBuffer.log.ops.length
+    await sleep(1_100)
+    await settle()
+    await settle()
+    expect(t.videoBuffer.log.removes.at(-1), 'the second eviction did not run').toEqual([50, 60])
+    const sizes = t.videoBuffer.log.appends.slice(3).map((chunk) => chunk.byteLength)
+    expect(sizes, 'A did not go in before B, once each').toEqual([3, 2])
+    expect(
+      t.videoBuffer.log.ops.slice(opsBefore),
+      'B was read while A was being evicted for',
+    ).toEqual(['remove', 'append', 'append'])
+    expect(t.engine.state(), 'the held re-append ended in an error').not.toBe('error')
+    t.close()
+  })
 })
