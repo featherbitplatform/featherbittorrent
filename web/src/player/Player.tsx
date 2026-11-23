@@ -780,6 +780,15 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     // the menu's; and while a menu is open, every key is the menu's, so an `ArrowUp` there never
     // also moves the volume.
     if (event.defaultPrevented || menuOpen) return
+    // The native video's own controls take Space and the arrows when they have the focus: the
+    // player must not take the keys away from them.
+    if (
+      target instanceof HTMLVideoElement &&
+      target.controls &&
+      [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)
+    ) {
+      return
+    }
     // A key from inside a range input or an open menu is the menu's, not the player's: an
     // `ArrowUp` on a listbox option moves the cursor, and the same key here would move the
     // volume. The menu's `role` on its items and its listbox names it either way.

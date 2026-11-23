@@ -20,6 +20,7 @@ import {
   makeVideoPlayable,
   makeVideoSeekable,
 } from './testing'
+import { FOCUSABLE_SELECTOR } from '../modal'
 
 
 installDialogShim()
@@ -2485,4 +2486,30 @@ describe('the final review fixes', () => {
     expect(screen.queryByRole('button', { name: 'Download' }) !== null, 'the file was not offered for download').toBe(true)
   })
 
+  it('keys on the native video stay with its controls', async () => {
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      for (const key of [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) {
+        expect(fireEvent.keyDown(video, { key }), `the player took ${JSON.stringify(key)} from the native controls`).toBe(true)
+      }
+    } finally {
+      native.restore()
+    }
+  })
+
+  it('the native video is in the tab trap', async () => {
+    const native = await renderNative()
+    try {
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.matches(FOCUSABLE_SELECTOR), 'the native video is not one of the dialog\'s stops').toBe(true)
+      // Tab from Close goes on to the video, the way a browser walks into its controls, rather
+      // than wrapping back to Close as if Close were the dialog's last stop.
+      const close = screen.getByRole('button', { name: 'Close player' })
+      close.focus()
+      expect(fireEvent.keyDown(close, { key: 'Tab' }), 'Tab from Close wrapped past the native video').toBe(true)
+    } finally {
+      native.restore()
+    }
+  })
 })
