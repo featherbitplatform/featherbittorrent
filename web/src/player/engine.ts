@@ -440,6 +440,10 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     stream.atEnd = false
     stream.isStart = true
     stream.fedTo = null
+    // The body this call opens begins here until its answer says otherwise: a body that fails
+    // before it answers (a 503, a 504, the network) must not leave the last body's start in
+    // place, or its retry resumes from where the old body was, not from where this one was asked.
+    stream.bodyStartMs = Math.max(0, startMs)
 
     const abort = new AbortController()
     stream.abort = abort
@@ -459,11 +463,16 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         // The engine's own abort is not a failure: the stream is being replaced, and the old
         // fetch is the way the engine said so.
         if (destroyed || abort.signal.aborted || isAbort(cause)) return
-        // A network error is a wait, not an end: the state, and its retries. A first fetch of
-        // the video that fails re-runs the whole start, so the audio is asked for too.
+        // A network error is a wait, not an end: the state, and its retries. A start of the
+        // video that fails re-runs the whole start, so the audio is asked for too. A resume (a
+        // retry, which has no `onStarted`) only asks again: a restart would move the playhead to
+        // the far end of what is buffered and skip everything in between.
         setState('waiting')
-        if (stream.role === 'video') scheduleRetry(stream, () => restartAll(startMs))
-        else scheduleRetry(stream)
+        if (stream.role === 'video' && onStarted !== undefined) {
+          scheduleRetry(stream, () => restartAll(startMs))
+        } else {
+          scheduleRetry(stream)
+        }
         return
       }
       if (destroyed || abort.signal.aborted) return
@@ -473,7 +482,8 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
         if (response.status === 504 || response.status === 503) {
           const retryAfterMs = parseRetryAfterMs(response)
           setState('waiting')
-          if (stream.role === 'video') {
+          // The same rule as the network error: only a start is re-run whole.
+          if (stream.role === 'video' && onStarted !== undefined) {
             scheduleRetry(stream, () => restartAll(startMs), retryAfterMs ?? undefined)
           } else {
             scheduleRetry(stream, undefined, retryAfterMs ?? undefined)
@@ -875,6 +885,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       // range an hour ahead is not this body's, and the retry must not start past it; the range
       // the playhead sits in may be one the body already left, and refetching it is waste. A
       // body with no data in the buffer resumes from its own start.
+      //
+      // An audio switch that has not reached its `changeType` is the exception: the buffer still
+      // holds the old track, and its range is not the new track's data. Resuming from its end
+      // would leave the old language playing up to it, so the new track is asked for at the
+      // playhead, or at the body's own start when that is later.
+      if (stream.pendingType !== null) {
+        beginStream(stream, Math.max(stream.bodyStartMs, mapTimes.toSource(video.currentTime)))
+        return
+      }
       const rangeEnd = fedRangeEnd(stream)
       const fromMs = rangeEnd > 0 ? mapTimes.toSource(rangeEnd) : stream.bodyStartMs
       beginStream(stream, fromMs)

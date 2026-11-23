@@ -2179,3 +2179,91 @@ describe('the player', () => {
     ).toBe(false)
   })
 })
+
+describe('the final review fixes', () => {
+  it('a failed resume keeps the playhead', async () => {
+    // The video body stops early; its resume gets a 504, the normal answer of a slow torrent.
+    // The next try must only ask again from where the buffer ends: a restart of the whole start
+    // would move the playhead to the far end of the buffered range and skip what lies between.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 2; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    expect(t.video.currentTime, 'the start did not land at media 1').toBe(1)
+    let busy = true
+    t.recorder.answer('/tracks/1/stream', () =>
+      busy ? { status: 504 } : { startMs: 1000, body: () => new FakeBody() },
+    )
+    vi.useFakeTimers()
+    try {
+      t.body(1).end()
+      await vi.advanceTimersByTimeAsync(1_100)
+      expect(t.recorder.callsFor('/tracks/1/stream').length, 'the early end was not retried').toBe(2)
+      busy = false
+      await vi.advanceTimersByTimeAsync(2_100)
+      const calls = t.recorder.callsFor('/tracks/1/stream')
+      expect(calls.length, 'the failed resume was not asked again').toBe(3)
+      expect(calls[2]?.url, 'the resume did not ask from the buffered end').toContain('start_ms=1000')
+      expect(t.video.currentTime, 'the failed resume moved the playhead').toBe(1)
+      expect(t.recorder.callsFor('/tracks/2/stream').length, 'the failed resume restarted the audio').toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+    t.close()
+  })
+
+  it('a busy answer after a seek fetches the new position', async () => {
+    // The seek's audio follow-up gets a 503. Its retry must ask for the new position, not resume
+    // the range the old body fed at the old position.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 2; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    let busy = true
+    t.recorder.answer('/tracks/2/stream', () =>
+      busy ? { status: 503 } : { startMs: 19_000, body: () => new FakeBody() },
+    )
+    t.video.currentTime = 20
+    await settle()
+    const asked = t.recorder.callsFor('/tracks/2/stream')
+    expect(asked.length, 'the seek did not ask for the audio').toBe(2)
+    expect(asked[1]?.url, 'the seek did not ask for the audio at the seek').toContain('start_ms=19000')
+    busy = false
+    await sleep(1_100)
+    await settle()
+    const calls = t.recorder.callsFor('/tracks/2/stream')
+    expect(calls.length, 'the busy answer was not retried').toBe(3)
+    expect(calls[2]?.url, 'the retry went back to the old position').toContain('start_ms=19000')
+    t.close()
+  })
+
+  it('a busy answer during an audio switch starts at the playhead', async () => {
+    // The new audio track's first body gets a 503. The buffer still holds the old track to media
+    // 3; the retry must ask for the new track at the playhead, not at the old track's range end,
+    // which would leave the old language playing up to it.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 3; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    let busy = true
+    t.recorder.answer('/tracks/3/stream', () =>
+      busy ? { status: 503 } : { startMs: 0, body: () => new FakeBody() },
+    )
+    expect(t.engine.setAudio(PROBE.tracks[2] as MediaTrack), 'the switch was refused').toBe(true)
+    await settle()
+    expect(t.recorder.callsFor('/tracks/3/stream').length, 'the switch did not ask for the new track').toBe(1)
+    busy = false
+    await sleep(1_100)
+    await settle()
+    await settle()
+    const calls = t.recorder.callsFor('/tracks/3/stream')
+    expect(calls.length, 'the busy answer was not retried').toBe(2)
+    expect(calls[1]?.url, 'the retry of the switch did not start at the playhead').toContain('start_ms=0')
+    expect(t.audioBuffer.log.removes, 'the old track was not cut at the playhead').toEqual([[1, 3]])
+    t.close()
+  })
+
+})
