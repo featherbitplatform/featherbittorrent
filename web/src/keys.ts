@@ -11,7 +11,7 @@
 export interface KeyBinding {
   keys: string[]
   action: string
-  where: 'Player' | 'Torrent list' | 'Detail tabs' | 'Dialogs'
+  where: 'Player' | 'Torrent list' | 'Detail tabs' | 'Menus' | 'Dialogs'
 }
 
 export const KEY_BINDINGS: readonly KeyBinding[] = [
@@ -31,6 +31,13 @@ export const KEY_BINDINGS: readonly KeyBinding[] = [
   { where: 'Detail tabs', action: 'Previous tab', keys: ['ArrowLeft'] },
   { where: 'Detail tabs', action: 'First tab', keys: ['Home'] },
   { where: 'Detail tabs', action: 'Last tab', keys: ['End'] },
+  { where: 'Menus', action: 'Open the menu', keys: ['ArrowDown', 'Enter', ' '] },
+  { where: 'Menus', action: 'Choose the focused option', keys: ['Enter', ' '] },
+  { where: 'Menus', action: 'Next option', keys: ['ArrowDown'] },
+  { where: 'Menus', action: 'Previous option', keys: ['ArrowUp'] },
+  { where: 'Menus', action: 'First option', keys: ['Home'] },
+  { where: 'Menus', action: 'Last option', keys: ['End'] },
+  { where: 'Menus', action: 'Close the menu', keys: ['Escape'] },
   { where: 'Dialogs', action: 'Close the dialog', keys: ['Escape'] },
 ]
 

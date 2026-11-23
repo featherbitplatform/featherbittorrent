@@ -311,14 +311,32 @@ describe('the keyboard', () => {
   })
 
   it("every handler's key is in the list: torrent list", () => {
-    const { container } = render(<PickingTable rows={rowsOf(5)} initial={'t2'} />)
-    const row = container.querySelector('[data-row="t2"]') as HTMLElement
-    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Torrent list')) {
+    const selectedId = (container: HTMLElement): string | null =>
+      container.querySelector('[aria-selected="true"]')?.getAttribute('data-row') ?? null
+    const effects: Record<string, { start: string | null; focus: string; want: string }> = {
+      'Select the focused torrent': { start: null, focus: 't1', want: 't1' },
+      'Move to the next torrent': { start: 't2', focus: 't2', want: 't3' },
+      'Move to the previous torrent': { start: 't2', focus: 't2', want: 't1' },
+    }
+    const listed = KEY_BINDINGS.filter((entry) => entry.where === 'Torrent list')
+    expect(listed.length === Object.keys(effects).length, 'a case has no binding in the list').toBe(true)
+    for (const binding of listed) {
+      const effect = effects[binding.action]
+      expect(effect !== undefined, `no effect check for ${binding.action}`).toBe(true)
       for (const key of binding.keys) {
+        const { container } = render(<PickingTable rows={rowsOf(5)} initial={effect?.start ?? null} />)
+        const row = container.querySelector(`[data-row="${effect?.focus}"]`) as HTMLElement
         const left = fireEvent.keyDown(row, { key })
         expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the list`).toBe(true)
+        expect(
+          selectedId(container) === effect?.want,
+          `${JSON.stringify(key)} (${binding.action}) selected ${selectedId(container)}, not ${effect?.want}`,
+        ).toBe(true)
+        cleanup()
       }
     }
+    const { container } = render(<PickingTable rows={rowsOf(5)} initial={'t2'} />)
+    const row = container.querySelector('[data-row="t2"]') as HTMLElement
     expect(fireEvent.keyDown(row, { key: 'q' }), 'the list took a key that is not in the list').toBe(true)
   })
 

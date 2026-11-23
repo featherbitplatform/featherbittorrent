@@ -8,13 +8,15 @@ import type { JSX } from 'react'
 import { KEY_BINDINGS } from '../../keys'
 import type { KeyBinding } from '../../keys'
 
-const GROUPS: readonly KeyBinding['where'][] = ['Player', 'Torrent list', 'Detail tabs', 'Dialogs']
+const GROUPS: readonly KeyBinding['where'][] = ['Player', 'Torrent list', 'Detail tabs', 'Menus', 'Dialogs']
 
 const PHONE_QUERY = '(max-width: 640px)'
 
 function keyLabel(key: string): string {
   if (key === ' ') return 'Space'
-  return key
+  const glyphs: Record<string, string> = { ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓' }
+  if (key in glyphs) return glyphs[key] as string
+  return key.length === 1 ? key.toUpperCase() : key
 }
 
 function onPhone(): boolean {

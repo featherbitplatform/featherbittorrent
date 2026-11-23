@@ -30,13 +30,23 @@ describe('the Shortcuts section', () => {
         `${binding.action} is not listed`,
       ).toBe(true)
     }
-    for (const where of ['Player', 'Torrent list', 'Detail tabs', 'Dialogs']) {
+    for (const where of ['Player', 'Torrent list', 'Detail tabs', 'Menus', 'Dialogs']) {
       expect(
         Array.from(container.querySelectorAll('h3')).some((heading) => heading.textContent === where),
         `no group heading for ${where}`,
       ).toBe(true)
     }
     expect(container.textContent?.includes('For a keyboard.'), 'the note showed on a wide screen').toBe(false)
+  })
+
+  it('the keys read as glyphs and capitals', () => {
+    stubMedia(() => false)
+    const { container } = render(<Shortcuts />)
+    const kbds = Array.from(container.querySelectorAll('kbd')).map((node) => node.textContent)
+    for (const label of ['←', '→', '↑', '↓', 'Space', 'K', 'F']) {
+      expect(kbds.includes(label), `no key is drawn as ${label}`).toBe(true)
+    }
+    expect(kbds.includes('ArrowLeft') || kbds.includes('k'), 'a key is drawn raw').toBe(false)
   })
 
   it('on a phone the section says it is for a keyboard', () => {

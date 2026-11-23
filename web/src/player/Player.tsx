@@ -115,6 +115,8 @@ function langOf(language: string | null): string {
 
 /** The seconds one nudge of the arrows moves the playhead. */
 const SEEK_STEP = 5
+/** The actions whose keys the native video's own controls take when they have the focus. */
+const NATIVE_CONTROL_ACTIONS: readonly string[] = ['Play or pause', 'Seek back', 'Seek forward', 'Volume up', 'Volume down']
 /** The fraction one nudge of the volume arrows moves the volume. */
 const VOLUME_STEP = 0.1
 
@@ -187,14 +189,14 @@ function ChoiceMenu({
 
   function onKeyDown(event: KeyboardEvent): void {
     if (!open) {
-      if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+      if (matches('Menus', 'Open the menu', event)) {
         event.preventDefault()
         setOpenAndReport(true)
       }
       return
     }
     // Escape closes the menu even when it has no choice that can be taken.
-    if (event.key === 'Escape') {
+    if (matches('Menus', 'Close the menu', event)) {
       event.preventDefault()
       close()
       return
@@ -207,7 +209,7 @@ function ChoiceMenu({
     // focus, and Enter takes the focused option, so a person can move and then choose.
     const focused = items.findIndex((item) => item === listRef.current?.querySelector<HTMLElement>(':focus'))
     const current = focused !== -1 ? focused : items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
-    if (event.key === 'Enter' || event.key === ' ') {
+    if (matches('Menus', 'Choose the focused option', event)) {
       event.preventDefault()
       const key = items[current === -1 ? 0 : current]?.getAttribute('data-key')
       if (key !== null && key !== undefined) onChoose(key)
@@ -215,10 +217,10 @@ function ChoiceMenu({
       return
     }
     let next: number
-    if (event.key === 'ArrowDown') next = (current + 1) % items.length
-    else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length
-    else if (event.key === 'Home') next = 0
-    else if (event.key === 'End') next = items.length - 1
+    if (matches('Menus', 'Next option', event)) next = (current + 1) % items.length
+    else if (matches('Menus', 'Previous option', event)) next = (current - 1 + items.length) % items.length
+    else if (matches('Menus', 'First option', event)) next = 0
+    else if (matches('Menus', 'Last option', event)) next = items.length - 1
     else return
     event.preventDefault()
     items[next]?.focus()
@@ -810,7 +812,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (
       target instanceof HTMLVideoElement &&
       target.controls &&
-      [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)
+      NATIVE_CONTROL_ACTIONS.some((action) => matches('Player', action, event))
     ) {
       return
     }

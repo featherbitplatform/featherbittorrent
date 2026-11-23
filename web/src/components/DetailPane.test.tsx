@@ -609,14 +609,31 @@ describe('the tabs on the keyboard', () => {
     const { client } = spyClient({})
     render(<DetailPane id="a" client={client} tick={0} />)
     await flush()
-    for (const binding of KEY_BINDINGS.filter((entry) => entry.where === 'Detail tabs')) {
+    const labels = ['Files', 'Peers', 'Trackers', 'Pieces']
+    const chosen = (): string =>
+      labels.find((label) => screen.getByRole('tab', { name: label }).getAttribute('aria-selected') === 'true') ?? ''
+    // From Peers (the second tab): next is Trackers, previous is Files, first is Files, last is Pieces.
+    const effects: Record<string, string> = {
+      'Next tab': 'Trackers',
+      'Previous tab': 'Files',
+      'First tab': 'Files',
+      'Last tab': 'Pieces',
+    }
+    const listed = KEY_BINDINGS.filter((entry) => entry.where === 'Detail tabs')
+    expect(listed.length === Object.keys(effects).length, 'a case has no binding in the list').toBe(true)
+    for (const binding of listed) {
+      const want = effects[binding.action]
+      expect(want !== undefined, `no effect check for ${binding.action}`).toBe(true)
       for (const key of binding.keys) {
-        const tab = screen.getAllByRole('tab')[1] as HTMLElement
-        const left = fireEvent.keyDown(tab, { key })
+        fireEvent.click(screen.getByRole('tab', { name: 'Peers' }))
+        await flush()
+        const left = fireEvent.keyDown(screen.getByRole('tab', { name: 'Peers' }), { key })
         expect(left === false, `${JSON.stringify(key)} (${binding.action}) was not taken by the tabs`).toBe(true)
+        expect(chosen() === want, `${JSON.stringify(key)} (${binding.action}) chose ${chosen()}, not ${want}`).toBe(true)
+        await flush()
       }
     }
-    const tab = screen.getAllByRole('tab')[0] as HTMLElement
+    const tab = screen.getByRole('tab', { name: 'Files' })
     expect(fireEvent.keyDown(tab, { key: 'q' }), 'the tabs took a key that is not in the list').toBe(true)
   })
 
