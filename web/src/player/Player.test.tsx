@@ -1757,9 +1757,13 @@ describe('the player', () => {
     await settle()
     await settle()
     await settle()
+    // The switch's own fetch went out and the seek aborted it; the restart fetches the new
+    // track again, at the seek, and that fetch is the live one.
     const italian = t.recorder.callsFor('/tracks/3/stream')
-    expect(italian.length, 'the restart did not fetch the new audio track').toBe(1)
-    expect(italian[0]?.url, 'the new track was not fetched at the seek').toContain('start_ms=19000')
+    expect(italian.length, 'the restart did not fetch the new audio track').toBe(2)
+    expect(italian[0]?.signal.aborted, 'the interrupted switch fetch was not aborted').toBe(true)
+    expect(italian[1]?.url, 'the new track was not fetched at the seek').toContain('start_ms=19000')
+    expect(italian[1]?.signal.aborted, 'the restart fetch of the new track was stopped').toBe(false)
     expect(t.recorder.callsFor('/tracks/2/stream').length, 'the restart brought the old track back').toBe(1)
     expect(t.audioBuffer.log.changeTypes, 'the buffer was not re-typed for the new track').toEqual([
       'audio/mp4; codecs="opus"',
@@ -1843,5 +1847,108 @@ describe('the player', () => {
     } finally {
       window.removeEventListener('error', onError)
     }
+  })
+
+  it('switching audio after the end plays the new track to the end', async () => {
+    // The file has ended. The person picks another audio track: the engine switches (the
+    // switch reopens the source), reads the new track to the end, and ends the source again.
+    const t = await openEngine()
+    for (let i = 0; i < 6; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.body(1).end()
+    t.body(2).end()
+    await settle()
+    expect(t.source.readyState, 'the source did not end').toBe('ended')
+    expect(t.engine.setAudio(PROBE.tracks[2] as MediaTrack), 'the switch after the end was refused').toBe(true)
+    await settle()
+    await settle()
+    await settle()
+    expect(t.recorder.callsFor('/tracks/3/stream').length, 'the new track was not fetched').toBe(1)
+    expect(t.audioBuffer.log.changeTypes, 'the buffer was not re-typed').toEqual(['audio/mp4; codecs="opus"'])
+    for (let i = 0; i < 6; i += 1) {
+      t.body(3).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.body(3).end()
+    await settle()
+    expect(t.source.endOfStreamCalls.length, 'the new track did not end the source again').toBe(2)
+    t.close()
+  })
+
+  it('switching audio after an error restarts both streams', async () => {
+    // The English audio route fails: an error, and every stream is stopped. Picking the Italian
+    // track is a full restart: the video is fetched again with it, and the state leaves the error.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ status: 500 }))
+    recorder.answer('/tracks/3/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 500 was not an error').toBe('error')
+    expect(engine.setAudio(PROBE.tracks[2] as MediaTrack), 'the switch after an error was refused').toBe(true)
+    await settle()
+    await settle()
+    await settle()
+    const videoCalls = recorder.callsFor('/tracks/1/stream')
+    expect(videoCalls.length, 'the switch did not restart the video').toBe(2)
+    expect(videoCalls[1]?.signal.aborted, 'the restarted video was stopped').toBe(false)
+    expect(recorder.callsFor('/tracks/3/stream').length, 'the new track was not fetched').toBe(1)
+    expect(engine.state(), 'the switch left the engine in the error').toBe('playing')
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('a later audio start keeps the old audio up to it', async () => {
+    // The audio buffer holds [0, 5] and the playhead is at 1. The new track's body answers
+    // `X-Fbtt-Start-Ms: 2500` (media 3.5), later than asked: the old audio is cut from 3.5, so
+    // the playhead keeps the old track up to the new data rather than a gap.
+    const t = await openEngine({ durationMs: 120_000 })
+    t.recorder.answer('/tracks/3/stream', () => ({ startMs: 2500, body: () => new FakeBody() }))
+    for (let i = 0; i < 5; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.engine.setAudio(PROBE.tracks[2] as MediaTrack)
+    await settle()
+    await settle()
+    await settle()
+    expect(t.audioBuffer.log.removes, 'the old audio was not cut where the new body starts').toEqual([[3.5, 5]])
+    expect(t.audioBuffer.log.changeTypes.length, 'the buffer was not re-typed').toBe(1)
+    t.close()
+  })
+
+  it('a refused audio switch keeps the selection', async () => {
+    // A source that never opens: the engine has no audio buffer, so it refuses the switch, and
+    // the Audio menu must not show the Italian track as chosen while the English one plays.
+    class NeverOpens extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /avc1|mp4a|opus/.test(mime)
+      }
+      open(): void {}
+    }
+    vi.stubGlobal('MediaSource', NeverOpens)
+    vi.stubGlobal('fetch', fakeFetch().fetch)
+    const { client } = probeClient()
+    const { container } = render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    fireEvent.keyDown(container.querySelector('dialog') as HTMLElement, { key: 'a' })
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const chosen = screen
+      .getAllByRole('option')
+      .filter((option) => option.getAttribute('aria-selected') === 'true')
+      .map((option) => option.textContent ?? '')
+    expect(
+      chosen.some((text) => text.startsWith('ita')),
+      `a refused switch showed the new track as chosen (${JSON.stringify(chosen)})`,
+    ).toBe(false)
   })
 })

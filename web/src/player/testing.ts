@@ -147,6 +147,7 @@ export class FakeSourceBuffer extends EventTarget {
 
   changeType(mime: string): void {
     this._refuseWhileBusy()
+    this.owner?.reopenIfEnded()
     this.log.changeTypes.push(mime)
     this.log.ops.push('changeType')
     this.currentMimeType = mime

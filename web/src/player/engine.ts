@@ -39,8 +39,12 @@ export interface EngineDeps {
 export interface Engine {
   /** Move the playhead to a point of source time. Outside the buffer, the streams restart there. */
   seek(sourceMs: number): void
-  /** Change the audio track: the old one is cut at the playhead, the new one is fetched there. */
-  setAudio(track: MediaTrack): void
+  /**
+   * Change the audio track: the old one is cut at the playhead, the new one is fetched there.
+   * False when the engine cannot switch (no audio buffer yet, or no mime for the track), so the
+   * player keeps showing the track that is still playing.
+   */
+  setAudio(track: MediaTrack): boolean
   /** The state the player draws. */
   state(): EngineState
   /** Stop everything: the fetches, the buffers, and the object URL the engine made, when it made one. */
@@ -445,12 +449,6 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     void (async () => {
       if (quiescent !== null) await quiescent
       if (destroyed || abort.signal.aborted) return
-      // An audio switch that has not reached its `changeType` yet is finished here, before the
-      // new track's first byte: the switch's own body, or a restart that interrupted it.
-      if (stream.pendingType !== null) {
-        const switched = await switchType(stream, stream.pendingType, mapTimes.toMedia(startMs), abort.signal)
-        if (!switched) return
-      }
       let response: Response
       try {
         response = await full.fetch(url, { signal: abort.signal, credentials: 'same-origin' })
@@ -487,6 +485,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       const parsed = header === null || header === undefined ? Number.NaN : Number(header)
       const bodyStartMs = Number.isFinite(parsed) && parsed > 0 ? parsed : Math.max(0, startMs)
       stream.bodyStartMs = bodyStartMs
+      // An audio switch that has not reached its `changeType` yet is finished here, before the
+      // new track's first byte: the switch's own body, or a restart that interrupted it. The cut
+      // starts where the new body's data starts, never before it: a body that begins later than
+      // asked leaves the old track playing up to it, not a gap at the playhead.
+      if (stream.pendingType !== null) {
+        const from = mapTimes.toMedia(Math.max(startMs, bodyStartMs))
+        const switched = await switchType(stream, stream.pendingType, from, abort.signal)
+        if (!switched) return
+      }
       onStarted?.(bodyStartMs, startMs)
 
       if (response.body === null) {
@@ -983,23 +990,36 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     for (const stream of streams) pump(stream)
   }
 
-  function setAudio(track: MediaTrack): void {
+  function setAudio(track: MediaTrack): boolean {
     // The buffers are added when the source opens; a switch asked for before then has no buffer
-    // to switch, and the track the probe chose is already the one the open will play.
-    if (destroyed || audioStream === null || source.readyState !== 'open') return
+    // to switch, and the track the probe chose is already the one the open will play. An ended
+    // source is a source with buffers: the switch's remove or append reopens it.
+    if (destroyed || audioStream === null) return false
+    if (source.readyState !== 'open' && source.readyState !== 'ended') return false
     const mime = probe.mimeFor(track)
-    if (mime === null) return
+    if (mime === null) return false
     // The audio track changes on the buffer it already has: a `SourceBuffer` cannot change its
     // mime in place, but it can `changeType`, and a second `addSourceBuffer` after media data has
     // arrived is the browser's `QuotaExceededError`. The new body's `beginStream` stops the old
-    // fetch and `abort()`s the buffer, then cuts it from the playhead to the end and re-types it
-    // (`switchType`), then asks for the new track at the playhead. The switch is pending until
-    // the `changeType` has happened: a seek that interrupts it restarts the audio on the new
-    // track, which is the one the player shows as chosen.
+    // fetch and `abort()`s the buffer, then cuts it from the new body's start to the end and
+    // re-types it (`switchType`), then reads the new track. The switch is pending until the
+    // `changeType` has happened: a seek that interrupts it restarts the audio on the new track,
+    // which is the one the player shows as chosen.
     const stream = audioStream
     stream.track = track
     stream.pendingType = mime
-    beginStream(stream, mapTimes.toSource(video.currentTime))
+    const fromMs = mapTimes.toSource(video.currentTime)
+    // After an error every stream is stopped: the switch is a full restart, which re-arms the
+    // error's stop and fetches the new track along with the video.
+    if (state === 'error') {
+      restartAll(fromMs)
+      return true
+    }
+    // After the end, the new track is read to the end again: the video keeps its end, and the
+    // source is ended again when the new audio reaches it.
+    if (endedFired) endedFired = false
+    beginStream(stream, fromMs)
+    return true
   }
 
   function destroy(): void {

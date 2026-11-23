@@ -605,8 +605,8 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     const currentId = audioKey !== null ? Number(audioKey) : choice.audio?.id
     const index = playable.findIndex((option) => option.track.id === currentId)
     const next = playable[(index + 1) % playable.length].track
-    engineRef.current?.setAudio(next)
-    setAudioKey(String(next.id))
+    // The engine says whether it switched: a refused switch keeps the track that still plays.
+    if (engineRef.current?.setAudio(next) === true) setAudioKey(String(next.id))
   }
 
   function nextSubtitle(): void {
@@ -620,8 +620,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (choice?.kind !== 'remux') return
     const found = choice.audioOptions.find((option) => String(option.track.id) === key)
     if (found === undefined || !found.playable) return
-    engineRef.current?.setAudio(found.track)
-    setAudioKey(key)
+    if (engineRef.current?.setAudio(found.track) === true) setAudioKey(key)
   }
 
   async function download(): Promise<void> {
