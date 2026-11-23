@@ -49,10 +49,11 @@ function server(
     refuse?: string[]
     add?: () => Response
     rootsAnswer?: () => Response
+    mkdirAnswer?: () => Response
   } = {},
 ): { client: Api; seen: Seen[] } {
   const roots = options.roots ?? ['/downloads', '/usb/media']
-  const dirs = options.dirs ?? {}
+  const dirs: Record<string, string[]> = { ...(options.dirs ?? {}) }
   const refuse = options.refuse ?? []
   const seen: Seen[] = []
   const fetchFn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -77,6 +78,12 @@ function server(
         )
       }
       return json(200, JSON.stringify({ path, dirs: dirs[path] ?? [] }))
+    }
+    if (url === '/api/v1/fs/mkdir' && call.method === 'POST') {
+      if (options.mkdirAnswer !== undefined) return options.mkdirAnswer()
+      const made = JSON.parse(String(call.body)) as { parent: string; name: string }
+      dirs[made.parent] = [...(dirs[made.parent] ?? []), made.name]
+      return json(201, JSON.stringify({ path: `${made.parent}/${made.name}` }))
     }
     if (url.startsWith('/api/v1/torrents') && call.method === 'POST') {
       return options.add?.() ?? json(201, '{"id":"a1b2c3d4","name":"Sintel"}')
@@ -340,6 +347,100 @@ describe('the folder the torrent goes into', () => {
         chosenPath(container) === '/downloads/linux',
       'a refused child folder lost the parent listing or the reason the server gave for refusing it',
     ).toBe(true)
+  })
+})
+
+describe('a new folder in the picker', () => {
+  const nameField = (): HTMLInputElement => screen.getByLabelText('Folder name') as HTMLInputElement
+  const createButton = (): HTMLButtonElement => screen.getByRole('button', { name: 'Create' }) as HTMLButtonElement
+  const mkdirCalls = (seen: Seen[]): Seen[] => seen.filter((call) => call.url === '/api/v1/fs/mkdir')
+
+  it('new folder creates and opens it', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    const { container } = openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: 'Season 2' } })
+    fireEvent.click(createButton())
+    await flush()
+    const call = mkdirCalls(seen)[0]
+    expect(call?.body, 'no mkdir request left the picker').toBe(
+      JSON.stringify({ parent: '/downloads', name: 'Season 2' }),
+    )
+    expect(chosenPath(container), 'the new folder was not the one shown').toBe('/downloads/Season 2')
+    expect(rowPaths(container), 'the new folder was not listed').toContain('/downloads/Season 2')
+  })
+
+  it.each([400, 403, 404, 409])('a refused name stays in the form with the reason for status %i', async (status) => {
+    const { client } = server({
+      roots: ['/downloads'],
+      mkdirAnswer: () =>
+        json(status, '{"error":{"code":"refused","message":"the server refused that folder"}}'),
+    })
+    const { container } = openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: 'Season 2' } })
+    fireEvent.click(createButton())
+    await flush()
+    expect(screen.queryByLabelText('Folder name') !== null, 'the form closed on a refusal').toBe(true)
+    expect(container.textContent, 'the server reason was not shown').toContain('the server refused that folder')
+    expect(chosenPath(container), 'the folder shown changed on a refusal').toBe('/downloads')
+  })
+
+  it('enter in the folder name field creates the folder', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: 'Season 2' } })
+    fireEvent.keyDown(nameField(), { key: 'Enter' })
+    await flush()
+    expect(mkdirCalls(seen).length, 'Enter did not create exactly one folder').toBe(1)
+    expect(
+      seen.filter((call) => call.url.startsWith('/api/v1/torrents')).length,
+      'Enter added the torrent',
+    ).toBe(0)
+  })
+
+  it('the folder name is sent as typed', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(nameField(), { target: { value: ' a ' } })
+    fireEvent.click(createButton())
+    await flush()
+    expect(mkdirCalls(seen)[0]?.body, 'the name was changed before it was sent').toBe(
+      JSON.stringify({ parent: '/downloads', name: ' a ' }),
+    )
+  })
+
+  it('escape in the folder name field closes only the field', async () => {
+    const { client } = server({ roots: ['/downloads'] })
+    const { events } = openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.keyDown(nameField(), { key: 'Escape' })
+    await flush()
+    expect(events.includes('closed'), 'Escape closed the whole dialog').toBe(false)
+    expect(screen.queryByLabelText('Folder name'), 'the field stayed open').toBeNull()
+    expect(document.activeElement, 'focus did not return to New folder').toBe(
+      screen.getByRole('button', { name: 'New folder' }),
+    )
+  })
+
+  it('an empty name cannot be sent', async () => {
+    const { client, seen } = server({ roots: ['/downloads'] })
+    openDialog(client)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    expect(createButton().disabled, 'Create was enabled with no name').toBe(true)
+    fireEvent.change(nameField(), { target: { value: '   ' } })
+    expect(createButton().disabled, 'Create was enabled for a blank name').toBe(true)
+    fireEvent.click(createButton())
+    await flush()
+    expect(mkdirCalls(seen).length, 'a blank name was sent').toBe(0)
   })
 })
 
