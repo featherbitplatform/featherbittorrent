@@ -1296,6 +1296,7 @@ describe('the player', () => {
       fakeDeps(source, recorder),
     )
     source.open()
+    video.paused = false
     await settle()
     const buf = source.activeSourceBuffers[0]
     // One chunk: the buffer is [0, 1], the playhead at 0, and the gate is open (ahead = 1).
