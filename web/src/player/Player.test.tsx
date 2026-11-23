@@ -5,12 +5,14 @@ import Files from '../components/detail/Files'
 import { createClient } from '../api/client'
 import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
 import { createEngine } from './engine'
+import type { EngineProbe } from './engine'
 import { toSource } from './time'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import {
   FakeBody,
   FakeMediaSource,
+  FakeSourceBuffer,
   fakeDeps,
   fakeFetch,
   fakeVideo,
@@ -198,6 +200,76 @@ async function settle(): Promise<void> {
 }
 
 
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** The audio mime the player would give a track, for the engine tests that switch the audio. */
+function audioMimeFor(track: MediaTrack): string | null {
+  for (const codec of track.mime_codecs) {
+    if (/mp4a|opus/.test(codec)) return `audio/mp4; codecs="${codec}"`
+  }
+  return null
+}
+
+/** The probe the engine tests hand the engine: the fixture's video and English audio. */
+function engineProbe(over: Partial<EngineProbe> = {}): EngineProbe {
+  return {
+    offsetMs: 1000,
+    durationMs: 4000,
+    video: PROBE.tracks[0] as MediaTrack,
+    videoMime: 'video/mp4; codecs="avc1.64000A"',
+    audio: PROBE.tracks[1] as MediaTrack,
+    audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+    mimeFor: audioMimeFor,
+    ...over,
+  }
+}
+
+/** Set a fake buffer's ranges by hand, the way a test puts the buffer in a shape it needs. */
+function setRanges(buffer: FakeSourceBuffer, ranges: [number, number][]): void {
+  ;(buffer as unknown as { _buffered: [number, number][] })._buffered = ranges
+}
+
+/**
+ * An engine over a fresh source, video element and fetch. The video's first fetch answers at 0
+ * and every later one at `restartMs`, so a seek's restart lands where the test asked; each fetch
+ * gets a fresh body, read back from `recorder.callsFor`.
+ */
+async function openEngine(over: Partial<EngineProbe> = {}, restartMs = 19_000) {
+  const source = new FakeMediaSource()
+  const recorder = fakeFetch()
+  let videoCalls = 0
+  recorder.answer('/tracks/1/stream', () => {
+    videoCalls += 1
+    return { startMs: videoCalls === 1 ? 0 : restartMs, body: () => new FakeBody() }
+  })
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  recorder.answer('/tracks/3/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  const video = fakeVideo()
+  document.body.appendChild(video)
+  const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(over), fakeDeps(source, recorder))
+  source.open()
+  await settle()
+  const body = (track: number, index = -1): FakeBody => {
+    const call = recorder.callsFor(`/tracks/${track}/stream`).at(index)
+    if (call?.body === undefined || call.body === null) throw new Error(`no body for track ${track}`)
+    return call.body
+  }
+  const close = (): void => {
+    engine.destroy()
+    document.body.removeChild(video)
+  }
+  return {
+    source,
+    recorder,
+    video,
+    engine,
+    videoBuffer: source.activeSourceBuffers[0] as FakeSourceBuffer,
+    audioBuffer: source.activeSourceBuffers[1] as FakeSourceBuffer,
+    body,
+    close,
+  }
+}
 
 function fileInfo(index: number, path: string): FileInfo {
   return { index, path, len: 1_048_576, downloaded: 524_288, priority: 'normal', pad: false }
@@ -419,19 +491,13 @@ describe('the player', () => {
     // the 4 s of content).
     expect(source.duration === 5, 'the source did not take the probe duration').toBe(true)
 
-    // Feed the two bodies enough that the buffers reach the end, and move the playhead with
-    // them: the end is measured on the range the playhead sits in, and the source is told once.
-    // The playhead moves with the buffer the way playback does: the end is measured on the
-    // range the playhead sits in, and the read keeps feeding that range.
+    // Feed the two bodies enough that the buffers reach the end, then end them: the source is
+    // told once. The playhead stays at the start: the end is measured on the range each body
+    // fed, not on where the playhead happens to be.
     for (let i = 0; i < 40; i += 1) {
       videoBody.push(new Uint8Array([1]))
       audioBody.push(new Uint8Array([1]))
       await settle()
-      if (i >= 3) {
-        video.currentTime = 5
-        video.dispatchEvent(new Event('timeupdate'))
-        await settle()
-      }
     }
     videoBody.end()
     audioBody.end()
@@ -744,27 +810,29 @@ describe('the player', () => {
     const firstBody = recorder.callsFor('/tracks/1/stream')[0]?.body
     firstBody?.push(new Uint8Array([1]))
     await settle()
-    video.currentTime = 2
-    await settle()
-    const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
-    // The new body feeds a chunk: the data is arriving, and the engine goes back to playing.
-    const newBody = recorder.callsFor('/tracks/1/stream').at(-1)?.body
-    newBody?.push(new Uint8Array([1]))
-    await settle()
-    // Wait past the retry timers (one, two, four seconds) with fake time: the old loop must not
-    // have said the file stopped and scheduled a retry, at any of the cadence's delays.
+    // Fake time from before the seek: any retry the old loop schedules when it wakes is on the
+    // fake clock, and the advance below runs it.
     vi.useFakeTimers()
-    await vi.advanceTimersByTimeAsync(5_000)
-    vi.useRealTimers()
-    await settle()
-    // The abort is the engine's own: the old loop did not say the file stopped (which would be
-    // a `waiting` with no new data) and the stream was not ended. The state is playing, and
-    // there is no new track-1 fetch from a retry.
-    expect(engine.state(), 'the old loop said the file stopped').toBe('playing')
-    expect(
-      recorder.callsFor('/tracks/1/stream').length - callsAfterSeek === 0,
-      'the old loop scheduled a retry fetch',
-    ).toBe(true)
+    try {
+      video.currentTime = 2
+      await vi.advanceTimersByTimeAsync(10)
+      const callsAfterSeek = recorder.callsFor('/tracks/1/stream').length
+      expect(callsAfterSeek, 'the seek did not restart the stream').toBe(2)
+      // The new body feeds a chunk: the data is arriving, and the engine goes back to playing.
+      const newBody = recorder.callsFor('/tracks/1/stream').at(-1)?.body
+      newBody?.push(new Uint8Array([1]))
+      await vi.advanceTimersByTimeAsync(10)
+      // Past the retry cadence (one, two, four seconds): the old loop must not have said the
+      // file stopped and scheduled a retry, at any of its delays.
+      await vi.advanceTimersByTimeAsync(8_000)
+      expect(engine.state(), 'the old loop said the file stopped').toBe('playing')
+      expect(
+        recorder.callsFor('/tracks/1/stream').length - callsAfterSeek === 0,
+        'the old loop scheduled a retry fetch',
+      ).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
     expect(source.endOfStreamCalls.length, 'an abort ended the stream').toBe(0)
     engine.destroy()
     document.body.removeChild(video)
@@ -900,8 +968,9 @@ describe('the player', () => {
   it('a busy server is a retry, not an error', async () => {
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
-    // The server is busy: a 503 with `Retry-After: 1`, the exact shape Task 6's routes give.
-    recorder.answer('/tracks/1/stream', () => ({ status: 503, headers: { 'Retry-After': '1' } }))
+    // The server is busy: a 503 with `Retry-After: 3`, the exact shape Task 6's routes give.
+    // Three seconds is longer than the first retry's one, so the header is what sets the wait.
+    recorder.answer('/tracks/1/stream', () => ({ status: 503, headers: { 'Retry-After': '3' } }))
     recorder.answer('/tracks/2/stream', { startMs: 0, body: () => new FakeBody() })
     const video = fakeVideo()
     document.body.appendChild(video)
@@ -925,18 +994,18 @@ describe('the player', () => {
     // A 503 is a wait, not an error: the engine is waiting, and it is not the permanent `error`.
     expect(engine.state(), 'a 503 was treated as a permanent error').toBe('waiting')
     expect(engine.state() === 'error', 'a 503 became an error').toBe(false)
-    // No refetch before the Retry-After: the 503's `Retry-After: 1` is the minimum delay, and
-    // ~900 ms is just under it, so the engine is still waiting.
+    // No refetch before the Retry-After: the 503's `Retry-After: 3` is the minimum delay, and
+    // ~2.9 s is just under it, so the engine is still waiting.
     const before = recorder.callsFor('/tracks/1/stream').length
     expect(before, 'the initial fetch did not happen').toBe(1)
-    await new Promise((r) => setTimeout(r, 900))
+    await new Promise((r) => setTimeout(r, 2_850))
     await settle()
     expect(
       recorder.callsFor('/tracks/1/stream').length === before,
       'the engine refetched before the Retry-After',
     ).toBe(true)
-    // The refetch is at 1000 ms: the Retry-After's second, the minimum delay.
-    await new Promise((r) => setTimeout(r, 300))
+    // The refetch is at 3000 ms: the Retry-After's three seconds, the minimum delay.
+    await new Promise((r) => setTimeout(r, 400))
     await settle()
     const after = recorder.callsFor('/tracks/1/stream').length
     expect(
@@ -980,43 +1049,25 @@ describe('the player', () => {
     await settle()
     const buffersAtStart = source.activeSourceBuffers.length
     const audioBuffer = source.activeSourceBuffers[1]
-    // Wait until the audio fetch has happened and handed out a body: the engine starts the
-    // audio stream when the source opens, and the body is what the test feeds chunks through.
-    let audioBody: FakeBody | null = null
-    for (let i = 0; i < 40 && audioBody === null; i += 1) {
-      audioBody = recorder.callsFor('/tracks/2/stream')[0]?.body ?? null
-      if (audioBody === null) await settle()
-    }
-    expect(audioBody !== null, 'the audio stream was not fetched').toBe(true)
-    const body = audioBody as FakeBody
-    // Feed the audio a chunk so the buffer has ranges to remove on the switch, and wait for it
-    // to land before feeding the next: a fixed settle is the window a flaky run lands in, with
-    // the read loop still between reads.
-    body.push(new Uint8Array([1]))
-    for (let i = 0; i < 40 && (audioBuffer.ranges[0]?.[1] ?? 0) < 1; i += 1) {
-      await settle()
-    }
-    expect((audioBuffer.ranges[0]?.[1] ?? 0) >= 1, 'the first audio chunk did not land').toBe(true)
-    // Feed the audio a second chunk: the buffer runs to media 2, and the playhead at 1 is
-    // inside it, so the switch has a range behind the playhead to remove and a point the new
-    // track fetches from.
-    body.push(new Uint8Array([1]))
-    // Wait until the buffer actually holds the second chunk (runs to media 2): the switch's
-    // remove is only legal once the buffer runs past the playhead.
-    for (let i = 0; i < 40 && (audioBuffer.ranges[0]?.[1] ?? 0) < 2; i += 1) {
-      await settle()
-    }
-    expect((audioBuffer.ranges[0]?.[1] ?? 0) >= 2, 'the second audio chunk did not land before the switch').toBe(true)
+    // The start is all microtasks (the open, the two fetches), so the audio body is out after
+    // one settle; each chunk lands in one `updateend`, a macrotask a settle covers.
+    const body = recorder.callsFor('/tracks/2/stream')[0]?.body
+    expect(body !== undefined && body !== null, 'the audio stream was not fetched').toBe(true)
+    // Two chunks: the audio buffer runs to media 2, and the playhead at 1 is inside it, so the
+    // switch has data ahead of the playhead to remove and a point the new track fetches from.
+    body?.push(new Uint8Array([1]))
+    await settle()
+    body?.push(new Uint8Array([1]))
+    await settle()
+    expect(audioBuffer.ranges, 'the two audio chunks did not land before the switch').toEqual([[0, 2]])
     // Switch the audio: the engine reuses the audio buffer with `changeType`, not a new one.
+    const opsBefore = audioBuffer.log.ops.length
     engine.setAudio(PROBE.tracks[2] as MediaTrack)
-    // The switch is async: the abort, the wait, the remove, the changeType, and the fetch each
-    // take a macrotask. `settle` is two macrotasks, and the switch's own waits run off the
-    // buffer's `updateend`s, so the test settles past the whole chain and once more while the
-    // buffer is still settling one, which is the window a flaky run lands in.
-    for (let i = 0; i < 8; i += 1) {
-      await settle()
-      if (audioBuffer !== undefined && audioBuffer.updating) await settle()
-    }
+    // The abort, the remove, the `changeType` and the fetch: two `updateend`s, and a settle
+    // more than that for margin.
+    await settle()
+    await settle()
+    await settle()
     expect(
       source.activeSourceBuffers.length === buffersAtStart,
       'changing audio added a second source buffer',
@@ -1025,11 +1076,12 @@ describe('the player', () => {
       audioBuffer !== undefined && audioBuffer.log.changeTypes.length === 1,
       'changing audio did not change the buffer type',
     ).toBe(true)
-    // The buffer was aborted before the remove and the changeType.
+    // The buffer is aborted first, then cut, then re-typed: one ordered log of all three calls,
+    // so an abort that comes late (or only from somewhere else) is read back as out of order.
     expect(
-      audioBuffer !== undefined && audioBuffer.log.aborts >= 1,
-      'changing audio did not abort the buffer',
-    ).toBe(true)
+      audioBuffer.log.ops.slice(opsBefore, opsBefore + 3),
+      'changing audio did not abort, then remove, then changeType the buffer',
+    ).toEqual(['abort', 'remove', 'changeType'])
     // The old audio ranges were removed from the playhead to the end.
     expect(
       audioBuffer !== undefined && audioBuffer.log.removes.length >= 1,
@@ -1312,10 +1364,12 @@ describe('the player', () => {
     render(<Player id="a" file={0} name="movie.mkv" client={client2} onClose={() => {} } />)
     await settle()
     await settle()
-    // The reopen fetch is from the start: no `start_ms`, or `start_ms=0`.
-    const reopenUrl = recorder2.callsFor('/tracks/1/stream')[0]?.url ?? ''
+    // Exactly one reopen fetch, and it is from the start.
+    const reopenCalls = recorder2.callsFor('/tracks/1/stream')
+    expect(reopenCalls.length, 'the reopen did not fetch the video exactly once').toBe(1)
+    const reopenUrl = reopenCalls[0]?.url ?? ''
     expect(
-      !reopenUrl.includes('start_ms') || reopenUrl.includes('start_ms=0'),
+      reopenUrl.includes('start_ms=0'),
       `a finished file did not start from the beginning (got ${reopenUrl})`,
     ).toBe(true)
     localStorage.removeItem('fbtt.position.a.0')
@@ -1412,10 +1466,14 @@ describe('the player', () => {
     // (the element's start, `toMedia(0)`), 130 seconds ahead, past the gate's stop line. The
     // read is held at the gate.
     ;(buf as unknown as { _buffered: [number, number][] })._buffered = [[0, 131]]
+    // The read already waiting takes this chunk (the gate answers before a read, not after),
+    // and the gate, measured after it lands, says stop.
     videoBody.push(new Uint8Array([1]))
     await settle()
+    // The next chunk is held: counted before the push, so the count can tell.
     const appendsAtGate = buf?.log.appends.length ?? 0
-    // The held chunk did not land: the gate said stop, and the read is waiting.
+    videoBody.push(new Uint8Array([1]))
+    await settle()
     expect(
       (buf?.log.appends.length ?? 0) === appendsAtGate,
       'the gate did not hold the read over a far-ahead range',
@@ -1443,11 +1501,10 @@ describe('the player', () => {
   })
 
   it('a retry after seeking back fills the gap', async () => {
-    // A buffer that runs far ahead of the playhead, in a range the playhead has left: when the
-    // body ends early, the retry goes from the end of the range the playhead sits in (or the
-    // body's own start, when it sits in none), not from the far end of everything buffered.
-    // Before the fix, the retry started past the far range, so the playhead's gap was never
-    // filled, and a far range that reached the file's end ended the stream early.
+    // A buffer with a far range the body did not feed: when the body ends early, the retry goes
+    // from the end of the range the body fed (or the body's own start, when that range is
+    // gone), not from the far end of everything buffered, which would start past the gap and
+    // never fill it.
     const source = new FakeMediaSource()
     const recorder = fakeFetch()
     const firstBody = new FakeBody()
@@ -1483,8 +1540,7 @@ describe('the player', () => {
     firstBody.end()
     await settle()
     // The body ended early: the engine is waiting, and it schedules a retry. The retry goes
-    // from the body's own start (the playhead sits in no range), not from the far end of the
-    // buffer (200).
+    // from the body's own start (its range is gone), not from the far end of the buffer (200).
     expect(engine.state(), 'an early end was not a wait').toBe('waiting')
     // Advance past the first retry delay (1 s): the retry fetch is at the body's start, not
     // past the far range.
@@ -1499,13 +1555,215 @@ describe('the player', () => {
     // The retry is from the body's own start (source 0), not from the far end of the buffer
     // (which would be source 199000, past the playhead's gap).
     expect(
-      retryCall !== undefined && (retryCall.url.includes('start_ms=0') || !retryCall.url.includes('start_ms')),
-      `the retry did not start from the playhead's range (got ${retryCall?.url})`,
+      retryCall !== undefined && retryCall.url.includes('start_ms=0'),
+      `the retry did not start from the body's own range (got ${retryCall?.url})`,
     ).toBe(true)
-    // The stream did not end: the far range did not reach the file's end on the playhead's
-    // behalf, so `endOfStream` was not called.
-    expect(source.endOfStreamCalls.length, 'a far range ended the stream').toBe(0)
     engine.destroy()
     document.body.removeChild(video)
+  })
+
+  it('a far range does not end the stream', async () => {
+    // The audio has reached the end of the file. The video body fed one second and ends; a far
+    // range it did not feed runs past the file's end. That range is not the video's data, so
+    // the video is not at its end, and the source is not ended.
+    const t = await openEngine()
+    for (let i = 0; i < 6; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.body(2).end()
+    await settle()
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    setRanges(t.videoBuffer, [[5, 200]])
+    t.body(1).end()
+    await settle()
+    expect(t.source.endOfStreamCalls.length, 'a far range ended the stream').toBe(0)
+    expect(t.engine.state(), 'an early end was not a wait').toBe('waiting')
+    t.close()
+  })
+
+  it('a seek drops the held chunk', async () => {
+    // A chunk the buffer refused for quota is held, then a seek restarts the stream. The held
+    // chunk is the old position's: it must never be appended, and the new body must be read.
+    const t = await openEngine({ durationMs: 120_000 })
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    t.videoBuffer.makeNextAppendThrowQuota(2)
+    t.body(1).push(new Uint8Array([7, 7, 7]))
+    await settle()
+    expect(t.videoBuffer.log.quotas, 'the chunk was not refused twice').toBe(2)
+    expect(t.videoBuffer.log.appends.length, 'the refused chunk was appended').toBe(1)
+    t.video.currentTime = 20
+    await settle()
+    expect(t.recorder.callsFor('/tracks/1/stream').length, 'the seek did not restart').toBe(2)
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(t.videoBuffer.log.appends.length, 'the new body was not read').toBe(2)
+    // Past the hold timer too: the old chunk never goes in.
+    await sleep(1_100)
+    await settle()
+    expect(
+      t.videoBuffer.log.appends.some((chunk) => chunk.byteLength === 3),
+      'the old position\'s held chunk was appended into the new stream',
+    ).toBe(false)
+    t.close()
+  })
+
+  it('a held chunk is offered again on a timer', async () => {
+    // The first chunk after a seek is refused for quota and held. It is the data at the
+    // playhead, so the element fires no `timeupdate` and the buffer no `updateend`: only the
+    // engine's own timer can offer it again.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 3; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.video.currentTime = 20
+    await settle()
+    t.videoBuffer.makeNextAppendThrowQuota(2)
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(t.videoBuffer.log.quotas, 'the chunk was not refused twice').toBe(2)
+    expect(t.videoBuffer.log.appends.length, 'the refused chunk was appended').toBe(3)
+    await sleep(1_100)
+    await settle()
+    expect(t.videoBuffer.log.appends.length, 'the held chunk was never offered again').toBe(4)
+    t.close()
+  })
+
+  it('quota evicts the ranges away from the playhead', async () => {
+    // After a seek to media 20, the buffer holds [0, 3]: not behind the playhead by the 60 s the
+    // keep line needs, but a range the playhead is not in and the body does not feed. A full
+    // buffer gives it up, so the chunk at the playhead fits.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 3; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.video.currentTime = 20
+    await settle()
+    t.videoBuffer.makeNextAppendThrowQuota(1)
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(t.videoBuffer.log.removes, 'the range away from the playhead was not evicted').toEqual([[0, 3]])
+    expect(t.videoBuffer.log.appends.length, 'the chunk did not go in after the eviction').toBe(4)
+    t.close()
+  })
+
+  it('the end is measured on the range the body fed', async () => {
+    // The playhead sits in an earlier range, [0.5, 2]; the video body feeds a later one that
+    // runs past the file's end. When both bodies end, the file is over: the source is ended
+    // once, and nothing waits or refetches.
+    const t = await openEngine()
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    setRanges(t.videoBuffer, [[0.5, 2], [3, 4]])
+    for (let i = 0; i < 3; i += 1) {
+      t.body(1).push(new Uint8Array([1]))
+      await settle()
+    }
+    for (let i = 0; i < 6; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.body(1).end()
+    t.body(2).end()
+    await settle()
+    expect(t.video.currentTime, 'the playhead moved').toBe(1)
+    expect(t.source.endOfStreamCalls.length, 'the end was not measured on the range the body fed').toBe(1)
+    expect(t.engine.state(), 'a body that reached the end was taken for an early stop').toBe('playing')
+    t.close()
+  })
+
+  it('a retry resumes from the range the body fed', async () => {
+    // The playhead sits in [0.5, 2]; the video body fed [3, 5] and stops early. The retry goes
+    // on from 5 (source 4000), not from the playhead's range end (source 1000), which would
+    // fetch again what the buffer already holds.
+    const t = await openEngine({ durationMs: 120_000 })
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    setRanges(t.videoBuffer, [[0.5, 2], [3, 4]])
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    t.body(1).end()
+    await settle()
+    expect(t.engine.state(), 'an early end was not a wait').toBe('waiting')
+    await sleep(1_100)
+    await settle()
+    const calls = t.recorder.callsFor('/tracks/1/stream')
+    expect(calls.length, 'the early end was not retried').toBe(2)
+    expect(calls[1]?.url, 'the retry did not resume from the range the body fed').toContain('start_ms=4000')
+    t.close()
+  })
+
+  it('a range just past the playhead holds the gate', async () => {
+    // The playhead is at media 1.000 and the buffered range starts at 1.020: the first fragment
+    // seldom starts on the exact millisecond. The playhead is in that range, so a range 130 s
+    // ahead of it shuts the gate.
+    const t = await openEngine()
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    setRanges(t.videoBuffer, [[1.02, 131]])
+    // The read already waiting takes this chunk; the gate, measured after it, says stop.
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    const appendsAtGate = t.videoBuffer.log.appends.length
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(
+      t.videoBuffer.log.appends.length,
+      "a range starting just past the playhead did not count as the playhead's: the gate stayed open",
+    ).toBe(appendsAtGate)
+    t.close()
+  })
+
+  it('an error after a seek stops the streams again', async () => {
+    // The audio route fails: an error, and the video stream is stopped. A seek starts both again,
+    // the audio fails again, and the new video stream must be stopped again too.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ status: 500 }))
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 500 was not an error').toBe('error')
+    expect(recorder.callsFor('/tracks/1/stream')[0]?.signal.aborted, 'the first error did not stop the video').toBe(true)
+    video.currentTime = 3
+    await settle()
+    const videoCalls = recorder.callsFor('/tracks/1/stream')
+    expect(videoCalls.length, 'the seek did not restart the video').toBe(2)
+    expect(recorder.callsFor('/tracks/2/stream').length, 'the seek did not restart the audio').toBe(2)
+    expect(engine.state(), 'the second 500 was not an error').toBe('error')
+    expect(videoCalls[1]?.signal.aborted, 'the second error did not stop the video stream').toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('a seek during an audio switch keeps the new track', async () => {
+    // The person picks the Italian audio and seeks before the switch has re-typed the buffer.
+    // The player shows the Italian track as chosen, so the restart must fetch it, with the
+    // buffer re-typed for it, and must not bring the English track back.
+    const t = await openEngine({ durationMs: 120_000 })
+    for (let i = 0; i < 2; i += 1) {
+      t.body(2).push(new Uint8Array([1]))
+      await settle()
+    }
+    t.engine.setAudio(PROBE.tracks[2] as MediaTrack)
+    t.video.currentTime = 20
+    await settle()
+    await settle()
+    await settle()
+    const italian = t.recorder.callsFor('/tracks/3/stream')
+    expect(italian.length, 'the restart did not fetch the new audio track').toBe(1)
+    expect(italian[0]?.url, 'the new track was not fetched at the seek').toContain('start_ms=19000')
+    expect(t.recorder.callsFor('/tracks/2/stream').length, 'the restart brought the old track back').toBe(1)
+    expect(t.audioBuffer.log.changeTypes, 'the buffer was not re-typed for the new track').toEqual([
+      'audio/mp4; codecs="opus"',
+    ])
+    t.close()
   })
 })

@@ -26,6 +26,11 @@ export interface BufferLog {
   changeTypes: string[]
   /** The appends a one-shot `QuotaExceededError` refused, so a test can read the refusal back. */
   quotas: number
+  /**
+   * Every `appendBuffer`, `remove`, `abort` and `changeType` the buffer took, in the order it took
+   * them, one shared log, so a test reads the order of different calls back, not only their counts.
+   */
+  ops: Array<'append' | 'remove' | 'abort' | 'changeType'>
 }
 
 /** A `TimeRanges` over a list of ranges, the shape the engine reads. */
@@ -42,14 +47,19 @@ function rangesOf(ranges: [number, number][]): TimeRanges {
  * Strict where a browser is strict: `appendBuffer` and `remove` throw `InvalidStateError` while
  * the buffer is updating, `changeType` is refused while updating, and `abort` stops the current
  * append without touching the ranges a real `abort` leaves in place.
+ *
+ * `abort` is the MSE spec's: on a buffer that is updating it sets `updating` to false at once and
+ * queues `abort` and `updateend`, and the aborted update's own `updateend` never comes; on a
+ * buffer that is not updating it does nothing at all, and no event fires.
  */
 export class FakeSourceBuffer extends EventTarget {
   readonly mimeType: string
-  readonly log: BufferLog = { appends: [], removes: [], aborts: 0, changeTypes: [], quotas: 0 }
+  readonly log: BufferLog = { appends: [], removes: [], aborts: 0, changeTypes: [], quotas: 0, ops: [] }
   /** The mime a successful `changeType` moves the buffer to, so a test can read the switch back. */
   currentMimeType: string
   private _buffered: [number, number][] = []
   private _updating = false
+  private _updateTimer: ReturnType<typeof setTimeout> | null = null
   private appendBufferOriginal: (data: ArrayBuffer | ArrayBufferView) => void
   /** The owning source, for the `InvalidStateError` a buffer in a closed source throws. */
   owner: FakeMediaSource | null = null
@@ -86,6 +96,7 @@ export class FakeSourceBuffer extends EventTarget {
   appendBuffer(data: ArrayBuffer | ArrayBufferView): void {
     this._refuseWhileBusy()
     this.log.appends.push(data as ArrayBuffer)
+    this.log.ops.push('append')
     // The fake buffer grows by a whole second per chunk: a test can reason about how far ahead
     // the buffer reaches without decoding what was appended.
     const last = this._buffered.at(-1)
@@ -97,19 +108,31 @@ export class FakeSourceBuffer extends EventTarget {
   remove(start: number, end: number): void {
     this._refuseWhileBusy()
     this.log.removes.push([start, end])
+    this.log.ops.push('remove')
     this._buffered = this._buffered.filter(([s, e]) => e <= start || s >= end)
     this._beginUpdate()
   }
 
   abort(): void {
     this.log.aborts += 1
-    // A real `abort()` only stops the current append: the buffered ranges stay.
-    this._beginUpdate()
+    this.log.ops.push('abort')
+    // A real `abort()` only stops the current update: the buffered ranges stay. On an idle buffer
+    // it does nothing. On a busy one, `updating` is false when the call returns, the aborted
+    // update never fires its own `updateend`, and `abort` then `updateend` are queued as a task.
+    if (!this._updating) return
+    if (this._updateTimer !== null) clearTimeout(this._updateTimer)
+    this._updating = false
+    this._updateTimer = null
+    setTimeout(() => {
+      this.dispatchEvent(new Event('abort'))
+      this.dispatchEvent(new Event('updateend'))
+    }, 0)
   }
 
   changeType(mime: string): void {
     this._refuseWhileBusy()
     this.log.changeTypes.push(mime)
+    this.log.ops.push('changeType')
     this.currentMimeType = mime
     this._beginUpdate()
   }
@@ -119,7 +142,8 @@ export class FakeSourceBuffer extends EventTarget {
     // A browser's `updateend` is a macrotask: the buffer is busy for a whole task, and a test
     // that appends and then appends again in the same task sees the `InvalidStateError` a browser
     // would throw, the way a missing wait for `updateend` shows up.
-    setTimeout(() => {
+    this._updateTimer = setTimeout(() => {
+      this._updateTimer = null
       this._updating = false
       this.dispatchEvent(new Event('updateend'))
     }, 0)
