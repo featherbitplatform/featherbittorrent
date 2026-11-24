@@ -88,6 +88,55 @@ where
     }
 }
 
+impl WindowState {
+    /// Whether the window is on screen in this state (a minimized window counts: it sits in the Dock or
+    /// the taskbar).
+    pub fn is_visible(self) -> bool {
+        self != WindowState::Hidden
+    }
+}
+
+/// Whether the app's icon shows in the macOS Dock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockIcon {
+    /// In the Dock, as an ordinary app.
+    Shown,
+    /// Out of the Dock: the menu bar (tray) icon is the only way in.
+    Hidden,
+}
+
+/// Whether the Dock icon shows, given whether the window is on screen and whether this system gave the
+/// app a tray.
+///
+/// The icon follows the window: a background start (the login item) and a close to the tray leave only
+/// the tray icon, and showing the window brings the Dock icon back. Without a tray the Dock icon never
+/// hides, since nothing else could bring the window back.
+pub fn dock_icon(window_visible: bool, tray_available: bool) -> DockIcon {
+    if window_visible || !tray_available {
+        DockIcon::Shown
+    } else {
+        DockIcon::Hidden
+    }
+}
+
+/// Puts the Dock icon in `icon`'s state through the activation policy: `Regular` shows it, `Accessory`
+/// hides it and leaves the menu bar icon. The call is queued to the main thread when it comes from
+/// another one, in order with the window calls that follow it.
+#[cfg(target_os = "macos")]
+fn apply_dock_icon<R: Runtime>(app: &AppHandle<R>, icon: DockIcon) {
+    let policy = match icon {
+        DockIcon::Shown => tauri::ActivationPolicy::Regular,
+        DockIcon::Hidden => tauri::ActivationPolicy::Accessory,
+    };
+    if let Err(problem) = app.set_activation_policy(policy) {
+        eprintln!("The Dock icon could not be changed: {problem}");
+    }
+}
+
+/// Only macOS has a Dock; the taskbar entry elsewhere follows the window by itself.
+#[cfg(not(target_os = "macos"))]
+fn apply_dock_icon<R: Runtime>(_app: &AppHandle<R>, _icon: DockIcon) {}
+
 /// The page's spelling of a close answer: `quit` or `tray`. `ask` is not an answer, it is the question.
 pub fn parse_close_action(action: &str) -> Result<CloseAction, String> {
     match action {
@@ -329,9 +378,15 @@ pub fn system_exit_code(state: &DesktopState) -> Option<i32> {
     (code != 0).then_some(code)
 }
 
-/// Shows the main window, brings it out of the Dock or taskbar, and focuses it.
+/// Shows the main window, brings it out of the Dock or taskbar, and focuses it. On macOS the Dock icon
+/// comes back first, so the focus (which also activates the app) lands on an ordinary app and the window
+/// comes forward.
 pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        apply_dock_icon(
+            app,
+            dock_icon(true, app.state::<Lifecycle>().tray_available()),
+        );
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -339,11 +394,18 @@ pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// Puts the window in the state a launch asked for. The window starts invisible (`tauri.conf.json`), so
-/// every launch passes through here.
+/// every launch passes through here. A hidden start on macOS also hides the Dock icon ([`dock_icon`]).
 pub fn apply_initial_state<R: Runtime>(app: &AppHandle<R>, state: WindowState) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
         return;
     };
+    apply_dock_icon(
+        app,
+        dock_icon(
+            state.is_visible(),
+            app.state::<Lifecycle>().tray_available(),
+        ),
+    );
     match state {
         WindowState::Shown => {
             let _ = window.show();
@@ -373,6 +435,8 @@ pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
                 let _ = window.hide();
             }
+            // Only reached with a tray, so on macOS the Dock icon goes with the window.
+            apply_dock_icon(app, dock_icon(false, true));
         }
         CloseOutcome::AskPage => {
             if let Err(problem) = app.emit(CLOSE_REQUESTED_EVENT, ()) {
@@ -418,7 +482,7 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
                 ExitRequestAnswer::Allow => {}
             }
         }
-        // The Dock icon clicked while the window is hidden in the tray.
+        // The app opened again (from Finder, Spotlight or the Dock) while the window is hidden in the tray.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
         RunEvent::Exit => {
@@ -534,9 +598,9 @@ mod tests {
     use fbtt_desktop_core::{CloseAction, DesktopSettings};
 
     use super::{
-        CloseOutcome, ExitAnswer, ExitRequestAnswer, Lifecycle, QUIT_WAIT, QuitPhase, STOP_BUDGET,
-        WindowState, initial_window_state, on_close_requested, on_exit, on_exit_requested,
-        parse_close_action, update_settings,
+        CloseOutcome, DockIcon, ExitAnswer, ExitRequestAnswer, Lifecycle, QUIT_WAIT, QuitPhase,
+        STOP_BUDGET, WindowState, dock_icon, initial_window_state, on_close_requested, on_exit,
+        on_exit_requested, parse_close_action, update_settings,
     };
     use crate::settings_store::SettingsStore;
     use crate::startup::START_WAIT;
@@ -627,6 +691,54 @@ mod tests {
             WindowState::Shown,
             "only the exact flag counts"
         );
+    }
+
+    #[test]
+    fn a_background_start_with_a_tray_hides_the_dock_icon() {
+        let background = ["featherbittorrent-desktop", "--background"];
+        let start = initial_window_state(background, true);
+        assert_eq!(
+            dock_icon(start.is_visible(), true),
+            DockIcon::Hidden,
+            "only the tray icon shows"
+        );
+    }
+
+    #[test]
+    fn a_background_start_without_a_tray_keeps_the_dock_icon() {
+        let background = ["featherbittorrent-desktop", "--background"];
+        let start = initial_window_state(background, false);
+        assert_eq!(start, WindowState::Minimized);
+        assert_eq!(
+            dock_icon(start.is_visible(), false),
+            DockIcon::Shown,
+            "the Dock is the only way back to a minimized window"
+        );
+    }
+
+    #[test]
+    fn a_normal_start_shows_the_dock_icon() {
+        let plain = ["featherbittorrent-desktop"];
+        for tray in [true, false] {
+            let start = initial_window_state(plain, tray);
+            assert_eq!(dock_icon(start.is_visible(), tray), DockIcon::Shown);
+        }
+    }
+
+    #[test]
+    fn the_dock_icon_follows_the_window_when_there_is_a_tray() {
+        assert_eq!(dock_icon(true, true), DockIcon::Shown, "window shown");
+        assert_eq!(
+            dock_icon(false, true),
+            DockIcon::Hidden,
+            "closed to the tray"
+        );
+    }
+
+    #[test]
+    fn without_a_tray_the_dock_icon_never_hides() {
+        assert_eq!(dock_icon(true, false), DockIcon::Shown);
+        assert_eq!(dock_icon(false, false), DockIcon::Shown);
     }
 
     #[test]

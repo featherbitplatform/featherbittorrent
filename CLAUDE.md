@@ -199,9 +199,11 @@ on the real system, by eye, before a release (the plan's last step is a pass on 
   `Use the system title bar` on Linux.
 - The tray: GNOME with and without the AppIndicator extension (without it the app must offer no tray and
   closing must quit), KDE, the macOS menu bar and the Windows notification area; Show, the instance line,
-  Quit, and the Dock icon bringing a hidden window back on macOS.
+  Quit, and on macOS the Dock icon leaving when the window is closed to the tray and coming back with the
+  window.
 - Start at login on each system (the LaunchAgent, the Run key, the autostart file) and that a
-  `--background` start shows no window.
+  `--background` start shows no window; on macOS, the Dock icon on a login start (hidden until the window
+  opens, then in the Dock and the window in front).
 - File associations: a `magnet:` link from Firefox and from Chrome on each system, with the app closed
   and open, and a `.torrent` double-clicked; on Linux through the `.deb` and `.rpm` launchers and through
   the `.tar.gz` plus its two `xdg-mime` commands. The Linux launcher is listed as `featherbittorrent` from
