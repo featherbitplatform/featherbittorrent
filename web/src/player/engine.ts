@@ -159,6 +159,8 @@ interface Stream {
   pump?: () => void
   /** Settled when the buffer stops updating after an `abort`; the next `beginStream` waits for it. */
   quiescent: Promise<void> | null
+  /** The buffer's `error` listener, kept so `destroy` can take it back off the buffer. */
+  errorListener: () => void
 }
 
 /** The shape the fake and the real `SourceBuffer` both give the engine. */
@@ -345,30 +347,70 @@ function messageOf(cause: unknown): string | null {
   return capDetail(typeof raw === 'string' ? raw : null)
 }
 
+/** How many bytes of an error body are worth reading: the message is a sentence, not a dump. */
+const ERROR_BODY_CAP_BYTES = 4_096
+/** How long an error body may take to say it: a server that keeps streaming is answered, not followed. */
+const ERROR_BODY_TIMEOUT_MS = 2_000
+
 /**
  * The server's own words for a refused stream: the error body is small JSON
- * (`{ "error": ..., "message": ... }`), and reading it is best effort. It never waits past the
- * abort that was already limiting this fetch.
+ * (`{ "error": ..., "message": ... }`). It is read through the body's own reader, capped at
+ * `ERROR_BODY_CAP_BYTES` bytes and `ERROR_BODY_TIMEOUT_MS` milliseconds - whichever comes first,
+ * so a large or never-ending body cannot hold the player in `loading` or grow memory without
+ * end. JSON gives its `message` field; a body that is not JSON is its own words, capped. The
+ * reader is cancelled afterwards, and its abort listener does not outlive the read.
  */
 async function errorDetail(response: Response, signal: AbortSignal): Promise<string | null> {
-  const text = await Promise.race([
-    response.text().catch((): string | null => null),
-    new Promise<string | null>((resolve) => {
-      if (signal.aborted) resolve(null)
-      else signal.addEventListener('abort', () => resolve(null), { once: true })
-    }),
-  ])
-  if (text === null) return null
-  let parsed: unknown
+  if (response.body === null) return null
+  const reader = response.body.getReader()
+  const gaveUp = Symbol('the read stopped early')
+  let timerId: ReturnType<typeof setTimeout> | null = null
+  // The abort listener's undo, set the moment the listener is put on; the `finally` below always
+  // runs it, so the listener never outlives the read it was racing.
+  let stopAbort: () => void = (): void => {}
+  const timeout = new Promise<typeof gaveUp>((resolve) => {
+    timerId = setTimeout(() => resolve(gaveUp), ERROR_BODY_TIMEOUT_MS)
+    const onAbort = (): void => resolve(gaveUp)
+    signal.addEventListener('abort', onAbort, { once: true })
+    stopAbort = (): void => signal.removeEventListener('abort', onAbort)
+  })
   try {
-    parsed = JSON.parse(text)
-  } catch {
-    return null
+    const decoder = new TextDecoder()
+    let text = ''
+    let size = 0
+    for (;;) {
+      const raced = await Promise.race([reader.read(), timeout])
+      if (raced === gaveUp) return null
+      if (raced.done === true) break
+      text += decoder.decode(raced.value, { stream: true })
+      size += raced.value.byteLength
+      if (size >= ERROR_BODY_CAP_BYTES) {
+        text = text.slice(0, ERROR_BODY_CAP_BYTES)
+        break
+      }
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      // Not JSON: the body's own text is what the server said.
+      return capDetail(text)
+    }
+    const message = parsed !== null && typeof parsed === 'object'
+      ? (parsed as { message?: unknown }).message
+      : undefined
+    return capDetail(typeof message === 'string' ? message : null)
+  } finally {
+    if (timerId !== null) clearTimeout(timerId)
+    stopAbort()
+    // The read is over however it ended: close the body, and any read still pending on it.
+    // A stream already closed says so, and that is the same done.
+    try {
+      void Promise.resolve(reader.cancel()).catch(() => {})
+    } catch {
+      // A reader that will not answer `cancel` is already closed.
+    }
   }
-  const message = parsed !== null && typeof parsed === 'object'
-    ? (parsed as { message?: unknown }).message
-    : undefined
-  return capDetail(typeof message === 'string' ? message : null)
 }
 
 /**
@@ -466,6 +508,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       role,
       generation: 0,
       quiescent: null,
+      errorListener: (): void => {},
     }
     // One `updateend` ends the append the buffer was busy with, and it is also where a stopped
     // read finds out there is room to go again.
@@ -475,11 +518,16 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     })
     // A buffer's own `error` is the MSE's word for a stream its decoder gave up on. It does not
     // throw anywhere the engine can catch it: the failed append still gets its `updateend`, so
-    // without this listener a broken track would look like a finished one.
-    stream.buffer.addEventListener('error', () => {
+    // without this listener a broken track would look like a finished one. An event already
+    // queued when the engine is torn down still reaches this listener after `destroy`, and a
+    // dead engine has no failure to report and no player left to tell.
+    const onBufferError = (): void => {
+      if (destroyed) return
       recordFailure({ role: stream.role, kind: 'decode', mime: stream.mime, status: null, detail: null })
       setState('error')
-    })
+    }
+    stream.errorListener = onBufferError
+    stream.buffer.addEventListener('error', onBufferError)
     streams.push(stream)
     // The pump closes over `readStream` and the rest, so it is handed to the stream once they are
     // all in scope: the `updateend` above and the `timeupdate` below both call it through this field.
@@ -1262,6 +1310,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     destroyed = true
     for (const stream of streams) {
       abortStream(stream)
+      // A `sourcebufferended`/`error` the buffer had already queued still finds this listener
+      // after the teardown: take it off, and the dead engine reports nothing it does not own.
+      stream.buffer.removeEventListener('error', stream.errorListener)
       try {
         stream.buffer.abort()
       } catch {

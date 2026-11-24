@@ -7,6 +7,7 @@ import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
 import { createEngine } from './engine'
 import type { EngineProbe } from './engine'
 import { toSource } from './time'
+import { positionKey } from './positions'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import { DesktopDownloadContext } from '../desktopDownload'
@@ -3101,5 +3102,369 @@ describe('player failures say why', () => {
     } finally {
       restoreMac()
     }
+  })
+})
+
+describe('failure follow-ups', () => {
+  it('an endless error body times out into an error', async () => {
+    // A 500 whose body never ends must not hold the player in `loading` forever and must not
+    // grow memory without end: the read is capped, the timer answers, and the stream is closed.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, endlessBody: true })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    vi.useFakeTimers()
+    try {
+      source.open()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(engine.state(), 'the video did not start while the audio refused').toBe('playing')
+      await vi.advanceTimersByTimeAsync(1_400)
+      expect(engine.state(), 'the endless error body was already answered').toBe('playing')
+      await vi.advanceTimersByTimeAsync(300)
+      expect(engine.state(), 'a 500 with an endless body never reached the error state').toBe('error')
+      const failure = engine.failure()
+      expect(failure?.kind, 'the endless body failure was not the server').toBe('server')
+      expect(failure?.status, 'the endless body failure did not name the status').toBe(500)
+      expect(failure?.detail, 'a body that never said anything became a detail').toBe(null)
+      const call = recorder.callsFor('/tracks/2/stream')[0]
+      expect(
+        (call?.response as unknown as { canceled: boolean } | undefined)?.canceled === true,
+        'the unread error body was left open',
+      ).toBe(true)
+    } finally {
+      engine.destroy()
+      document.body.removeChild(video)
+      vi.useRealTimers()
+    }
+  })
+
+  it('a plain text error body says its own words', async () => {
+    // Not every refusal is JSON. When the body is plain words, those words are what the person
+    // should see - the old code threw the body away for failing to parse.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, text: 'the audio route gave up' })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 500 refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.role, 'the 500 refusal did not say the audio').toBe('audio')
+    expect(failure?.kind, 'the 500 refusal was not the server').toBe('server')
+    expect(failure?.detail, 'the plain text body was thrown away').toBe('the audio route gave up')
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('an error body past the cap keeps its raw head', async () => {
+    // An error body far past the read cap is truncated, so it no longer parses as JSON: the
+    // player then shows the body's own opening words rather than the message it cannot reach.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const message = 'a'.repeat(4_300)
+    const raw = JSON.stringify({ error: 'unsupported_media', message })
+    expect(raw.length > 4_096, 'the fixture body was not past the cap').toBe(true)
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, text: raw })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a large refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.detail, 'the capped body did not surface as its own text').toBe(raw.slice(0, 300))
+    const call = recorder.callsFor('/tracks/2/stream')[0]
+    expect(
+      (call?.response as unknown as { canceled: boolean } | undefined)?.canceled === true,
+      'the capped error body was left open',
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('a destroyed engine stops listening to its buffers', async () => {
+    // The teardown takes the buffer `error` listener off: a SourceBuffer that still has the
+    // listener, or an engine that answers it after being destroyed, reports failures nobody is
+    // listening for any more.
+    const t = await openEngine()
+    const wasPlaying = t.engine.state()
+    t.close()
+    // jsdom's `EventTarget` has no `listenerCount`, so the listener's absence is read the way
+    // the engine would feel it: an event that finds no listener changes nothing at all.
+    t.videoBuffer.dispatchEvent(new Event('error'))
+    expect(t.engine.state(), 'a destroyed engine still answers its buffers').toBe(wasPlaying)
+    expect(t.engine.failure(), 'a destroyed engine recorded a failure nobody asked for').toBe(null)
+  })
+
+  it('audio menu after a drop offers the other tracks', async () => {
+    // The failed track is not playable on this system and must not be shown as the chosen one:
+    // the menu marks it dead, marks nothing playing, and offers the other track.
+    const t = await renderRemux()
+    const first = mediaSources.at(-1) as FakeMediaSource
+    const audioBuffer = first.activeSourceBuffers[1] as FakeSourceBuffer
+    act(() => {
+      audioBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the dropped file does not say it is playing without sound',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const options = screen.getAllByRole('option')
+    const failedOption = options.find((option) => (option.textContent ?? '').startsWith('eng')) as
+      | HTMLButtonElement
+      | undefined
+    expect(failedOption !== undefined, 'the Audio menu lost the failed track').toBe(true)
+    expect(failedOption!.disabled === true, 'the failed track is still offered as playable').toBe(true)
+    expect(
+      (failedOption!.textContent ?? '').includes('not playable here'),
+      'the failed track does not say why it cannot be chosen',
+    ).toBe(true)
+    const ita = options.find((option) => (option.textContent ?? '').startsWith('ita')) as
+      | HTMLButtonElement
+      | undefined
+    expect(ita !== undefined && ita.disabled === false, 'the other track is not offered').toBe(true)
+    expect(
+      options.filter((option) => option.getAttribute('aria-selected') === 'true').length,
+      'the menu still marks the dead track as playing',
+    ).toBe(0)
+    expect(
+      t.recorder.callsFor('/tracks/1/stream').length,
+      'the retry did not ask for the video again',
+    ).toBe(2)
+  })
+
+  it('choosing another track after a drop restarts with it', async () => {
+    // Once a track has failed, choosing another one is a fresh open on the chosen track, at the
+    // point the playhead stands: the engine with the dead track has no buffer to switch.
+    const t = await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/3/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    const retry = mediaSources.at(-1) as FakeMediaSource
+    expect(retry !== first, 'the audio-less retry did not make a fresh engine').toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    const chosen = mediaSources.at(-1) as FakeMediaSource
+    expect(chosen !== retry, 'choosing the other track did not re-open the file on it').toBe(true)
+    const audioCalls = t.recorder.callsFor('/tracks/3/stream')
+    expect(audioCalls.length, 'choosing the other track did not ask for its audio').toBe(1)
+    expect(
+      audioCalls[0]?.url,
+      'the chosen track did not start where the playhead stands',
+    ).toContain('start_ms=3000')
+    expect(
+      chosen.activeSourceBuffers.map((buffer) => buffer.mimeType),
+      'the engine did not open the buffer of the chosen track',
+    ).toEqual(['video/mp4; codecs="avc1.64000A"', 'audio/mp4; codecs="opus"'])
+    expect(
+      screen.queryByText('This audio track cannot be played here, so the video plays without sound.') === null,
+      'the no-sound notice stayed while the chosen track plays',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const options = screen.getAllByRole('option')
+    expect(
+      options.filter((option) => option.getAttribute('aria-selected') === 'true').map((option) => option.textContent ?? ''),
+      'the chosen track is not marked as playing',
+    ).toEqual(['ita'])
+    const eng = options.find((option) => (option.textContent ?? '').includes('not playable here'))
+    expect(eng !== undefined, 'the failed track came back as playable').toBe(true)
+  })
+
+  it('the error overlay leaves while the retry opens the file', async () => {
+    // The audio-less retry replaces the engine; until the new one's video answers, the old
+    // failure's overlay (and its Download) must come down: the file is opening again, not failed.
+    const t = await renderRemux(PROBE, (recorder) => {
+      let videoCalls = 0
+      recorder.answer('/tracks/1/stream', () => {
+        videoCalls += 1
+        return videoCalls === 1 ? { startMs: 0, body: () => new FakeBody() } : { hang: true }
+      })
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      t.recorder.callsFor('/tracks/1/stream').length,
+      'the retry did not ask for the video again',
+    ).toBe(2)
+    expect(
+      screen.queryByText(/Playback failed/) === null,
+      'the stale error overlay stayed while the file was re-opening',
+    ).toBe(true)
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the re-opening file does not say it is playing without sound',
+    ).toBe(true)
+  })
+
+  it('no hevc hint on an audio server failure', async () => {
+    // The HEVC hint belongs to a video decode failure on Windows: a 500 on the audio route is
+    // neither, and shopping for a video extension would send the person after the wrong fix.
+    const hevcProbe: MediaProbe = {
+      ...PROBE,
+      tracks: [
+        track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'], default: true }),
+        track({ id: 2, kind: 'audio', codec: 'aac', mime_codecs: ['mp4a.40.2'], language: 'eng', default: true }),
+      ],
+    }
+    class HevcBrowserMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /hvc1|mp4a|opus/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+    }
+    vi.stubGlobal('MediaSource', HevcBrowserMediaSource)
+    const hint = 'On Windows, HEVC video needs the HEVC Video Extensions from the Microsoft Store.'
+    const restoreWindows = setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      await renderRemux(hevcProbe, (recorder) => {
+        recorder.answer('/tracks/2/stream', { status: 500, json: { error: 'unsupported_media' } })
+      })
+      expect(
+        screen.getByText('Playback failed: the server answered 500.') !== null,
+        'the audio refusal did not name the status',
+      ).toBe(true)
+      expect(
+        screen.queryByText(hint) === null,
+        'a server failure on the audio track showed the HEVC purchase hint',
+      ).toBe(true)
+    } finally {
+      restoreWindows()
+    }
+  })
+
+  it('a replaced engine does not put its error back', async () => {
+    // The player switches files: the old engine is gone, and a `SourceBuffer` that still carries
+    // its listener must not bring its failure back onto the new file's screen.
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    const { rerender } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const first = mediaSources[0] as FakeMediaSource
+    const firstBuffer = first.activeSourceBuffers[0] as FakeSourceBuffer
+    rerender(<Player id="a" file={1} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(mediaSources.length, 'the new file did not get its own engine').toBe(2)
+    act(() => {
+      firstBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    expect(
+      screen.queryByText(/Playback failed/) === null,
+      'a replaced engine put its error back on the screen',
+    ).toBe(true)
+    expect(
+      screen.getByRole('dialog') !== null,
+      'the player lost the file it was opened on',
+    ).toBe(true)
+  })
+
+  it('an audio server failure is a plain error, not a silent retry', async () => {
+    // Retrying without audio is the answer to a track this system cannot decode. A 500 from the
+    // audio route is the server's failure: it shows the server line, keeps every track offered,
+    // and does not mute the video.
+    const t = await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/2/stream', {
+        status: 500,
+        json: { error: 'boom', message: 'the audio route exploded' },
+      })
+    })
+    expect(
+      screen.getByText('Playback failed: the server answered 500.') !== null,
+      'the audio refusal did not name the server and status',
+    ).toBe(true)
+    expect(
+      screen.getByText('the audio route exploded') !== null,
+      'the server message was not shown',
+    ).toBe(true)
+    expect(
+      screen.queryByText('This audio track cannot be played here, so the video plays without sound.') === null,
+      'a server failure took the video sound away without being asked',
+    ).toBe(true)
+    expect(mediaSources.length, 'the server failure started an unasked audio-less retry').toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    expect(
+      screen.getAllByRole('option').some((option) => (option.textContent ?? '').startsWith('eng')),
+      'a server refusal marked the track itself as not playable',
+    ).toBe(true)
+    expect(t.container.querySelector('video') !== null, 'the player lost its video').toBe(true)
+  })
+
+  it('a retry that never landed resumes from the remembered start', async () => {
+    // The audio buffer fails at the source open, before the video landed, so the playhead never
+    // moved off zero: the point to resume from is the remembered start the open was aimed at,
+    // not the zero the element is sitting at.
+    class RefusesAudioMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /avc1|mp4a/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+      addSourceBuffer(mime: string): FakeSourceBuffer {
+        if (mime.startsWith('audio/')) {
+          throw new DOMException('this system will not open an audio buffer for that codec', 'NotSupportedError')
+        }
+        return super.addSourceBuffer(mime)
+      }
+    }
+    vi.stubGlobal('MediaSource', RefusesAudioMediaSource)
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+    vi.stubGlobal('fetch', recorder.fetch)
+    window.localStorage.setItem(positionKey('a', 0), '3')
+    const { client } = probeClient()
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    await settle()
+    expect(mediaSources.length, 'the retry after the audio refused at open did not make a new engine').toBe(2)
+    expect(mediaSources[1].activeSourceBuffers.length, 'the audio-less retry opened an audio buffer').toBe(1)
+    const asked = recorder.callsFor('/tracks/1/stream')
+    expect(asked.length, 'the retry did not ask for the video again').toBe(1)
+    expect(
+      asked[0]?.url,
+      'the retry lost the remembered start the video never reached',
+    ).toContain('start_ms=3000')
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the no-sound retry did not say it is playing without sound',
+    ).toBe(true)
   })
 })
