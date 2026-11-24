@@ -822,28 +822,8 @@ struct ErrorDetail {
     message: String,
 }
 
-/// The routes featherbittorrent adds, on paths fbt-api does not serve.
-///
-/// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
-/// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
-///
-/// On the desktop app's own engine that serves nobody else, the login routes are not mounted at all: the
-/// launch secret is the only credential there, so no session can be asked for and those paths answer `404`.
-///
-/// And no route may be added here - or on fbt-api's router - that catches what every other route missed
-/// (`Router::fallback`, a `/{*rest}` nest) while that mode stands: its auth accepts a request that matched
-/// no route without asking for any credential (`FbttAuth`'s `matched_path.is_none()` shortcut in
-/// `crate::auth`), and that is safe only because an unmatched path really has nothing behind it and gets
-/// the empty `404` it is shown. A fallback would make every guessed path answer something to a request
-/// that never presented the secret; `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs`
-/// is what notices if one appears.
-/// `Cache-Control: no-store` on every answer to a request whose query carries a `token`.
-///
-/// A player or an `EventSource` cannot set a header, so the routes behind them take the credential as
-/// `?token=`, and a webview or a browser that stores the answer files it under that whole URL, token
-/// included, in a cache on disk that outlives the session. This server's own routes say not to. It is a
-/// layer on this server's routes only: fbt-api's own (the file stream and the event stream) are behind
-/// its router, which this one is merged into and cannot wrap.
+/// `Cache-Control: no-store` on every answer to a request whose query carries a `token`: a cache would file
+/// the answer under the whole URL, credential included. It covers this server's routes only, not fbt-api's.
 pub(crate) async fn no_store_with_token(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -866,6 +846,21 @@ fn query_has_token(query: &str) -> bool {
         .any(|pair| pair.split('=').next() == Some("token"))
 }
 
+/// The routes featherbittorrent adds, on paths fbt-api does not serve.
+///
+/// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
+/// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
+///
+/// On the desktop app's own engine that serves nobody else, the login routes are not mounted at all: the
+/// launch secret is the only credential there, so no session can be asked for and those paths answer `404`.
+///
+/// And no route may be added here - or on fbt-api's router - that catches what every other route missed
+/// (`Router::fallback`, a `/{*rest}` nest) while that mode stands: its auth accepts a request that matched
+/// no route without asking for any credential (`FbttAuth`'s `matched_path.is_none()` shortcut in
+/// `crate::auth`), and that is safe only because an unmatched path really has nothing behind it and gets
+/// the empty `404` it is shown. A fallback would make every guessed path answer something to a request
+/// that never presented the secret; `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs`
+/// is what notices if one appears.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
     // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not

@@ -743,7 +743,7 @@ mod tests {
         saver.join().expect("the saver thread");
     }
 
-    /// A save that never finishes does not hold the exit forever.
+    /// The system exit's wait covers a quit that first waited for the start and then for the stop.
     #[test]
     fn the_exit_waits_for_a_start_and_then_a_stop() {
         assert_eq!(QUIT_WAIT, START_WAIT + STOP_BUDGET);
@@ -754,6 +754,7 @@ mod tests {
         assert!(!STOP_BUDGET.is_zero());
     }
 
+    /// A save that never finishes does not hold the exit forever.
     #[test]
     fn the_wait_for_a_save_is_bounded() {
         let lifecycle = Lifecycle::new(SettingsStore::new("unused.yaml".into()));
