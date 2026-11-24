@@ -130,7 +130,7 @@ function openScreen(client: Api): { container: HTMLElement; polite: HTMLElement 
   const { container } = render(
     <>
       <div role="status" aria-live="polite" />
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} onShowTorrents={() => {}} client={client} />
     </>,
   )
   return {
@@ -286,6 +286,37 @@ describe('the dialogs the screen opens', () => {
     expect(container.querySelector('dialog'), 'the add dialog element stayed in the page').toBeNull()
   })
 
+  it('add dialog never mounts while hidden', async () => {
+    const { client } = fakeClient({ rows: [], roots: ['/downloads'] })
+    const showTorrents = vi.fn()
+    render(
+      <Torrents
+        signedIn
+        signOutError={null}
+        onSignOut={() => {}}
+        onSettings={() => {}}
+        onShowTorrents={showTorrents}
+        hidden
+        client={client}
+      />,
+    )
+    await flush()
+
+    // The desktop header lives in the title bar, where the covering screen does not reach it, so
+    // this click is one a person really can make while another screen is up.
+    fireEvent.click(button('Add torrent'))
+    await drain()
+
+    expect(
+      showTorrents,
+      'pressing Add while another screen covers this one did not ask for the screen back',
+    ).toHaveBeenCalledTimes(1)
+    expect(
+      screen.queryByRole('dialog') === null,
+      'the Add dialog mounted while this screen was still hidden',
+    ).toBe(true)
+  })
+
   it('a_removed_torrent_clears_the_selection', async () => {
     const { client, calls } = fakeClient({ rows: [torrentInfo('a'), torrentInfo('b')] })
     const { container, polite } = openScreen(client)
@@ -429,6 +460,7 @@ describe('the phone layout', () => {
         signedIn
         signOutError={null}
         onSettings={() => {}}
+        onShowTorrents={() => {}}
         onSignOut={() => {
           signedOut += 1
         }}
@@ -605,7 +637,7 @@ describe('the phone layout', () => {
     const { client } = fakeClient({ rows: [torrentInfo('a')] })
     phoneWidth(true)
     const { container, unmount } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} onShowTorrents={() => {}} client={client} />,
     )
     await flush()
     fireEvent.click(cards(container)[0])
