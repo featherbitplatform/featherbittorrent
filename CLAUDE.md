@@ -34,6 +34,7 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 - **No attribution of any kind:** no `Co-Authored-By` trailer, no `Claude-Session` line or session link in commits, no "Generated with" footer or session link in PR bodies.
 - **Semantic versioning.** The workspace version is bumped on the `release/X.Y.Z` branch; the annotated `vX.Y.Z` tag on `main` triggers the release workflow.
 - **Changelog:** `CHANGELOG.md` at the root (Keep a Changelog); user-visible changes go under `## [Unreleased]`, each ending in its PR link.
+- **Docs website:** Docusaurus in `website/`, deployed to `https://featherbitplatform.github.io/featherbittorrent/` by `.github/workflows/docs.yml` (builds on pull requests, deploys from `main` only), same pattern as `../terminal/website`. It reads the user guides in `docs/` in place (`docs/intro.md` is the landing page); `docs/superpowers/` and `docs/examples/` are left out. README.md and this file link to `docs/*.md`, so never move or copy a guide into `website/`. A link from a guide to anything outside `docs/` (`packaging/`, `crates/`, an example folder) must be an absolute `https://github.com/featherbitplatform/featherbittorrent/blob/develop/...` (or `/tree/develop/...`) URL so it works on GitHub and on the site; broken links and anchors fail the build. The Changelog page is generated: `website/scripts/changelog.mjs` copies `CHANGELOG.md` to `website/src/pages/changelog.md` (git-ignored) before `npm start` and `npm run build`; never edit the copy. `website/audit-ci.jsonc` gates its npm dependencies in `security.yml`, and releases attach a docs SBOM (`featherbittorrent-docs-<version>.cdx.json`).
 - **CI gates:** `cargo fmt --all --check` (Linux), `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --workspace --all-features` on Linux, macOS and Windows, `cargo doc` with warnings denied, cargo-deny, plus the security scans in `.github/workflows/security.yml` (semgrep, grype, gitleaks over the full history; also weekly on `main`). Their configs live at the repo root (`deny.toml`, `.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`); every ignore carries a one-line reason. `--all-features` is what makes `fbtt-core`'s `local` test target run at all: it requires that crate's `test-support` feature, and a filtered-out test is a test nobody noticed. PRs merge only when every gate is green.
 
 ## Commands
@@ -170,6 +171,10 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo deny check
+
+# The docs site (website/, Node 22): dev server, and the production build that fails on broken links.
+cd website && npm ci && npm start
+cd website && npm run build
 
 # Local security scans via Docker (semgrep, deny, grype, gitleaks); one tool:
 # bash dev/sast.sh semgrep. Windows twin: ./dev/sast.ps1
