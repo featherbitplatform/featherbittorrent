@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 
 use fbtt_core::player::{PlayError, SystemLookup, play, sweep_playlists};
 use fbtt_core::{PlaySource, PlayTarget, PlayerConfig, StreamUrl};
+use fbtt_desktop_core::LOCAL_ID;
 
 use crate::commands::DesktopState;
 use crate::download::{NOT_A_STREAM, instance_base, stream_target};
 use crate::instances::Instances;
+use crate::startup::START_WAIT;
 
 /// The folder a playlist handed to a system player is written to, beside the engine's own files:
 /// `<data_dir>/playlists`. The terminal client's own playlists are `<data_dir>/play`; the desktop app
@@ -65,6 +67,46 @@ fn player_target(base: &str, url: &str) -> Result<url::Url, String> {
     stream_target(base, url).ok_or_else(|| NOT_A_STREAM.to_string())
 }
 
+/// The address to hand the player: `url` with this run's launch secret taken out of its query when that is
+/// the credential it carries, and exactly as it came when `secret` is `None`, which is an instance this app
+/// did not start - a token of another server is that server's business.
+fn player_url(url: url::Url, secret: Option<&str>) -> url::Url {
+    match secret {
+        Some(secret) => without_launch_secret(url, secret),
+        None => url,
+    }
+}
+
+/// `url` without its `token` when that token is `secret`, and otherwise unchanged, down to the absence of a
+/// query: a player that was given an address with nothing on it must not be given a `?` to wonder about.
+///
+/// The playlist `play` writes waits for its player - and a playlist a killed run left waits for the sweep
+/// that is twelve hours away - while the launch secret is the credential this entire run answers with, so a
+/// secret can outlive its reason for being in that file by hours. Taking it out costs nothing where it is
+/// the secret: an address that carries it came from a server that handed out no stream token for this file,
+/// which is a server that will not look for one on the way back in. A stream token is left alone, because
+/// that is the credential that opens this one file and nothing else, and a player sent to an address with no
+/// credential is refused the file it was sent for.
+fn without_launch_secret(url: url::Url, secret: &str) -> url::Url {
+    let mut url = url;
+    // The pairs, read once and owned: the query is small, and rewriting it wants the rest of them anyway.
+    let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    if !pairs
+        .iter()
+        .any(|(name, value)| name == "token" && value == secret)
+    {
+        return url;
+    }
+    url.set_query(None);
+    for (name, value) in &pairs {
+        if name == "token" && value == secret {
+            continue;
+        }
+        url.query_pairs_mut().append_pair(name, value);
+    }
+    url
+}
+
 /// The desktop line for a player that was not started. `config.yaml` means nothing to an app user, so the
 /// lines the terminal client's `find_player` answers with are reworded to what a person can do about it.
 fn player_error_line(problem: &PlayError) -> &'static str {
@@ -78,10 +120,30 @@ fn player_error_line(problem: &PlayError) -> &'static str {
     }
 }
 
+/// This run's launch secret, when `instance` is the engine this run started: the credential the page was
+/// handed for it, and the only credential this shell could be asked to keep out of a playlist. A saved
+/// instance is another server, and a token on its address is that server's own, so `None` there says leave
+/// it alone rather than "no credential".
+async fn own_secret(state: &tauri::State<'_, DesktopState>, instance: &str) -> Option<String> {
+    if instance != LOCAL_ID {
+        return None;
+    }
+    // The same address and secret the page's connection was built on. Asking again costs no wait: the
+    // start settled before `instance_base` answered, and a start that never settled answers an error,
+    // which is an address that came from somewhere else anyway.
+    state
+        .startup()
+        .endpoint(START_WAIT)
+        .await
+        .ok()
+        .map(|(_, secret)| secret)
+}
+
 /// Starts the system's media player on `url`, a file-stream address of instance `instance`, and answers
 /// the line saying what was opened. Only an address of that instance is opened ([`player_target`]); the
-/// address goes in a private playlist, never on the command line. A refusal or a failure rejects with the
-/// line to show ([`player_error_line`]).
+/// address goes in a private playlist, never on the command line, and this run's launch secret is taken out
+/// of it first ([`player_url`]) so the credential of the whole run is not left in a file written for one
+/// player. A refusal or a failure rejects with the line to show ([`player_error_line`]).
 #[tauri::command]
 pub async fn open_in_player(
     instance: String,
@@ -93,6 +155,8 @@ pub async fn open_in_player(
 ) -> Result<String, String> {
     let base = instance_base(&state, &instances, &instance).await?;
     let target = player_target(&base, &url)?;
+    let secret = own_secret(&state, &instance).await;
+    let target = player_url(target, secret.as_deref());
     let opened = play(
         &PlayerConfig::default(),
         PlayTarget::new(&title, PlaySource::Url(StreamUrl::new(target.to_string()))),
@@ -109,7 +173,9 @@ mod tests {
     use fbtt_core::PlayerConfig;
     use fbtt_core::player::{PlayError, find_player};
 
-    use super::{player_error_line, player_target, playlist_dir};
+    use super::{
+        player_error_line, player_target, player_url, playlist_dir, without_launch_secret,
+    };
     use crate::download::NOT_A_STREAM;
     use std::path::{Path, PathBuf};
 
@@ -199,6 +265,101 @@ mod tests {
         assert_eq!(
             playlist_dir(Path::new("/var/app")),
             PathBuf::from("/var/app/playlists")
+        );
+    }
+
+    /// A launch secret, spelled the way `fbtt_desktop_core::launch_secret` spells one: 43 url-safe
+    /// characters, and the same shape a stream token has, which is why the two are compared by value and
+    /// not by length.
+    const SECRET: &str = "3xQk0VY7m1sTbW9dLpAeRjHgNuCiFoKyBvXlMnZsQwE";
+    /// A stream token: the credential the app's own engine issues for one file, and not this run's secret.
+    const ISSUED: &str = "8Bq2tY1wLkN4sVp6zRdXeA0mHcJfKgTuOyBnIvZrQ3E";
+
+    /// What the page hands over is an address whose `token` opens this one file. When that token is instead
+    /// this run's launch secret, the secret comes back out before a playlist is written: a playlist waits
+    /// for its player, and one a killed run left sits until a sweep twelve hours away, while the launch
+    /// secret is the credential this whole run answers with. Anything else the query holds is none of this
+    /// business, because a player sent to an address with no credential on it is refused the file it was
+    /// sent for.
+    #[test]
+    fn the_launch_secret_never_reaches_a_player() {
+        let base = "http://127.0.0.1:53211";
+        let url = url::Url::parse(&format!("{}?token={}", stream(base), SECRET))
+            .expect("an address carrying a credential");
+
+        let handed = without_launch_secret(url, SECRET);
+        assert_eq!(
+            handed.query_pairs().count(),
+            0,
+            "the credential is gone: {handed}"
+        );
+        assert!(
+            !handed.as_str().contains(SECRET),
+            "the secret is not in {handed}"
+        );
+        assert_eq!(
+            handed.path(),
+            format!("/api/v1/torrents/{HASH}/files/3/stream"),
+            "and the file it names is still the same file"
+        );
+
+        // A second pair stays where it was: only the credential that is ours is taken out.
+        let beside = url::Url::parse(&format!("{}?token={}&start_ms=1200", stream(base), SECRET))
+            .expect("an address with a credential and a start");
+        let handed = without_launch_secret(beside, SECRET);
+        assert_eq!(
+            handed.as_str(),
+            format!("{base}/api/v1/torrents/{HASH}/files/3/stream?start_ms=1200"),
+            "the other pair keeps its value and its order"
+        );
+    }
+
+    /// The token the app's own engine answers with today is its own stream token: `start_desktop` turns
+    /// logins on for the launch secret, so `POST /api/v1/stream-tokens` issues one and the address the page
+    /// builds carries that rather than the secret. A stream token is exactly what a player has to keep, and
+    /// so is a saved instance's token, which belongs to another server and is never this run's secret. An
+    /// address with nothing on it goes as it came, with no `?` left behind.
+    #[test]
+    fn a_stream_token_is_kept() {
+        let base = "http://127.0.0.1:53211";
+        let url = url::Url::parse(&format!("{}?token={}", stream(base), ISSUED))
+            .expect("an address carrying a stream token");
+
+        assert_eq!(
+            without_launch_secret(url.clone(), SECRET),
+            url,
+            "a stream token goes as it came"
+        );
+        assert_eq!(
+            player_url(url.clone(), None),
+            url,
+            "an instance we did not start keeps its token"
+        );
+        assert_eq!(
+            player_url(url.clone(), Some(SECRET)),
+            url,
+            "the secret is offered and the token is not it"
+        );
+        // A token spelled exactly like our secret on an address of an instance we did not start is that
+        // server's credential, and no business of ours to remove.
+        let foreign = url::Url::parse(&format!("{}?token={}", stream(base), SECRET))
+            .expect("a foreign token");
+        assert_eq!(
+            player_url(foreign.clone(), None),
+            foreign,
+            "no secret of ours is offered, so nothing comes off"
+        );
+
+        let bare = url::Url::parse(&stream(base)).expect("an address with no credential");
+        let handed = without_launch_secret(bare, SECRET);
+        assert_eq!(
+            handed.query_pairs().count(),
+            0,
+            "nothing was added: {handed}"
+        );
+        assert!(
+            !handed.as_str().ends_with('?'),
+            "no empty query left behind: {handed}"
         );
     }
 }
