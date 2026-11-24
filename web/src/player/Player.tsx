@@ -19,6 +19,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import type { KeyboardEvent, ReactNode } from 'react'
 import {
   Download,
+  ExternalLink,
   Maximize,
   Pause,
   Play,
@@ -28,13 +29,15 @@ import {
   VolumeX,
   X,
 } from 'lucide-react'
+import Button from '../components/Button'
 import { useConnection } from '../connection'
 import { CANCELLED_COPY, useDesktopDownload } from '../desktopDownload'
 import type { FileDownload } from '../desktopDownload'
-import { isAbsolute } from '../endpoint'
+import { useDesktopPlayer } from '../desktopPlayer'import { isAbsolute } from '../endpoint'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe, formatBytes, formatPercent } from '../format'
 import { matches } from '../keys'
+import { announcePolite } from '../live'
 import { MODAL_CENTRED, useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
 import { createEngine } from './engine'
@@ -500,7 +503,12 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     shell === null ? noShellSubscribe : shell.subscribe,
     shell === null ? noShellDownload : () => shell.current(fileKey),
   )
-  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
+  const openInPlayer = useDesktopPlayer()
+  // True while a start of the system's player is in flight: a second click does nothing, the way
+  // `downloading` keeps a second Download from racing the first.
+  const [opening, setOpening] = useState(false)
+  // The shell's line for an open it refused, shown beside the button in Download's alert style.
+  const [openProblem, setOpenProblem] = useState<string | null>(null)  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
   // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
   // the buffer restarts the streams, and a drag writes dozens of values.
   const [scrub, setScrub] = useState<number | null>(null)
@@ -1133,6 +1141,54 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     }
   }
 
+  /**
+   * Hand the file to the system's media player. The in-page video yields first (one window on one
+   * file), the stream token is fetched at the click because it lives 60 seconds, and the address goes to
+   * the shell, which reads it from a private playlist rather than a command line. The line about what
+   * was opened goes to the polite region; the line for a refusal is shown beside the button, and a second
+   * click while one is in flight does nothing.
+   */
+  async function openInSystemPlayer(): Promise<void> {
+    if (opening || openInPlayer === null) return
+    setOpening(true)
+    try {
+      setOpenProblem(null)
+      const video = videoRef.current
+      if (video !== null && !video.paused) video.pause()
+      const url = await client.streamToken(id, file)
+      announcePolite(await openInPlayer.open(url, name))
+    } catch (problem) {
+      setOpenProblem(problem instanceof Error ? problem.message : String(problem))
+    } finally {
+      setOpening(false)
+    }
+  }
+
+  /** The Open in player button, with the line for the open it refused. Drawn only where the app provides a shell, never in a browser. */
+  function openInPlayerControl(): ReactNode {
+    if (openInPlayer === null) return null
+    return (
+      <>
+        <Button
+          variant="secondary"
+          size="sm"
+          aria-label="Open in player"
+          disabled={opening}
+          onClick={() => {
+            void openInSystemPlayer()
+          }}
+        >
+          <ExternalLink className="h-4 w-4" aria-hidden="true" />
+          Open in player
+        </Button>
+        {openProblem !== null && (
+          <p role="alert" className="max-w-sm text-[13px] text-error">
+            {displaySafe(openProblem)}
+          </p>
+        )}
+      </>
+    )
+  }
   const { ref: modalRef, onKeyDown } = useModalDialog(onClose)
   useEffect(() => {
     dialogRef.current = modalRef.current
@@ -1264,7 +1320,7 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
             }}
             onCancel={cancelFileDownload}
           />
-          {downloadProblem !== null && (
+          {openInPlayerControl()}          {downloadProblem !== null && (
             <p role="alert" className="max-w-sm text-[13px] text-error">
               {displaySafe(downloadProblem)}
             </p>
@@ -1273,11 +1329,18 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       )}
 
       {probe !== null && choice?.kind === 'native' && (
-        <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
-          {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
-              player on `play()`. */}
-          <video ref={videoRef} src={nativeSrc ?? undefined} controls playsInline className="max-h-full max-w-full" />
-        </div>
+        <>
+          <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
+            {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
+                player on `play()`. */}
+            <video ref={videoRef} src={nativeSrc ?? undefined} controls playsInline className="max-h-full max-w-full" />
+          </div>
+          {openInPlayer !== null && (
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-ink-700 px-3 py-2.5">
+              {openInPlayerControl()}
+            </div>
+          )}
+        </>
       )}
 
       {probe !== null && choice?.kind === 'remux' && (
@@ -1313,6 +1376,7 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
                     {displaySafe(downloadProblem)}
                   </p>
                 )}
+                {openInPlayerControl()}
               </div>
             )}
           </div>
@@ -1399,6 +1463,9 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
             <IconButton label="Fullscreen" onClick={toggleFullscreen}>
               <Maximize className="h-4 w-4" aria-hidden="true" />
             </IconButton>
+            {/* When the file is playing, the way out to VLC or mpv sits with the other controls; when
+                playback failed, the failure's own overlay offers it, so it is not drawn twice. */}
+            {!failed && openInPlayerControl()}
           </div>
         </>
       )}

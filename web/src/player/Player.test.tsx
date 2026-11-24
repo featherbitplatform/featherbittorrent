@@ -13,7 +13,8 @@ import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
 import type { DesktopDownload, DownloadProgress } from '../desktopDownload'
-import {
+import { DesktopPlayerContext } from '../desktopPlayer'
+import type { DesktopPlayer } from '../desktopPlayer'import {
   FakeBody,
   FakeMediaSource,
   FakeSourceBuffer,
@@ -2766,13 +2767,22 @@ const NATIVE_PROBE: MediaProbe = {
   external_subtitles: [],
 }
 
-/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. */
-async function renderNative(): Promise<{ container: HTMLElement; restore(): void }> {
+/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. `shell` renders it as the desktop app draws it. */
+async function renderNative(
+  shell?: DesktopPlayer,
+): Promise<{ container: HTMLElement; restore(): void }> {
   const spy = vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockImplementation((mime: string) =>
     mime.startsWith('video/webm') ? 'maybe' : '',
   )
   const { client } = probeClient(NATIVE_PROBE)
-  const { container } = render(<Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />)
+  const player = <Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />
+  const { container } = render(
+    shell === undefined ? (
+      player
+    ) : (
+      <DesktopPlayerContext.Provider value={shell}>{player}</DesktopPlayerContext.Provider>
+    ),
+  )
   await settle()
   return { container, restore: () => spy.mockRestore() }
 }
@@ -3925,5 +3935,156 @@ describe('error bodies know an HTML page', () => {
     expect(failure?.detail, 'the HTML error page was shown as a detail').toBe(null)
     engine.destroy()
     document.body.removeChild(video)
+  })
+})
+
+/**
+ * The player rendered as the desktop app draws it: `shell` behind `DesktopPlayerContext`, or no provider
+ * for a browser. Streams are answered the way `renderRemux` answers them, so a remux playback opens.
+ */
+async function renderInApp(
+  shell?: DesktopPlayer,
+  probe: MediaProbe = PROBE,
+): Promise<{ container: HTMLElement; video: HTMLVideoElement; dialog: HTMLDialogElement }> {
+  const recorder = fakeFetch()
+  recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  vi.stubGlobal('fetch', recorder.fetch)
+  const { client } = probeClient(probe)
+  const player = <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
+  const { container } = render(
+    shell === undefined ? (
+      player
+    ) : (
+      <DesktopPlayerContext.Provider value={shell}>{player}</DesktopPlayerContext.Provider>
+    ),
+  )
+  await settle()
+  const video = container.querySelector('video') as HTMLVideoElement
+  const dialog = container.querySelector('dialog') as HTMLDialogElement
+  return { container, video, dialog }
+}
+
+describe('open in player', () => {
+  it('open in player is offered only in the app', async () => {
+    // A browser has no shell to start a player with, so the control is not drawn at all.
+    await renderInApp()
+    expect(screen.queryByRole('button', { name: 'Open in player' })).toBeNull()
+    cleanup()
+    // In the app the way out to VLC or mpv is there.
+    await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('open in player hands the stream address to the shell', async () => {
+    const calls: Array<[string, string]> = []
+    const shell: DesktopPlayer = {
+      open: async (url, title) => {
+        calls.push([url, title])
+        return 'Opening movie.mkv in VLC'
+      },
+    }
+    const { video } = await renderInApp(shell)
+    makeVideoPlayable(video)
+    video.play()
+    await settle()
+    expect(video.paused, 'the test video was not playing before the click').toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    // The address is the file-stream token fetched at the click, and the file is named for the player.
+    expect(calls).toEqual([['/api/v1/stream/t?token=abc', 'movie.mkv']])
+    // The in-page video yields to the shell's player.
+    expect(video.paused, 'the in-page video kept playing after the open').toBe(true)
+  })
+
+  it("open in player shows the shell's refusal", async () => {
+    const shell: DesktopPlayer = {
+      open: () => Promise.reject('No media player found. Install VLC or mpv.'),
+    }
+    await renderInApp(shell)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    expect(screen.getByRole('alert').textContent).toBe('No media player found. Install VLC or mpv.')
+  })
+
+  it('failed playback offers open in player', async () => {
+    const { video } = await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    act(() => {
+      setElementError(video, 'PIPELINE_ERROR_DECODE', true)
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the failed player did not say why',
+    ).toBe(true)
+    // The way out is right there in the failure, beside its Download.
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('open in player ignores a second click while opening', async () => {
+    const calls: Array<[string, string]> = []
+    // An `open` the shell has not answered yet: the answer arrives only when `release` is called, so
+    // everything below happens while the shell is still working.
+    let release = () => {}
+    const shell: DesktopPlayer = {
+      open: (url, title) =>
+        new Promise<string>((done) => {
+          calls.push([url, title])
+          release = () => done('Opening movie.mkv in VLC')
+        }),
+    }
+    await renderInApp(shell)
+    const button = screen.getByRole('button', {
+      name: 'Open in player',
+    }) as HTMLButtonElement
+    fireEvent.click(button)
+    await settle()
+    expect(calls.length, 'the first click did not ask the shell').toBe(1)
+    expect(button.disabled, 'the button was not busy while the open was in flight').toBe(true)
+    // Impatient, the person clicks again while VLC is being started: nothing is asked for twice.
+    fireEvent.click(button)
+    await settle()
+    expect(calls.length, 'a second click while opening asked the shell again').toBe(1)
+    release()
+    await settle()
+  })
+
+  it('open in player pauses the video', async () => {
+    const shell: DesktopPlayer = { open: async () => 'Opening movie.mkv in VLC' }
+    const { video } = await renderInApp(shell)
+    makeVideoPlayable(video)
+    video.play()
+    await settle()
+    expect(video.paused, 'the test video was not playing before the click').toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    // Two players on one file: the window's own picture stops as the shell's starts.
+    expect(video.paused, 'the in-page video was still playing after the open').toBe(true)
+  })
+
+  it('unplayable file offers open in player', async () => {
+    const hevc: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    await renderInApp({ open: async () => 'Opening movie.mkv in VLC' }, hevc)
+    expect(
+      screen.getByText('This browser cannot play hevc video.') !== null,
+      'the unplayable screen did not say which codec it cannot play',
+    ).toBe(true)
+    // The screen that says the window cannot play this file is the screen that offers the way out.
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('native video offers open in player', async () => {
+    const native = await renderNative({ open: async () => 'Opening clip.webm in VLC' })
+    try {
+      // A file the browser plays by itself still has the shell's players beside it.
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.hasAttribute('controls'), 'the native path did not render').toBe(true)
+      expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+    } finally {
+      native.restore()
+    }
   })
 })

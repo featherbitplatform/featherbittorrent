@@ -158,6 +158,11 @@ export async function cancelDownload(handle: string): Promise<void> {
   await invoke('cancel_download', { handle })
 }
 
+/** Starts the system's media player on the file at `url` on instance `id` and answers the line saying what was opened. Rejects with the shell's line. */
+export async function openInPlayer(id: string, url: string, title: string): Promise<string> {
+  return invoke<string>('open_in_player', { instance: id, url, title })
+}
+
 /** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */
 export async function probeInstance(id: string): Promise<Probe> {
   return invoke<Probe>('probe_instance', { id })

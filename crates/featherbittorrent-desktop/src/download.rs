@@ -408,7 +408,7 @@ impl Drop for Running<'_> {
 }
 
 /// The base address of instance `id`: This computer's while it runs, a saved instance's otherwise.
-async fn instance_base(
+pub(crate) async fn instance_base(
     state: &DesktopState,
     instances: &Instances,
     id: &str,

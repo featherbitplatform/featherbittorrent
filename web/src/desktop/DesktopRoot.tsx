@@ -51,6 +51,8 @@ import type { Connection } from '../connection'
 import { useTitleBarSlots } from '../components/titleBarSlots'
 import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
 import type { DesktopDownload } from '../desktopDownload'
+import { DesktopPlayerContext } from '../desktopPlayer'
+import type { DesktopPlayer } from '../desktopPlayer'
 import { DesktopSettingsContext } from '../desktopSettings'
 import type { DesktopSettingsSlot, SettingsRequest } from '../desktopSettings'
 import { setOverrides } from '../keys'
@@ -64,6 +66,7 @@ import {
   LOCAL_ID,
   cancelDownload,
   chooseDownloadPlace,
+  openInPlayer,
   probeInstance,
   saveDownload,
   savePassword,
@@ -177,11 +180,18 @@ function Connected({
       ),
     [id],
   )
+  // The player's Open in player: the shell starts VLC or mpv on a file the window cannot play itself.
+  const player = useMemo<DesktopPlayer>(
+    () => ({ open: (url, title) => openInPlayer(id, url, title) }),
+    [id],
+  )
   if (refused) return <Connecting />
   return (
     <ConnectionContext.Provider value={connection}>
       <DesktopDownloadContext.Provider value={save}>
-        <App />
+        <DesktopPlayerContext.Provider value={player}>
+          <App />
+        </DesktopPlayerContext.Provider>
       </DesktopDownloadContext.Provider>
     </ConnectionContext.Provider>
   )

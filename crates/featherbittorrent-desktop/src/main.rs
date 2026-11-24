@@ -17,6 +17,7 @@ mod lifecycle;
 mod local;
 mod navigation;
 mod opened;
+mod player;
 mod preferences;
 mod serving;
 mod settings_store;
@@ -86,6 +87,9 @@ fn main() {
         .manage(download::Downloads::new())
         // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
+        // The player's playlist folder, beside This computer's files. Made before `paths` moves into
+        // Serving on the next line: the command and the sweep at app start share it (`player::Playlists`).
+        .manage(player::Playlists::new(&paths.data_dir))
         .manage(serving::Serving::new(paths, settings_store.clone()))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
@@ -119,6 +123,7 @@ fn main() {
             download::choose_download_place,
             download::save_download,
             download::cancel_download,
+            player::open_in_player,
             window::system_title_bar,
             window::set_system_title_bar,
             instances::list_instances,
@@ -196,6 +201,10 @@ fn setup(app: &mut tauri::App, serve: bool) -> Result<(), Box<dyn std::error::Er
     // 5. The links and files this launch was opened with, kept until the page asks, and on macOS the
     //    ones the system opens the running app with from now on.
     opened::install(handle, &app.state::<opened::OpenedState>());
+    // 6. A playlist is written for one player and taken out when that player exits, so any playlist a
+    //    previous run left belongs to one that never cleaned up. Sweeping it is off the event loop and
+    //    best effort (`player::Playlists::sweep_stale`).
+    app.state::<player::Playlists>().sweep_stale();
     Ok(())
 }
 

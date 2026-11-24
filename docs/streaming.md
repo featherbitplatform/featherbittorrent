@@ -12,6 +12,10 @@ machine is doing the downloading.
 - Nothing selected sends nothing. A torrent still fetching its metadata gets one line on the footer,
   `the torrent has no metadata yet`, and nothing else happens.
 
+Pressing `s` also puts the file it plays first: that file goes to High priority and its pieces download
+in order, so playback can start sooner, while the torrent's other files keep their priorities; the
+priority shows in the file list, where it can be changed back.
+
 ## Where the bytes come from
 
 **A file that is already whole plays by its path.** The rule is: the torrent is seeding, this file's
