@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Playing a file (the web player, the desktop app's Open in player, or s in the terminal client) now raises it to High priority and downloads its pieces in order, so playback can start sooner; the torrent's other files keep their priorities. Built on fbt-lib 0.12.0.
+- Playing a file (the web player, the desktop app's Open in player, or s in the terminal client) now raises it to High priority and downloads its pieces in order, so playback can start sooner; the torrent's other files keep their priorities. Built on fbt-lib 0.12.0. ([#38](https://github.com/featherbitplatform/featherbittorrent/pull/38))
 
 ### Fixed
 
