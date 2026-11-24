@@ -20,6 +20,7 @@ import {
   fakeVideoBeforeMetadata,
   makeVideoPlayable,
   makeVideoSeekable,
+  setElementError,
 } from './testing'
 import { FOCUSABLE_SELECTOR, MODAL_CENTRED } from '../modal'
 import { KEY_BINDINGS } from '../keys'
@@ -35,11 +36,15 @@ const objectUrls: string[] = []
 let objectUrlCount = 0
 const revokeObjectUrls: string[] = []
 let createObjectUrlCalls = 0
+// Every media source the player's engine makes, in order, so a test can reach the buffers of the
+// engine a render started (and of the one an audio retry starts).
+const mediaSources: FakeMediaSource[] = []
 beforeEach(() => {
   objectUrlCount = 0
   createObjectUrlCalls = 0
   objectUrls.length = 0
   revokeObjectUrls.length = 0
+  mediaSources.length = 0
   // jsdom has no `MediaSource`, so the player's `chooseTracks` would answer `unplayable` for
   // everything. The stub is a `FakeMediaSource` with a browser-shaped `isTypeSupported`: it takes
   // the codecs a real browser takes (h264, aac, opus, vp8, vp9) and refuses the rest (hevc), which
@@ -48,6 +53,10 @@ beforeEach(() => {
   class BrowserMediaSource extends FakeMediaSource {
     static isTypeSupported(mime: string): boolean {
       return /avc1|mp4a|opus|vp8|vp9/.test(mime)
+    }
+    constructor() {
+      super()
+      mediaSources.push(this)
     }
   }
   vi.stubGlobal('MediaSource', BrowserMediaSource)
@@ -2519,7 +2528,10 @@ async function renderNative(): Promise<{ container: HTMLElement; restore(): void
 }
 
 /** Render the remuxed player over a fake `fetch` the engine reads as `window.fetch`. */
-async function renderRemux(probe: MediaProbe = PROBE): Promise<{
+async function renderRemux(
+  probe: MediaProbe = PROBE,
+  beforeRender?: (recorder: ReturnType<typeof fakeFetch>) => void,
+): Promise<{
   container: HTMLElement
   recorder: ReturnType<typeof fakeFetch>
   video: HTMLVideoElement
@@ -2532,6 +2544,7 @@ async function renderRemux(probe: MediaProbe = PROBE): Promise<{
     return { startMs: videoCalls === 1 ? 0 : 3000, body: () => new FakeBody() }
   })
   recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  beforeRender?.(recorder)
   vi.stubGlobal('fetch', recorder.fetch)
   const { client } = probeClient(probe)
   const { container } = render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
@@ -2883,5 +2896,210 @@ describe('the final review fixes', () => {
     expect(seek.value, 'the bar jumped back on release').toBe('3')
     await settle()
     expect(seek.value, 'the bar jumped back while waiting for data').toBe('3')
+  })
+})
+
+/** Write `navigator.userAgent` the way a test needs it, and hand back the undo. */
+function setUserAgent(userAgent: string): () => void {
+  const own = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent')
+  Object.defineProperty(window.navigator, 'userAgent', {
+    value: userAgent,
+    configurable: true,
+    writable: true,
+  })
+  return (): void => {
+    if (own !== undefined) {
+      Object.defineProperty(window.navigator, 'userAgent', own)
+    } else {
+      delete (window.navigator as unknown as Record<string, unknown>).userAgent
+    }
+  }
+}
+
+describe('player failures say why', () => {
+  it('element decode error reports the codec', async () => {
+    // Chrome's real Windows failure: the element raises `error` (code 3) with its own words, and
+    // the player must say which codec broke and show the system's message, not just the old line.
+    const t = await renderRemux()
+    act(() => {
+      setElementError(t.video, 'PIPELINE_ERROR_DECODE', true)
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the failed player did not name the codec it could not decode',
+    ).toBe(true)
+    expect(
+      screen.getByText('PIPELINE_ERROR_DECODE') !== null,
+      'the failed player did not show the system error message',
+    ).toBe(true)
+  })
+
+  it('append after element error is a decode failure', async () => {
+    // The engine's real sequence on a dead decoder: the element fails first, and the next
+    // `appendBuffer` throws `InvalidStateError`. The append throw must not be filed as the cause:
+    // the element's error is, with the element's own message.
+    const t = await openEngine()
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(t.engine.state(), 'the first append did not land').not.toBe('error')
+    setElementError(t.video, 'PIPELINE_ERROR_DECODE')
+    t.videoBuffer.makeNextAppendThrow('InvalidStateError', 'The source buffer is in the invalid state.')
+    t.body(1).push(new Uint8Array([2]))
+    await settle()
+    expect(t.engine.state(), 'an append after a decode failure was not an error').toBe('error')
+    const failure = t.engine.failure()
+    expect(failure !== null, 'the throw after the element error recorded nothing').toBe(true)
+    expect(failure?.kind, 'a throw after an element error was not called a decode failure').toBe('decode')
+    expect(failure?.role, 'the decode failure did not say which track').toBe('video')
+    expect(failure?.detail, 'the element message was not kept').toBe('PIPELINE_ERROR_DECODE')
+    t.close()
+  })
+
+  it('sourcebuffer error event is not a success', async () => {
+    // A `SourceBuffer` that fires `error` ends the stream: its `updateend` after the failed append
+    // is the end of the failure, not a success, and the engine must say which track broke.
+    const t = await openEngine()
+    t.videoBuffer.dispatchEvent(new Event('error'))
+    await settle()
+    expect(t.engine.state(), 'a sourcebuffer error left the engine going').toBe('error')
+    const failure = t.engine.failure()
+    expect(failure !== null, 'the sourcebuffer error recorded nothing').toBe(true)
+    expect(failure?.role, 'the sourcebuffer error did not say which track').toBe('video')
+    expect(failure?.kind, 'a sourcebuffer error was not a decode failure').toBe('decode')
+    expect(failure?.mime).toBe('video/mp4; codecs="avc1.64000A"')
+    t.close()
+  })
+
+  it('addSourceBuffer throw is an error, not loading forever', async () => {
+    // A source that refuses the buffer leaves the engine with nothing to append to: it is done,
+    // and it must say so with the track and the browser's own words, not sit in `loading`.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.makeNextAddSourceBufferThrow('NotSupportedError', 'the mime is not supported here')
+    source.open()
+    await settle()
+    expect(engine.state(), 'a refused addSourceBuffer left the player loading forever').toBe('error')
+    const failure = engine.failure()
+    expect(failure !== null, 'the refused buffer recorded nothing').toBe(true)
+    expect(failure?.role, 'the refused buffer did not say which track').toBe('video')
+    expect(failure?.kind, 'a refused addSourceBuffer was not a buffer failure').toBe('buffer')
+    expect(failure?.mime).toBe('video/mp4; codecs="avc1.64000A"')
+    expect(failure?.status).toBe(null)
+    expect(failure?.detail).toBe('the mime is not supported here')
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('server error names the status', async () => {
+    // The video stream answers 415 with the route's own JSON error body: the player names the
+    // status, shows the server's message, and keeps the file downloadable.
+    await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/1/stream', {
+        status: 415,
+        json: { error: 'unsupported_media', message: 'x' },
+      })
+    })
+    expect(
+      screen.getByText('Playback failed: the server answered 415.') !== null,
+      'the failed player did not name the status the server answered',
+    ).toBe(true)
+    expect(screen.getByText('x') !== null, 'the server message was not shown').toBe(true)
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'a failed video offers no way to download it',
+    ).toBe(true)
+  })
+
+  it('audio failure retries without audio once', async () => {
+    // The real Windows 11 24H2 case: an AC-3 track with no decoder. The picture is fine, so the
+    // player re-opens the file once with no audio, says the video plays without sound, and keeps
+    // the failure from killing the video; a second failure is the final word.
+    const t = await renderRemux()
+    const first = mediaSources.at(-1) as FakeMediaSource
+    const audioBuffer = first.activeSourceBuffers[1] as FakeSourceBuffer
+    act(() => {
+      audioBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    const videoCalls = t.recorder.callsFor('/tracks/1/stream')
+    expect(videoCalls.length, 'the audio failure did not start the video again').toBe(2)
+    expect(videoCalls[1]?.url, 'the retry did not resume the video where it was').toContain('start_ms=0')
+    expect(t.recorder.callsFor('/tracks/2/stream').length, 'the retry fetched the audio again').toBe(1)
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the retry played without telling the person there is no sound',
+    ).toBe(true)
+    const second = mediaSources.at(-1) as FakeMediaSource
+    expect(second !== first, 'the retry re-used the first media source').toBe(true)
+    expect(second.activeSourceBuffers.length, 'the retry opened an audio buffer').toBe(1)
+    const videoBuffer2 = second.activeSourceBuffers[0] as FakeSourceBuffer
+    act(() => {
+      videoBuffer2.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the second failure did not show the final error',
+    ).toBe(true)
+  })
+
+  it('windows hevc hint', async () => {
+    // The Windows case the bug was filed from: `isTypeSupported` says yes to HEVC, the decoder is
+    // missing, and the fix is a purchase. The hint belongs on Windows and nowhere else.
+    const hevcProbe: MediaProbe = {
+      ...PROBE,
+      tracks: [
+        track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'], default: true }),
+      ],
+    }
+    class HevcBrowserMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /hvc1|mp4a|opus/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+    }
+    vi.stubGlobal('MediaSource', HevcBrowserMediaSource)
+    const hint = 'On Windows, HEVC video needs the HEVC Video Extensions from the Microsoft Store.'
+    const restoreWindows = setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      const windows = await renderRemux(hevcProbe)
+      act(() => {
+        setElementError(windows.video, 'PIPELINE_ERROR_DECODE', true)
+      })
+      await settle()
+      expect(
+        screen.getByText('Playback failed: this system could not decode the hevc video.') !== null,
+        'the HEVC player did not name the codec',
+      ).toBe(true)
+      expect(screen.getByText(hint) !== null, 'a Windows HEVC decode failure did not name the extension').toBe(true)
+    } finally {
+      restoreWindows()
+    }
+    cleanup()
+    const restoreMac = setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      const mac = await renderRemux(hevcProbe)
+      act(() => {
+        setElementError(mac.video, 'PIPELINE_ERROR_DECODE', true)
+      })
+      await settle()
+      expect(screen.queryByText(hint) === null, 'the Windows HEVC hint showed on a Mac').toBe(true)
+    } finally {
+      restoreMac()
+    }
   })
 })

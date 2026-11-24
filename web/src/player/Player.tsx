@@ -37,7 +37,7 @@ import { matches } from '../keys'
 import { MODAL_CENTRED, useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
 import { createEngine } from './engine'
-import type { Engine, EngineState } from './engine'
+import type { Engine, EngineFailure, EngineState } from './engine'
 import { loadPosition, savePosition } from './positions'
 import { chooseTracks } from './tracks'
 import type { TrackChoice } from './tracks'
@@ -66,6 +66,10 @@ interface SubtitleOption {
 const WAITING_COPY = 'Waiting for data...'
 /** The line the player draws when the engine's state is `error`, beside the file it can still offer. */
 const ERROR_COPY = 'Playback failed.'
+/** The line shown beside the controls after the audio was dropped so the video could play. */
+const AUDIO_RETRY_COPY = 'This audio track cannot be played here, so the video plays without sound.'
+/** The line shown when a Windows system is missing the decoder HEVC needs. */
+const HEVC_WINDOWS_COPY = 'On Windows, HEVC video needs the HEVC Video Extensions from the Microsoft Store.'
 /** The one sentence a browser that cannot decode the video gets, with the codec in it. */
 function unplayableCopy(codec: string): string {
   return `This browser cannot play ${codec} video.`
@@ -75,6 +79,42 @@ function unplayableCopy(codec: string): string {
  * tracks in): there is no video codec to name, and this player plays video files only.
  */
 const NO_VIDEO_COPY = 'This file has no video track to play.'
+
+/**
+ * The error line for the engine's failure: the codec that could not be decoded, the status the
+ * server answered, or the buffer the browser refused, each named in the copy's own words. With no
+ * failure recorded (an engine that stopped for some other reason) it is today's bare line.
+ */
+function playbackFailureCopy(
+  failure: EngineFailure | null,
+  video: MediaTrack | null,
+  audio: MediaTrack | null,
+): string {
+  if (failure === null) return ERROR_COPY
+  if (failure.kind === 'server') return `Playback failed: the server answered ${failure.status}.`
+  const track = failure.role === 'audio' ? audio : video
+  const codec = displaySafe(track?.codec ?? 'unknown')
+  if (failure.kind === 'buffer') {
+    return `Playback failed: the browser refused the ${codec} ${failure.role ?? 'video'} stream.`
+  }
+  if (failure.role === 'audio') return `Playback failed: this system could not decode the ${codec} audio.`
+  return `Playback failed: this system could not decode the ${codec} video.`
+}
+
+/**
+ * Whether the Windows HEVC line applies: a track named with an `hvc1` or `hev1` codec (the failing
+ * one when the engine named one, the chosen video track otherwise), on Windows, where the decoder
+ * is a paid extension and its absence is the commonest cause of a decode failure.
+ */
+function hevcWindowsHint(failure: EngineFailure | null, video: MediaTrack | null): boolean {
+  if (!navigator.userAgent.includes('Windows')) return false
+  const isHevc = (codec: string): boolean => codec.startsWith('hvc1') || codec.startsWith('hev1')
+  if (video !== null && video.mime_codecs.some(isHevc)) return true
+  if (failure === null || failure.mime === null) return false
+  const match = /codecs="([^"]*)"/.exec(failure.mime)
+  const codecs = match !== null ? match[1] : failure.mime
+  return codecs.split(',').some((entry) => isHevc(entry.trim()))
+}
 
 /** The words a track is listed under: its name when it has one, its language when it does not. The name is remote text, so it goes through `displaySafe` on the way out. */
 function trackLabel(track: MediaTrack): string {
@@ -341,6 +381,9 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   const [audioKey, setAudioKey] = useState<string | null>(null)
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
+  // True once the audio has been dropped so the video could play: one retry per opened file, and
+  // the notice above the controls belongs to it.
+  const [audioDropped, setAudioDropped] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [downloadProblem, setDownloadProblem] = useState<string | null>(null)
   const saveDownload = useDesktopDownload()
@@ -372,6 +415,9 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   const externalDoneRef = useRef<Set<number>>(new Set())
   // The position the probe's answer will start at, in source seconds, decided once per probe.
   const startRef = useRef(0)
+  // The point, in source milliseconds, where an engine that failed on the audio hands the playhead
+  // to the engine that replaces it; read once by the next engine effect, then cleared.
+  const resumeMsRef = useRef<number | null>(null)
   // True once the open has asked the element to play: the open plays once, and later data or
   // events do not ask it again. Opening a file starts playback, so a second press is not needed;
   // an autoplay the browser refuses leaves the Play control showing, the person's own choice.
@@ -475,8 +521,12 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     if (video === null) return
 
     // The start is source seconds, the clock the position is kept in; the engine speaks source
-    // milliseconds, so the one conversion is the seconds to milliseconds, not a media mapping.
-    const startMs = Math.round(startRef.current * 1000)
+    // milliseconds, so the one conversion is the seconds to milliseconds, not a media mapping. A
+    // start after an audio failure is the point the failed engine handed over, already in the
+    // engine's own clock.
+    const resumeMs = resumeMsRef.current
+    resumeMsRef.current = null
+    const startMs = resumeMs !== null ? resumeMs : Math.round(startRef.current * 1000)
     const engine = createEngine(
       video,
       { id, file },
@@ -485,8 +535,10 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
         durationMs: probe.duration_ms,
         video: choice.video,
         videoMime: choice.videoMime,
-        audio: choice.audio,
-        audioMime: choice.audioMime,
+        // After an audio this system cannot decode, the engine runs on the video alone, and the
+        // notice above the controls says so.
+        audio: audioDropped ? null : choice.audio,
+        audioMime: audioDropped ? null : choice.audioMime,
         mimeFor: (track: MediaTrack): string | null => {
           for (const codec of track.mime_codecs) {
             const mime = `audio/mp4; codecs="${codec}"`
@@ -500,7 +552,19 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       bearer ? { streamUrl: (track, ms) => client.mediaStreamUrl(id, file, track, ms) } : undefined,
     )
     engineRef.current = engine
-    engine.onState(setState)
+    engine.onState((next: EngineState): void => {
+      setState(next)
+      // One audio track this system cannot decode is not a reason to lose the picture: open the
+      // file once more at the point it stopped, with no audio. Once per opened file only; a
+      // second failure is the final word, and the error overlay is the one that speaks.
+      if (next !== 'error' || audioDropped) return
+      if (choice.audio === null) return
+      const failure = engine.failure()
+      if (failure === null || failure.role !== 'audio') return
+      const at = videoRef.current
+      resumeMsRef.current = at !== null ? Math.round(toSource(at.currentTime, probe.time_offset_ms)) : 0
+      setAudioDropped(true)
+    })
     engine.seek(startMs)
 
     // A play or pause the viewer makes (Space or `k`, or the Play control) is their word for what
@@ -558,7 +622,7 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       engine.destroy()
       engineRef.current = null
     }
-  }, [choice, probe, bearer, client, id, file])
+  }, [choice, probe, bearer, client, id, file, audioDropped])
 
   function trackLanguage(trackId: number, probeNow: MediaProbe): string | null {
     return probeNow.tracks.find((track) => track.id === trackId)?.language ?? null
@@ -694,6 +758,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
 
   const waiting = choice?.kind === 'remux' && state === 'waiting'
   const failed = choice?.kind === 'remux' && state === 'error'
+  const videoTrack = choice?.kind === 'remux' ? choice.video : null
+  const audioTrack = choice?.kind === 'remux' ? choice.audio : null
+  // Why the engine stopped, read from the engine that stopped: the overlay's words come from it.
+  const engineFailure = failed ? engineRef.current?.failure() ?? null : null
+  const errorCopy = playbackFailureCopy(engineFailure, videoTrack, audioTrack)
+  const errorDetail = engineFailure !== null && engineFailure.detail !== null ? displaySafe(engineFailure.detail) : null
+  const showHevcHint = failed && hevcWindowsHint(engineFailure, videoTrack)
+  const audioNotice = audioDropped && audioTrack !== null
 
   function togglePlay(): void {
     const video = videoRef.current
@@ -995,11 +1067,39 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
               </div>
             )}
             {failed && (
-              <div className="absolute inset-0 flex items-center justify-center">
-                <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{ERROR_COPY}</span>
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+                <span className="max-w-md rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">
+                  {errorCopy}
+                </span>
+                {errorDetail !== null && <span className="max-w-md text-[12px] text-muted">{errorDetail}</span>}
+                {showHevcHint && <span className="max-w-md text-[12px] text-muted">{HEVC_WINDOWS_COPY}</span>}
+                {/* A video that will not play here is still the person's file: the Download offer
+                    the unplayable screen gives stays reachable from the failure. */}
+                <button
+                  type="button"
+                  aria-label="Download"
+                  onClick={() => {
+                    void download()
+                  }}
+                  className="flex h-10 cursor-pointer items-center gap-2 rounded-control bg-accent px-4 text-[13px] font-medium text-strong hover:bg-accent-hover disabled:cursor-default disabled:opacity-55"
+                  disabled={downloading}
+                >
+                  <Download className="h-4 w-4" aria-hidden="true" />
+                  Download
+                </button>
+                {downloadProblem !== null && (
+                  <p role="alert" className="max-w-sm text-[13px] text-error">
+                    {displaySafe(downloadProblem)}
+                  </p>
+                )}
               </div>
             )}
           </div>
+          {audioNotice && (
+            <div role="status" aria-live="polite" className="border-t border-ink-700 px-4 py-2 text-[13px] text-muted">
+              {AUDIO_RETRY_COPY}
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-ink-700 px-3 py-2.5">
             {/* The Seek bar gets its own full-width row on a phone, above the other controls:
                 sharing the row with the buttons and the volume slider squeezed it to ~30 px, so

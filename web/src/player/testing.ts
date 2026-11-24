@@ -187,6 +187,22 @@ export class FakeSourceBuffer extends EventTarget {
       this.appendBufferOriginal(data)
     }
   }
+
+  /**
+   * Make the next `count` appends throw a named `DOMException`, the way a buffer whose stream the
+   * decoder gave up on answers the next `appendBuffer` (an `InvalidStateError` once the element has
+   * failed): the call throws at once, the way it does in a browser, rather than starting an update.
+   */
+  makeNextAppendThrow(name: string, message: string, count = 1): void {
+    let left = count
+    this.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
+      if (left > 0) {
+        left -= 1
+        throw new DOMException(message, name)
+      }
+      this.appendBufferOriginal(data)
+    }
+  }
 }
 
 /**
@@ -247,6 +263,21 @@ export class FakeMediaSource extends EventTarget {
   removeSourceBuffer(buffer: FakeSourceBuffer): void {
     const index = this.activeSourceBuffers.indexOf(buffer)
     if (index !== -1) this.activeSourceBuffers.splice(index, 1)
+  }
+
+  /**
+   * Make the next `addSourceBuffer` throw a named `DOMException`, the way a source that will not
+   * open a buffer for a mime answers it. A later call goes through the real fake method.
+   */
+  makeNextAddSourceBufferThrow(name: string, message: string): void {
+    let armed = true
+    this.addSourceBuffer = (mime: string): FakeSourceBuffer => {
+      if (armed) {
+        armed = false
+        throw new DOMException(message, name)
+      }
+      return FakeMediaSource.prototype.addSourceBuffer.call(this, mime)
+    }
   }
 
   endOfStream(mode?: string): void {
@@ -664,4 +695,18 @@ export function fakeVideoBeforeMetadata(): { video: HTMLVideoElement; loadMetada
   makeVideoPlayable(video)
   const handle = makeVideoSeekable(video, { metadata: false })
   return { video, loadMetadata: handle.loadMetadata }
+}
+
+/**
+ * Give an element a decode failure's `MediaError` and, with `fire`, raise the `error` event that
+ * comes with it, the way Chrome does when its decoder gives up mid-stream. jsdom's `error` is
+ * getter-only (always null), so the fake writes it with a property definition.
+ */
+export function setElementError(video: HTMLVideoElement, message: string, fire = false): void {
+  Object.defineProperty(video, 'error', {
+    value: { code: 3, message },
+    configurable: true,
+    writable: true,
+  })
+  if (fire) video.dispatchEvent(new Event('error'))
 }

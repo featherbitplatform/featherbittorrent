@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Player: a video that fails to play now says why (the codec and the system's own message) instead of only "Playback failed.", hints at the HEVC Video Extensions on Windows, and keeps playing without sound when only the audio track cannot be decoded.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

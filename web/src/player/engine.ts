@@ -42,6 +42,23 @@ export interface EngineDeps {
   streamUrl?: (trackId: number, startMs: number) => string
 }
 
+/**
+ * Why the engine stopped, in the engine's own terms: which track broke, what kind of thing broke
+ * it, and whatever words the browser or the server offered.
+ */
+export interface EngineFailure {
+  /** Which track failed, when the engine can tell: a stream's own HTTP answer, its SourceBuffer, its append. `null` for the element's own error. */
+  role: 'video' | 'audio' | null
+  /** `decode`: the element's MediaError or a SourceBuffer error; `server`: a non-OK HTTP answer other than 503/504; `buffer`: addSourceBuffer or appendBuffer threw. */
+  kind: 'decode' | 'server' | 'buffer'
+  /** The mime of the failing track (`video/mp4; codecs="..."`), when role is set. */
+  mime: string | null
+  /** The HTTP status, for kind `server`. */
+  status: number | null
+  /** The browser's or server's own words (MediaError.message, the exception's message, or the error body's `message` field when it parses as JSON), at most 300 characters, or null. */
+  detail: string | null
+}
+
 /** The surface the player drives: seek, change the audio, read the state, go away. */
 export interface Engine {
   /** Move the playhead to a point of source time. Outside the buffer, the streams restart there. */
@@ -54,6 +71,11 @@ export interface Engine {
   setAudio(track: MediaTrack): boolean
   /** The state the player draws. */
   state(): EngineState
+  /**
+   * Why it stopped, or null while it has not. The first failure is the one the player shows:
+   * later ones are that failure's consequences and never overwrite it.
+   */
+  failure(): EngineFailure | null
   /** Stop everything: the fetches, the buffers, and the object URL the engine made, when it made one. */
   destroy(): void
   /** Subscribe to state changes. The engine does not hand back an unsubscribe; it dies with the player. */
@@ -84,6 +106,8 @@ export interface EngineProbe {
 interface Stream {
   track: MediaTrack
   buffer: SourceBuffer
+  /** The mime this stream's buffer decodes, the one its failures are named by; updated with a `changeType`. */
+  mime: string
   /** The chunk a quota refusal kept: it goes in before any later chunk, when the buffer has room. */
   heldChunk: ArrayBuffer | null
   /**
@@ -164,6 +188,8 @@ interface VideoLike extends EventTarget {
   /** `HAVE_NOTHING` (0) until the element has its metadata; a write then fires no `seeking`. */
   readyState: number
   buffered: { length: number; start(i: number): number; end(i: number): number }
+  /** The element's own answer for why playback broke (`MediaError`), set when its `error` fires. */
+  error?: { message?: string } | null
 }
 
 /**
@@ -297,6 +323,54 @@ function isAborted(stream: Stream): boolean {
   return stream.abort !== null && stream.abort.signal.aborted
 }
 
+/** How long a failure's `detail` may be: an explanation, not a dump. */
+const DETAIL_MAX_CHARS = 300
+
+/** The browser's or server's own words, capped, with an empty one made into null. */
+function capDetail(message: string | null): string | null {
+  if (message === null || message === '') return null
+  return message.length > DETAIL_MAX_CHARS ? message.slice(0, DETAIL_MAX_CHARS) : message
+}
+
+/** The browser's or exception's own words, capped, or null when it has none. */
+function messageOf(cause: unknown): string | null {
+  // Read the `message` without assuming `cause instanceof Error`: the browser's refusals are
+  // `DOMException`s, which are Error-like whether or not a given runtime puts them on Error's
+  // chain, and their words are exactly what the player must show.
+  const raw = cause instanceof Error
+    ? cause.message
+    : typeof cause === 'object' && cause !== null && 'message' in cause
+      ? (cause as { message: unknown }).message
+      : null
+  return capDetail(typeof raw === 'string' ? raw : null)
+}
+
+/**
+ * The server's own words for a refused stream: the error body is small JSON
+ * (`{ "error": ..., "message": ... }`), and reading it is best effort. It never waits past the
+ * abort that was already limiting this fetch.
+ */
+async function errorDetail(response: Response, signal: AbortSignal): Promise<string | null> {
+  const text = await Promise.race([
+    response.text().catch((): string | null => null),
+    new Promise<string | null>((resolve) => {
+      if (signal.aborted) resolve(null)
+      else signal.addEventListener('abort', () => resolve(null), { once: true })
+    }),
+  ])
+  if (text === null) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  const message = parsed !== null && typeof parsed === 'object'
+    ? (parsed as { message?: unknown }).message
+    : undefined
+  return capDetail(typeof message === 'string' ? message : null)
+}
+
 /**
  * Feed one video element from the server's per-track streams.
  *
@@ -323,6 +397,15 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   // the beginning (the remembered position) before it opens: the start the `onOpen` will act on.
   let pendingStartMs: number | null = null
   let errorFired = false
+  // The reason the engine stopped, kept for the player to say. The first failure is the cause:
+  // every later one is its consequence, and it does not overwrite the record.
+  let recorded: EngineFailure | null = null
+  // Whether the buffers exist: an `addSourceBuffer` that threw leaves the engine with none, and
+  // a restart then has no video stream to fetch.
+  let buffersOpen = false
+  function recordFailure(next: EngineFailure): void {
+    if (recorded === null) recorded = next
+  }
   // The point the engine itself put the playhead at, so the `seeking` that write fires is not
   // answered with a restart of the streams it was just asking for.
   let engineSeekTo: number | null = null
@@ -363,6 +446,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     // The source the engine holds is its own structural read; the buffer it returns is the same.
     const stream: Stream = {
       track,
+      mime,
       buffer: source.addSourceBuffer(mime) as unknown as Stream['buffer'],
       heldChunk: null,
       holdTimer: null,
@@ -389,6 +473,13 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       stream.appending = false
       stream.pump?.()
     })
+    // A buffer's own `error` is the MSE's word for a stream its decoder gave up on. It does not
+    // throw anywhere the engine can catch it: the failed append still gets its `updateend`, so
+    // without this listener a broken track would look like a finished one.
+    stream.buffer.addEventListener('error', () => {
+      recordFailure({ role: stream.role, kind: 'decode', mime: stream.mime, status: null, detail: null })
+      setState('error')
+    })
     streams.push(stream)
     // The pump closes over `readStream` and the rest, so it is handed to the stream once they are
     // all in scope: the `updateend` above and the `timeupdate` below both call it through this field.
@@ -398,13 +489,41 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
 
   // The buffers are added when the source opens, not when the engine is made: a `SourceBuffer`
   // refused by a source that is not yet open is the browser's `InvalidStateError`, and the order
-  // the decoder wants them in is the video first, the audio after.
+  // the decoder wants them in is the video first, the audio after. A buffer the source refuses
+  // outright is the end of playback, not a thing to retry: the engine says so instead of sitting
+  // in `loading` with no stream to fetch.
   function openBuffers(): void {
-    videoStream = addStream(probe.video, probe.videoMime, 'video')
-    audioStream =
-      probe.audio !== null && probe.audioMime !== null
-        ? addStream(probe.audio, probe.audioMime, 'audio')
-        : null
+    try {
+      videoStream = addStream(probe.video, probe.videoMime, 'video')
+    } catch (cause) {
+      recordFailure({
+        role: 'video',
+        kind: 'buffer',
+        mime: probe.videoMime,
+        status: null,
+        detail: messageOf(cause),
+      })
+      setState('error')
+      return
+    }
+    buffersOpen = true
+    if (probe.audio === null || probe.audioMime === null) {
+      audioStream = null
+      return
+    }
+    try {
+      audioStream = addStream(probe.audio, probe.audioMime, 'audio')
+    } catch (cause) {
+      audioStream = null
+      recordFailure({
+        role: 'audio',
+        kind: 'buffer',
+        mime: probe.audioMime,
+        status: null,
+        detail: messageOf(cause),
+      })
+      setState('error')
+    }
   }
 
   function streamUrl(trackId: number, startMs: number): string {
@@ -517,6 +636,17 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
           }
           return
         }
+        // A refusal (404, 415, 500) is this file's answer, not a wait: name the status and take
+        // the server's own message from the small JSON body it answers with.
+        const detail = await errorDetail(response, abort.signal)
+        if (destroyed || abort.signal.aborted) return
+        recordFailure({
+          role: stream.role,
+          kind: 'server',
+          mime: stream.mime,
+          status: response.status,
+          detail,
+        })
         setState('error')
         return
       }
@@ -610,6 +740,33 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   /**
+   * Record the append that threw. When the element already has its own error, the throw is that
+   * failure's echo: an append after a dead decoder is the browser's `InvalidStateError`, and the
+   * decode failure with the element's message is the real cause, not the append. Otherwise the
+   * buffer refused the data for a reason the engine cannot answer.
+   */
+  function recordAppendFailure(stream: Stream, cause: unknown): void {
+    const elementError = video.error ?? null
+    if (elementError !== null) {
+      recordFailure({
+        role: stream.role,
+        kind: 'decode',
+        mime: stream.mime,
+        status: null,
+        detail: capDetail(elementError.message ?? null),
+      })
+      return
+    }
+    recordFailure({
+      role: stream.role,
+      kind: 'buffer',
+      mime: stream.mime,
+      status: null,
+      detail: messageOf(cause),
+    })
+  }
+
+  /**
    * Append one chunk, and if the buffer is full, run the eviction ranges one at a time, each
    * awaited to `updateend`, and retry the same chunk before any later one. A chunk that still
    * does not fit stops the read at the gate rather than throwing.
@@ -639,6 +796,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       // error is the buffer saying no for a reason the engine cannot answer, and it is the
       // player's `error`, not a silent drop of the chunk.
       if (!isQuotaError(cause)) {
+        recordAppendFailure(stream, cause)
         setState('error')
         return false
       }
@@ -687,6 +845,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
           armHold(stream, generation)
           return false
         }
+        recordAppendFailure(stream, cause)
         setState('error')
         return false
       }
@@ -782,6 +941,8 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     } catch {
       // A buffer that will not change its type is one that is already gone.
     }
+    // The stream now carries this track: its failures are named by the new mime.
+    stream.mime = mime
     stream.pendingType = null
     await waitNotUpdating(stream.buffer, gone)
     return !gone()
@@ -983,6 +1144,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   function restartAll(fromMs: number): void {
+    // A stream that was never opened has nothing to restart: a refused buffer is itself the
+    // error, and there is no video stream to fetch again.
+    if (!buffersOpen) return
     // A restart after an error is a fresh start: the streams run again, so an error in them must
     // stop them again, and the state is the start's, not the old error.
     errorFired = false
@@ -1045,6 +1209,22 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     for (const stream of streams) pump(stream)
   }
 
+  // The element's own `error`: the decoder giving up mid-stream, the playback dying for a reason
+  // outside any stream. Its `MediaError.message` is the system's own words; and when an append
+  // has already recorded which track broke, the message fills in that record rather than being
+  // recorded over it, because the throw was this failure's echo.
+  function onElementError(): void {
+    const message = capDetail(video.error?.message ?? null)
+    if (recorded === null) {
+      recorded = { role: null, kind: 'decode', mime: null, status: null, detail: message }
+    } else if (recorded.role !== null && recorded.detail === null && message !== null) {
+      // The track that broke is the better answer than "something broke", and the message is the
+      // part that was missing from it.
+      recorded = { ...recorded, detail: message }
+    }
+    setState('error')
+  }
+
   function setAudio(track: MediaTrack): boolean {
     // The buffers are added when the source opens; a switch asked for before then has no buffer
     // to switch, and the track the probe chose is already the one the open will play. An ended
@@ -1091,6 +1271,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     source.removeEventListener('sourceopen', onOpen)
     video.removeEventListener('timeupdate', onTimeUpdate)
     video.removeEventListener('seeking', onSeeking)
+    video.removeEventListener('error', onElementError)
     if (objectUrl !== null) {
       URL.revokeObjectURL(objectUrl)
       objectUrl = null
@@ -1106,6 +1287,9 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     setUp = true
     if (probe.durationMs !== null) source.duration = mapTimes.toMedia(probe.durationMs)
     openBuffers()
+    // A buffer the source refused is the end: the failure is recorded, the state is `error`, and
+    // starting a fetch into a stopped engine would only run against it.
+    if (!buffersOpen || recorded !== null) return
     // The start is where the player asked to begin, when it did before the source opened; that is
     // the remembered position, and it is where the streams will be asked for.
     const startMs = pendingStartMs ?? 0
@@ -1119,6 +1303,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   source.addEventListener('sourceopen', onOpen)
   video.addEventListener('timeupdate', onTimeUpdate)
   video.addEventListener('seeking', onSeeking)
+  video.addEventListener('error', onElementError)
 
   return {
     seek(sourceMs: number): void {
@@ -1132,6 +1317,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
     },
     setAudio,
     state: () => state,
+    failure: (): EngineFailure | null => recorded,
     destroy,
     onState(cb: (s: EngineState) => void): void {
       listeners.push(cb)
