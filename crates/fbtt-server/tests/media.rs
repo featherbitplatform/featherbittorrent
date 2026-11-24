@@ -19,8 +19,11 @@
 //! needs and the cues element at the file's end - because that is the only stream that serves
 //! fragments and holds a permit while still waiting inside a read.
 //!
-//! Logins are off except in the one test about credentials, because nine of these ten tests are about
-//! containers and budgets, not about who is allowed to read them.
+//! Logins are off except in the one test about credentials, because most of these tests are about
+//! containers and budgets, not about who is allowed to read them. The last group of tests is about what a
+//! play does to the file it plays, which is a question about the file list rather than the bytes: the
+//! address a player is handed is the address it always got, and what changed is which file this server is
+//! now asked for first.
 
 use std::fs;
 use std::io::{Cursor, Seek as _, SeekFrom, Write as _};
@@ -585,6 +588,76 @@ async fn bearer(served: &Served) -> String {
     body["token"]
         .as_str()
         .expect("a login that answers with a token")
+        .to_string()
+}
+
+/// The priorities this server reports for `id`'s files, in index order, spelled the way the file pane
+/// spells them: `skip`, `low`, `normal`, `high`.
+async fn priorities_of(served: &Served, id: &str) -> Vec<String> {
+    let response = get(
+        &http(),
+        &served.url(&format!("/api/v1/torrents/{id}/files")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the file list of the test torrent did not answer"
+    );
+    let files = body(response).await;
+    let rows = files
+        .as_array()
+        .unwrap_or_else(|| panic!("the file list is not an array: {files}"));
+    rows.iter()
+        .map(|row| {
+            row["priority"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a file row with no priority in it: {row}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// `PUT /api/v1/torrents/{id}/file-priorities`, one priority per file the way the web UI's file pane
+/// sends them: the starting point a play is then measured against.
+async fn put_priorities(served: &Served, id: &str, priorities: &[&str]) {
+    let response = within(
+        http()
+            .put(served.url(&format!("/api/v1/torrents/{id}/file-priorities")))
+            .json(&serde_json::json!({ "priorities": priorities }))
+            .send(),
+    )
+    .await
+    .expect("the priorities reached the server");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "the server refused the priorities this test starts from"
+    );
+}
+
+/// `POST /api/v1/stream-tokens` for file `file` of torrent `id`, with the 201 checked: the address a
+/// player would be handed, token in it wherever one was issued.
+async fn token_for(served: &Served, id: &str, file: usize) -> String {
+    let response = within(
+        http()
+            .post(served.url("/api/v1/stream-tokens"))
+            .json(&serde_json::json!({ "torrent": id, "file": file }))
+            .send(),
+    )
+    .await
+    .expect("the token request reached the server");
+    let status = response.status();
+    let answer = body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "no stream address was issued for file {file}: {answer}"
+    );
+    answer["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer names no path: {answer}"))
         .to_string()
 }
 
@@ -1839,6 +1912,150 @@ async fn read_timeout_ends_the_stream() {
         );
         assert_eq!(code, "read_timeout", "{path} gave the wrong code");
     }
+
+    served.stop().await;
+}
+
+// What a play does to the file it plays: the file goes to High priority and every other file keeps what
+// it had.
+//
+// The five tests here are about the file list rather than the bytes. The stream address a player is
+// handed is the address it always got; what changed is which file this server is now asked for first,
+// and the file list read back right after the play is where that shows. The three-file torrent is the
+// one every media test here plays from (the video, its `.srt` sidecar, then a text file), and one of
+// its files is always put on Skip first: a play that rebuilt the list from scratch rather than raising
+// one row of it would look correct until a file with something to keep is in it.
+
+/// `POST /api/v1/stream-tokens` is what the web player's Play button, the desktop app's Open in player
+/// and `s` against a server all ask for an address with: the file it names goes to High, and the video
+/// beside it and the skipped file below it are left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_token_raises_the_file_to_high() {
+    let served = Served::start("media-token-raise", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    put_priorities(&served, &id, &["normal", "normal", "skip"]).await;
+
+    token_for(&served, &id, 1).await;
+
+    assert_eq!(
+        priorities_of(&served, &id).await,
+        vec!["normal", "high", "skip"],
+        "an address for file 1 did not leave the other two files as they were"
+    );
+
+    served.stop().await;
+}
+
+/// A file the person already pushed to the top is not moved by playing it: the play asks for the same
+/// priority it already had, so the engine is not asked to lower it back down.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_token_keeps_a_high_file_high() {
+    let served = Served::start("media-token-keep-high", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    put_priorities(&served, &id, &["normal", "high", "skip"]).await;
+
+    token_for(&served, &id, 1).await;
+
+    assert_eq!(
+        priorities_of(&served, &id).await,
+        vec!["normal", "high", "skip"],
+        "playing a file that was already at the top moved it off the top"
+    );
+
+    served.stop().await;
+}
+
+/// A file the person had set to Skip, played anyway, is asked for: pressing Play on it is them changing
+/// their mind about that file, and the priority list they set for the others stays as they set it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_file_played_is_raised() {
+    let served = Served::start("media-token-raise-skip", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    put_priorities(&served, &id, &["normal", "normal", "skip"]).await;
+
+    token_for(&served, &id, 2).await;
+
+    assert_eq!(
+        priorities_of(&served, &id).await,
+        vec!["normal", "normal", "high"],
+        "playing the skipped file left it skipped, or moved one of the other two"
+    );
+
+    served.stop().await;
+}
+
+/// The web player's own route, the one that streams the track: it raises the file the same way, from a
+/// lower priority than the token tests start at, and for a track of the video rather than of the sidecar.
+#[tokio::test(flavor = "multi_thread")]
+async fn track_stream_raises_the_file() {
+    let served = Served::start("media-stream-raise", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    put_priorities(&served, &id, &["low", "normal", "skip"]).await;
+
+    let response = get(
+        &http(),
+        &served.url(&format!("/api/v1/media/{id}/0/tracks/1/stream")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the video track did not stream, which is not what this test is about"
+    );
+    drop(response);
+
+    assert_eq!(
+        priorities_of(&served, &id).await,
+        vec!["high", "normal", "skip"],
+        "streaming the video did not put it at the head of the queue, or moved a file nobody played"
+    );
+
+    served.stop().await;
+}
+
+/// The routes that only read a file's header, or read a different file altogether, are not plays: a probe
+/// and a cue read must not change what this server is asked for first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_and_a_cue_read_change_no_priority() {
+    let served = Served::start("media-read-keeps", |dir| {
+        base_config(dir, vec![], Some(false))
+    })
+    .await;
+    let id = seed_show(&served, None).await;
+    put_priorities(&served, &id, &["low", "normal", "skip"]).await;
+    let before = priorities_of(&served, &id).await;
+
+    for path in [
+        format!("/api/v1/media/{id}/0"),
+        format!("/api/v1/media/{id}/0/tracks/4/cues?from_ms=0&to_ms=10000"),
+        format!("/api/v1/media/{id}/0/subtitles/1"),
+    ] {
+        let response = get(&http(), &served.url(&path), None).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} did not answer as it used to, so its control here proves nothing"
+        );
+    }
+
+    assert_eq!(
+        priorities_of(&served, &id).await,
+        before,
+        "a route that only reads changed the file list"
+    );
 
     served.stop().await;
 }

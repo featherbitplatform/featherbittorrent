@@ -60,6 +60,10 @@ ssh-agent-lib = { workspace = true, features = ["agent"] }
 # featherbittorrent device login stays Ed25519-only (see `remote::device`).
 ssh-key = { workspace = true, features = ["p256"] }
 thiserror.workspace = true
+# The debug lines of `engine::prefer_for_playback`: a play that could not
+# raise the file it plays says so in the log and carries on streaming. No subscriber here, same as every
+# other crate in this workspace: the binary decides where logs go.
+tracing.workspace = true
 # The password and key passphrase, overwritten when they are dropped.
 zeroize.workspace = true
 # The backend task, its channels and its two timers (Task 4). `select!` is a macro, so
