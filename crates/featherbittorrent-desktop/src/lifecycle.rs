@@ -122,8 +122,15 @@ fn current_settings(settings: &SettingsStore) -> DesktopSettings {
     })
 }
 
+/// How long a quit gives This computer's stop (its final save) once the engine is out.
+pub const STOP_BUDGET: Duration = Duration::from_secs(30);
+
 /// The longest the system's exit waits for a quit's final save before it lets the process end anyway.
-pub const QUIT_WAIT: Duration = Duration::from_secs(30);
+///
+/// A quit that arrives while This computer is still starting first waits for the start (at most
+/// [`START_WAIT`]) and only then stops the engine, so the exit's wait covers both: a shorter one would end
+/// the process in the middle of the final save of a large library that was slow to start.
+pub const QUIT_WAIT: Duration = START_WAIT.saturating_add(STOP_BUDGET);
 
 /// Where the app is on its way out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,11 +534,12 @@ mod tests {
     use fbtt_desktop_core::{CloseAction, DesktopSettings};
 
     use super::{
-        CloseOutcome, ExitAnswer, ExitRequestAnswer, Lifecycle, QuitPhase, WindowState,
-        initial_window_state, on_close_requested, on_exit, on_exit_requested, parse_close_action,
-        update_settings,
+        CloseOutcome, ExitAnswer, ExitRequestAnswer, Lifecycle, QUIT_WAIT, QuitPhase, STOP_BUDGET,
+        WindowState, initial_window_state, on_close_requested, on_exit, on_exit_requested,
+        parse_close_action, update_settings,
     };
     use crate::settings_store::SettingsStore;
+    use crate::startup::START_WAIT;
 
     fn closing(close: CloseAction) -> DesktopSettings {
         DesktopSettings {
@@ -736,6 +744,16 @@ mod tests {
     }
 
     /// A save that never finishes does not hold the exit forever.
+    #[test]
+    fn the_exit_waits_for_a_start_and_then_a_stop() {
+        assert_eq!(QUIT_WAIT, START_WAIT + STOP_BUDGET);
+        assert!(
+            QUIT_WAIT > START_WAIT,
+            "the system exit gives up before a quit that waited for the start could save"
+        );
+        assert!(!STOP_BUDGET.is_zero());
+    }
+
     #[test]
     fn the_wait_for_a_save_is_bounded() {
         let lifecycle = Lifecycle::new(SettingsStore::new("unused.yaml".into()));
