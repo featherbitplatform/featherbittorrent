@@ -187,6 +187,22 @@ export class FakeSourceBuffer extends EventTarget {
       this.appendBufferOriginal(data)
     }
   }
+
+  /**
+   * Make the next `count` appends throw a named `DOMException`, the way a buffer whose stream the
+   * decoder gave up on answers the next `appendBuffer` (an `InvalidStateError` once the element has
+   * failed): the call throws at once, the way it does in a browser, rather than starting an update.
+   */
+  makeNextAppendThrow(name: string, message: string, count = 1): void {
+    let left = count
+    this.appendBuffer = (data: ArrayBuffer | ArrayBufferView): void => {
+      if (left > 0) {
+        left -= 1
+        throw new DOMException(message, name)
+      }
+      this.appendBufferOriginal(data)
+    }
+  }
 }
 
 /**
@@ -249,6 +265,21 @@ export class FakeMediaSource extends EventTarget {
     if (index !== -1) this.activeSourceBuffers.splice(index, 1)
   }
 
+  /**
+   * Make the next `addSourceBuffer` throw a named `DOMException`, the way a source that will not
+   * open a buffer for a mime answers it. A later call goes through the real fake method.
+   */
+  makeNextAddSourceBufferThrow(name: string, message: string): void {
+    let armed = true
+    this.addSourceBuffer = (mime: string): FakeSourceBuffer => {
+      if (armed) {
+        armed = false
+        throw new DOMException(message, name)
+      }
+      return FakeMediaSource.prototype.addSourceBuffer.call(this, mime)
+    }
+  }
+
   endOfStream(mode?: string): void {
     // The spec refuses an end on a source that is not open or a buffer that is updating.
     if (this._state !== 'open') {
@@ -285,6 +316,12 @@ export interface StreamAnswer {
   headers?: Record<string, string>
   /** A JSON body the answer carries, for the routes that answer JSON rather than a stream. */
   json?: unknown
+  /** The plain text of an error answer's body: the refusal that answers in words, not JSON. */
+  text?: string
+  /** The fetch never answers: the request a server is still chewing on. */
+  hang?: boolean
+  /** The status arrives but the body's reads never settle: a stream that will not end. */
+  endlessBody?: boolean
 }
 
 /** What the fake `fetch` records for every call it answers. */
@@ -294,6 +331,8 @@ export interface FetchCall {
   method?: string
   /** The body the call was given, when the answer had one. */
   body: FakeBody | null
+  /** The response the call was answered with, once built. */
+  response?: Response
 }
 
 export interface FetchRecorder {
@@ -400,6 +439,59 @@ export class FakeBody {
 }
 
 /**
+ * A body that answers its text in one chunk and ends: the shape of a route's error body, which
+ * the browser hands over exactly this way. Its `canceled` flag lets a test read back that the
+ * reader was closed when the read was done with it.
+ */
+function singleChunkReader(state: { canceled: boolean }, text: string): ReadableStreamDefaultReader<Uint8Array> {
+  let sent = false
+  return {
+    read: async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+      if (sent) return { done: true, value: undefined }
+      sent = true
+      return { done: false, value: new TextEncoder().encode(text) }
+    },
+    cancel: async (): Promise<void> => {
+      sent = true
+      state.canceled = true
+    },
+    releaseLock: (): void => {},
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>
+}
+
+/** A body whose reads never settle: a stream that keeps answering, or never ends. */
+function neverReader(state: { canceled: boolean }): ReadableStreamDefaultReader<Uint8Array> {
+  let settle: ((r: ReadableStreamReadResult<Uint8Array>) => void) | null = null
+  return {
+    read: (): Promise<ReadableStreamReadResult<Uint8Array>> =>
+      new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+        settle = resolve
+      }),
+    cancel: async (): Promise<void> => {
+      state.canceled = true
+      settle?.({ done: true, value: undefined })
+    },
+    releaseLock: (): void => {},
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>
+}
+
+/** A response body read after the signal fired: the `AbortError` a browser's reads reject with. */
+function rejectBodyReads(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  const error = abortError()
+  try {
+    reader.read = (): Promise<ReadableStreamReadResult<Uint8Array>> => Promise.reject(error)
+    reader.cancel = (): Promise<void> => Promise.resolve()
+  } catch {
+    // A reader that will not take the rejection is answered by the closed stream anyway.
+  }
+}
+
+/** The abort that arrives between building the answer and handing it over. */
+function rejectFetchNow(signal: AbortSignal): void {
+  signal.dispatchEvent(new Event('abort'))
+}
+
+/**
  * A `Response` the engine reads the way a browser's `fetch` answer is read: `status`, `ok`, and
  * the `body` it `getReader()`s. It is not a real `Response` because a `Response` over a
  * `ReadableStream` would hand back the stream's own reader, and that reader swallows the
@@ -411,17 +503,26 @@ class FakeResponse {
   private readonly bodyReader: ReadableStreamDefaultReader<Uint8Array> | null
   private readonly bodyHeaders: Headers
   private readonly bodyText: string
+  /** Set for error answers that carry a real body: its `canceled` flag is read back by tests. */
+  private readonly bodyState: { canceled: boolean } | null
 
   constructor(
     bodyReader: ReadableStreamDefaultReader<Uint8Array> | null,
     status: number,
     bodyHeaders: Headers,
     bodyText = '',
+    bodyState: { canceled: boolean } | null = null,
   ) {
     this.bodyReader = bodyReader
     this.status = status
     this.bodyHeaders = bodyHeaders
     this.bodyText = bodyText
+    this.bodyState = bodyState
+  }
+
+  /** True once the body's reader was cancelled: the engine closes the stream it stopped reading. */
+  get canceled(): boolean {
+    return this.bodyState?.canceled === true
   }
 
   get ok(): boolean {
@@ -443,10 +544,14 @@ class FakeResponse {
   }
 
   json(): Promise<unknown> {
+    // A stream that never ends never gives its JSON either, the way a hanging body's `json()`
+    // waits forever in a browser.
+    if (this.bodyState !== null && this.bodyText === '') return new Promise(() => {})
     return Promise.resolve(JSON.parse(this.bodyText))
   }
 
   text(): Promise<string> {
+    if (this.bodyState !== null && this.bodyText === '') return new Promise(() => {})
     return Promise.resolve(this.bodyText)
   }
 }
@@ -490,13 +595,17 @@ export function fakeFetch(): FetchRecorder {
     for (const [name, value] of Object.entries(answer.headers ?? {})) headers.set(name, value)
 
     const body = status === 200 && answer.body !== undefined ? answer.body() : null
-    calls.push({ url, signal, method: init?.method, body })
+    const call: FetchCall = { url, signal, method: init?.method, body }
+    calls.push(call)
 
     // A 504 or 503 answers with the body its route names, not a stream.
     if (status === 504 || status === 503) {
       const code = status === 504 ? 'read_timeout' : 'too_many_media_streams'
-      const text = JSON.stringify({ error: code })
-      const response = new FakeResponse(null, status, headers, text) as unknown as Response
+      const response = new FakeResponse(null, status, headers, JSON.stringify({ error: code })) as unknown as Response
+      call.response = response
+      if (signal.aborted) {
+        return Promise.reject(abortError())
+      }
       return Promise.resolve(response)
     }
 
@@ -506,6 +615,8 @@ export function fakeFetch(): FetchRecorder {
     // back a `ReadableStream`'s reader, which would swallow the `AbortError` the engine must see
     // at the `read()`.
     let bodyReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    let bodyState: { canceled: boolean } | null = null
+    let errorText = ''
     if (body !== null) {
       // A fresh body for this fetch: any abort from an earlier fetch of the same body is gone, so
       // this fetch's signal is the only one that can reject its reads.
@@ -513,6 +624,18 @@ export function fakeFetch(): FetchRecorder {
       bodyReader = body.getReader()
       if (signal.aborted) body.fireAbort()
       else signal.addEventListener('abort', () => body.fireAbort(), { once: true })
+    } else if (status >= 400 && (answer.endlessBody === true || answer.text !== undefined || answer.json !== undefined)) {
+      // The refused-stream answers carry a body of their own words; a browser hands it over the
+      // way it hands over media: through the body's reader, chunk by chunk, then the end.
+      // `endlessBody`: the reads never settle - a stream that keeps answering, or never ends.
+      errorText = answer.text ?? (answer.json !== undefined ? JSON.stringify(answer.json) : '')
+      bodyState = { canceled: false }
+      const errorReader = answer.endlessBody === true
+        ? neverReader(bodyState)
+        : singleChunkReader(bodyState, errorText)
+      bodyReader = errorReader
+      if (signal.aborted) rejectBodyReads(errorReader)
+      else signal.addEventListener('abort', () => rejectBodyReads(errorReader), { once: true })
     }
 
     const defaultText =
@@ -520,11 +643,22 @@ export function fakeFetch(): FetchRecorder {
         ? JSON.stringify(answer.json)
         : status === 200 && answer.body === undefined
           ? JSON.stringify({})
-          : ''
+          : errorText
     const response: Response =
       bodyReader === null
         ? (new FakeResponse(null, status, headers, defaultText) as unknown as Response)
-        : (new FakeResponse(bodyReader, status, headers) as unknown as Response)
+        : (new FakeResponse(bodyReader, status, headers, defaultText, bodyState) as unknown as Response)
+    call.response = response
+
+    // `hang`: the answer never arrives - a request the server is still chewing on. The abort
+    // that replaces the stream still rejects it, the way a browser's does.
+    if (answer.hang === true) {
+      const hang = new Promise<Response>((_, rejectFetch) => {
+        signal.addEventListener('abort', () => rejectFetch(abortError()), { once: true })
+      })
+      if (signal.aborted) rejectFetchNow(signal)
+      return hang
+    }
 
     // An abort before the answer lands rejects the fetch with the `AbortError`.
     if (signal.aborted) {
@@ -664,4 +798,18 @@ export function fakeVideoBeforeMetadata(): { video: HTMLVideoElement; loadMetada
   makeVideoPlayable(video)
   const handle = makeVideoSeekable(video, { metadata: false })
   return { video, loadMetadata: handle.loadMetadata }
+}
+
+/**
+ * Give an element a decode failure's `MediaError` and, with `fire`, raise the `error` event that
+ * comes with it, the way Chrome does when its decoder gives up mid-stream. jsdom's `error` is
+ * getter-only (always null), so the fake writes it with a property definition.
+ */
+export function setElementError(video: HTMLVideoElement, message: string, fire = false): void {
+  Object.defineProperty(video, 'error', {
+    value: { code: 3, message },
+    configurable: true,
+    writable: true,
+  })
+  if (fire) video.dispatchEvent(new Event('error'))
 }
