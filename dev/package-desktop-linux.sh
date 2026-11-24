@@ -309,7 +309,8 @@ install -Dm644 NOTICE "$top/usr/local/share/doc/$name/NOTICE"
 # binary and the hicolor icon by name, and Exec carries the %u field code so a clicked magnet link or
 # .torrent file reaches the app instead of being dropped), with the MimeType= line spelled out,
 # trailing semicolon included, because the whole point of the file is the two associations the
-# packages declare.
+# packages declare. Name= is the menu label, featherbittorrent as on macOS and Windows and as the
+# .deb and .rpm template spells it.
 # mkdir first: install -D creates the directories for its own target, cat creates only the file.
 mkdir -p "$top/usr/local/share/applications"
 cat > "$top/usr/local/share/applications/$name.desktop" <<EOF
@@ -318,7 +319,7 @@ Categories=Network;FileTransfer;P2P;
 Comment=featherbittorrent desktop app: the web UI in a native window, with This computer's engine behind it
 Exec=/usr/local/bin/$name %u
 Icon=$name
-Name=featherbittorrent desktop
+Name=featherbittorrent
 StartupWMClass=$name
 Terminal=false
 Type=Application

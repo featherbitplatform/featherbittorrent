@@ -204,6 +204,12 @@ if ! grep '^MimeType=' "$desktop_file" | sed 's/^MimeType=//' | tr ';' '\n' | gr
   echo "FAIL: $desktop_file does not declare application/x-bittorrent in MimeType=" >&2
   exit 1
 fi
+# The menu label is the product's name on every system and from every format: the .deb, the .rpm and
+# the tarball all list featherbittorrent, as macOS and Windows do.
+if [[ "$(grep '^Name=' "$desktop_file")" != 'Name=featherbittorrent' ]]; then
+  echo "FAIL: $desktop_file lists the launcher as \"$(grep '^Name=' "$desktop_file" | sed 's/^Name=//')\", expected \"featherbittorrent\"" >&2
+  exit 1
+fi
 if ! grep -q '^Icon=' "$desktop_file"; then
   echo "FAIL: $desktop_file has no Icon line" >&2
   exit 1

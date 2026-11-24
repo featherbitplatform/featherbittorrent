@@ -209,6 +209,26 @@ mod tests {
         ));
     }
 
+    /// The Linux menu lists the app as featherbittorrent, as macOS and Windows do, from the `.deb` and
+    /// `.rpm` (the template) and from the tarball (its own desktop file) alike.
+    #[test]
+    fn the_linux_launcher_is_named_featherbittorrent() {
+        let named = |file: &str| {
+            file.lines()
+                .filter(|line| line.starts_with("Name="))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(include_str!("../linux.desktop.template")),
+            ["Name=featherbittorrent"]
+        );
+        assert_eq!(
+            named(include_str!("../../../dev/package-desktop-linux.sh")),
+            ["Name=featherbittorrent"]
+        );
+    }
+
     /// `tauri.conf.json` names no version of its own, so the window, the bundles and `desktop_info` all
     /// carry the workspace's: Tauri falls back to the crate's version, which is the workspace's.
     #[test]

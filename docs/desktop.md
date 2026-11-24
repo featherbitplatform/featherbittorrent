@@ -61,7 +61,7 @@ featherbittorrent-desktop --version
 The `./` says "this file here", not "a package with that name from a repository". The package carries no
 maintainer script, so nothing runs after the files are placed, and it conflicts with nothing the CLI ships:
 it sits beside `featherbittorrent` and `featherbittorrent-headless`, which are a pair of their own. It puts
-the binary in `/usr/bin` and a launcher in the applications menu, listed as `featherbittorrent-desktop`.
+the binary in `/usr/bin` and a launcher in the applications menu, listed as `featherbittorrent`.
 
 ### Fedora and family
 
@@ -82,8 +82,8 @@ featherbittorrent-desktop --version
 The archive is a small system root, not a folder to unpack anywhere: extracted onto `/` it puts the binary in
 `/usr/local/bin`, a launcher in `/usr/local/share/applications`, the icons under `/usr/local/share/icons` and
 a `README-desktop.txt` beside the licenses in `/usr/local/share/doc/featherbittorrent-desktop`. The launcher
-is listed as `featherbittorrent desktop`, with a space, where the `.deb` and the `.rpm` list
-`featherbittorrent-desktop`. The archive carries no dependency metadata, so its binary needs the libraries in
+is listed as `featherbittorrent`, as it is from the `.deb` and the `.rpm`. The archive carries no dependency
+metadata, so its binary needs the libraries in
 [The Linux floor](#the-linux-floor) already installed, and the launcher is only a declaration: making the app
 the one that answers `magnet:` links and `.torrent` files takes the two `xdg-mime` commands in
 [Magnet links and torrent files](#magnet-links-and-torrent-files). The `.deb` and the `.rpm` declare the

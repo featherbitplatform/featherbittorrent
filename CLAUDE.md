@@ -199,8 +199,8 @@ on the real system, by eye, before a release (the plan's last step is a pass on 
   `--background` start shows no window.
 - File associations: a `magnet:` link from Firefox and from Chrome on each system, with the app closed
   and open, and a `.torrent` double-clicked; on Linux through the `.deb` and `.rpm` launchers and through
-  the `.tar.gz` plus its two `xdg-mime` commands. The Linux launcher is listed as `featherbittorrent-desktop`
-  from the packages and `featherbittorrent desktop` from the tarball.
+  the `.tar.gz` plus its two `xdg-mime` commands. The Linux launcher is listed as `featherbittorrent` from
+  every format.
 - MSE playback of a video in WebView2, WKWebView and WebKitGTK.
 - Download from the player (a file the webview cannot play): the save dialog opens, the file is written where
   chosen, and the window stays on the app.
