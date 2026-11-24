@@ -26,7 +26,7 @@ and the keyboard shortcuts, and a phone layout, with the off switch in `server.w
 which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and
 changes nothing for the TUI. Every artifact is built and smoke tested in a clean container or runner before
 anything is published, and the release workflow publishes them all on a `v*` tag. The desktop app,
-`featherbittorrent-desktop`, is in development now: the same web UI in its own window, with an engine of its
+`featherbittorrent-desktop`, is not released yet and ships with the next release: the same web UI in its own window, with an engine of its
 own on this machine (`This computer`), instances to switch between, a tray, start at login, `magnet:` links
 and `.torrent` files, and changeable keyboard shortcuts, shipped as a `.dmg`, an `.msi`, `.deb`, `.rpm` and
 `.tar.gz` beside the CLI builds ([docs/desktop.md](docs/desktop.md)).

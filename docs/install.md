@@ -278,14 +278,14 @@ library with them, and removing it touches neither of them.
 
 | System | The desktop app's file |
 | --- | --- |
-| macOS, Apple Silicon or Intel | `featherbittorrent-desktop-<version>-macos-universal.dmg` |
+| macOS 11 or newer, Apple Silicon or Intel | `featherbittorrent-desktop-<version>-macos-universal.dmg` |
 | Windows, x86-64 | `featherbittorrent-desktop-<version>-windows-x86_64.msi` |
 | Debian, Ubuntu or Raspberry Pi OS 64-bit | `featherbittorrent-desktop-<version>-linux-x86_64.deb`, or `-linux-aarch64.deb` |
 | Fedora and family | `featherbittorrent-desktop-<version>-linux-x86_64.rpm`, or `-linux-aarch64.rpm` |
 | Any other Linux with glibc 2.35 or newer | `featherbittorrent-desktop-<version>-linux-x86_64.tar.gz`, or `-linux-aarch64.tar.gz` |
 
 The desktop app's Linux floor is not the CLI's. Its files are built on Ubuntu 22.04, against glibc 2.35, and
-they run on Ubuntu 22.04 and newer, Debian 12 and newer and current Fedora; RHEL 9 and its rebuilds are not
+every release tests them on Ubuntu 22.04, Debian 12 and Fedora 41; RHEL 9 and its rebuilds are not
 supported for it, because its webview needs WebKitGTK 4.1 with libsoup 3. The CLI's files above keep running
 on the glibc 2.34 floor, RHEL 9 included.
 
@@ -299,8 +299,9 @@ On macOS, open the `.dmg` and drag `featherbittorrent.app` onto `Applications`. 
 Apple Developer ID or notarized, the `.msi` carries no signature either, so the first run is the one that
 asks. macOS says it cannot verify the app until you approve it once, and SmartScreen may show
 `Windows protected your PC`, where `More info` and then `Run anyway` is the answer.
-[docs/desktop.md](desktop.md) has every install step, both notes in full, and the `.tar.gz` with the two
-`xdg-mime` commands that register it for `magnet:` links and `.torrent` files.
+[docs/desktop.md](desktop.md) has every install step, both notes in full, and the `.tar.gz`, which is
+extracted onto `/` with `tar -C /` and then takes two `xdg-mime` commands to become the handler for `magnet:`
+links and `.torrent` files.
 
 What installing the desktop app never does is the list above, unchanged: no service installed or enabled, no
 account created, nothing started, nothing that starts at boot or login (its own `Start at login` is a setting
