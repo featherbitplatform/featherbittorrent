@@ -107,7 +107,9 @@ impl Serving {
     /// that will not start serving is started for the window alone, the switch is saved off and the line
     /// kept for the Serving section, exactly as [`apply`](Self::apply) does it; only a start that cannot
     /// run at all (the library held by another run, a second failure) is the answer, which the page then
-    /// shows as the startup problem. `settings` makes the engine's settings from the config.
+    /// shows as the startup problem. A saved switch over a config with logins off, or with no user, is
+    /// started for the window alone the same way ([`local::LOGINS_OFF`]). `settings` makes the engine's
+    /// settings from the config.
     pub async fn start_this_computer<S>(
         &self,
         serve: bool,
@@ -116,10 +118,22 @@ impl Serving {
     where
         S: Fn(&Config) -> fbt::Settings + Clone,
     {
-        let problem = match local::start_with(&self.paths, serve, settings.clone()).await {
-            Ok(running) => return Ok(running),
-            Err(problem) if !serve || problem == local::ALREADY_RUNNING => return Err(problem),
-            Err(problem) => problem,
+        // Serving to other machines needs logins: the switch asks for a user name and a password, and a
+        // config edited since to turn logins off (or to drop every user) would serve the page to the
+        // network with only the Host guard. Such a start serves nothing: the window gets its engine
+        // alone, and the Serving section the line.
+        let problem = if serve
+            && !self
+                .config()
+                .is_some_and(|config| local::logins_on(&config))
+        {
+            local::LOGINS_OFF.to_string()
+        } else {
+            match local::start_with(&self.paths, serve, settings.clone()).await {
+                Ok(running) => return Ok(running),
+                Err(problem) if !serve || problem == local::ALREADY_RUNNING => return Err(problem),
+                Err(problem) => problem,
+            }
         };
         eprintln!("{problem}");
         let running = local::start_with(&self.paths, false, settings).await?;
@@ -817,6 +831,78 @@ mod tests {
         drop(squatter);
         if let Some(this) = state.startup().take_when_settled(DEADLINE).await {
             this.stop().await;
+        }
+        drop(app);
+    }
+
+    /// With the switch saved on but logins turned off in `config.yaml` since (or every user removed), the
+    /// first start does not serve: the window gets its engine alone, and the Serving section has the line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_start_with_logins_off_serves_nothing() {
+        let app = running("desktop-serving-logins-off").await;
+        let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, free_loopback_port()));
+        app.apply(on(&bind.to_string(), "alice", "hunter2"))
+            .await
+            .expect("serving turns on");
+        let paths = app.serving.paths.clone();
+        let store = app.serving.settings.clone();
+        if let Some(this) = app.state.startup().take_when_settled(DEADLINE).await {
+            this.stop().await;
+        }
+        let config_file = paths.library().config_file();
+        let edit = |change: &dyn Fn(&mut Config)| {
+            let mut config = Config::load_for_edit(&config_file)
+                .expect("reads")
+                .expect("there");
+            change(&mut config);
+            config.save(&config_file).expect("saves");
+        };
+
+        for (what, change) in [
+            (
+                "logins off",
+                &(|config: &mut Config| {
+                    config
+                        .server
+                        .as_mut()
+                        .expect("a server section")
+                        .auth
+                        .enabled = Some(false);
+                }) as &dyn Fn(&mut Config),
+            ),
+            (
+                "no user",
+                &(|config: &mut Config| {
+                    let server = config.server.as_mut().expect("a server section");
+                    server.auth.enabled = Some(true);
+                    server.auth.users.clear();
+                }) as &dyn Fn(&mut Config),
+            ),
+        ] {
+            edit(change);
+            store
+                .change(|settings| {
+                    settings.serve.enabled = true;
+                    Ok(())
+                })
+                .expect("the switch is saved on");
+            let serving = Serving::new(paths.clone(), store.clone());
+            let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
+                .await
+                .expect("in time")
+                .expect("starts for the window");
+            assert!(!this.exposed(), "{what}: served with logins off");
+            let state = DesktopState::running(this);
+            let view = serving.view(state.serving_addr(), None);
+            assert!(view.address.is_none(), "{what}");
+            assert_eq!(
+                view.problem.as_deref(),
+                Some(crate::local::LOGINS_OFF),
+                "{what}: the line is kept for the Serving section"
+            );
+            if let Some(this) = state.startup().take_when_settled(DEADLINE).await {
+                this.stop().await;
+            }
         }
         drop(app);
     }

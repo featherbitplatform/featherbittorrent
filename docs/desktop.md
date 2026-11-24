@@ -314,6 +314,9 @@ stays the server's own rules in that same file: `server.allowed_hosts` for a nam
 the browser side does ([docs/server.md](server.md), [docs/web-ui.md](web-ui.md)). The section shows the
 address the page is reachable at, and while the address listens on more than loopback it warns that passwords
 travel unencrypted over `http`: for anything beyond your own network, put the page behind `https`.
+If `config.yaml` is edited later to turn logins off (`server.auth.enabled: false`) or to remove every user,
+the next start serves nothing: the window gets its engine as usual, and the section says why and turns the
+setting off until you turn it on again with a user name and a password.
 
 The app itself is unaffected either way: its window keeps reaching the engine on the private loopback port
 with its own secret, port open or closed, and the sign-in you complete in a browser is the browser's own.

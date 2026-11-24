@@ -50,6 +50,19 @@ pub fn paths_problem(problem: &ConfigError) -> String {
     }
 }
 
+/// Why Serve the web UI did not start: the library's config has logins off, or no user to sign in as.
+pub const LOGINS_OFF: &str = "Serve the web UI did not start: logins are off in the library's config.yaml, \
+     or it has no user. Turn it on again with a user name and a password.";
+
+/// Whether `config` has logins on and at least one user to sign in as: what serving to other machines
+/// needs.
+pub fn logins_on(config: &Config) -> bool {
+    config
+        .server
+        .as_ref()
+        .is_some_and(|server| server.auth_on() && !server.auth.users.is_empty())
+}
+
 /// This computer while it runs: the server, and the secret the page presents to it.
 pub struct ThisComputer {
     server: Server,
