@@ -227,9 +227,9 @@ function DesktopScreens() {
   }, [phase])
 
   // The player's Download, through the shell: a link to the engine's origin would take the
-  // window away. The store of running downloads lives above the per-instance page — switching
+  // window away. The store of running downloads lives above the per-instance page: switching
   // instances, or reconnecting This computer after a new launch token, remounts the page and not
-  // the store — so a running download survives it with its Cancel. Its records are composed with
+  // the store, so a running download survives it with its Cancel. Its records are composed with
   // the instance the page shows: a save belongs to the instance shown when it runs, which the
   // scoped view hands down to the store with every call.
   const downloadStore = useMemo(

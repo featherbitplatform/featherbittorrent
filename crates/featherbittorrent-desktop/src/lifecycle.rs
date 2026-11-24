@@ -913,16 +913,17 @@ mod tests {
         assert_eq!(lifecycle.phase(), QuitPhase::Quitting);
     }
 
-    /// The two stops a quit runs — taking the running downloads' part files down and This
-    /// computer's final save — run at the same time: the quit's total is the longer of the two, not
+    /// The two stops a quit runs, taking the running downloads' part files down and This
+    /// computer's final save, run at the same time: the quit's total is the longer of the two, not
     /// the sum, so it stays inside the [`QUIT_WAIT`] the event loop's Exit handler waits for.
-    /// A 1 s download cap beside a 3 s engine stop: run one after the other they would take 4 s.
-    #[tokio::test]
+    /// Paused time makes the total exact rather than wall-clock dependent: a 1 s download cap
+    /// beside a 3 s engine stop measures 3 s run together, 4 s run one after the other.
+    #[tokio::test(start_paused = true)]
     async fn quit_stops_downloads_and_the_engine_at_the_same_time() {
         let downloads = crate::download::Downloads::new();
         // A save that does not end on its own: `stop_all` waits out its whole cap.
         let _watching = downloads.register("place-1");
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         // The engine stop measures its 3 seconds from the moment it is first polled: built at the
         // call, not before it, the way `stop_for_quit` runs its work only when stopped.
         stop_together(&downloads, Duration::from_secs(1), async move {
@@ -930,12 +931,9 @@ mod tests {
         })
         .await;
         let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(2900),
-            "the engine stop was cut short: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(3700),
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(3),
             "the two stops ran one after the other: {elapsed:?}"
         );
     }

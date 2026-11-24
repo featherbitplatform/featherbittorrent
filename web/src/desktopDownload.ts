@@ -36,7 +36,7 @@ export interface DesktopDownload {
   choosing(key: string): void
   /** Takes the record of file `key` down: the dialog was answered with no place, or its failure was dismissed. */
   forget(key: string): void
-  /** Runs the download of file `key`: saves the file at `url` to the place `handle` names and keeps {@link DesktopDownload.current} fresh while it runs. `instanceId` is the instance the save streams from — the store does not know it otherwise, and the shell's save needs it. Resolves when the file is saved or the download was cancelled, and rejects with the shell's line on any other failure — keeping a `failed` record with that line, for the next player opened on the file to show. */
+  /** Runs the download of file `key`: saves the file at `url` to the place `handle` names and keeps {@link DesktopDownload.current} fresh while it runs. `instanceId` is the instance the save streams from: the store does not know it otherwise, and the shell's save needs it. Resolves when the file is saved or the download was cancelled, and rejects with the shell's line on any other failure, keeping a `failed` record with that line, for the next player opened on the file to show. */
   run(key: string, handle: string, url: string, instanceId?: string): Promise<void>
 }
 
