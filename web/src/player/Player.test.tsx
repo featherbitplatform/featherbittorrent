@@ -14,7 +14,8 @@ import Player from './Player'
 import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
 import type { DesktopDownload, DownloadProgress } from '../desktopDownload'
 import { DesktopPlayerContext } from '../desktopPlayer'
-import type { DesktopPlayer } from '../desktopPlayer'import {
+import type { DesktopPlayer } from '../desktopPlayer'
+import {
   FakeBody,
   FakeMediaSource,
   FakeSourceBuffer,
@@ -634,6 +635,9 @@ describe('the player', () => {
     expect(bar.tagName).toBe('PROGRESS')
     expect(bar.getAttribute('value'), 'the progress bar got no value').toBe(String(WRITTEN))
     expect(bar.getAttribute('max'), 'the progress bar got no max').toBe(String(SIZE))
+    const line = screen.getByText('Downloading 42% (1.2 GiB of 2.9 GiB)')
+    expect(line.getAttribute('role'), 'the progress line sits in a live region').toBeNull()
+    expect(line.getAttribute('aria-live'), 'the progress line announces on every update').toBeNull()
     act(() => {
       held[0]!.saved()
     })
@@ -642,6 +646,7 @@ describe('the player', () => {
       screen.getByText('Saved.') !== null,
       'the saved file was not announced',
     ).toBe(true)
+    expect(screen.getByText('Saved.').getAttribute('role'), 'Saved. is not announced politely').toBe('status')
     expect(
       screen.getByRole('button', { name: 'Download' }) !== null,
       'the Download button did not come back',
@@ -772,6 +777,101 @@ describe('the player', () => {
     ).toBeNull()
     expect(held.length, 'a second download was started for the file').toBe(2)
     expect(chooses.length, 'the place was chosen more than twice for the file').toBe(2)
+  })
+
+  it('a file whose save dialog is open cannot be downloaded twice', async () => {
+    // The store records the save from the moment the dialog is asked, not from the moment it is
+    // answered: a player opened while an unanswered dialog stands must not start a second one.
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const { client } = probeClient(unplayable)
+    const held: HeldSave[] = []
+    const chooses: string[] = []
+    let answer: (place: string | null) => void = () => {}
+    const shell = createDownloads(
+      (name: string) =>
+        new Promise<string | null>((resolve) => {
+          chooses.push(name)
+          answer = resolve
+        }),
+      (_handle: string, url: string, onProgress: (progress: DownloadProgress) => void) =>
+        new Promise<void>((resolve, reject) => {
+          held.push({
+            url,
+            progress: onProgress,
+            saved: () => {
+              resolve()
+            },
+            failed: (line: string) => {
+              reject(line)
+            },
+          })
+        }),
+      async () => {},
+    )
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(chooses.length, 'no save dialog was opened').toBe(1)
+    // The player closes and opens again on the same store while that dialog is still open.
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    const offered = screen.getByRole<HTMLButtonElement>('button', { name: 'Download' })
+    expect(offered.disabled, 'a second start was offered while the dialog was open').toBe(true)
+    fireEvent.click(offered)
+    await settle()
+    expect(chooses.length, 'a second save dialog was opened for the same file').toBe(1)
+    // Answered with no place, the file is downloadable again.
+    await act(async () => {
+      answer(null)
+    })
+    await settle()
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Download' }).disabled,
+      'the file stayed blocked after the dialog was answered with no place',
+    ).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(chooses.length, 'a cancelled dialog left the file undownloadable').toBe(2)
+    await act(async () => {
+      answer('place-1')
+    })
+    await settle()
+    expect(held.length, 'no save was started for the file').toBe(1)
+  })
+
+  it('a download that failed while the player was closed is shown on reopening', async () => {
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    act(() => {
+      held[0]!.failed('The download broke off.')
+    })
+    // The failure happened with no player open: it waits in the store for the next one to show.
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByRole('alert').textContent,
+      'the failure that happened while closed was not shown',
+    ).toBe('The download broke off.')
+    // Dismissing it takes the record down for good.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert'), 'dismissing left the alert up').toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(screen.queryByRole('alert'), 'the dismissed failure came back').toBeNull()
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Download' }).disabled,
+      'the file stayed blocked after its failure was dismissed',
+    ).toBe(false)
   })
 
   it('managed media source attaches by srcObject', async () => {

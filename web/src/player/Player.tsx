@@ -33,7 +33,8 @@ import Button from '../components/Button'
 import { useConnection } from '../connection'
 import { CANCELLED_COPY, useDesktopDownload } from '../desktopDownload'
 import type { FileDownload } from '../desktopDownload'
-import { useDesktopPlayer } from '../desktopPlayer'import { isAbsolute } from '../endpoint'
+import { useDesktopPlayer } from '../desktopPlayer'
+import { isAbsolute } from '../endpoint'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe, formatBytes, formatPercent } from '../format'
 import { matches } from '../keys'
@@ -435,11 +436,14 @@ function DownloadOffer({
   onCancel(): void
 }) {
   const saving = download !== null && download.state === 'saving'
+  const choosing = download !== null && download.state === 'choosing'
   return (
     <>
       {saving && download !== null && (
         <>
-          <p role="status" aria-live="polite" className="max-w-sm text-center text-[13px] text-strong">
+          {/* Not a live region: this text changes several times a second. The bar's accessible
+              name carries the state; `Saved.` and `Download cancelled.` announce below. */}
+          <p className="max-w-sm text-center text-[13px] text-strong">
             {downloadProgressCopy(download)}
             <progress
               aria-label="Download progress"
@@ -454,7 +458,13 @@ function DownloadOffer({
       )}
       {!saving && (
         <>
-          <button type="button" aria-label="Download" onClick={onDownload} disabled={disabled} className={OFFER_BUTTON}>
+          <button
+            type="button"
+            aria-label="Download"
+            onClick={onDownload}
+            disabled={disabled || choosing}
+            className={OFFER_BUTTON}
+          >
             <Download className="h-4 w-4" aria-hidden="true" />
             Download
           </button>
@@ -508,7 +518,8 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   // `downloading` keeps a second Download from racing the first.
   const [opening, setOpening] = useState(false)
   // The shell's line for an open it refused, shown beside the button in Download's alert style.
-  const [openProblem, setOpenProblem] = useState<string | null>(null)  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
+  const [openProblem, setOpenProblem] = useState<string | null>(null)
+  // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
   // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
   // the buffer restarts the streams, and a drag writes dozens of values.
   const [scrub, setScrub] = useState<number | null>(null)
@@ -1094,9 +1105,10 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   }
 
   async function download(): Promise<void> {
-    // One download per file at a time: the store's `saving` covers a download that started before
-    // this player opened, and `downloading` the moment between the click and the store's entry.
-    if (downloading || fileDownload?.state === 'saving') return
+    // One download per file at a time: the store's `saving` covers a download that started
+    // before this player opened, its `choosing` a save dialog another player has open, and
+    // `downloading` the moment between this click and the store's entry.
+    if (downloading || fileDownload?.state === 'saving' || fileDownload?.state === 'choosing') return
     setDownloading(true)
     try {
       setDownloadProblem(null)
@@ -1107,8 +1119,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       // entry fresh (progress for the screen, the ending for whoever opens the player next) and
       // swallows a cancel; any other failure gets rethrown, and its line goes to the alert below.
       if (shell !== null) {
+        // The record starts with the dialog: a player opened on this file while the dialog is
+        // open cannot start a second save of it.
+        shell.choosing(fileKey)
         const handle = await shell.choose(name)
-        if (handle === null) return
+        if (handle === null) {
+          shell.forget(fileKey)
+          return
+        }
         await shell.run(fileKey, handle, await client.streamToken(id, file))
         return
       }
@@ -1127,6 +1145,9 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       anchor.click()
       anchor.remove()
     } catch (problem) {
+      // The marker comes down when the dialog or the token broke before any save started; a
+      // save that broke keeps its `failed` record, whose line the next player shows.
+      if (shell !== null && shell.current(fileKey)?.state === 'choosing') shell.forget(fileKey)
       setDownloadProblem(problem instanceof Error ? problem.message : String(problem))
     } finally {
       setDownloading(false)
@@ -1139,6 +1160,21 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
         // Nothing else to do: the save fails or finishes on its own, and the store shows that.
       })
     }
+  }
+
+  // A download of this file that failed while the player was closed: the store kept the shell's
+  // line beside the file, and it stands in the alert below until it is dismissed or the file is
+  // downloaded again. Taken up in the render, not from an effect; a line from this player's own
+  // attempt wins while one is up.
+  const failedLine =
+    fileDownload !== null && fileDownload.state === 'failed' && typeof fileDownload.line === 'string'
+      ? fileDownload.line
+      : null
+  const alertLine = downloadProblem ?? failedLine
+
+  function dismissDownloadProblem(): void {
+    setDownloadProblem(null)
+    if (shell !== null && fileDownload?.state === 'failed') shell.forget(fileKey)
   }
 
   /**
@@ -1320,10 +1356,16 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
             }}
             onCancel={cancelFileDownload}
           />
-          {openInPlayerControl()}          {downloadProblem !== null && (
-            <p role="alert" className="max-w-sm text-[13px] text-error">
-              {displaySafe(downloadProblem)}
-            </p>
+          {openInPlayerControl()}
+          {alertLine !== null && (
+            <>
+              <p role="alert" className="max-w-sm text-[13px] text-error">
+                {displaySafe(alertLine)}
+              </p>
+              <Button variant="secondary" size="sm" aria-label="Dismiss" onClick={dismissDownloadProblem}>
+                Dismiss
+              </Button>
+            </>
           )}
         </div>
       )}
@@ -1371,10 +1413,20 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
                   }}
                   onCancel={cancelFileDownload}
                 />
-                {downloadProblem !== null && (
-                  <p role="alert" className="max-w-sm text-[13px] text-error">
-                    {displaySafe(downloadProblem)}
-                  </p>
+                {alertLine !== null && (
+                  <>
+                    <p role="alert" className="max-w-sm text-[13px] text-error">
+                      {displaySafe(alertLine)}
+                    </p>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      aria-label="Dismiss"
+                      onClick={dismissDownloadProblem}
+                    >
+                      Dismiss
+                    </Button>
+                  </>
                 )}
                 {openInPlayerControl()}
               </div>

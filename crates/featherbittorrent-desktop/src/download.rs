@@ -234,10 +234,18 @@ pub async fn save_to(
     drop(response);
     drop(file);
     let result = match result {
-        Ok(written) => tokio::fs::rename(&partial, destination)
-            .await
-            .map(|()| written)
-            .map_err(|_| SAVE_FAILED.to_string()),
+        Ok(written) => {
+            // A cancel that landed while the file was flushed and synced still cancels: this is
+            // the last point where it can, right where the rename happens.
+            if *cancel.borrow() {
+                Err(CANCELLED.to_string())
+            } else {
+                tokio::fs::rename(&partial, destination)
+                    .await
+                    .map(|()| written)
+                    .map_err(|_| SAVE_FAILED.to_string())
+            }
+        }
         Err(problem) => Err(problem),
     };
     if result.is_err() {
@@ -984,5 +992,52 @@ mod tests {
         );
         let fresh = downloads.register("place-1");
         assert!(!*fresh.borrow(), "a download started again is uncancelled");
+    }
+
+    /// The cancel that arrives on the tail of the last progress report, while the file is being
+    /// flushed and synced, still cancels: the rename is checked again right before it happens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_after_the_last_report_still_cancels_the_rename() {
+        let dir = ScratchDir::new("desktop-download-cancel-rename");
+        let body: Vec<u8> = (0..70_000u32).map(|n| (n % 7) as u8).collect();
+        let base = answering("200 OK", body.clone()).await;
+        let target = stream_target(&base, &stream(&base)).expect("a target");
+        let destination = dir.path().join("movie.mkv");
+        let (sender, cancel) = watch::channel(false);
+        let mut asked = false;
+
+        let problem = tokio::time::timeout(
+            Duration::from_secs(30),
+            save_to(
+                &client(),
+                target,
+                &destination,
+                |progress| {
+                    // The tail of the reports: the whole file against the answer's length. The
+                    // cancel lands after the last check before the report, in the flush-and-sync
+                    // stretch that precedes the rename itself.
+                    if progress.received > 0 && progress.total == Some(progress.received) && !asked
+                    {
+                        asked = true;
+                        let _ = sender.send(true);
+                    }
+                },
+                cancel,
+            ),
+        )
+        .await
+        .expect("within the deadline")
+        .expect_err("a download cancelled before its rename is not a file");
+
+        assert_eq!(problem, "Download cancelled.");
+        assert!(
+            !destination.exists(),
+            "the cancelled download renamed its part file"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the folder")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "the cancelled download left {left:?}");
     }
 }

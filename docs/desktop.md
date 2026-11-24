@@ -114,8 +114,9 @@ The player's `Download` asks where to save first, then writes the file there in 
 has gotten shows in the player (`Downloading 42% (1.2 GiB of 2.9 GiB)`, or the bytes so far where the
 server gives no file size), and `Cancel download` stops it. Closing the player keeps a download running;
 reopen it on the same file and the download is shown where it stands, and only one download runs per file
-at a time. A cancelled download, and any download that did not finish, leaves no partial file: quitting
-the app cancels the downloads that are running and takes their `<name>.<random>.part` files away.
+at a time. A cancelled download leaves no partial file: quitting the app stops the downloads that are
+running and takes their partial files away; a crash can leave one behind, named `<name>.<random>.part`
+next to the place you chose.
 
 Playing a file here does what it does in a browser: the file
 goes to High priority and downloads in order, the torrent's other files keep their priorities, and the

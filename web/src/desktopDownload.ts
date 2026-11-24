@@ -32,8 +32,12 @@ export interface DesktopDownload {
   current(key: string): FileDownload | null
   /** Calls `changed` whenever any file's download changes; answers the function that stops listening. */
   subscribe(changed: () => void): () => void
-  /** Runs the download of file `key`: saves the file at `url` to the place `handle` names and keeps {@link DesktopDownload.current} fresh while it runs. Resolves when the file is saved or the download was cancelled, and rejects with the shell's line on any other failure (when the download is forgotten again and the player shows the line). */
-  run(key: string, handle: string, url: string): Promise<void>
+  /** Marks file `key` as having its save dialog open: while that stands, no other player opened on the file can start a second save of it. */
+  choosing(key: string): void
+  /** Takes the record of file `key` down: the dialog was answered with no place, or its failure was dismissed. */
+  forget(key: string): void
+  /** Runs the download of file `key`: saves the file at `url` to the place `handle` names and keeps {@link DesktopDownload.current} fresh while it runs. `instanceId` is the instance the save streams from — the store does not know it otherwise, and the shell's save needs it. Resolves when the file is saved or the download was cancelled, and rejects with the shell's line on any other failure — keeping a `failed` record with that line, for the next player opened on the file to show. */
+  run(key: string, handle: string, url: string, instanceId?: string): Promise<void>
 }
 
 /** One report from the shell while it writes: `received` bytes so far, and `total`, the file's size, null when the answer brought no length to report against. */
@@ -44,14 +48,17 @@ export interface DownloadProgress {
 
 /**
  * One file's download, kept above the player: the shell's `handle`, how far the writing has
- * gotten, and `state`: `saving` while bytes arrive, `saved` or `cancelled` once the download ends.
- * A failure leaves no download behind: the player says the shell's line itself.
+ * gotten, and `state`: `choosing` while the save dialog is open, `saving` while bytes arrive, and
+ * `saved`, `cancelled` or `failed` once the download ends. A `failed` download keeps the shell's
+ * line in `line`, for the next player opened on the file to show.
  */
 export interface FileDownload {
   handle: string
   received: number
   total: number | null
-  state: 'saving' | 'saved' | 'cancelled'
+  state: 'choosing' | 'saving' | 'saved' | 'cancelled' | 'failed'
+  /** The shell's line, kept for a `failed` download. */
+  line?: string
 }
 
 /** The line the shell rejects a cancelled download with, and the line the player then shows. */
@@ -66,7 +73,12 @@ export const CANCELLED_COPY = 'Download cancelled.'
  */
 export function createDownloads(
   choose: (name: string) => Promise<string | null>,
-  save: (handle: string, url: string, onProgress: (progress: DownloadProgress) => void) => Promise<void>,
+  save: (
+    handle: string,
+    url: string,
+    onProgress: (progress: DownloadProgress) => void,
+    instanceId?: string,
+  ) => Promise<void>,
   cancel: (handle: string) => Promise<void>,
 ): DesktopDownload {
   const files = new Map<string, FileDownload>()
@@ -94,7 +106,13 @@ export function createDownloads(
         listeners.delete(notify)
       }
     },
-    async run(key: string, handle: string, url: string): Promise<void> {
+    choosing(key: string): void {
+      put(key, { handle: '', received: 0, total: null, state: 'choosing' })
+    },
+    forget(key: string): void {
+      put(key, null)
+    },
+    async run(key: string, handle: string, url: string, instanceId?: string): Promise<void> {
       put(key, { handle, received: 0, total: null, state: 'saving' })
       try {
         await save(handle, url, (progress) => {
@@ -102,7 +120,7 @@ export function createDownloads(
           if (was !== undefined && was.state === 'saving') {
             put(key, { ...was, received: progress.received, total: progress.total })
           }
-        })
+        }, instanceId)
         settle(key, 'saved')
       } catch (problem) {
         const line = problem instanceof Error ? problem.message : String(problem)
@@ -110,10 +128,40 @@ export function createDownloads(
           settle(key, 'cancelled')
           return
         }
-        put(key, null)
+        // The failure stays on the record with the shell's line: a player that opens on this
+        // file later shows it, and only dismissing it or starting again takes it down.
+        const was = files.get(key)
+        put(key, {
+          handle: was?.handle ?? handle,
+          received: was?.received ?? 0,
+          total: was?.total ?? null,
+          state: 'failed',
+          line,
+        })
         throw problem
       }
     },
+  }
+}
+
+/**
+ * The store's records re-keyed per instance: `current`, `run`, `choosing` and `forget` take the
+ * page's file key and add `instanceId`, and `run` hands it to the shell's save too. The view is
+ * built for the instance the page shows at the time, so switching the instance neither drops
+ * another instance's running download nor shows it as the new instance's own. The rest passes
+ * straight through.
+ */
+export function scopedDownloads(store: DesktopDownload, instanceId: string): DesktopDownload {
+  const at = (key: string): string => `${instanceId}:${key}`
+  return {
+    choose: (name) => store.choose(name),
+    save: (handle, url, onProgress) => store.save(handle, url, onProgress),
+    cancel: (handle) => store.cancel(handle),
+    current: (key) => store.current(at(key)),
+    subscribe: (changed) => store.subscribe(changed),
+    choosing: (key) => store.choosing(at(key)),
+    forget: (key) => store.forget(at(key)),
+    run: (key, handle, url) => store.run(at(key), handle, url, instanceId),
   }
 }
 
