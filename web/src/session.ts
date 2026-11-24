@@ -35,12 +35,29 @@
  * generation / endSession), so the rules are testable without a DOM, and `useSession` is the React
  * reading of that store rather than a second implementation of it.
  *
+ * The desktop app has no cookie: it talks to an engine at an address of its own with a bearer token
+ * (a `bearer` endpoint). Its store keeps the same states and the same generation rule, with two
+ * differences. A token handed in at launch is a session from the start (`signedIn` as `desktop`,
+ * nothing to ask the server); with none, the page starts on the sign-in screen and a sign-in is
+ * `POST /api/v1/auth/session` with `Authorization: Basic`, whose answer's token lives in this closure
+ * only, for the same reasons the CSRF value does. Two sign-ins sent before either answer arrives
+ * share one post, so a token the server minted is never left orphaned there. A `401` ends it exactly
+ * as it ends a cookie session.
+ *
  * @module session
  */
 import { useEffect, useSyncExternalStore } from 'react'
+import { SAME_ORIGIN, resolve } from './endpoint'
+import type { Endpoint } from './endpoint'
 
 /** The one endpoint every question about this session asks. It is this server's own, not part of the generated API document, which is why its shapes are written by hand here. */
 const ENDPOINT = '/api/v1/auth/web-session'
+
+/** The desktop's sign-in: user and password in, a bearer token out. */
+const BEARER_SIGN_IN = '/api/v1/auth/session'
+
+/** Who a session started from a launch token is: the desktop app's own engine has no user name to show. */
+export const DESKTOP_SUBJECT = 'desktop'
 
 /**
  * The notice the Sign in screen shows when a call finds the session gone mid-use. The plan names
@@ -120,13 +137,16 @@ export interface SessionStore {
    * sign-in screen's last message).
    */
   endSession(ended: number): void
+  /** The bearer token calls carry right now, or null: always null for the browser's cookie session. */
+  token(): string | null
 }
 
 /**
  * The store, over an injected `fetch` so the tests answer it themselves and nothing here needs a
  * running server. The states it walks are the rules; only the transport is a parameter.
  */
-export function createSessionStore(fetchFn: typeof fetch): SessionStore {
+export function createSessionStore(fetchFn: typeof fetch, endpoint: Endpoint = SAME_ORIGIN): SessionStore {
+  if (endpoint.kind === 'bearer') return createBearerStore(fetchFn, endpoint)
   let state: SessionState = { phase: 'loading' }
   let token: string | null = null
   // Which session the page is in the middle of. Every start and every end of a session moves it,
@@ -303,6 +323,144 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
       generation += 1
       signedOut(null, SESSION_ENDED)
     },
+    token: () => null,
+  }
+}
+
+/** `user:password` as HTTP Basic wants it: the UTF-8 bytes, base64. `btoa` alone refuses anything past Latin-1. */
+function basic(user: string, password: string): string {
+  let binary = ''
+  for (const byte of new TextEncoder().encode(`${user}:${password}`)) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+/** The desktop's store: a bearer token in memory, from the launch or from a sign-in. */
+function createBearerStore(
+  fetchFn: typeof fetch,
+  endpoint: Extract<Endpoint, { kind: 'bearer' }>,
+): SessionStore {
+  let token = endpoint.token
+  let generation = token === null ? 0 : 1
+  let state: SessionState =
+    token === null
+      ? { phase: 'signedOut', notice: null, error: null }
+      : { phase: 'signedIn', subject: DESKTOP_SUBJECT, csrf: '', error: null }
+  const listeners = new Set<() => void>()
+  // The sign-in in flight, shared the way the cookie store shares one refresh. Every accepted post
+  // mints its own token on the server, so two taps before either answer arrives must share one post:
+  // two posts would leave the first token valid there while the page only ever kept the second.
+  let signingIn: Promise<boolean> | null = null
+
+  function set(next: SessionState): void {
+    state = next
+    for (const listener of listeners) listener()
+  }
+
+  function signedOut(notice: string | null, error: string | null): void {
+    token = null
+    set({ phase: 'signedOut', notice, error })
+  }
+
+  async function attemptSignIn(user: string, password: string): Promise<boolean> {
+    const notice = state.phase === 'signedOut' ? state.notice : null
+    let response: Response
+    try {
+      response = await fetchFn(resolve(endpoint, BEARER_SIGN_IN), {
+        method: 'POST',
+        headers: { authorization: `Basic ${basic(user, password)}` },
+        credentials: 'omit',
+      })
+    } catch {
+      signedOut(notice, SIGN_IN_FAILED)
+      return false
+    }
+    if (response.ok) {
+      let body: { token?: unknown; subject?: unknown } = {}
+      try {
+        body = (await response.json()) as typeof body
+      } catch {
+        // Not JSON: no token in it, which the check below says.
+      }
+      if (typeof body.token === 'string' && typeof body.subject === 'string') {
+        token = body.token
+        generation += 1
+        set({ phase: 'signedIn', subject: body.subject, csrf: '', error: null })
+        return true
+      }
+      signedOut(notice, SIGN_IN_FAILED)
+      return false
+    }
+    let error = SIGN_IN_FAILED
+    if (response.status === 401) error = WRONG_CREDENTIALS
+    else if (response.status === 429) error = RATE_LIMITED
+    else {
+      try {
+        const body = (await response.json()) as { error?: { message?: unknown } }
+        const detail = body?.error?.message
+        if (typeof detail === 'string' && detail !== '') error = detail
+      } catch {
+        // No words of its own to borrow.
+      }
+    }
+    signedOut(notice, error)
+    return false
+  }
+
+  return {
+    get: () => state,
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+    // Nothing to ask: a launch token is a session and no token is the sign-in screen, both known
+    // before any answer could arrive.
+    refresh: async () => {},
+    // One sign-in in flight at a time: a second caller while the first post is out gets that post's
+    // answer rather than sending its own, so no minted token is left orphaned on the server.
+    signIn: (user, password) => {
+      signingIn ??= attemptSignIn(user, password).finally(() => {
+        signingIn = null
+      })
+      return signingIn
+    },
+    // The same rule as the cookie store: the server ends the session, because the token has already
+    // travelled in query strings and forgetting it here would leave it good until it expires. A 2xx
+    // or a 401 means it is over; anything else left it alive, so the page stays signed in and says so.
+    signOut: async () => {
+      if (state.phase !== 'signedIn' || token === null) return
+      const given = token
+      const mine = generation
+      let ended: boolean
+      try {
+        const response = await fetchFn(resolve(endpoint, BEARER_SIGN_IN), {
+          method: 'DELETE',
+          headers: { authorization: `Bearer ${given}` },
+          credentials: 'omit',
+        })
+        ended = response.ok || response.status === 401
+      } catch {
+        ended = false
+      }
+      // A `401` elsewhere may have ended this session while the DELETE was in flight: that ending,
+      // and its notice, already happened.
+      if (generation !== mine || state.phase !== 'signedIn') return
+      if (ended) {
+        generation += 1
+        signedOut(null, null)
+        return
+      }
+      set({ ...state, error: SIGN_OUT_FAILED })
+    },
+    csrf: () => null,
+    generation: () => generation,
+    endSession: (ended) => {
+      if (ended !== generation || state.phase === 'signedOut') return
+      generation += 1
+      signedOut(SESSION_ENDED, null)
+    },
+    token: () => token,
   }
 }
 
@@ -310,22 +468,22 @@ export function createSessionStore(fetchFn: typeof fetch): SessionStore {
 export const session = createSessionStore(fetch)
 
 /** The state the page renders, plus the things a person can do about it. */
-export function useSession(): {
+export function useSession(store: SessionStore = session): {
   state: SessionState
   signIn: (user: string, password: string) => Promise<boolean>
   signOut: () => Promise<void>
   refresh: () => Promise<void>
 } {
-  const state = useSyncExternalStore(session.subscribe, session.get)
+  const state = useSyncExternalStore(store.subscribe, store.get)
   // The server answers before anything about this cookie is known, so nothing is drawn as decided
   // until that answer has arrived.
   useEffect(() => {
-    void session.refresh()
-  }, [])
+    void store.refresh()
+  }, [store])
   return {
     state,
-    signIn: session.signIn,
-    signOut: session.signOut,
-    refresh: () => session.refresh(),
+    signIn: store.signIn,
+    signOut: store.signOut,
+    refresh: () => store.refresh(),
   }
 }

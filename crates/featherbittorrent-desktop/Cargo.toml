@@ -1,0 +1,86 @@
+[package]
+name = "featherbittorrent-desktop"
+description = "featherbittorrent desktop app: the web UI in a native window, with This computer's engine behind it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "featherbittorrent-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+# Reads `tauri.conf.json` and the capabilities, and embeds what `generate_context!` needs.
+tauri-build.workspace = true
+
+[dependencies]
+# The window, the webview and the commands the page calls; `tray-icon` for the tray (Task 8).
+tauri = { workspace = true, features = ["tray-icon"] }
+# Start at login: the app's own login item, launched with `--background`.
+tauri-plugin-autostart.workspace = true
+# One copy of the app: a second launch forwards its arguments (the links and files it was opened with)
+# to the first and exits.
+tauri-plugin-single-instance.workspace = true
+# The `magnet:` scheme and the links the system hands the running app (`opened.rs`).
+tauri-plugin-deep-link.workspace = true
+# A `.torrent` the app was opened with goes to the page as base64 (`opened.rs`).
+base64.workspace = true
+# The file URLs macOS hands an app that was opened with a `.torrent`.
+url.workspace = true
+# The quit signals on Unix (SIGTERM, SIGINT, SIGHUP), so a stop by signal still runs the final save; the
+# wait on This computer's start (`startup.rs`: a notify, a timeout, `pin!`); and the async lock that keeps
+# a start or restart of This computer and a quit from overlapping (`sync`). The runtime itself is Tauri's;
+# this only names the features.
+tokio = { workspace = true, features = ["signal", "sync", "time", "macros"] }
+# `generate_context!` expands to code that names `serde_json` from the crate that calls it, so it has to
+# be a direct dependency (the Tauri spike's finding).
+serde_json.workspace = true
+# The answers the commands hand the page.
+serde.workspace = true
+# Where the app's files live, its settings file and the launch secret.
+fbtt-desktop-core.workspace = true
+# This computer's library: its config and its lock.
+fbtt-core.workspace = true
+# This computer's engine, served on loopback with the launch secret (`Server::start_desktop`). `web-ui`:
+# with Serve the web UI on, the engine serves the browser page to other machines as the full build does
+# (the app needs `web/dist` built anyway, for its own window).
+fbtt-server = { workspace = true, features = ["web-ui"] }
+# The engine's own settings type, which `Server::start_desktop` takes beside the config.
+fbt.workspace = true
+# Saved instance passwords, in the system keychain (`keychain.rs`).
+keyring.workspace = true
+# Holds a saved password while the shell signs in with it, and overwrites it when done.
+zeroize.workspace = true
+# The shell's HTTP client for remote instances: the saved-password sign-in and the reachability probe.
+# rustls, as `fbtt-core` already asks for it, so https servers need no system TLS stack.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
+# The native message for a library already in use. macOS needs no feature: its alert is the
+# platform's own. Windows takes the same common controls v6 the webview's manifest asks for, as
+# `tauri-plugin-dialog` does. Everywhere else it is GTK 3, which the webview links anyway.
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+rfd = { workspace = true, features = ["common-controls-v6"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+rfd = { workspace = true, features = ["gtk3"] }
+# Whether the session bus has a tray host: the tray builder succeeds on a desktop without one.
+zbus.workspace = true
+
+[dev-dependencies]
+# `fbtt_core::scratch`: each test runs This computer on a library of its own.
+fbtt-core = { workspace = true, features = ["test-support"] }
+# The tests' runtime, the deadline every wait is under, and the raw loopback socket of the stand-in server
+# that answers a sign-in with a body over the cap.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+# The tests' client: plain http to loopback, so no TLS stack is asked for.
+reqwest.workspace = true

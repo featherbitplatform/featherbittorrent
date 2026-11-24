@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 # Bumped on the release/X.Y.Z branch; main holds the annotated vX.Y.Z tag.
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -33,6 +33,9 @@ fbtt-tui = { path = "crates/fbtt-tui" }
 fbtt-server = { path = "crates/fbtt-server" }
 # Joins the table now that the server's media routes read a file through it.
 fbtt-media = { path = "crates/fbtt-media" }
+# The desktop app's own core (plan 2026-11-23-desktop-app): paths, settings, instances, the launch
+# secret and handed-over links and files, joined by the Tauri shell when it starts (Task 5).
+fbtt-desktop-core = { path = "crates/fbtt-desktop-core" }
 clap = { version = "4.6", features = ["derive"] }
 # The man pages and shell completions the packages install, written by the hidden `generate-assets`
 # subcommand from the same `Command` that prints `--help`, so they cannot drift from the flags.
@@ -190,3 +193,33 @@ subtle = "2.6"
 # and timestamp values.
 matroska-demuxer = { git = "https://github.com/featherbitplatform/matroska-demuxer", tag = "v0.8.1+featherbit.1" }
 mp4-atom = "0.17.1"
+
+# The desktop app's shell (plan 2026-11-23-desktop-app, Task 5): Tauri 2 and its build helper, pinned
+# exactly to the versions the Tauri spike built together (2.x, not the 3.0 alpha line `cargo search`
+# lists first), with the default features the spike built with. `tauri-cli` is installed at its own
+# exact version where the bundles are made, not here. The three plugins join this table with the tasks
+# that use them, at the spike's versions (single instance 2.5.5 and deep link 2.6.3 with the handed-over
+# links, autostart 2.7.0 with Start at login): cargo warns about a workspace entry no crate uses. The
+# keychain is the workspace `keyring` entry above, already in this tree for the CLI.
+tauri = "=2.12.7"
+tauri-build = "=2.7.6"
+# The one native message the desktop app shows before it has a window: the library is already in use
+# (or there is no home directory to keep it in). No default features: the Linux half is GTK 3, which
+# the webview already links, rather than the xdg portal and its async stack. 0.17 is the line
+# `tauri-plugin-dialog` 2.8 uses: it links the same `gtk-sys` 0.18 as Tauri, and two copies of a crate
+# that links `gtk-3` cannot be in one build.
+rfd = { version = "=0.17.2", default-features = false }
+# Start at login (plan 2026-11-23-desktop-app, Task 8): the app writes and removes its own login item at
+# runtime (a LaunchAgent on macOS, the Run key on Windows, an XDG autostart entry on Linux), launched with
+# `--background`. Pinned to the spike's version, which needs tauri ^2.12 like the rest.
+tauri-plugin-autostart = "=2.7.0"
+# A second launch hands its arguments (a `magnet:` link, a `.torrent` file) to the copy already running
+# and exits (Task 9). Pinned to the spike's version.
+tauri-plugin-single-instance = "=2.5.5"
+# The `magnet:` scheme: registered with the system from `plugins.deep-link` in `tauri.conf.json` when the
+# app is bundled, and the links the system hands the running app (Task 9). Pinned to the spike's version.
+tauri-plugin-deep-link = "=2.6.3"
+# The Linux tray check (Task 8): whether a StatusNotifier host owns `org.kde.StatusNotifierWatcher` on the
+# session bus, since the tray builder succeeds without one. Already in the tree through keyring's Linux
+# store, at its default features (async-io and the blocking API), so this adds no crates.
+zbus = "5.19"

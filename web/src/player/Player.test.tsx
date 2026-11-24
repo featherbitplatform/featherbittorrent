@@ -9,6 +9,7 @@ import type { EngineProbe } from './engine'
 import { toSource } from './time'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
+import { DesktopDownloadContext } from '../desktopDownload'
 import {
   FakeBody,
   FakeMediaSource,
@@ -20,7 +21,7 @@ import {
   makeVideoPlayable,
   makeVideoSeekable,
 } from './testing'
-import { FOCUSABLE_SELECTOR } from '../modal'
+import { FOCUSABLE_SELECTOR, MODAL_CENTRED } from '../modal'
 import { KEY_BINDINGS } from '../keys'
 
 
@@ -315,6 +316,16 @@ describe('the Files tab', () => {
 })
 
 describe('the player', () => {
+  it('opens centred in the window', () => {
+    // Preflight zeroes the `margin: auto` a browser centres a modal with; the shared class puts it back.
+    const { client } = probeClient()
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    const dialog = document.querySelector('dialog')
+    expect(dialog, 'the player is not a dialog').not.toBeNull()
+    expect(dialog!.className.split(' ')).toContain(MODAL_CENTRED)
+    expect(dialog!.className.split(' '), 'the player lost its phone margin').toContain('max-[640px]:m-0')
+  })
+
   it('lists audio and subtitle choices', async () => {
     const { client } = probeClient()
     render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
@@ -402,6 +413,105 @@ describe('the player', () => {
       followed.includes('/api/v1/stream/x?token=abc'),
       `the anchor did not follow the returned path (got ${followed})`,
     ).toBe(true)
+  })
+
+  it('download in the desktop app asks where to save before the token, and clicks no link', async () => {
+    // In the app the token route answers an absolute address on the engine's own origin, which is
+    // not the page's. Clicking it would navigate the whole window to the media address, so the
+    // shell saves it. The save dialog is answered before the token is asked for: the token lives
+    // 60 seconds, and a person can take longer than that to choose a folder.
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const address = 'http://127.0.0.1:53211/api/v1/torrents/abc/files/0/stream?token=abc'
+    const order: string[] = []
+    let answerDialog: (handle: string | null) => void = () => {}
+    const recorder = fakeFetch()
+    const client: Api = {
+      ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
+      probe: async () => unplayable,
+      cues: async () => ({ cues: [] }),
+      subtitleFile: async () => ({ cues: [] }),
+      streamToken: async () => {
+        order.push('token')
+        return address
+      },
+    }
+    const saved: Array<[string, string]> = []
+    const shell = {
+      choose: (name: string) =>
+        new Promise<string | null>((resolve) => {
+          order.push(`dialog ${name}`)
+          answerDialog = (handle) => {
+            order.push('dialog answered')
+            resolve(handle)
+          }
+        }),
+      save: async (handle: string, url: string) => {
+        order.push('save')
+        saved.push([handle, url])
+      },
+    }
+    const clicked: string[] = []
+    const originalClick = HTMLAnchorElement.prototype.click
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
+      clicked.push(this.href)
+    }
+    try {
+      render(
+        <DesktopDownloadContext.Provider value={shell}>
+          <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
+        </DesktopDownloadContext.Provider>,
+      )
+      await settle()
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+      expect(order, 'the token was asked for while the dialog was open').toEqual(['dialog movie.mkv'])
+      await act(async () => answerDialog('place-1'))
+      await settle()
+
+      // Cancelled: no token at all.
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+      await act(async () => answerDialog(null))
+      await settle()
+    } finally {
+      ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
+    }
+    expect(order).toEqual(['dialog movie.mkv', 'dialog answered', 'token', 'save', 'dialog movie.mkv', 'dialog answered'])
+    expect(clicked, 'a link was clicked').toEqual([])
+    expect(saved, 'the shell was not asked to save the file').toEqual([['place-1', address]])
+  })
+
+  it('download of a cross-origin address with no shell says so and clicks nothing', async () => {
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const recorder = fakeFetch()
+    const client: Api = {
+      ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
+      probe: async () => unplayable,
+      cues: async () => ({ cues: [] }),
+      subtitleFile: async () => ({ cues: [] }),
+      streamToken: async () => 'http://127.0.0.1:53211/api/v1/torrents/abc/files/0/stream?token=abc',
+    }
+    const clicked: string[] = []
+    const originalClick = HTMLAnchorElement.prototype.click
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
+      clicked.push(this.href)
+    }
+    try {
+      render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+      await settle()
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+    } finally {
+      ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
+    }
+    expect(clicked, 'a link was clicked').toEqual([])
+    expect(screen.getByRole('alert').textContent).toBe('This file cannot be downloaded here.')
   })
 
   it('managed media source attaches by srcObject', async () => {

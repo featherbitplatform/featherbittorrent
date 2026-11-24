@@ -258,6 +258,14 @@ pub struct ServerConfig {
     /// When the browser session cookie carries the `Secure` flag. See [`CookieSecure`].
     #[serde(default, skip_serializing_if = "CookieSecure::is_auto")]
     pub cookie_secure: CookieSecure,
+    /// The origins of clients served from somewhere else that may call this API from a browser engine:
+    /// the desktop app's webview (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on
+    /// Windows) is the one this is for. Each entry is a whole origin, scheme included, and is handed to
+    /// fbt-api's CORS layer as it is. Being on this list changes nothing about credentials: a listed
+    /// origin still has to sign in, and the browser session cookie keeps its own origin rule. Empty, the
+    /// default, means no cross-origin caller at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -273,6 +281,7 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             web_ui: None,
             cookie_secure: CookieSecure::default(),
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -566,8 +575,7 @@ impl Config {
         {
             create_private_dir(parent).map_err(cannot_write)?;
         }
-        write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, text.as_bytes())
-            .map_err(cannot_write)
+        replace_file(path, text.as_bytes()).map_err(cannot_write)
     }
 
     /// This config as it belongs in a file: the roots unnamed when they are the one directory
@@ -768,10 +776,14 @@ fn player_problem_line(path: &Path, problem: &str) -> String {
 }
 
 /// Writes `bytes` into `path` the way every featherbittorrent file is written: a temp
-/// file beside the target, readable only by the owner on Unix, synced, then renamed over
-/// it. The session state save shares this so both files are replaced by the same rules
-/// ([`crate::LocalBackend`]).
-pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// file beside the target (`<file>.tmp`), readable only by the owner on Unix, synced, then
+/// renamed over it, so a reader sees either the old file or the new one and never half of
+/// each. This is the product's one rule for writing a file atomically with private
+/// permissions: the config save, the session state save ([`crate::LocalBackend`]) and the
+/// desktop app's settings save all go through it. A leftover temp file from a failed write is
+/// taken out of the way first, so its mode is never the mode the file ends up with. The
+/// directory must already exist; [`create_private_dir`] makes it the same way.
+pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_then_rename(&suffixed(path, TEMP_FILE_SUFFIX), path, bytes)
 }
 
@@ -827,9 +839,10 @@ fn create_private_file(temp: &Path) -> std::io::Result<std::fs::File> {
 /// Makes `dir` and every missing directory above it, owner-only on Unix for the same reason the
 /// file inside it is: 0700 keeps another local user out of the folder holding the hashes. Only what
 /// this call creates gets that mode; a directory that was already there keeps whatever its owner
-/// chose for it.
+/// chose for it. The directory half of the rule [`replace_file`] is the file half of: every
+/// featherbittorrent save that may have to make its directory makes it here.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     let mut builder = std::fs::DirBuilder::new();
@@ -840,7 +853,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Makes `dir` and every missing parent, as it always has on a platform where the mode a new
 /// directory gets is not something this call decides.
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -1486,6 +1499,63 @@ mod tests {
             yaml_value(&written, "cookie_secure"),
             None,
             "no cookie line for the rule nobody changed: {written}"
+        );
+    }
+
+    /// The desktop webview's origin key round-trips: a YAML that names `cors_origins` reads them into
+    /// the field, what the save writes back reads in again as the same config, and a config that names
+    /// none - the state every config file was in before this key existed - still writes no
+    /// `cors_origins` line, so a save never adds one to a file that never had it.
+    #[test]
+    fn cors_origins_round_trips_in_yaml() {
+        let dir = ScratchDir::new("config_cors_origins_round_trip");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        fs::write(&path, "server:\n  cors_origins: [tauri://localhost]\n")
+            .expect("write a config naming the desktop webview's origin");
+        let ConfigLoad::Loaded(chosen) = Config::load(&paths).expect("read the origin") else {
+            panic!("a config naming cors_origins is still a config");
+        };
+        let server = chosen
+            .server
+            .as_ref()
+            .expect("naming the origins gives a section");
+        assert_eq!(
+            server.cors_origins,
+            vec!["tauri://localhost".to_string()],
+            "`cors_origins: [tauri://localhost]` reads into the field"
+        );
+
+        // What that config saves, the next run reads back unchanged, and the key is in the file.
+        chosen
+            .save(&path)
+            .expect("save the config that named an origin");
+        let written = fs::read_to_string(&path).expect("read the save back");
+        assert!(
+            yaml_value(&written, "cors_origins").is_some(),
+            "a config that named origins writes them back: {written}"
+        );
+        let ConfigLoad::Loaded(again) = Config::load(&paths).expect("read the save back") else {
+            panic!("the save wrote a config");
+        };
+        assert_eq!(again, chosen, "the round trip is the identity");
+
+        // And a config that names none writes no line at all: this is every file written before this
+        // key existed, and a save must leave it exactly that.
+        let quiet = Config {
+            server: Some(ServerConfig::default()),
+            ..Config::default()
+        }
+        .resolve(&paths);
+        quiet
+            .save(&path)
+            .expect("save a config that named no origins");
+        let written = fs::read_to_string(&path).expect("read the silent save back");
+        assert_eq!(
+            yaml_value(&written, "cors_origins"),
+            None,
+            "no cors_origins line for a config that named none: {written}"
         );
     }
 

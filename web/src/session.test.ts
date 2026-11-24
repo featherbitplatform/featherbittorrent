@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * The session store, against a fake fetch: which states the endpoint's answers move it through, and
  * what the sign-in screen is shown when an answer is a refusal - and, just as much, which answers
@@ -6,9 +7,10 @@
  *
  * @module session.test
  */
-import { expect, it } from 'vitest'
-import { createSessionStore } from './session'
+import { expect, it, vi } from 'vitest'
+import { SESSION_ENDED, createSessionStore } from './session'
 import type { SessionStore } from './session'
+import { createClient } from './api/client'
 
 function json(status: number, body: string): Response {
   return new Response(body, { status, headers: { 'content-type': 'application/json' } })
@@ -121,4 +123,131 @@ it('a_failed_sign_out_after_the_session_ended_says_nothing', async () => {
     state.phase === 'signedOut' && state.notice === 'Your session ended. Sign in again.' && state.error === null,
     'a sign-out that arrived after its session ended went looking for a screen to complain on',
   ).toBe(true)
+})
+
+const BASE = 'http://127.0.0.1:53211'
+
+it('bearer_sign_in_uses_basic_and_keeps_the_token_in_memory', async () => {
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const cookie = vi.spyOn(document, 'cookie', 'set')
+  const seen: Array<{ url: string; init: RequestInit | undefined }> = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push({ url: String(input), init })
+    return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+  }, { kind: 'bearer', base: BASE, token: null })
+
+  expect(shown(store), 'a bearer connection with no token did not start on the sign-in screen').toEqual({
+    phase: 'signedOut',
+    notice: null,
+    error: null,
+  })
+  expect(await store.signIn('alice', 'pässword'), 'a good password did not sign in').toBe(true)
+
+  expect(seen.length, 'sign-in asked the server more than once').toBe(1)
+  expect(seen[0].url, 'sign-in did not go to the engine').toBe(`${BASE}/api/v1/auth/session`)
+  expect(seen[0].init?.method, 'sign-in was not a POST').toBe('POST')
+  expect(seen[0].init?.credentials, 'sign-in rode cookies along').toBe('omit')
+  const auth = new Headers(seen[0].init?.headers).get('authorization')
+  const expected = btoa(String.fromCharCode(...new TextEncoder().encode('alice:pässword')))
+  expect(auth, 'sign-in did not use Basic with the UTF-8 user and password').toBe(`Basic ${expected}`)
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'alice', 'the answer subject was not the session').toBe(true)
+  expect(store.token(), 'the token the server handed out was not kept').toBe('tok-1')
+  expect(store.csrf(), 'a bearer session claimed a CSRF value').toBeNull()
+  expect(setItem, 'the token was written to web storage').not.toHaveBeenCalled()
+  expect(cookie, 'the token was written to a cookie').not.toHaveBeenCalled()
+  setItem.mockRestore()
+  cookie.mockRestore()
+})
+
+it('bearer_sign_in_twice_at_once_posts_once', async () => {
+  // Two taps before either answer arrives must share one post, the way the cookie store shares one
+  // refresh: every accepted post mints its own token on the server, so two posts would leave the
+  // first token sitting valid there while the page only ever kept the second one.
+  const { promise, release } = held()
+  const seen: string[] = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push(`${init?.method ?? 'GET'} ${String(input)}`)
+    return promise.then(() => json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}'))
+  }, { kind: 'bearer', base: BASE, token: null })
+
+  const first = store.signIn('alice', 'hunter2')
+  const second = store.signIn('bob', 'hunter3')
+  release()
+  const answers = await Promise.all([first, second])
+
+  expect(answers, 'the second overlapping sign-in did not take the shared answer').toEqual([true, true])
+  expect(seen, 'two sign-ins sent at once asked the engine more than once').toEqual([
+    `POST ${BASE}/api/v1/auth/session`,
+  ])
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'alice', 'the shared answer was not the engine answer').toBe(true)
+  expect(store.token(), 'the shared sign-in did not keep the token it was given').toBe('tok-1')
+})
+
+it('bearer_401_returns_to_sign_in_with_session_ended', async () => {
+  const store = createSessionStore(async () => json(401, UNAUTHORIZED), { kind: 'bearer', base: BASE, token: 'launch-secret' })
+  const state = store.get()
+  expect(state.phase === 'signedIn' && state.subject === 'desktop', 'a bearer token did not start signed in as desktop').toBe(true)
+  await store.refresh()
+  expect(store.get().phase, 'refresh moved a desktop session that nothing ended').toBe('signedIn')
+
+  store.endSession(store.generation())
+
+  expect(shown(store), 'a 401 did not return to sign-in with the ended notice').toEqual({
+    phase: 'signedOut',
+    notice: SESSION_ENDED,
+    error: null,
+  })
+  expect(store.token(), 'the ended token was kept').toBeNull()
+})
+
+it('bearer_sign_out_deletes_the_session_with_the_token', async () => {
+  const seen: Array<{ url: string; init: RequestInit | undefined }> = []
+  const store = createSessionStore(async (input, init) => {
+    seen.push({ url: String(input), init })
+    if (init?.method === 'DELETE') return new Response(null, { status: 204 })
+    return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+  }, { kind: 'bearer', base: BASE, token: null })
+  await store.signIn('alice', 'password')
+
+  await store.signOut()
+
+  const del = seen[1]
+  expect(del?.init?.method, 'sign-out did not DELETE the session').toBe('DELETE')
+  expect(del?.url, 'sign-out did not go to the engine').toBe(`${BASE}/api/v1/auth/session`)
+  expect(new Headers(del?.init?.headers).get('authorization'), 'sign-out did not prove which session to end').toBe(
+    'Bearer tok-1',
+  )
+  expect(del?.init?.credentials, 'sign-out rode cookies along').toBe('omit')
+  expect(shown(store), 'a sign-out the server took did not land on sign-in').toEqual({
+    phase: 'signedOut',
+    notice: null,
+    error: null,
+  })
+  expect(store.token(), 'the ended token was kept').toBeNull()
+})
+
+it('bearer_sign_out_failure_keeps_the_session', async () => {
+  const seen: Array<{ url: string; auth: string | null }> = []
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push({ url: String(input), auth: new Headers(init?.headers).get('authorization') })
+    if (init?.method === 'DELETE') return json(500, 'boom')
+    if (String(input).endsWith('/auth/session')) return json(200, '{"token":"tok-1","expires_in":3600,"subject":"alice"}')
+    return json(200, '[]')
+  }) as typeof fetch
+  const store = createSessionStore(fetchFn, { kind: 'bearer', base: BASE, token: null })
+  await store.signIn('alice', 'password')
+
+  await store.signOut()
+
+  const state = store.get()
+  expect(
+    state.phase === 'signedIn' && state.subject === 'alice' && state.error === 'Could not sign out. Try again.',
+    'a refused sign-out did not keep the session with its error',
+  ).toBe(true)
+  expect(store.token(), 'a refused sign-out dropped a token the server still honours').toBe('tok-1')
+  const client = createClient(fetchFn, store.csrf, store.generation, store.endSession, { kind: 'bearer', base: BASE, token: null }, store.token)
+  await client.torrents()
+  expect(seen[seen.length - 1].auth, 'the next call went out without the kept token').toBe('Bearer tok-1')
 })

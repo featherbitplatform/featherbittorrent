@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { UNREACHABLE_COPY } from './live'
 import { SESSION_ENDED, session } from './session'
+import { ConnectionContext, createConnection } from './connection'
 
 // The `api` and `session` singletons read `globalThis.fetch` the moment their modules load,
 // so the controllable fetch must exist before this file's imports run.
@@ -136,6 +137,39 @@ describe('the page as a whole', () => {
   })
 })
 
+describe('the screens in the desktop frame', () => {
+  /** Whether every element from `from` up to (not including) `top` is `display: contents`. */
+  function boxless(from: Element | null, top: Element): string[] {
+    const boxes: string[] = []
+    for (let at = from; at !== null && at !== top; at = at.parentElement) {
+      if (!at.classList.contains('contents')) boxes.push(at.outerHTML.slice(0, 80))
+    }
+    return boxes
+  }
+
+  it('the_torrents_root_is_laid_out_by_the_frame_not_by_a_wrapper', async () => {
+    // The frame sizes `.h-dvh` as `height: 100%` of its page column; a box of auto height between
+    // the two leaves the percentage nothing to resolve against and the screen shrinks to its content.
+    world.behavior = alive
+    const { container } = render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    const root = screen.getByRole('button', { name: 'Add torrent' }).closest('.h-dvh')
+    expect(root, 'the Torrents root lost h-dvh, which the browser build sizes itself by').not.toBeNull()
+    expect(root!.className.split(' '), 'the Torrents root classes changed').toEqual(
+      expect.arrayContaining(['flex', 'h-dvh', 'min-h-0', 'flex-col', 'overflow-hidden']),
+    )
+    expect(boxless(root!.parentElement, container), 'a box sits between the frame and the Torrents root').toEqual([])
+
+    // The wrapper that keeps the table mounted under Settings still hides it there.
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(root!.parentElement!.hasAttribute('hidden'), 'the Torrents wrapper is not hidden under Settings').toBe(true)
+    const settings = screen.getByRole('heading', { name: 'Server' }).closest('.min-h-dvh')
+    expect(settings, 'the Settings root lost min-h-dvh').not.toBeNull()
+    expect(boxless(settings!.parentElement, container), 'a box sits between the frame and the Settings root').toEqual([])
+    world.behavior = null
+  })
+})
+
 describe('the Settings screen in the page', () => {
   it('settings_replaces_the_torrents_and_back_returns', async () => {
     world.behavior = alive
@@ -200,6 +234,39 @@ describe('the Settings screen in the page', () => {
     ).toBeNull()
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
     push.mockRestore()
+    world.behavior = null
+  })
+})
+
+describe('the page on a desktop connection', () => {
+  it('app_reads_the_connection_from_context', async () => {
+    const seen: Array<{ url: string; auth: string | null }> = []
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      seen.push({ url, auth: new Headers(init?.headers).get('authorization') })
+      if (url.endsWith('/api/v1/torrents')) return answer([])
+      if (url.endsWith('/api/v1/session')) return answer(SESSION_BODY)
+      return answer({})
+    }) as unknown as typeof fetch
+    const connection = createConnection({ kind: 'bearer', base: 'http://127.0.0.1:53211', token: 'launch-secret' }, fetchFn)
+    world.behavior = (url) => Promise.reject(new Error(`the page used the browser singletons for ${url}`))
+
+    render(
+      <ConnectionContext.Provider value={connection}>
+        <App />
+      </ConnectionContext.Provider>,
+    )
+
+    await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    await waitFor(() => {
+      expect(
+        seen.some((call) => call.url === 'http://127.0.0.1:53211/api/v1/torrents'),
+        'the page never asked the fake base for the torrents',
+      ).toBe(true)
+    })
+    expect(seen.every((call) => call.auth === 'Bearer launch-secret'), 'a desktop call went out without the token').toBe(true)
+    expect(seen.some((call) => call.url.includes('/auth/web-session')), 'the desktop asked about a browser cookie').toBe(false)
+    expect(screen.queryByRole('button', { name: 'Sign out' }), 'the launch-secret desktop offered a sign-out').toBeNull()
     world.behavior = null
   })
 })

@@ -28,11 +28,13 @@ import {
   VolumeX,
   X,
 } from 'lucide-react'
-import { api } from '../api/client'
+import { useConnection } from '../connection'
+import { useDesktopDownload } from '../desktopDownload'
+import { isAbsolute } from '../endpoint'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe } from '../format'
 import { matches } from '../keys'
-import { useModalDialog } from '../modal'
+import { MODAL_CENTRED, useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
 import { createEngine } from './engine'
 import type { Engine, EngineState } from './engine'
@@ -311,7 +313,24 @@ function IconButton({
   )
 }
 
-export default function Player({ id, file, name, client = api, onClose }: PlayerProps) {
+/** What Download says where a file on another origin has nothing to save it with. */
+const NO_DOWNLOAD_COPY = 'This file cannot be downloaded here.'
+
+/** Whether `address` is on the page's own origin, where an `<a download>` saves rather than navigates. */
+function sameOriginAddress(address: string): boolean {
+  // A path is on the page's own origin by definition (the browser build's token route answers one).
+  if (!isAbsolute(address) && !address.startsWith('//')) return true
+  try {
+    return new URL(address, window.location.href).origin === window.location.origin
+  } catch {
+    return false
+  }
+}
+
+export default function Player({ id, file, name, client: given, onClose }: PlayerProps) {
+  const connection = useConnection()
+  const client = given ?? connection.api
+  const bearer = connection.endpoint.kind === 'bearer'
   const [probe, setProbe] = useState<MediaProbe | null>(null)
   const [probeError, setProbeError] = useState<string | null>(null)
   const [state, setState] = useState<EngineState>('loading')
@@ -323,6 +342,8 @@ export default function Player({ id, file, name, client = api, onClose }: Player
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  const [downloadProblem, setDownloadProblem] = useState<string | null>(null)
+  const saveDownload = useDesktopDownload()
   // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
   // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
   // the buffer restarts the streams, and a drag writes dozens of values.
@@ -474,6 +495,9 @@ export default function Player({ id, file, name, client = api, onClose }: Player
           return null
         },
       },
+      // The browser keeps the engine's own route on the page's origin; the desktop's engine lives at
+      // another address, so the body comes from the client's absolute URL with the token in it.
+      bearer ? { streamUrl: (track, ms) => client.mediaStreamUrl(id, file, track, ms) } : undefined,
     )
     engineRef.current = engine
     engine.onState(setState)
@@ -534,7 +558,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
       engine.destroy()
       engineRef.current = null
     }
-  }, [choice, probe, id, file])
+  }, [choice, probe, bearer, client, id, file])
 
   function trackLanguage(trackId: number, probeNow: MediaProbe): string | null {
     return probeNow.tracks.find((track) => track.id === trackId)?.language ?? null
@@ -782,15 +806,33 @@ export default function Player({ id, file, name, client = api, onClose }: Player
     if (downloading) return
     setDownloading(true)
     try {
+      setDownloadProblem(null)
+      // In the app the stream address is on the engine's origin, not the page's: a link to it is not a
+      // download (the webview ignores `download` there and navigates the page itself to the media), so
+      // the shell saves it. Where to save is asked first, and the token only after: it is good for 60
+      // seconds, and a person reading a save dialog can take longer than that.
+      if (saveDownload !== null) {
+        const handle = await saveDownload.choose(name)
+        if (handle === null) return
+        await saveDownload.save(handle, await client.streamToken(id, file))
+        return
+      }
       // The token is fetched at the click, not at the open: it is good for 60 seconds, and the
-      // click is the moment the person is actually about to take the file.
+      // click is the moment the person is actually about to take the file. Only a same-origin
+      // address is clicked; a browser has no shell to save another one with.
       const path = await client.streamToken(id, file)
+      if (!sameOriginAddress(path)) {
+        setDownloadProblem(NO_DOWNLOAD_COPY)
+        return
+      }
       const anchor = document.createElement('a')
       anchor.href = path
       anchor.download = name
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()
+    } catch (problem) {
+      setDownloadProblem(problem instanceof Error ? problem.message : String(problem))
     } finally {
       setDownloading(false)
     }
@@ -882,7 +924,7 @@ export default function Player({ id, file, name, client = api, onClose }: Player
         onDialogKey(event)
         onKeyDown(event)
       }}
-      className="flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0"
+      className={`${MODAL_CENTRED} flex h-[min(700px,calc(100dvh-48px))] w-[min(960px,calc(100vw-48px))] flex-col overflow-hidden rounded-overlay border border-rule bg-canvas text-body max-[640px]:h-dvh max-[640px]:w-full max-[640px]:rounded-none max-[640px]:border-0 max-[640px]:max-w-none max-[640px]:max-h-none max-[640px]:m-0`}
     >
       <div className="flex items-center justify-between gap-3 border-b border-ink-700 px-4 py-2.5">
         <span className="min-w-0 truncate text-[13px] text-strong">{displaySafe(name)}</span>
@@ -925,6 +967,11 @@ export default function Player({ id, file, name, client = api, onClose }: Player
             <Download className="h-4 w-4" aria-hidden="true" />
             Download
           </button>
+          {downloadProblem !== null && (
+            <p role="alert" className="max-w-sm text-[13px] text-error">
+              {displaySafe(downloadProblem)}
+            </p>
+          )}
         </div>
       )}
 

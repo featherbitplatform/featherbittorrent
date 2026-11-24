@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- The desktop app, `featherbittorrent-desktop`: the web UI in a native window (Tauri 2) beside the terminal client, as its own package in the same release. It runs an engine of its own on this machine, `This computer`, with its own settings and library; it draws its own title bar with an instance switcher, and switches between `This computer` and remote instances added by address. A remote instance asks for a user name and a password once, and `Save password` keeps the password in the system keychain. The first close asks whether closing quits or keeps the app running in the tray, and the answer can be changed in Settings; where there is no tray, closing quits. `Start at login` is off until you turn it on. `magnet:` links and `.torrent` files open its Add page, with an instance picker, and a second launch hands them to the copy already running. `Serve the web UI` puts the web UI on an address of your choice for other machines, behind a login it asks you to create. Releases carry a `.dmg` for macOS (universal), an `.msi` for Windows (x86-64) and a `.deb`, an `.rpm` and a `.tar.gz` for Linux (x86-64 and aarch64), each with a `.sha256`; none of them is signed, and none installs or starts a service. The desktop app's Linux floor is glibc 2.35 (Ubuntu 22.04, Debian 12, Fedora 41), higher than the command line builds', and it needs WebKitGTK 4.1 and libsoup 3. Documented in `docs/desktop.md`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+- `server.cors_origins`: the origins of clients served from somewhere else that may call a server's API, empty by default. The desktop app connecting to a remote server needs its own origin listed, `tauri://localhost` on macOS and Linux and `http://tauri.localhost` on Windows. Listing an origin signs nobody in. Beside it, the server has a desktop access mode for the engine the desktop app runs itself: it accepts a launch secret made when the app starts, and exposes the configured `server:` section to the network only when `Serve the web UI` is on. Documented in `docs/server.md`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+- The web client signs in with a bearer token to any address, not only to the origin it was served from, which is how the desktop app reaches a remote server: the token is kept in memory, with no cookie and no CSRF header, and signing out ends the session on the server. The keyboard shortcuts can be changed in the desktop app (`Change` on a row, `Already used by <action>` for a key another action in the group holds, `Reset to defaults`), and the list stays read-only in a browser. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+
+### Changed
+
+- On macOS the desktop app keeps its Dock icon hidden when it starts in the background (at login, or with `--background`): only its menu bar icon shows. Showing the window, from the tray, a second launch, or a `magnet:` link or `.torrent` file opened with the app, puts the Dock icon back, and closing the window to the tray takes it away again. Where there is no tray the Dock icon never hides. Documented in `docs/desktop.md`. ([#32](https://github.com/featherbitplatform/featherbittorrent/pull/32))
+
+### Fixed
+
+- Dialogs (close, delete, add torrent, limits, move files, remove device and the player) now open centred in the window instead of in its top-left corner. This affected the web UI released in `0.3.0`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+
 ## [0.3.0] - 2026-11-23
 
 ### Added
@@ -80,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.4.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.0
 [0.3.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0
 [0.2.3]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3
 [0.2.2]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2

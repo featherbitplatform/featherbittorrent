@@ -6,15 +6,15 @@ scripts, nothing installed under `/etc/systemd`, nothing under `/Library/LaunchA
 leaves. What this guide covers is the other half: how to run `featherbittorrent serve` under a service
 manager if you want it running before you log in, one command at a time, all of it your choice.
 
-The four example files live in [packaging/](../packaging/README.md) and ship inside every artifact as
+The four example files live in [packaging/](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/README.md) and ship inside every artifact as
 documentation, never where a service manager would pick them up on its own:
 
 | You want | The example | Where the artifact carries it |
 | --- | --- | --- |
-| a systemd system service | [packaging/systemd/system/featherbittorrent.service](../packaging/systemd/system/featherbittorrent.service) | `/usr/share/doc/featherbittorrent/examples/systemd/system/` in the `.deb` and `.rpm`, `examples/systemd/system/` in the Linux `.tar.gz` |
-| a systemd user service | [packaging/systemd/user/featherbittorrent.service](../packaging/systemd/user/featherbittorrent.service) | the same two places, under `user/` |
-| a launchd agent (macOS) | [packaging/launchd/io.featherbit.featherbittorrent.plist](../packaging/launchd/io.featherbit.featherbittorrent.plist) | `examples/launchd/` in the macOS `.tar.gz` |
-| a scheduled task (Windows) | [packaging/windows/register-task.ps1](../packaging/windows/register-task.ps1) | `examples\windows\` in the Windows `.zip` |
+| a systemd system service | [packaging/systemd/system/featherbittorrent.service](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/systemd/system/featherbittorrent.service) | `/usr/share/doc/featherbittorrent/examples/systemd/system/` in the `.deb` and `.rpm`, `examples/systemd/system/` in the Linux `.tar.gz` |
+| a systemd user service | [packaging/systemd/user/featherbittorrent.service](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/systemd/user/featherbittorrent.service) | the same two places, under `user/` |
+| a launchd agent (macOS) | [packaging/launchd/io.featherbit.featherbittorrent.plist](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/launchd/io.featherbit.featherbittorrent.plist) | `examples/launchd/` in the macOS `.tar.gz` |
+| a scheduled task (Windows) | [packaging/windows/register-task.ps1](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/windows/register-task.ps1) | `examples\windows\` in the Windows `.zip` |
 
 This guide itself goes to `/usr/share/doc/featherbittorrent/autostart.md` in the Linux packages and sits
 beside `server.md` in the archives.
@@ -75,7 +75,7 @@ account before anything writes into it. `StateDirectory=featherbittorrent` in th
 ground on a machine where you would rather not think about it.
 
 **Copy the unit** from
-[packaging/systemd/system/featherbittorrent.service](../packaging/systemd/system/featherbittorrent.service),
+[packaging/systemd/system/featherbittorrent.service](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/systemd/system/featherbittorrent.service),
 which is also `/usr/share/doc/featherbittorrent/examples/systemd/system/featherbittorrent.service` once
 the `.deb` or `.rpm` is installed:
 
@@ -375,7 +375,7 @@ create` will happily register one, and starting it fails with error 1053 because
 the service control protocol. A native service mode would be a code change, and this milestone does not
 make one. What works today is Task Scheduler, which runs an ordinary program at boot.
 
-**Register the task** from [packaging/windows/register-task.ps1](../packaging/windows/register-task.ps1),
+**Register the task** from [packaging/windows/register-task.ps1](https://github.com/featherbitplatform/featherbittorrent/blob/develop/packaging/windows/register-task.ps1),
 which the `.zip` carries as `examples\windows\register-task.ps1`, in an **elevated** PowerShell:
 
 ```powershell

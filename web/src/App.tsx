@@ -30,19 +30,27 @@
  * person going back. The Torrents screen under Settings is told it is hidden, so its live loop
  * reads at the hidden-page cadence until it is shown again.
  *
+ * The session and the client come from {@link useConnection}: the browser's own unless the page is
+ * rendered under a provider (the desktop app's bearer connection). A desktop session that started
+ * from its launch token has nothing to sign out of, so it gets no Sign out button, as `open` does not.
+ *
  * @module App
  */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Button from './components/Button'
 import { createLiveAnnouncer, UNREACHABLE_COPY } from './live'
 import type { LiveAnnouncer } from './live'
-import { session, useSession } from './session'
+import { useConnection } from './connection'
+import { useDesktopSettings } from './desktopSettings'
+import { useSession } from './session'
 import { Settings } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
 export default function App() {
-  const { state, signIn, signOut, refresh } = useSession()
+  const connection = useConnection()
+  const { session } = connection
+  const { state, signIn, signOut, refresh } = useSession(session)
   const politeRef = useRef<HTMLDivElement>(null)
   const assertiveRef = useRef<HTMLDivElement>(null)
   const live = useRef<LiveAnnouncer | null>(null)
@@ -51,6 +59,9 @@ export default function App() {
   // Whether Settings owns a history entry, and the number of the last one it pushed.
   const settingsPushed = useRef(false)
   const settingsToken = useRef(0)
+  // The desktop app asks for Settings at a section (Manage instances, or after This computer restarted).
+  const desktop = useDesktopSettings()
+  const [settingsSection, setSettingsSection] = useState<string | null>(null)
 
   useEffect(() => {
     const onPop = (event: PopStateEvent): void => {
@@ -67,14 +78,15 @@ export default function App() {
     }
   }, [])
 
-  function openSettings(): void {
+  const openSettings = useCallback((section: string | null = null): void => {
+    setSettingsSection(section)
     if (!settingsPushed.current) {
       settingsToken.current += 1
       window.history.pushState({ fbttSettings: settingsToken.current }, '')
       settingsPushed.current = true
     }
     setSettingsOpen(true)
-  }
+  }, [])
 
   /** Back to torrents: through the history when Settings owns an entry, so the entry is consumed. */
   function closeSettings(): void {
@@ -96,7 +108,7 @@ export default function App() {
       live.current = null
       announcer.stop()
     }
-  }, [])
+  }, [session])
 
   // Going back hands the focus to the button that opened Settings, which is on screen again by then.
   const wasOpen = useRef(false)
@@ -109,6 +121,17 @@ export default function App() {
 
   // Settings belongs to a live workspace: when the session ends, the next sign-in starts on Torrents.
   const workspace = state.phase === 'signedIn' || state.phase === 'open'
+
+  // A desktop request is answered once the workspace is on screen, and then handed back as done.
+  const request = desktop?.request ?? null
+  const onOpened = desktop?.onOpened
+  const answered = useRef<number | null>(null)
+  useEffect(() => {
+    if (!workspace || request === null || answered.current === request.seq) return
+    answered.current = request.seq
+    openSettings(request.section)
+    onOpened?.(request.seq)
+  }, [workspace, request, onOpened, openSettings])
   if (!workspace && settingsOpen) setSettingsOpen(false)
   // ...and the entry Settings pushed goes back with it.
   useEffect(() => {
@@ -132,6 +155,11 @@ export default function App() {
   }
 
   const signOutError = state.phase === 'signedIn' && state.error !== null ? state.error : null
+  // The launch token is the desktop's own engine letting the page in; there is no sign-in to undo.
+  const launched =
+    connection.endpoint.kind === 'bearer' &&
+    connection.endpoint.token !== null &&
+    session.token() === connection.endpoint.token
   return (
     <>
       <div ref={politeRef} role="status" aria-live="polite" className="sr-only" />
@@ -154,14 +182,19 @@ export default function App() {
       ) : (
         <>
           {settingsOpen && (
-            <Settings onBack={closeSettings} />
+            <Settings onBack={closeSettings} section={settingsSection} />
           )}
-          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again. */}
-          <div hidden={settingsOpen}>
+          {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again.
+              `contents` while shown, so the wrapper draws no box and the screen's own root is the one
+              its parent lays out: the desktop frame sizes `h-dvh` as `height: 100%` of the space under
+              the title bar, and a percentage through a block of auto height is no height at all, which
+              cut the Torrents screen (sidebar and all) to its content. Preflight's `display: none
+              !important` on `[hidden]` still hides it while Settings is up. */}
+          <div hidden={settingsOpen} className="contents">
             <Torrents
               hidden={settingsOpen}
-              onSettings={openSettings}
-              signedIn={state.phase === 'signedIn'}
+              onSettings={() => openSettings()}
+              signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}
               onSignOut={() => void signOut()}
             />

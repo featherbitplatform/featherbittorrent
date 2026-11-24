@@ -2,6 +2,8 @@
 
 featherbittorrent is a BitTorrent client built on [fbt-lib](https://github.com/featherbitplatform/fbt-lib), the from-scratch pure-Rust library that does the downloading and seeding. It runs in one of two roles: as a server (`featherbittorrent serve`), headless, downloading and seeding and controlled over the network; or as a TUI in the terminal that either runs the engine itself on the same machine or connects to one server. A typical setup is a Raspberry Pi at home running the server and saving to a NAS or another chosen storage, controlled from a laptop's TUI over the LAN or remotely through a reverse proxy. On the laptop itself the TUI is a complete client with no daemon behind it.
 
+The documentation is on the site at <https://featherbitplatform.github.io/featherbittorrent/>; the same guides are in [docs/](docs/).
+
 The clients that came before it (uTorrent, Deluge, qBittorrent) work, and their shape is the one people expect: a torrent list with a detail pane, a daemon and a thin client. featherbittorrent wants that shape snappier and lighter: keypresses that feel instant, redraws that stay smooth with hundreds of torrents, and memory and CPU use small enough for the server to run comfortably on a Raspberry Pi 2B.
 
 Status: milestone 1, the local client, is complete: `featherbittorrent` in a terminal is a whole
@@ -12,9 +14,11 @@ the server role (`serve`), the remote backend, authentication and streaming, shi
 [0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4, and
 [0.2.1](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1),
 [0.2.2](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2) and
-[0.2.3](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3) fix what came after them, and
+[0.2.3](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3) fix what came after them,
 [0.3.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0) is the first release with the
-web UI.
+web UI, and
+[0.4.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.0) is the first release with the
+desktop app.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
 files, each carrying man pages, shell completions, the licenses and the docs. The web UI, released in 0.3.0,
@@ -25,7 +29,11 @@ and the keyboard shortcuts, and a phone layout, with the off switch in `server.w
 ([docs/web-ui.md](docs/web-ui.md)). Every release now ships two builds: the full build, `featherbittorrent`,
 which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and
 changes nothing for the TUI. Every artifact is built and smoke tested in a clean container or runner before
-anything is published, and the release workflow publishes them all on a `v*` tag.
+anything is published, and the release workflow publishes them all on a `v*` tag. The desktop app,
+`featherbittorrent-desktop`, released in 0.4.0: the same web UI in its own window, with an engine of its
+own on this machine (`This computer`), instances to switch between, a tray, start at login, `magnet:` links
+and `.torrent` files, and changeable keyboard shortcuts, shipped as a `.dmg`, an `.msi`, `.deb`, `.rpm` and
+`.tar.gz` beside the CLI builds ([docs/desktop.md](docs/desktop.md)).
 
 ## Install
 
@@ -37,7 +45,9 @@ installing puts its files. Installing never starts anything: no package installs
 creates an account, and nothing runs after the install. To have `serve` start at boot under systemd, launchd
 or Windows Task Scheduler, [docs/autostart.md](docs/autostart.md) has the commands, one at a time, all of it
 opt-in. The web UI's sign-in, the off switch and where to serve it are in
-[docs/web-ui.md](docs/web-ui.md).
+[docs/web-ui.md](docs/web-ui.md). The desktop app is a package of its own in the same releases: its files,
+its install steps and everything you can turn on after them are in [docs/desktop.md](docs/desktop.md), and
+the last section of [docs/install.md](docs/install.md) covers its files beside these.
 
 ## Build and run
 

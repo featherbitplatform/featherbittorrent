@@ -3,6 +3,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import Header from './Header'
 import type { HeaderProps } from './Header'
+import { TitleBarSlotsContext } from './titleBarSlots'
 
 afterEach(cleanup)
 
@@ -105,4 +106,22 @@ it('the_countdown_restarts_on_equal_pauses', () => {
   } finally {
     vi.useRealTimers()
   }
+})
+
+it('inside_the_desktop_the_header_moves_into_the_title_bar', () => {
+  const lead = document.createElement('div')
+  const actions = document.createElement('div')
+  document.body.append(lead, actions)
+  const { container } = render(
+    <TitleBarSlotsContext.Provider value={{ switcher: null, lead, actions }}>
+      <Header {...headerProps({})} />
+    </TitleBarSlotsContext.Provider>,
+  )
+  expect(container.querySelector('header'), 'the header drew its own strip as well').toBeNull()
+  expect(lead.textContent).toContain('featherbittorrent')
+  expect(lead.textContent).toContain('Connected')
+  expect(actions.textContent).toContain('Add torrent')
+  expect(actions.textContent).toContain('Settings')
+  lead.remove()
+  actions.remove()
 })

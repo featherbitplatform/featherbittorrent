@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.11.1`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface, the local backend over `fbt::Session`, the remote backend and its login methods), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering), `fbtt-server` (the HTTP server: fbt-api's routes plus this product's auth, device and fs routes, the Host guard when auth is off) and `featherbittorrent` (the binary that wires terminal, runtime, backends, the wizard and the `user`/`device` admin commands together). The screen side of a backend comes apart through `Client::split`: the command sender and the two receivers become fields the runtime owns, because a method on the client borrows the whole client and one `select!` branch cannot hold that borrow while another sends on it.
+**featherbittorrent**: a BitTorrent client for the terminal, built on `fbt-lib` (`../fbt-lib`, released as `v0.11.1`). One binary, two roles: plain `featherbittorrent` runs a TUI that embeds the engine (or, from milestone 2, connects to one server), and `featherbittorrent serve` runs headless and is controlled over the network. Cargo workspace under `crates/`: `fbtt-core` (config, platform paths, the library lock, the client interface, the local backend over `fbt::Session`, the remote backend and its login methods), `fbtt-tui` (the model: keys in, actions out; plus ratatui rendering), `fbtt-server` (the HTTP server: fbt-api's routes plus this product's auth, device and fs routes, the Host guard when auth is off), `featherbittorrent` (the binary that wires terminal, runtime, backends, the wizard and the `user`/`device` admin commands together), and the two desktop crates: `fbtt-desktop-core` (the desktop app's paths, `desktop.yaml` settings, instance list, launch secret and the links and files handed to a running copy; no Tauri, so it is tested without a webview) and `featherbittorrent-desktop` (the Tauri 2 shell: window chrome, tray, closing and quitting, start at login, instances and the keychain, `magnet:` and `.torrent` handling, This computer's engine and Serve the web UI; its page is `web/dist`, embedded by `generate_context!`, so `web/dist` must be built before the crate compiles). The screen side of a backend comes apart through `Client::split`: the command sender and the two receivers become fields the runtime owns, because a method on the client borrows the whole client and one `select!` branch cannot hold that borrow while another sends on it.
 
-Status: milestone 1, the local client, is complete (branch `feature/m1-local-client`). Milestone 2, the server role (`serve`), the remote backend, logins (users and passwords, Ed25519 device keys, gateway private key and gateway password), the folder picker, the devices screen, the wizard and hand-off, `docs/server.md` and `docs/reverse-proxy.md` with a runnable gateway-Authelia example under `docs/examples/gateway-oidc/`, a root `Dockerfile` and the release workflow, is complete and carried the first release (`v0.1.0`). Every release bumps the workspace version on its own `release/X.Y.Z` branch. Milestone 4, packages and autostart docs, shipped in `v0.2.0`: the hidden `generate-assets` subcommand (man pages and shell completions written from the same `Command` as `--help`), `.deb` and `.rpm` for x86_64 and aarch64 plus Linux, macOS and Windows archives that carry the same files, the service examples under `packaging/`, the smoke scripts that check every artifact in a clean container or runner before anything is published, `docs/install.md` and `docs/autostart.md`; no package installs or enables a service, and removal keeps the user's config. Milestone 3, also in `v0.2.0`: streaming to mpv or VLC with `s` (a local path or a loopback stream, server stream tokens from `POST /api/v1/stream-tokens`, the loopback gateway relay), the `player:` settings, and the featherbit mark drawn as an image in the header and on the help screen (`logo: auto | off`, kitty graphics, iTerm2 inline images, sixel) with the terminal probe; `docs/streaming.md` describes it. Web UI milestones 1, 2 (the media player) and 2b (file priorities, torrent actions, New folder, Settings with devices and shortcuts, the phone layout) shipped in `v0.3.0`. Milestone 1: a React app in `web/` built with Vite, embedded into `fbtt-server` behind the `web-ui` cargo feature (on `featherbittorrent` as `web-ui = ["fbtt-server/web-ui"]`), served on the API's own origin. Browser sign-in is a cookie session (`fbtt_session`, `SameSite=Strict`, a CSRF token `X-CSRF-Token` on every change); the live torrent table, the detail pane, and add, pause, resume and remove are in it, with `server.web_ui: false` and `FBTT_WEB_UI` as the off switch. Every release ships two builds: the full build (`--features web-ui`, which serves the web UI and needs `web/dist` built first) and the headless build (no feature, no front end, today's binary), and the two are named `featherbittorrent` and `featherbittorrent-headless` in the release artifacts and remove the other on install in the Linux packages (the `.deb` says so with `Conflicts` and `Replaces`, the `.rpm` with `Obsoletes`); `featherbittorrent --version` prints `(full)` or `(headless)` to say which. `docs/web-ui.md` covers the web UI, its sign-in, the off switch and where to serve it. Release `0.2.0` carried milestones 3 and 4, `0.2.1` is a fix release (fbt-lib `v0.11.0` and the milestone 3 leftovers), `0.2.2` makes the image logo work: the probe runs in raw mode and on Windows, and the mark keeps its alpha, `0.2.3` fixes the mark drawn over the text header and moves to fbt-lib `v0.11.1`, and `0.3.0` is the first release with the web UI, so the workspace version is `0.3.0`.
+Status: milestone 1, the local client, is complete (branch `feature/m1-local-client`). Milestone 2, the server role (`serve`), the remote backend, logins (users and passwords, Ed25519 device keys, gateway private key and gateway password), the folder picker, the devices screen, the wizard and hand-off, `docs/server.md` and `docs/reverse-proxy.md` with a runnable gateway-Authelia example under `docs/examples/gateway-oidc/`, a root `Dockerfile` and the release workflow, is complete and carried the first release (`v0.1.0`). Every release bumps the workspace version on its own `release/X.Y.Z` branch. Milestone 4, packages and autostart docs, shipped in `v0.2.0`: the hidden `generate-assets` subcommand (man pages and shell completions written from the same `Command` as `--help`), `.deb` and `.rpm` for x86_64 and aarch64 plus Linux, macOS and Windows archives that carry the same files, the service examples under `packaging/`, the smoke scripts that check every artifact in a clean container or runner before anything is published, `docs/install.md` and `docs/autostart.md`; no package installs or enables a service, and removal keeps the user's config. Milestone 3, also in `v0.2.0`: streaming to mpv or VLC with `s` (a local path or a loopback stream, server stream tokens from `POST /api/v1/stream-tokens`, the loopback gateway relay), the `player:` settings, and the featherbit mark drawn as an image in the header and on the help screen (`logo: auto | off`, kitty graphics, iTerm2 inline images, sixel) with the terminal probe; `docs/streaming.md` describes it. Web UI milestones 1, 2 (the media player) and 2b (file priorities, torrent actions, New folder, Settings with devices and shortcuts, the phone layout) shipped in `v0.3.0`. Milestone 1: a React app in `web/` built with Vite, embedded into `fbtt-server` behind the `web-ui` cargo feature (on `featherbittorrent` as `web-ui = ["fbtt-server/web-ui"]`), served on the API's own origin. Browser sign-in is a cookie session (`fbtt_session`, `SameSite=Strict`, a CSRF token `X-CSRF-Token` on every change); the live torrent table, the detail pane, and add, pause, resume and remove are in it, with `server.web_ui: false` and `FBTT_WEB_UI` as the off switch. Every release ships two builds: the full build (`--features web-ui`, which serves the web UI and needs `web/dist` built first) and the headless build (no feature, no front end, today's binary), and the two are named `featherbittorrent` and `featherbittorrent-headless` in the release artifacts and remove the other on install in the Linux packages (the `.deb` says so with `Conflicts` and `Replaces`, the `.rpm` with `Obsoletes`); `featherbittorrent --version` prints `(full)` or `(headless)` to say which. `docs/web-ui.md` covers the web UI, its sign-in, the off switch and where to serve it. Release `0.2.0` carried milestones 3 and 4, `0.2.1` is a fix release (fbt-lib `v0.11.0` and the milestone 3 leftovers), `0.2.2` makes the image logo work: the probe runs in raw mode and on Windows, and the mark keeps its alpha, `0.2.3` fixes the mark drawn over the text header and moves to fbt-lib `v0.11.1`, `0.3.0` is the first release with the web UI, and `0.4.0` is the first release with the desktop app and the docs site, so the workspace version is `0.4.0`. The desktop app (plan `docs/superpowers/plans/2026-11-23-desktop-app.md`) shipped in `0.4.0`: it is its own package, `featherbittorrent-desktop`, beside the two CLI builds, with `docs/desktop.md` as its guide.
 
 Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. The current plan is `docs/superpowers/plans/2026-11-19-milestone-3-streaming-and-logo.md`, and its Global Constraints are the rules below.
 
@@ -24,6 +24,7 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 - **Remote input never panics, hangs or allocates without bound.** A server, a peer or a torrent file must not take the TUI or the server down.
 - **Cross-platform.** Builds and tests pass on macOS, Linux and Windows.
 - **Packages never install, enable or start a service** (the owner's rule): no maintainer scripts, nothing under `/lib/systemd`, `/usr/lib/systemd`, `/etc/systemd`, `/etc/init.d` or `/Library/Launch*`, and no service account created. The systemd, launchd and Task Scheduler examples live under `packaging/` and ship as documentation only: `/usr/share/doc/featherbittorrent/examples/` in the `.deb` and `.rpm`, `examples/` inside the archives. `check_no_service` in `dev/package-linux.sh` enforces it at build time and `dev/smoke-linux.sh` after an install, and a package owns nothing of the user's: `apt purge` and `dnf remove` leave the config and library where they are.
+- **The desktop app's Linux floor is higher: glibc 2.35, built inside `ubuntu:22.04`.** Tauri 2 links WebKitGTK 4.1, GTK 3 and libsoup 3 from the distribution, and Ubuntu 22.04 is the oldest system that has them, so RHEL 9 and its rebuilds are out for the desktop app (the CLI keeps 2.34). `dev/check-linux-binary.sh --desktop` holds the binary to GLIBC_2.35 and to an allow list extended by the libraries it links (`libgtk-3`, `libgdk-3`, `libgdk_pixbuf-2.0`, `libgobject-2.0`, `libglib-2.0`, `libgio-2.0`, `libpango-1.0`, `libcairo`, `libcairo-gobject`, `libdbus-1`, `libwebkit2gtk-4.1`, `libjavascriptcoregtk-4.1`, `libsoup-3.0`); a new library goes into that list and into `bundle.linux` `deb.depends` and `rpm.depends` in `crates/featherbittorrent-desktop/tauri.conf.json` together. The tray's AppIndicator library is dlopened, not linked, so no package declares it. The same no-service rule holds for the desktop packages: no maintainer script, no scriptlet, and start at login is the app's own setting written at runtime, never by a package.
 - **Linux artifacts need glibc 2.34 or newer**, built inside `almalinux:9` (RHEL 9's glibc, the oldest supported target: Ubuntu 22.04 and RHEL 9 up to Debian 13 and Raspberry Pi OS 13), so one binary serves the `.deb`, the `.rpm` and the `.tar.gz`. `dev/check-linux-binary.sh` refuses a binary that needs a glibc symbol newer than that floor or any `NEEDED` library outside `libc.so.6`, `libm.so.6`, `libgcc_s.so.1`, `libpthread.so.0`, `libdl.so.2`, `librt.so.1`, `ld-linux-x86-64.so.2` and `ld-linux-aarch64.so.1`; a new library goes into that allow list and into `[package.metadata.deb] depends` together.
 
 ## Conventions
@@ -33,6 +34,7 @@ Binding design: `docs/superpowers/specs/2026-11-14-featherbittorrent-design.md`.
 - **No attribution of any kind:** no `Co-Authored-By` trailer, no `Claude-Session` line or session link in commits, no "Generated with" footer or session link in PR bodies.
 - **Semantic versioning.** The workspace version is bumped on the `release/X.Y.Z` branch; the annotated `vX.Y.Z` tag on `main` triggers the release workflow.
 - **Changelog:** `CHANGELOG.md` at the root (Keep a Changelog); user-visible changes go under `## [Unreleased]`, each ending in its PR link.
+- **Docs website:** Docusaurus in `website/`, deployed to `https://featherbitplatform.github.io/featherbittorrent/` by `.github/workflows/docs.yml` (builds on pull requests, deploys from `main` only), same pattern as `../terminal/website`. It reads the user guides in `docs/` in place (`docs/intro.md` is the landing page); `docs/superpowers/` and `docs/examples/` are left out. README.md and this file link to `docs/*.md`, so never move or copy a guide into `website/`. A link from a guide to anything outside `docs/` (`packaging/`, `crates/`, an example folder) must be an absolute `https://github.com/featherbitplatform/featherbittorrent/blob/develop/...` (or `/tree/develop/...`) URL so it works on GitHub and on the site; broken links and anchors fail the build. The Changelog page is generated: `website/scripts/changelog.mjs` copies `CHANGELOG.md` to `website/src/pages/changelog.md` (git-ignored) before `npm start` and `npm run build`; never edit the copy. `website/audit-ci.jsonc` gates its npm dependencies in `security.yml`, and releases attach a docs SBOM (`featherbittorrent-docs-<version>.cdx.json`).
 - **CI gates:** `cargo fmt --all --check` (Linux), `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --workspace --all-features` on Linux, macOS and Windows, `cargo doc` with warnings denied, cargo-deny, plus the security scans in `.github/workflows/security.yml` (semgrep, grype, gitleaks over the full history; also weekly on `main`). Their configs live at the repo root (`deny.toml`, `.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`); every ignore carries a one-line reason. `--all-features` is what makes `fbtt-core`'s `local` test target run at all: it requires that crate's `test-support` feature, and a filtered-out test is a test nobody noticed. PRs merge only when every gate is green.
 
 ## Commands
@@ -135,11 +137,44 @@ docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash dev/smoke-linux.sh tar.
 # -Target x86_64-pc-windows-msvc
 bash dev/package-macos.sh "$(bash dev/release-version.sh)"
 
+# The desktop app (crates/featherbittorrent-desktop, Tauri 2). It is a workspace member, so every
+# cargo step above and below builds it, and on Linux that needs the webview libraries: apt install
+# libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev
+# (macOS and Windows need nothing extra). It embeds web/dist, so build the front end first. Its logic
+# is tested without a window: `cargo test -p fbtt-desktop-core -p featherbittorrent-desktop` runs
+# This computer on a scratch library and needs no display.
+npm --prefix web ci && npm --prefix web run build
+cargo run -p featherbittorrent-desktop                    # opens the window on your own profile
+cargo test -p fbtt-desktop-core -p featherbittorrent-desktop
+cargo run -p featherbittorrent-desktop -- --version       # answered before any window exists
+
+# A throwaway desktop profile: these two replace the desktop app's config and data directories, and
+# the CLI's FBTT_CONFIG_DIR and FBTT_DATA_DIR are deliberately not read by it (four variables move
+# both programs). Use them for every manual run so your own library and desktop.yaml stay untouched.
+FBTT_DESKTOP_CONFIG_DIR=/tmp/fbtt-desktop-config FBTT_DESKTOP_DATA_DIR=/tmp/fbtt-desktop-data \
+  cargo run -p featherbittorrent-desktop
+
+# The desktop packages, each followed by its own smoke (the release workflow's desktop-* jobs run the
+# same scripts). tauri-cli is pinned: `cargo install --locked tauri-cli@2.12.6`, and the macOS and Windows scripts
+# refuse any other version. Output: target/dist/featherbittorrent-desktop-<version>-<os>-<arch>.<ext> and .sha256.
+bash dev/package-desktop-macos.sh "$(bash dev/release-version.sh)"            # universal .dmg, macOS only
+./dev/package-desktop-windows.ps1 -Version <v>                                # .msi, Windows only, x86-64
+# Linux .deb, .rpm and .tar.gz, native per architecture, inside ubuntu:22.04 (the script's header has
+# the full docker run line); needs Docker:
+bash dev/package-desktop-linux.sh "$(bash dev/release-version.sh)" "$(uname -m)"
+bash dev/smoke-desktop-linux.sh <deb|rpm|tar.gz> target/dist <version>        # in a clean container, as root
+bash dev/smoke-desktop-macos.sh target/dist <version>
+./dev/smoke-desktop-windows.ps1 target/dist <version>                         # as administrator, on a clean machine
+
 # Full gate, as CI runs it (fmt is Linux-only in CI; deny runs as cargo-deny-action)
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo deny check
+
+# The docs site (website/, Node 22): dev server, and the production build that fails on broken links.
+cd website && npm ci && npm start
+cd website && npm run build
 
 # Local security scans via Docker (semgrep, deny, grype, gitleaks); one tool:
 # bash dev/sast.sh semgrep. Windows twin: ./dev/sast.ps1
@@ -152,3 +187,30 @@ bash dev/sast.sh
 # FBTT_DATA_DIR=/data/library); the image itself sets no ENV for either.
 FBTT_CONFIG_DIR=/tmp/fbtt-config FBTT_DATA_DIR=/tmp/fbtt-data cargo run -p featherbittorrent
 ```
+
+## What CI cannot check on the desktop app
+
+Tests cover the logic (settings, instances, close and tray decisions, handoff, serving) and the packages
+are smoked as files, but nothing here drives a real window, tray or file association. These need a person
+on the real system, by eye, before a release (the plan's last step is a pass on the built `.app`):
+
+- Window chrome: the macOS window buttons sitting on the title bar, the drawn controls on Windows and
+  Linux, dragging, double-click to maximize, edge resize and Windows snap on an undecorated window, and
+  `Use the system title bar` on Linux.
+- The tray: GNOME with and without the AppIndicator extension (without it the app must offer no tray and
+  closing must quit), KDE, the macOS menu bar and the Windows notification area; Show, the instance line,
+  Quit, and on macOS the Dock icon leaving when the window is closed to the tray and coming back with the
+  window.
+- Start at login on each system (the LaunchAgent, the Run key, the autostart file) and that a
+  `--background` start shows no window; on macOS, the Dock icon on a login start (hidden until the window
+  opens, then in the Dock and the window in front).
+- File associations: a `magnet:` link from Firefox and from Chrome on each system, with the app closed
+  and open, and a `.torrent` double-clicked; on Linux through the `.deb` and `.rpm` launchers and through
+  the `.tar.gz` plus its two `xdg-mime` commands. The Linux launcher is listed as `featherbittorrent` from
+  every format.
+- MSE playback of a video in WebView2, WKWebView and WebKitGTK.
+- Download from the player (a file the webview cannot play): the save dialog opens, the file is written where
+  chosen, and the window stays on the app.
+- Saved passwords in the macOS keychain, the Windows credential manager and a Linux Secret Service, and the
+  `This system has no keychain` line where there is none.
+- Serving the web UI to a phone on the same network.

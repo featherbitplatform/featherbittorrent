@@ -1,0 +1,97 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "featherbittorrent",
+  "identifier": "io.featherbit.featherbittorrent.desktop",
+  "build": {
+    "frontendDist": "../../web/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "visible": false,
+        "title": "featherbittorrent",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 26 }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http: https:; media-src 'self' http: https: blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "msi", "deb", "rpm"],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "wix": {
+        "upgradeCode": "97828bd2-4932-4d8b-bbb3-84b05ea345e4"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["torrent"],
+        "name": "BitTorrent file",
+        "description": "A torrent to add in featherbittorrent",
+        "mimeType": "application/x-bittorrent",
+        "role": "Viewer"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux.desktop.template",
+        "depends": [
+          "libc6",
+          "libgcc-s1",
+          "libgtk-3-0",
+          "libgdk-pixbuf-2.0-0",
+          "libglib2.0-0",
+          "libpango-1.0-0",
+          "libcairo2",
+          "libcairo-gobject2",
+          "libdbus-1-3",
+          "libwebkit2gtk-4.1-0",
+          "libjavascriptcoregtk-4.1-0",
+          "libsoup-3.0-0"
+        ]
+      },
+      "rpm": {
+        "desktopTemplate": "linux.desktop.template",
+        "depends": [
+          "glibc",
+          "libgcc",
+          "gtk3",
+          "glib2",
+          "gdk-pixbuf2",
+          "pango",
+          "cairo",
+          "dbus-libs",
+          "webkit2gtk4.1",
+          "libsoup3"
+        ]
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["magnet"]
+      }
+    }
+  }
+}

@@ -618,6 +618,58 @@ async fn password_login_then_api() {
     served.stop().await;
 }
 
+/// A request that carries `?token=` gets an answer marked `Cache-Control: no-store` from this server's own
+/// routes, so the URL (credential included) is not filed in a cache on disk; one without it is left alone.
+#[tokio::test]
+async fn token_query_answers_are_not_stored() {
+    let served = Served::start("token-query-no-store", |scratch| {
+        base_config(scratch, vec![alice()], Vec::new(), Some(true))
+    })
+    .await;
+    let client = http();
+    let (token, _) = session_of(
+        post_basic(
+            &client,
+            &served.url("/api/v1/auth/session"),
+            "alice",
+            "hunter2",
+        )
+        .await,
+    )
+    .await;
+
+    for query in ["?token=x", "?a=1&token=", "?token"] {
+        let answer = get(
+            &client,
+            &served.url(&format!("/api/v1/fs/roots{query}")),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(answer.status(), StatusCode::OK, "{query}");
+        assert_eq!(
+            answer
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "{query}: an answer to a token-bearing URL may be stored",
+        );
+    }
+    let plain = get(
+        &client,
+        &served.url("/api/v1/fs/roots?tokens=x"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    assert!(
+        plain.headers().get("cache-control").is_none(),
+        "an answer with no token in its URL keeps its own caching",
+    );
+
+    served.stop().await;
+}
+
 /// The login routes cap what a stranger can make this server hold: 64 KiB, not the 32 MiB fbt-api keeps
 /// for uploading a `.torrent`. A key login is three short fields, and these are the only two calls that
 /// take bytes from someone whose identity is not known yet. The refusal is this API's own error shape, and
