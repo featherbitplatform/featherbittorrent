@@ -319,6 +319,10 @@ impl Server {
             extra
         };
 
+        // Every answer of this server's own routes to a request with `?token=` is not to be stored: the
+        // credential is in the URL a cache would file it under.
+        let extra = extra.layer(axum::middleware::from_fn(routes::no_store_with_token));
+
         let api = ApiServer::start_with(
             // A clone, and every clone is the same session: fbt-api answers requests from it while this
             // task keeps driving the saves, and neither owns it more than the other.

@@ -837,6 +837,35 @@ struct ErrorDetail {
 /// the empty `404` it is shown. A fallback would make every guessed path answer something to a request
 /// that never presented the secret; `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs`
 /// is what notices if one appears.
+/// `Cache-Control: no-store` on every answer to a request whose query carries a `token`.
+///
+/// A player or an `EventSource` cannot set a header, so the routes behind them take the credential as
+/// `?token=`, and a webview or a browser that stores the answer files it under that whole URL, token
+/// included, in a cache on disk that outlives the session. This server's own routes say not to. It is a
+/// layer on this server's routes only: fbt-api's own (the file stream and the event stream) are behind
+/// its router, which this one is merged into and cannot wrap.
+pub(crate) async fn no_store_with_token(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let carries = request.uri().query().is_some_and(query_has_token);
+    let mut response = next.run(request).await;
+    if carries {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+/// Whether a query string names a `token` parameter, with a value or without.
+fn query_has_token(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some("token"))
+}
+
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
     // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
