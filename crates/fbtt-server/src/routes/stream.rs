@@ -24,6 +24,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use fbt::{InfoHashV1, InfoHashV2, InfoHashes, SessionError};
 use fbtt_core::client::TorrentId;
+use fbtt_core::engine::prefer_for_playback;
 use fbtt_core::stream::stream_path;
 use fbtt_core::stream::tokens::FIRST_USE;
 use serde::{Deserialize, Serialize};
@@ -112,6 +113,11 @@ pub(super) async fn issue(
     if file.pad {
         return Err(RouteError::not_found("no such file"));
     }
+    // Whoever asked for this address is about to play the file it names, so the file goes to High priority
+    // if it is below it and downloads in order, and the torrent's other files keep their priorities. The
+    // terminal client's `s`, the desktop app's Open in player and the web player's Download button all end
+    // up here, and a download of a file reads it front to back, so in order is right for that too.
+    prefer_for_playback(&torrent, file.index).await;
 
     // The address, spelled once: the id is the wire hash this torrent actually has - lower-cased by
     // [`TorrentId::from_wire_hash`], whatever spelling named it - and the index as a plain decimal. A token

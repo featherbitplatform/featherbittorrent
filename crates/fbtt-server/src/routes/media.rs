@@ -42,6 +42,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use fbt::{FileStatus, InfoHashes, SessionError, TorrentHandle};
+use fbtt_core::engine::prefer_for_playback;
 use fbtt_media::{self as media, Cue, MediaError, SubtitleFormat, TrackInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
@@ -341,6 +342,11 @@ pub(super) async fn track_stream(
     };
     let permit = media_permit(&shared)?;
     let (torrent, _) = listed(&shared, &hashes, file).await?;
+    // The viewer pressed Play on this file, so it goes to High priority if it is below it and its pieces
+    // download in order, and the torrent's other files keep their priorities. Any track of it counts as
+    // playing it - a subtitle track and an unplayable container are still this file being asked for - and
+    // the routes that only read a header are not plays and do not do it (see `probe`).
+    prefer_for_playback(&torrent, file).await;
     let (reader, stop) = open_reader(&shared, &torrent, file).await?;
     let (heads, head) = oneshot::channel();
     let (fragments, queue) = mpsc::channel::<Vec<u8>>(FRAGMENTS_QUEUED);
