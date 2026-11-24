@@ -347,7 +347,7 @@ impl Downloads {
     }
 
     /// Starts watching for the cancel of the download the page opened under `handle`: the answer
-    /// is the switch [`save_to`](save_to) reads, and [`cancel`](Self::cancel) throws, until
+    /// is the switch [`save_to`] reads, and [`cancel`](Self::cancel) throws, until
     /// [`finish`](Self::finish) takes the handle back out.
     pub fn register(&self, handle: &str) -> tokio::sync::watch::Receiver<bool> {
         let (sender, receiver) = tokio::sync::watch::channel(false);
