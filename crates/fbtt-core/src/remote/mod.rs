@@ -163,7 +163,9 @@ impl RemoteBackend {
                 // with nothing until it is dropped or asked to stop. The link goes to `Lost` rather than
                 // staying `Connecting`: there is nothing here that a later attempt could fix, and a header
                 // that spins forever on somebody's typo reads as a server that is still being reached.
-                let _ = channels.notices.try_send(Notice::Error(clean(&problem)));
+                // The snapshot goes out before the line, the same order `Backend::refresh` keeps: a notice
+                // about the link and the state it names are published in that order so they are seen
+                // together.
                 let retry_in_secs = BACKOFF[0].as_secs();
                 let _ = channels.snapshot.send(Arc::new(blank(
                     name,
@@ -171,6 +173,7 @@ impl RemoteBackend {
                     auth,
                     LinkState::Lost { retry_in_secs },
                 )));
+                let _ = channels.notices.try_send(Notice::Error(clean(&problem)));
                 tokio::spawn(idle(channels.commands, channels.snapshot, channels.notices));
                 client
             }

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remote client: the snapshot that says the link is lost - or that it came back - is published before the notice about it, so the two are seen together instead of the line arriving against the state from before. ([#39](https://github.com/featherbitplatform/featherbittorrent/pull/39))
 - Desktop app: pressing Add torrent while Settings was open left the window unresponsive. It now goes back to the torrent list and opens the Add dialog there. ([#35](https://github.com/featherbitplatform/featherbittorrent/pull/35))
 - Player: a video that fails to play now says why (the codec and the system's own message) instead of only "Playback failed.", hints at the HEVC Video Extensions on Windows, and keeps playing without sound when only the audio track cannot be decoded. ([#36](https://github.com/featherbitplatform/featherbittorrent/pull/36))
 
