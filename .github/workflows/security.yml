@@ -2,7 +2,7 @@ name: Security
 
 # Security scans: the same scanners and thresholds as dev/sast.sh and
 # dev/sast.ps1. Every tool reads its config from the repo root (deny.toml,
-# .semgrepignore, .gitleaks.toml, .grype.yaml) so local
+# .semgrepignore, .gitleaks.toml, .grype.yaml, website/audit-ci.jsonc) so local
 # runs and CI can't drift. Jobs fail on high/critical findings (semgrep: ERROR);
 # the SARIF reports go to the Security tab.
 
@@ -110,3 +110,18 @@ jobs:
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
+
+  # npm dependency CVEs of the docs site (no install needed: the audit reads
+  # the lockfile and queries the registry). audit-ci instead of raw `npm audit`
+  # because it supports a documented allowlist (website/audit-ci.jsonc); plain
+  # npm audit has no ignore mechanism at all.
+  npm-audit:
+    name: npm audit (website)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npx --yes audit-ci@^7 --config audit-ci.jsonc
+        working-directory: website

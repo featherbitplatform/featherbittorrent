@@ -58,8 +58,10 @@ jobs:
         id: version
         run: bash dev/release-version.sh
 
-  # CycloneDX SBOM of the workspace's crates (Cargo.lock). Same generator, pin and naming as
-  # fbt-lib's release workflow, so one toolchain reviews every release artifact of the platform.
+  # CycloneDX SBOMs: the workspace's crates (Cargo.lock) and the docs site's npm packages
+  # (website/package-lock.json, the JavaScript the published docs site serves). Same generator,
+  # pin and naming as fbt-lib's release workflow, so one toolchain reviews every release artifact
+  # of the platform.
   sbom:
     needs: verify
     runs-on: ubuntu-latest
@@ -81,14 +83,18 @@ jobs:
           "$SYFT" scan file:Cargo.lock \
             --source-name featherbittorrent --source-version "$VERSION" \
             -o "cyclonedx-json=target/dist/featherbittorrent-$VERSION.cdx.json"
+          "$SYFT" scan file:website/package-lock.json \
+            --source-name featherbittorrent-docs --source-version "$VERSION" \
+            -o "cyclonedx-json=target/dist/featherbittorrent-docs-$VERSION.cdx.json"
           # An SBOM without components means syft read nothing from the lockfile.
-          jq -e '.components | length > 0' "target/dist/featherbittorrent-$VERSION.cdx.json" > /dev/null \
-            || { echo "::error::no components in the SBOM"; exit 1; }
+          for f in target/dist/*.cdx.json; do
+            jq -e '.components | length > 0' "$f" > /dev/null || { echo "::error::no components in $f"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: featherbittorrent-sbom
           if-no-files-found: error
-          path: target/dist/featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json
+          path: target/dist/*.cdx.json
 
   # The Linux packages and archives are built inside an almalinux:9 container on native runners of each
   # arch. Its glibc (2.34, RHEL 9's) is the oldest of the supported systems, so one binary serves the .deb,
@@ -564,7 +570,7 @@ jobs:
   # One release with every system's packages and archives plus the SBOM, published only when every job
   # passed: any failing build or smoke test skips this one, so nothing untested is published, the desktop
   # app's jobs included. Only a tag push publishes; a pull request or manual run builds and checks, never
-  # releases. The release is made as a draft, gets all 53 files, and only then is published, so a failed
+  # releases. The release is made as a draft, gets all 54 files, and only then is published, so a failed
   # upload never leaves a half-published release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
@@ -601,7 +607,7 @@ jobs:
         No package installs, enables or starts a service; `docs/autostart.md` shows how to run `serve`
         under systemd, launchd or Windows Task Scheduler, and `docs/web-ui.md` covers the full build's
         browser sign-in and the off switch. `featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json`
-        is this release's CycloneDX SBOM. The desktop app, `featherbittorrent-desktop`, installs beside either
+        is this release's CycloneDX SBOM, and `featherbittorrent-docs-${{ needs.verify.outputs.version }}.cdx.json` is the one for the docs site. The desktop app, `featherbittorrent-desktop`, installs beside either
         build: a universal `.dmg` for macOS 11 or newer, an `.msi` for Windows x86_64, and `.deb`, `.rpm` and
         `.tar.gz` for Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 41 and later), each for
         x86_64 and aarch64. Like the CLI it starts nothing at boot or login, and removing it keeps your
@@ -663,6 +669,7 @@ jobs:
           dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip
           dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip.sha256
           dist/featherbittorrent-$VERSION.cdx.json
+          dist/featherbittorrent-docs-$VERSION.cdx.json
           dist/featherbittorrent-desktop-$VERSION-macos-universal.dmg
           dist/featherbittorrent-desktop-$VERSION-macos-universal.dmg.sha256
           dist/featherbittorrent-desktop-$VERSION-windows-x86_64.msi
@@ -690,12 +697,12 @@ jobs:
           # The expected count comes from the build matrix, not from a remembered number: 2 Linux
           # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
           # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
-          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM, plus the
+          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 2 SBOMs (the crates and the docs site), plus the
           # desktop app: 1 macOS .dmg and 1 Windows .msi with their .sha256 (2 x 2), and 2 Linux archs
           # x 6 files each (deb, rpm, tar.gz + one .sha256 each).
           # The heredoc above must list exactly that many lines, and dist/ must hold exactly that
           # many files; a line added or dropped in either place is caught here.
-          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 + 2 * 2 + 2 * 6 ))
+          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 2 + 2 * 2 + 2 * 6 ))
           listed="$(wc -l < "$RUNNER_TEMP/release-files")"
           echo "release file list holds $listed files, expected $expected"
           [ "$listed" -eq "$expected" ]
