@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The desktop app, `featherbittorrent-desktop`: the web UI in a native window (Tauri 2) beside the terminal client, as its own package in the same release. It runs an engine of its own on this machine, `This computer`, with its own settings and library; it draws its own title bar with an instance switcher, and switches between `This computer` and remote instances added by address. A remote instance asks for a user name and a password once, and `Save password` keeps the password in the system keychain. The first close asks whether closing quits or keeps the app running in the tray, and the answer can be changed in Settings; where there is no tray, closing quits. `Start at login` is off until you turn it on. `magnet:` links and `.torrent` files open its Add page, with an instance picker, and a second launch hands them to the copy already running. `Serve the web UI` puts the web UI on an address of your choice for other machines, behind a login it asks you to create. Releases carry a `.dmg` for macOS (universal), an `.msi` for Windows (x86-64) and a `.deb`, an `.rpm` and a `.tar.gz` for Linux (x86-64 and aarch64), each with a `.sha256`; none of them is signed, and none installs or starts a service. The desktop app's Linux floor is glibc 2.35 (Ubuntu 22.04, Debian 12, Fedora 41), higher than the command line builds', and it needs WebKitGTK 4.1 and libsoup 3. Documented in `docs/desktop.md`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+- `server.cors_origins`: the origins of clients served from somewhere else that may call a server's API, empty by default. The desktop app connecting to a remote server needs its own origin listed, `tauri://localhost` on macOS and Linux and `http://tauri.localhost` on Windows. Listing an origin signs nobody in. Beside it, the server has a desktop access mode for the engine the desktop app runs itself: it accepts a launch secret made when the app starts, and exposes the configured `server:` section to the network only when `Serve the web UI` is on. Documented in `docs/server.md`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+- The web client signs in with a bearer token to any address, not only to the origin it was served from, which is how the desktop app reaches a remote server: the token is kept in memory, with no cookie and no CSRF header, and signing out ends the session on the server. The keyboard shortcuts can be changed in the desktop app (`Change` on a row, `Already used by <action>` for a key another action in the group holds, `Reset to defaults`), and the list stays read-only in a browser. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+
+### Fixed
+
+- Dialogs (close, delete, add torrent, limits, move files, remove device and the player) now open centred in the window instead of in its top-left corner. This affected the web UI released in `0.3.0`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
+
 ## [0.3.0] - 2026-11-23
 
 ### Added

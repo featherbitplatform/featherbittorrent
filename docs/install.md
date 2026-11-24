@@ -4,7 +4,9 @@ Every release puts one artifact per system on the
 [releases page](https://github.com/featherbitplatform/featherbittorrent/releases), with a `.sha256` beside
 each one. This guide says which file to download, how to check it, where its files land, and what installing
 never does: no package installs, enables or starts a service, and none of them creates an account. Running
-`serve` at boot is your own choice, and [docs/autostart.md](autostart.md) is the guide to it.
+`serve` at boot is your own choice, and [docs/autostart.md](autostart.md) is the guide to it. The desktop app,
+`featherbittorrent-desktop`, has files of its own in the same releases: they are the last section here, and
+[docs/desktop.md](desktop.md) is its guide.
 
 ## Which file is yours
 
@@ -265,3 +267,52 @@ Nothing above starts featherbittorrent for you. If you want `serve` running befo
 restarting itself after a crash, [docs/autostart.md](autostart.md) walks through systemd (a system unit and a
 user one), launchd and Windows Task Scheduler one command at a time, with the example file for each in
 `packaging/` and inside every artifact as documentation.
+
+## The desktop app
+
+`featherbittorrent-desktop` is the web UI in a window of its own, with an engine of its own on the machine it
+runs on ([docs/desktop.md](desktop.md)). It carries the same version as the two builds above, it is published
+in the same release and on the same page with its own `.sha256` beside each file, and it is its own package:
+it removes neither `featherbittorrent` nor `featherbittorrent-headless` when you install it, it shares no
+library with them, and removing it touches neither of them.
+
+| System | The desktop app's file |
+| --- | --- |
+| macOS 11 or newer, Apple Silicon or Intel | `featherbittorrent-desktop-<version>-macos-universal.dmg` |
+| Windows, x86-64 | `featherbittorrent-desktop-<version>-windows-x86_64.msi` |
+| Debian, Ubuntu or Raspberry Pi OS 64-bit | `featherbittorrent-desktop-<version>-linux-x86_64.deb`, or `-linux-aarch64.deb` |
+| Fedora and family | `featherbittorrent-desktop-<version>-linux-x86_64.rpm`, or `-linux-aarch64.rpm` |
+| Any other Linux with glibc 2.35 or newer | `featherbittorrent-desktop-<version>-linux-x86_64.tar.gz`, or `-linux-aarch64.tar.gz` |
+
+The desktop app's Linux floor is not the CLI's. Its files are built on Ubuntu 22.04, against glibc 2.35, and
+every release tests them on Ubuntu 22.04, Debian 12 and Fedora 41; RHEL 9 and its rebuilds are not
+supported for it, because its webview needs WebKitGTK 4.1 with libsoup 3. The CLI's files above keep running
+on the glibc 2.34 floor, RHEL 9 included.
+
+```bash
+sudo apt install ./featherbittorrent-desktop-<version>-linux-x86_64.deb    # or dnf install ./...rpm
+featherbittorrent-desktop --version
+```
+
+On macOS, open the `.dmg` and drag `featherbittorrent.app` onto `Applications`. On Windows, double-click the
+`.msi`. The desktop app's files are unsigned, as this project's other artifacts are: nothing is signed with an
+Apple Developer ID or notarized, the `.msi` carries no signature either, so the first run is the one that
+asks. macOS says it cannot verify the app until you approve it once, and SmartScreen may show
+`Windows protected your PC`, where `More info` and then `Run anyway` is the answer.
+[docs/desktop.md](desktop.md) has every install step, both notes in full, and the `.tar.gz`, which is
+extracted onto `/` with `tar -C /` and then takes two `xdg-mime` commands to become the handler for `magnet:`
+links and `.torrent` files.
+
+What installing the desktop app never does is the list above, unchanged: no service installed or enabled, no
+account created, nothing started, nothing that starts at boot or login (its own `Start at login` is a setting
+you turn on, written when you turn it on), and no file written before the first run. Its files are its own,
+in directories of its own beside the ones above:
+
+- `~/.config/featherbittorrent-desktop` and `~/.local/share/featherbittorrent-desktop` on Linux
+- `~/Library/Application Support/io.featherbit.featherbittorrent-desktop` on macOS
+- `%APPDATA%\featherbit\featherbittorrent-desktop\config`, and the `data` folder beside it, on Windows
+
+`apt purge featherbittorrent-desktop` and `dnf remove featherbittorrent-desktop` remove what the package
+installed and leave all of that where it is, exactly as they do for the CLI. Its library answers to
+`FBTT_DESKTOP_CONFIG_DIR` and `FBTT_DESKTOP_DATA_DIR`, not to `FBTT_CONFIG_DIR` and `FBTT_DATA_DIR`: pointing
+a service or a container at another library does not move the desktop app's.

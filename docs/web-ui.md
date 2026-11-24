@@ -78,6 +78,32 @@ and fail; the gateway-only setup is the one where the two do not collide. Setups
 bearer and device-key logins working through the gateway. The web UI never signs in at the gateway:
 where it is served, in setups 1 and 3, it signs in at the server.
 
+## In the desktop app
+
+The desktop app shows this same page, from its own bundle rather than from a server, in a native window: the
+same React code and the same API client, with the desktop-only parts drawn onto it (its own title bar with
+the instance switcher, the desktop settings, the editable shortcut list, the instance picker on the Add page)
+loaded only when the page is running inside that window. A browser loads the same files and shows none of
+them, and none of them costs it a byte more.
+
+What the page does through the API it does the same way there. Only how it reaches the API differs, and only
+in the credential. For `This computer`, the engine the app runs itself, the window calls a loopback address
+with a secret made when the app launched. For an instance on another machine it signs in with a user name and
+a password and keeps the bearer token that answers in memory: no cookie, no `X-CSRF-Token`, nothing written to
+browser storage, so the cookie rules above do not apply to it and the session ends when the app closes.
+
+A remote server has to allow that in two ways: its logins on, and the desktop app's origin in
+`server.cors_origins`. A webview sends the origin of its own page on every call it makes to another address,
+and the desktop app's is `tauri://localhost` on macOS and Linux and `http://tauri.localhost` on Windows. A
+server with logins off answers those calls `403`, because with nobody signed in the name a request carries and
+the origin it carries are the only credentials that server has. [docs/desktop.md](desktop.md) has both rules,
+and what the app shows when a connection is refused for its origin.
+
+`Serve the web UI` in the desktop app's settings puts this page on an address of its own for other machines,
+where a phone signs in with the cookie session described above, while the app itself keeps using its private
+loopback address. Video plays through the system's own webview, so where that webview cannot play a codec the
+player shows the same `This browser cannot play` line and `Download` button it shows in a browser.
+
 ## Playing media
 
 The web UI plays video files in the browser, with no media player to install. Files that show a
@@ -227,7 +253,9 @@ says `Device logins need the server's logins on.` instead.
 
 ### Keyboard shortcuts
 
-A read-only list of every shortcut, in groups.
+A read-only list of every shortcut, in groups. In the desktop app the same section is editable: `Change` on a
+row waits for the next key you press, a key another action in the group holds is refused with `Already used by
+<action>`, and `Reset to defaults` puts the shipped keys back, as [docs/desktop.md](desktop.md) describes.
 
 **Player**
 
