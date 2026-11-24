@@ -106,10 +106,14 @@ impl Backend {
 
     /// Reads the table once and takes it in, then says how the link stands.
     pub(crate) async fn refresh(&mut self) {
+        // What this round has to say, kept and said after the snapshot it is about. A screen takes the
+        // notice and the snapshot from two different channels, so the order they are sent in is the order
+        // they can be seen in: the state the line describes has to be out there before the line arrives.
+        let mut line: Option<Notice> = None;
         match self.poll().await {
             Ok(()) => {
                 if matches!(self.state, LinkState::Lost { .. }) {
-                    self.notify(Notice::Info(format!("reached {} again", self.name)));
+                    line = Some(Notice::Info(format!("reached {} again", self.name)));
                 }
                 self.state = LinkState::Connected;
                 self.backoff = 0;
@@ -131,9 +135,16 @@ impl Backend {
                 // next trouble is news again.
                 if !self.complained {
                     self.complained = true;
-                    self.notify(problem.notice());
+                    line = Some(problem.notice());
                 }
             }
+        }
+        // The snapshot before the line, always: whatever the round ended up saying about the link, the
+        // state it says it about is already published, so a notice and the snapshot that agrees with it are
+        // seen together rather than the line arriving against the state from before this round.
+        self.publish();
+        if let Some(line) = line {
+            self.notify(line);
         }
         self.publish_gate();
     }

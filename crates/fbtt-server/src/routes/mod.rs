@@ -298,10 +298,10 @@ impl Shared {
         self.verify_tally.max_concurrent_verifies()
     }
 
-    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks are sitting
-    /// inside the verify right now, with a change to wait for. Under `test-support` only, and arming it
-    /// twice changes nothing about the checks - both watchers see the same count. See
-    /// [`Server::park_verifies`].
+    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks have reached
+    /// the hold since it was armed (arrivals ever, never a count of what is there now), with a change to wait
+    /// for. Under `test-support` only, and arming it twice changes nothing about the checks - both watchers
+    /// see the same count. See [`Server::park_verifies`].
     #[cfg(feature = "test-support")]
     pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
         self.verify_tally.park()
@@ -433,9 +433,13 @@ impl VerifyTally {
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
 struct VerifyHold {
-    /// How many checks are parked here right now. Every arrival bumps it and sends the new number, so a
-    /// watcher reads a count and waits for the next change instead of polling - which is how a test counts
-    /// what is holding the permits without guessing at how long a hash takes on somebody else's machine.
+    /// How many checks have reached the hold since it was armed, and the count a watcher waits on. It is
+    /// arrivals ever, not a count of what is parked right now: it is bumped on every arrival and never
+    /// brought down, because what a test waits for is the *next* check to arrive, and a check that finished
+    /// and left would otherwise look the same as one that never came. Every arrival bumps it and sends the
+    /// new number, so a watcher reads a count and waits for the next change instead of polling - which is how
+    /// a test counts what is holding the permits without guessing at how long a hash takes on somebody else's
+    /// machine.
     parked: AtomicU64,
     counts: watch::Sender<u64>,
     /// `false` while checks are being held; [`VerifyHold::release`] makes it `true` for good, so the checks
