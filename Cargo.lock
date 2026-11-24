@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-desktop-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "directories",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-media"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "matroska-demuxer",
  "mp4-atom",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "axum",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "fbtt-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "color_quant",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "featherbittorrent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "featherbittorrent-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "fbt",
