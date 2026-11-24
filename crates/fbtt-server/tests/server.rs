@@ -1868,14 +1868,15 @@ impl Drop for ReleaseParked<'_> {
 /// permit was returned at all, not how fast argon2 runs on the machine next door.
 const SETTLE: Duration = Duration::from_secs(3);
 
-/// Waits until `want` Argon2 checks have reached the hold (see `Server::park_verifies`). The count the hold
-/// moves is *arrivals ever*, not a count of what is parked right now, so it is only ever waited on and never
-/// compared against a target: reaching `want` means a `want`'s worth have arrived, and anything beyond that
-/// is a later arrival this leaves marked as read so the caller can wait for the next change.
-async fn wait_until_parked(parked: &mut tokio::sync::watch::Receiver<u64>, want: u64) {
+/// Waits until `want` Argon2 checks have reached the hold (see `Server::park_verifies`), and returns the count
+/// it read. The count the hold moves is published in order and only ever rises, so a `want`'s worth of
+/// arrivals reads back as exactly `want`: the number cannot move under the reader, which is what makes reading
+/// it for equality a measurement of how many are parked rather than a race against the next arrival.
+async fn wait_until_parked(parked: &mut tokio::sync::watch::Receiver<u64>, want: u64) -> u64 {
     while *parked.borrow_and_update() < want {
         within(parked.changed()).await.expect("a check parked");
     }
+    *parked.borrow_and_update()
 }
 
 /// The bound on the slow part of logging in, measured rather than inferred: an Argon2 check wants about 19
@@ -1926,17 +1927,14 @@ async fn verify_concurrency_is_bounded() {
         }));
     }
     let want = u64::try_from(cap).expect("a count of permits");
-    // Wait for a cap's worth of checks to reach their hold. The held count is arrivals ever, not a count of
-    // what is parked now, so it is only waited on here and never compared: a further arrival can carry it
-    // past the cap without any check having got past the permit, which is what made reading it for equality
-    // a race against the next arrival rather than a measurement of the bound.
-    wait_until_parked(&mut parked, want).await;
-    // The bound itself, read where it lives: the most this server has had running at once. Every permit is
-    // held by a check that has not finished, so that most is exactly a cap's worth - and it could never be
-    // more, because the permit is what a check has to take before it counts here.
+    // Wait for a cap's worth of checks to reach their hold, and read the number back. The count is published
+    // in order and only ever rises, so exactly a cap's worth of arrivals reads back as the cap - and no more,
+    // because only a cap's worth of requests are in flight to arrive. That number is the bound itself: every
+    // permit is held by a check that has not finished, and a check has to take the permit before it counts
+    // here.
     assert_eq!(
-        usize::try_from(served.server.max_concurrent_verifies()).expect("a count of checks"),
-        cap,
+        wait_until_parked(&mut parked, want).await,
+        want,
         "every permit this server has is held by a check that has not finished",
     );
 

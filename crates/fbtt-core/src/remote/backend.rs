@@ -139,6 +139,14 @@ impl Backend {
                 }
             }
         }
+        // A round that gave up because somebody pressed stop (see `crate::remote`'s relay) has nothing new
+        // to show: the link did not go somewhere, this client did. Publishing the `Lost` this round worked
+        // out would put a lost link on the screen of a server nobody is waiting for any more, which is what
+        // the loop behind this already refuses to do - so this round stops here, before the snapshot, before
+        // the line, and before the stream's gate.
+        if self.api.asked_to_stop() {
+            return;
+        }
         // The snapshot before the line, always: whatever the round ended up saying about the link, the
         // state it says it about is already published, so a notice and the snapshot that agrees with it are
         // seen together rather than the line arriving against the state from before this round.
@@ -293,5 +301,104 @@ impl Backend {
             return;
         }
         let _ = self.notices.try_send(notice);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::LiveLimits;
+    use crate::remote::Secret;
+    use crate::remote::blank;
+    use crate::remote::http::Api;
+    use crate::remote::stopping::Stopping;
+    use crate::ui_state::{LoginMethod, RemoteTarget};
+    use std::collections::HashMap;
+    use tokio::sync::{Notify, mpsc, watch};
+
+    /// A round that gave up because somebody pressed stop has nothing to publish: the link did not go
+    /// anywhere, this client did. Putting the `Lost` it worked out on the screen is the snapshot the loop
+    /// behind it already refuses to publish - news about a server nobody is waiting for any more.
+    #[tokio::test]
+    async fn a_round_given_up_for_a_stop_publishes_nothing() {
+        let stopping = Arc::new(Stopping::default());
+        // Nothing has to answer on the other end: the stop is already in by the time the round runs, so
+        // every call the round makes ends on the stop rather than on a socket.
+        let target = RemoteTarget {
+            url: "http://127.0.0.1:1".to_string(),
+            login: LoginMethod::None,
+            user: None,
+            key_path: None,
+            token_url: None,
+            gateway_key_header: None,
+            client_id: None,
+        };
+        let api = Arc::new(
+            Api::try_new(&target, Secret::None, None, Arc::clone(&stopping))
+                .expect("an address that is one"),
+        );
+        let initial = Arc::new(blank(
+            "a server".to_string(),
+            false,
+            "open".to_string(),
+            LinkState::Connected,
+        ));
+        let (snapshot_tx, mut snapshots) = watch::channel(Arc::clone(&initial));
+        let (notices, _lines) = mpsc::channel(1);
+        let (gate, _up) = watch::channel(Gate::Down);
+        let mut backend = Backend {
+            api,
+            name: "a server".to_string(),
+            secure: false,
+            auth: "open".to_string(),
+            roots: Vec::new(),
+            default_dir: PathBuf::new(),
+            watching: None,
+            dirs: None,
+            devices: None,
+            relay: None,
+            torrents: Vec::new(),
+            totals: Totals {
+                down_rate: 0,
+                up_rate: 0,
+                dht_nodes: None,
+            },
+            limits: LiveLimits {
+                download_kib: 0,
+                upload_kib: 0,
+                active_downloads: None,
+                active_seeds: None,
+                active_total: None,
+            },
+            detail: None,
+            queue: None,
+            want_limits: false,
+            stalled: HashMap::new(),
+            state: LinkState::Connected,
+            backoff: 0,
+            complained: false,
+            published: Arc::clone(&initial),
+            snapshot_tx,
+            notices,
+            wake: Arc::new(Notify::new()),
+            gate,
+        };
+
+        // The stop lands while the round is reading, which is what leaves `asked_to_stop` set by the time the
+        // round would publish: it must put nothing on the screen at all.
+        stopping.stop();
+        backend.refresh().await;
+
+        assert!(
+            !snapshots
+                .has_changed()
+                .expect("the round left the snapshot queue open"),
+            "a round given up for a stop publishes nothing"
+        );
+        assert_eq!(
+            *snapshots.borrow_and_update(),
+            initial,
+            "the screen keeps the last good snapshot, not a lost link worked out on the way out"
+        );
     }
 }

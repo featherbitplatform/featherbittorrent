@@ -386,12 +386,12 @@ impl Server {
     /// Stops every Argon2 password check this server starts inside the check, and returns a count of how many
     /// have reached that stopping point since it was armed - a count a test waits on rather than polls, and
     /// releases with [`release_parked_verifies`](Self::release_parked_verifies). The count is arrivals ever,
-    /// not how many are held right now (see [`VerifyTally`]): a test reads it to wait for a check to arrive,
-    /// never as a measure of the bound, which [`max_concurrent_verifies`](Self::max_concurrent_verifies)
-    /// gives. Only a test does this, and it is how that test says the bound is real without timing somebody
-    /// else's hashing: hold the checks that are holding every permit, hang up on their connections, and see
-    /// whether anything else gets a turn. A check stays parked until released even after its client has gone,
-    /// which is the point of the exercise.
+    /// not how many are held right now, and it is published in order and only ever rises (see [`VerifyTally`]),
+    /// so a test can wait for a check to arrive and read the number back without it moving under it. Only a
+    /// test does this, and it is how that test says the bound is real without timing somebody else's hashing:
+    /// hold the checks that are holding every permit, hang up on their connections, and see whether anything
+    /// else gets a turn. A check stays parked until released even after its client has gone, which is the
+    /// point of the exercise.
     #[cfg(feature = "test-support")]
     pub fn park_verifies(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.park_verifies()
