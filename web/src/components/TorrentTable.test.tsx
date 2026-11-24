@@ -465,7 +465,7 @@ describe('phone width', () => {
       session: async () => SESSION_BODY,
     } as unknown as Api
     const { container } = render(
-      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} client={client} />,
+      <Torrents signedIn signOutError={null} onSignOut={() => {}} onSettings={() => {}} onShowTorrents={() => {}} client={client} />,
     )
     // Let the mount effects' reads land before looking at anything.
     await act(async () => {

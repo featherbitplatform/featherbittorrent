@@ -110,11 +110,16 @@ export default function App() {
     }
   }, [session])
 
-  // Going back hands the focus to the button that opened Settings, which is on screen again by then.
+  // Going back hands the focus to the button that opened Settings, which is on screen again by
+  // then. Settings closing because Add torrent asked for the screen back is the exception: that
+  // click opens the dialog in the same render, its layout effect has already put the focus inside
+  // it by the time this runs, and pulling focus to the opener would strand it behind a modal.
   const wasOpen = useRef(false)
   useEffect(() => {
     if (wasOpen.current && !settingsOpen) {
-      document.querySelector<HTMLElement>('[data-settings-opener]')?.focus()
+      if (document.querySelector('dialog[open]') === null) {
+        document.querySelector<HTMLElement>('[data-settings-opener]')?.focus()
+      }
     }
     wasOpen.current = settingsOpen
   }, [settingsOpen])
@@ -194,6 +199,7 @@ export default function App() {
             <Torrents
               hidden={settingsOpen}
               onSettings={() => openSettings()}
+              onShowTorrents={closeSettings}
               signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}
               onSignOut={() => void signOut()}

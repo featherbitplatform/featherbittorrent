@@ -39,7 +39,11 @@
  * and closing it gives the focus back to the card that opened it. An action's refusal is drawn in
  * the full view as well as in the banner, and any later action the server accepts clears it.
  * `hidden` is App's word that Settings covers this screen: the loop then reads at its hidden-page
- * cadence, and wakes the moment the screen is shown again.
+ * cadence, and wakes the moment the screen is shown again. The Add and Remove dialogs never mount
+ * while it is true, because a modal inside a hidden subtree still enters the top layer and makes
+ * the rest of the page inert: it would block every click unseen. The header's Add torrent lives in
+ * the desktop title bar, where no screen covers it, so pressing it here asks for the screen back
+ * through `onShowTorrents` and opens the dialog on the screen that is actually shown.
  *
  * @module screens/Torrents
  */
@@ -71,6 +75,8 @@ export interface TorrentsProps {
   onSignOut(): void
   /** Opens the Settings screen, which replaces this one. */
   onSettings(): void
+  /** Settings covers this screen and something here needs the screen back: close Settings. The header's Add torrent lives in the desktop title bar where Settings cannot cover it, so its dialog must open on a visible screen, not inside a hidden subtree. */
+  onShowTorrents(): void
   /** Whether another screen (Settings) covers this one: the live loop slows to its hidden-page cadence. */
   hidden?: boolean
   /** The client to read through. Defaults to the connection's so tests can hand in a fake. */
@@ -110,6 +116,7 @@ export default function Torrents({
   signOutError,
   onSignOut,
   onSettings,
+  onShowTorrents,
   hidden = false,
   client: given,
 }: TorrentsProps) {
@@ -434,6 +441,11 @@ export default function Torrents({
         onSignOut={onSignOut}
         onSettings={onSettings}
         onAdd={() => {
+          // The header's Add torrent lives in the desktop title bar, where Settings cannot cover
+          // it: pressing it while Settings is up has to ask for this screen back in the same
+          // render, so the dialog mounts on a screen that is shown and not inside a hidden
+          // subtree, where a modal would block every click unseen.
+          if (hidden) onShowTorrents()
           setAddOpen(true)
         }}
       />
@@ -513,7 +525,7 @@ export default function Torrents({
           onRemoved={goneFull}
         />
       )}
-      {addOpen && (
+      {addOpen && !hidden && (
         <AddTorrent
           client={client}
           onAdded={() => {
@@ -527,7 +539,7 @@ export default function Torrents({
           }}
         />
       )}
-      {confirming !== null && (
+      {confirming !== null && !hidden && (
         <ConfirmDelete
           key={confirming.id}
           id={confirming.id}
