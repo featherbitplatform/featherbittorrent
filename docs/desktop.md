@@ -151,9 +151,8 @@ remove one, and mark the default. Adding takes a name and an address: `http://19
 which is another instance rather than `This computer`. An address is a scheme, a host and an optional port,
 and nothing else: no path, no query, no user name in it. A name is at most 64 characters, it is unique
 among the instances read without regard to case, and it is never `This computer`, which is the app's own
-instance and is in the switcher already. An `https` address needs a certificate from an authority the
-system trusts, and there is no setting yet for trusting a private certificate authority
-([docs/server.md](server.md)).
+instance and is in the switcher already. An `https` address needs a certificate the operating system's certificate store trusts, which is what the app's
+webview checks against, and there is no setting yet for trusting a private certificate authority.
 
 The default is `This computer` until you mark another one, and the app connects to the default when it
 starts. A default it cannot reach does not leave you with a stuck window: the app opens, says `Cannot reach
