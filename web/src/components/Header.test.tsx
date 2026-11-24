@@ -8,7 +8,7 @@ import { TitleBarSlotsContext } from './titleBarSlots'
 afterEach(cleanup)
 
 /** A version number that belongs to the engine library and to nothing else in this test: if it reaches the visible text the header is quoting the server instead of itself. */
-const ENGINE_VERSION = '0.11.1'
+const ENGINE_VERSION = '0.12.0'
 
 const headerText = (container: HTMLElement): string =>
   container.querySelector('header')?.textContent ?? ''
