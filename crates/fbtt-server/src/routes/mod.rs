@@ -155,20 +155,26 @@ impl Shared {
     /// `roots` are those folders as canonicalised directories - the same list
     /// [`fbt_api::ApiConfig::allowed_roots`] is handed - and `dummy_password_hash` is the hash computed
     /// once at startup for the accounts this config has, or `None` when it has none worth hiding behind.
-    /// `session` is the engine's own session, cloned: what the torrent routes answer about.
+    /// `session` is the engine's own session, cloned: what the torrent routes answer about. `launch` is the
+    /// desktop app's launch secret and whether it is the only way in, for an engine the app started
+    /// ([`crate::DesktopAccess`]), and `None` for any other server.
     pub(crate) fn new(
         config: Config,
         paths: Paths,
         roots: Vec<fs::Root>,
         dummy_password_hash: Option<String>,
         session: fbt::Session,
+        launch: Option<(String, bool)>,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
         // what `Server::build` serves on in the same case.
         let server = config.server.clone().unwrap_or_default();
         let devices = Mutex::new(DeviceTable::build(&server.auth.devices));
         Shared {
-            auth: Arc::new(FbttAuth::new(&server)),
+            auth: Arc::new(match launch {
+                Some((secret, only)) => FbttAuth::new(&server).with_launch_secret(secret, only),
+                None => FbttAuth::new(&server),
+            }),
             users: server.auth.users.clone(),
             devices,
             changing_devices: tokio::sync::Mutex::new(()),
@@ -816,10 +822,45 @@ struct ErrorDetail {
     message: String,
 }
 
+/// `Cache-Control: no-store` on every answer to a request whose query carries a `token`: a cache would file
+/// the answer under the whole URL, credential included. It covers this server's routes only, not fbt-api's.
+pub(crate) async fn no_store_with_token(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let carries = request.uri().query().is_some_and(query_has_token);
+    let mut response = next.run(request).await;
+    if carries {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+/// Whether a query string names a `token` parameter, with a value or without.
+fn query_has_token(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some("token"))
+}
+
 /// The routes featherbittorrent adds, on paths fbt-api does not serve.
 ///
 /// [`fbt_api::ApiServer::start_with`] merges these ahead of its auth layer, body limit and CORS, so
 /// they arrive with all three; axum panics if one of these paths were also one fbt-api serves.
+///
+/// On the desktop app's own engine that serves nobody else, the login routes are not mounted at all: the
+/// launch secret is the only credential there, so no session can be asked for and those paths answer `404`.
+///
+/// And no route may be added here - or on fbt-api's router - that catches what every other route missed
+/// (`Router::fallback`, a `/{*rest}` nest) while that mode stands: its auth accepts a request that matched
+/// no route without asking for any credential (`FbttAuth`'s `matched_path.is_none()` shortcut in
+/// `crate::auth`), and that is safe only because an unmatched path really has nothing behind it and gets
+/// the empty `404` it is shown. A fallback would make every guessed path answer something to a request
+/// that never presented the secret; `secret_only_unknown_path_is_an_empty_404` in `tests/desktop_access.rs`
+/// is what notices if one appears.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     // The login calls read their bodies under their own cap, far smaller than the 32 MiB fbt-api keeps
     // for uploading a `.torrent`: they are the three places this server takes bytes from someone it has not
@@ -849,6 +890,11 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
                 .delete(web_session::sign_out)
                 .layer(DefaultBodyLimit::max(login::MAX_LOGIN_BODY)),
         );
+    let logins = if shared.auth.secret_only() {
+        Router::new()
+    } else {
+        logins
+    };
     Router::new()
         .merge(logins)
         .route(

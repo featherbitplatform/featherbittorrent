@@ -19,7 +19,7 @@
 //! them as an argument instead, which is how a test - or the binary's debug-only offline mode - keeps
 //! every socket where the caller put it.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,12 @@ use crate::routes::{self, Shared, fs};
 /// stored anywhere: only its hash is computed, once, at startup, and nothing can log in with it because
 /// no account has it.
 const DUMMY_PASSWORD: &str = "featherbittorrent-no-such-account";
+
+/// The shortest launch secret [`Server::start_desktop`] accepts, in characters: the length of 32 random bytes
+/// in unpadded base64url, which is what the desktop app makes. A shorter one is refused rather than served,
+/// because the secret is the whole defence of the app's engine and an empty one would match an empty
+/// `?token=`.
+pub const MIN_LAUNCH_SECRET_CHARS: usize = 43;
 
 /// Why a server did not start. Every case is one the person who ran `serve` has to act on, which is why
 /// each says what to do about it in the line itself.
@@ -64,6 +70,41 @@ pub enum ServerError {
     /// or could not open the listener.
     #[error(transparent)]
     Api(#[from] ApiError),
+    /// The desktop launch secret handed to [`Server::start_desktop`] is shorter than
+    /// [`MIN_LAUNCH_SECRET_CHARS`]. Nothing was started: an engine guarded by a guessable secret is not one
+    /// to serve.
+    #[error(
+        "the launch secret is too short: it needs at least {MIN_LAUNCH_SECRET_CHARS} characters"
+    )]
+    LaunchSecret,
+}
+
+/// How the desktop app reaches the engine it starts ([`Server::start_desktop`]).
+///
+/// The app makes a secret at every launch, keeps it in memory only, and presents it as a bearer token (or
+/// as the query token on the routes that take one). Its webview calls from an origin of its own, which is
+/// why `origins` are added to the server's CORS list. `expose` is whether this engine also serves other
+/// people as the config's `server` section says; without it the engine is the app's alone.
+#[derive(Clone)]
+pub struct DesktopAccess {
+    /// The per-launch secret. Accepted as a credential on every route, compared in constant time.
+    pub launch_secret: String,
+    /// The webview's origins, added to `server.cors_origins`.
+    pub origins: Vec<String>,
+    /// `false`: bind `127.0.0.1:0` whatever the config says, serve no web UI, mount no login routes, and
+    /// accept the launch secret alone. `true`: serve the config's `server` section exactly as
+    /// [`Server::start`] does, and accept the launch secret beside its logins.
+    pub expose: bool,
+}
+
+impl std::fmt::Debug for DesktopAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret: a `Debug` printing ends up beside a panic message.
+        f.debug_struct("DesktopAccess")
+            .field("origins", &self.origins)
+            .field("expose", &self.expose)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A running featherbittorrent server: the library, the API and the save in between them.
@@ -107,7 +148,7 @@ impl Server {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<Self, ServerError> {
-        Self::build(config.session_settings(), config, paths, lock).await
+        Self::build(config.session_settings(), config, paths, lock, None).await
     }
 
     /// [`start`](Self::start) with the engine's settings given rather than taken from the config.
@@ -128,24 +169,71 @@ impl Server {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<Self, ServerError> {
-        Self::build(settings, config, paths, lock).await
+        Self::build(settings, config, paths, lock, None).await
     }
 
-    /// The two starts, which differ only in where the settings came from.
+    /// The engine the desktop app starts for its own window: [`start_with_settings`](Self::start_with_settings)
+    /// with the access [`DesktopAccess`] describes.
+    ///
+    /// The CORS list is `access.origins` plus the config's own `server.cors_origins`. With `expose` off the
+    /// server binds `127.0.0.1` on a port the OS picks whatever the config asks, serves no web UI, mounts no
+    /// login routes (they answer `404`), and accepts only the launch secret. With `expose` on, the config's
+    /// `server` section applies exactly as it does for [`start`](Self::start), and the launch secret is
+    /// accepted beside it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`start`](Self::start), and [`ServerError::LaunchSecret`] for a launch secret shorter
+    /// than [`MIN_LAUNCH_SECRET_CHARS`].
+    pub async fn start_desktop(
+        settings: Settings,
+        config: Config,
+        paths: &Paths,
+        lock: LibraryLock,
+        access: DesktopAccess,
+    ) -> Result<Self, ServerError> {
+        // Checked before anything starts. Counted in characters, as the secret is text; the app's own is
+        // ASCII, so this is its byte length too.
+        if access.launch_secret.chars().count() < MIN_LAUNCH_SECRET_CHARS {
+            return Err(ServerError::LaunchSecret);
+        }
+        Self::build(settings, config, paths, lock, Some(access)).await
+    }
+
+    /// The three starts, which differ only in where the settings came from and in the desktop access.
     async fn build(
         settings: Settings,
         config: Config,
         paths: &Paths,
         lock: LibraryLock,
+        desktop: Option<DesktopAccess>,
     ) -> Result<Self, ServerError> {
         // The section this server was started from. A config with none is not a contradiction: `serve`
         // only gets here once something chose to serve, but a caller that hands its own settings (a test,
         // or a run serving a library somewhere other than where its config points) may hand a config that
         // says nothing about a server, and the defaults are then what an unwritten section means.
         let server = config.server.clone().unwrap_or_default();
-        let bind = server.bind;
-        let auth_on = server.auth_on();
-        let passwords_in_use = !server.auth.users.is_empty();
+        // The desktop app's own engine, serving nobody else: loopback on a port the OS picks, whatever the
+        // config asks, because the window is the only client and the secret the only credential.
+        let secret_only = desktop.as_ref().is_some_and(|access| !access.expose);
+        let bind = if secret_only {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+        } else {
+            server.bind
+        };
+        let auth_on = secret_only || server.auth_on();
+        let mut cors_origins = desktop
+            .as_ref()
+            .map(|access| access.origins.clone())
+            .unwrap_or_default();
+        for origin in &server.cors_origins {
+            if !cors_origins.contains(origin) {
+                cors_origins.push(origin.clone());
+            }
+        }
+        let launch = desktop.map(|access| (access.launch_secret, !access.expose));
+        // No password is taken on the secret-only engine: its login routes are not there.
+        let passwords_in_use = !secret_only && !server.auth.users.is_empty();
         // Said before any of the slow work, because it is about how this server will be reached: if
         // someone is going to type a password over this address, they should know now.
         warn_if_passwords_are_exposed(bind, auth_on, passwords_in_use);
@@ -191,6 +279,7 @@ impl Server {
             roots,
             dummy_password_hash,
             engine.session().clone(),
+            launch,
         ));
 
         // Per-torrent reports from the saves this task makes: a torrent whose resume data would not come
@@ -211,6 +300,10 @@ impl Server {
         // tokens are this server's - is already made in `crate::auth`.
         api_config.auth = Auth::Custom(shared.authenticator());
         api_config.allowed_roots = Some(given_roots);
+        // The origins a browser engine may call from: `server.cors_origins`, plus the desktop webview's own
+        // when the app started this engine. fbt-api answers their preflights before auth and adds the CORS
+        // headers to every answer; who may do what is still decided by the authenticator above.
+        api_config.cors_origins = cors_origins;
 
         // The routes fbt-api is handed, which are featherbittorrent's own: the logins, the devices, the
         // folder browsing, the stream token.
@@ -220,11 +313,15 @@ impl Server {
         // switch, and `web_ui_on` is the only question asked of it; a headless build never gets here, so
         // the same config key on that build is accepted, ignored, and said once at startup instead.
         #[cfg(feature = "web-ui")]
-        let extra = if server.web_ui_on() {
+        let extra = if server.web_ui_on() && !secret_only {
             extra.merge(crate::web::router())
         } else {
             extra
         };
+
+        // Every answer of this server's own routes to a request with `?token=` is not to be stored: the
+        // credential is in the URL a cache would file it under.
+        let extra = extra.layer(axum::middleware::from_fn(routes::no_store_with_token));
 
         let api = ApiServer::start_with(
             // A clone, and every clone is the same session: fbt-api answers requests from it while this

@@ -11,10 +11,11 @@
  * @module components/settings/Devices
  */
 import { useEffect, useId, useRef, useState } from 'react'
-import { api, ApiError, errorMessage } from '../../api/client'
+import { ApiError, errorMessage } from '../../api/client'
+import { useConnection } from '../../connection'
 import type { Api, DeviceRow } from '../../api/client'
 import { displaySafe } from '../../format'
-import { PHONE_FULLSCREEN, useModalDialog } from '../../modal'
+import { MODAL_DIALOG, useModalDialog } from '../../modal'
 import Banner from '../Banner'
 import Button from '../Button'
 import TextField from '../TextField'
@@ -74,7 +75,7 @@ function ConfirmRemove({
       ref={ref}
       onKeyDown={onKeyDown}
       aria-labelledby="remove-device-title"
-      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${PHONE_FULLSCREEN}`}
+      className={`w-[min(460px,calc(100vw-32px))] rounded-overlay border border-rule bg-raised text-body shadow-[0_24px_64px_rgba(0,0,0,0.5)] backdrop:bg-canvas/72 ${MODAL_DIALOG}`}
     >
       <div className="flex flex-col gap-2 px-5.5 py-5">
         <h2 id="remove-device-title" className="text-[16px] font-semibold text-strong">
@@ -102,7 +103,9 @@ function ConfirmRemove({
   )
 }
 
-export default function Devices({ client = api }: { client?: Api }) {
+export default function Devices({ client: given }: { client?: Api }) {
+  const connection = useConnection()
+  const client = given ?? connection.api
   const [load, setLoad] = useState<Load>({ phase: 'loading' })
   const [rows, setRows] = useState<DeviceRow[]>([])
   const [name, setName] = useState('')

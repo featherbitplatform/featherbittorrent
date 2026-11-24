@@ -55,7 +55,8 @@ import StateFilters from '../components/StateFilters'
 import TorrentCards from '../components/TorrentCards'
 import TorrentFullView from '../components/TorrentFullView'
 import TorrentTable from '../components/TorrentTable'
-import { api, errorMessage } from '../api/client'
+import { errorMessage } from '../api/client'
+import { useConnection } from '../connection'
 import type { Api, SessionInfo } from '../api/client'
 import { announcePolite, startLive } from '../live'
 import type { LinkState, LiveHandle, TorrentRow } from '../live'
@@ -72,12 +73,12 @@ export interface TorrentsProps {
   onSettings(): void
   /** Whether another screen (Settings) covers this one: the live loop slows to its hidden-page cadence. */
   hidden?: boolean
-  /** The client to read through. Defaults to the page's one so tests can hand in a fake. */
+  /** The client to read through. Defaults to the connection's so tests can hand in a fake. */
   client?: Api
 }
 
 /** The stream this screen wakes on: the `status` category, and nothing else (the payload is never read; see `live.ts`). */
-const EVENTS_URL = '/api/v1/events?categories=status'
+const EVENTS_QUERY = 'categories=status'
 
 /** How often the session row is re-read for the header's version and DHT count. It is decoration, not the live table; the refresh model puts the once-a-second cadence on the list. */
 const SESSION_POLL_MS = 30_000
@@ -110,8 +111,10 @@ export default function Torrents({
   onSignOut,
   onSettings,
   hidden = false,
-  client = api,
+  client: given,
 }: TorrentsProps) {
+  const connection = useConnection()
+  const client = given ?? connection.api
   const [rows, setRows] = useState<TorrentRow[]>([])
   const [link, setLink] = useState<LinkState>({ phase: 'live' })
   const [filter, setFilter] = useState<FilterKey>('all')
@@ -236,9 +239,11 @@ export default function Torrents({
           document.removeEventListener('visibilitychange', handler)
         }
       },
-      // The cookie authenticates the stream; it is same-origin, so there is nothing to add to it.
-      // An environment without EventSource (a test jsdom) simply gets no stream.
-      eventSource: () => (typeof EventSource === 'function' ? new EventSource(EVENTS_URL) : null),
+      // The browser's cookie authenticates the stream as it is; the desktop's URL carries its token,
+      // because EventSource cannot set a header. An environment without EventSource (a test jsdom)
+      // simply gets no stream.
+      eventSource: () =>
+        typeof EventSource === 'function' ? new EventSource(connection.eventsUrl(EVENTS_QUERY)) : null,
     })
     // The handle stays reachable because the toolbar needs it after the effect that started the loop
     // is long gone: the read a pause earns happens on a click, not on a mount.
@@ -247,7 +252,7 @@ export default function Torrents({
       liveRef.current = null
       live.stop()
     }
-  }, [client])
+  }, [client, connection])
 
   useEffect(() => {
     let stopped = false

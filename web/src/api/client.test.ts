@@ -445,3 +445,97 @@ it('a mkdir answer without a path is an error', async () => {
   const { client } = clientFor(201, '{}')
   await expect(client.mkdir('/data', 'new')).rejects.toThrow()
 })
+
+const BASE = 'http://127.0.0.1:53211'
+
+it('bearer_client_prefixes_base_and_sends_the_token', async () => {
+  const { seen, fetchFn } = record(() => json(200, '[]'))
+  const client = createClient(fetchFn, () => null, () => 0, () => {}, { kind: 'bearer', base: BASE, token: 'desk-token' })
+
+  await client.torrents()
+  await client.pause(ID)
+
+  expect(seen[0].url, 'a bearer read went to the page origin instead of the engine').toBe(`${BASE}/api/v1/torrents`)
+  expect(seen[1].url, 'a bearer change went to the page origin instead of the engine').toBe(`${BASE}/api/v1/torrents/${ID}/pause`)
+  expect(
+    seen.every((call) => call.headers.get('authorization') === 'Bearer desk-token'),
+    'a bearer call went out without its token',
+  ).toBe(true)
+})
+
+it('bearer_client_omits_credentials_and_csrf', async () => {
+  const { seen, fetchFn } = record(() => json(200, '[]'))
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {}, { kind: 'bearer', base: `${BASE}/`, token: 'desk-token' })
+
+  await client.torrents()
+  await client.pause(ID)
+  await client.remove(ID, false)
+
+  expect(seen[0].url, 'a trailing slash on the base doubled up in the path').toBe(`${BASE}/api/v1/torrents`)
+  expect(seen.every((call) => call.credentials === 'omit'), 'a bearer call rode cookies along').toBe(true)
+  expect(seen.some((call) => call.headers.has('x-csrf-token')), 'a bearer call carried a CSRF token').toBe(false)
+})
+
+it('same_origin_client_is_unchanged', async () => {
+  const { seen, fetchFn } = record(() => json(200, '[]'))
+  const client = createClient(fetchFn, () => 'csrf-value', () => 0, () => {}, { kind: 'sameOrigin' })
+
+  await client.torrents()
+  await client.pause(ID)
+
+  expect(seen[0].url, 'the browser client stopped using relative paths').toBe('/api/v1/torrents')
+  expect(seen.every((call) => call.credentials === 'same-origin'), 'the browser client dropped its cookie').toBe(true)
+  expect(seen[1].headers.get('x-csrf-token'), 'the browser client dropped the CSRF token').toBe('csrf-value')
+  expect(seen.some((call) => call.headers.has('authorization')), 'the browser client sent an Authorization header').toBe(false)
+  expect(
+    client.mediaStreamUrl(ID, 0, 1, 1500),
+    'the browser stream path changed',
+  ).toBe(`/api/v1/media/${ID}/0/tracks/1/stream?start_ms=1500`)
+})
+
+it('bearer_stream_paths_are_absolute', async () => {
+  const { fetchFn } = record((call) =>
+    call.url.endsWith('/stream-tokens') && call.body !== null && String(call.body).includes('"file":1')
+      ? json(200, '{"path":"/api/v1/stream/abc?token=st-1"}')
+      : json(200, '{"path":"/api/v1/stream/abc"}'),
+  )
+  const client = createClient(fetchFn, () => null, () => 0, () => {}, { kind: 'bearer', base: BASE, token: 'desk token' })
+
+  expect(await client.streamToken(ID, 1), 'a stream token path stayed relative, or lost its own token').toBe(
+    `${BASE}/api/v1/stream/abc?token=st-1`,
+  )
+  expect(await client.streamToken(ID, 0), 'a stream path with no token of its own did not get the bearer one').toBe(
+    `${BASE}/api/v1/stream/abc?token=desk%20token`,
+  )
+  expect(client.mediaStreamUrl(ID, 0, 1, 1500), 'the remux stream URL is not absolute and authorized').toBe(
+    `${BASE}/api/v1/media/${ID}/0/tracks/1/stream?start_ms=1500&token=desk%20token`,
+  )
+})
+
+it('bearer_token_is_not_added_to_a_foreign_absolute_stream_url', async () => {
+  // The stream path the token answer names is not always under the engine's own base: an answer can
+  // point at somebody else's server, and that server has no business seeing this session's token. A
+  // base-name lookalike is somebody else too.
+  const paths = [
+    'https://cdn.example.test/stream/abc',
+    `${BASE}1/stream/lookalike`,
+    `${BASE}/stream/onbase`,
+    '/stream/relative',
+  ]
+  let asked = 0
+  const { fetchFn } = record(() => json(200, `{"path":"${paths[asked++]}"}`))
+  const client = createClient(fetchFn, () => null, () => 0, () => {}, { kind: 'bearer', base: BASE, token: 'desk-token' })
+
+  expect(await client.streamToken(ID, 0), 'the bearer token went to somebody else\'s server').toBe(
+    'https://cdn.example.test/stream/abc',
+  )
+  expect(await client.streamToken(ID, 1), 'the bearer token went to a base-name lookalike').toBe(
+    `${BASE}1/stream/lookalike`,
+  )
+  expect(await client.streamToken(ID, 2), 'a stream on the engine\'s own base lost its token').toBe(
+    `${BASE}/stream/onbase?token=desk-token`,
+  )
+  expect(await client.streamToken(ID, 3), 'a relative stream path lost its token').toBe(
+    `${BASE}/stream/relative?token=desk-token`,
+  )
+})

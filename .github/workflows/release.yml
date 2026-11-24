@@ -19,6 +19,11 @@ on:
       - dev/fixtures/**
       - packaging/**
       - crates/featherbittorrent/Cargo.toml
+      # The desktop app's bundle: its config (identifier, schemes, associations, the .msi's UpgradeCode),
+      # its manifest and its icons are what the desktop jobs below package and smoke.
+      - crates/featherbittorrent-desktop/Cargo.toml
+      - crates/featherbittorrent-desktop/tauri*.conf.json
+      - crates/featherbittorrent-desktop/icons/**
       - web/**
       - Dockerfile
       - .github/workflows/release.yml
@@ -333,15 +338,249 @@ jobs:
             target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
             target/dist/featherbittorrent-${{ matrix.variant == 'headless' && 'headless-' || '' }}${{ steps.version.outputs.version }}-${{ matrix.target }}.zip.sha256
 
+  # The desktop app (crates/featherbittorrent-desktop) as a universal .dmg. tauri-cli is pinned at 2.12.6 and
+  # installed from its own lockfile; dev/package-desktop-macos.sh refuses any other version. The bundler
+  # builds both Apple architectures and joins them, and the script finishes with
+  # dev/smoke-desktop-macos.sh on the image it wrote: the .sha256, the mounted image, the app's Info.plist
+  # (identifier, magnet scheme, .torrent document type), both slices, the SDK, the ad-hoc signature and
+  # `--version`. The runner is Apple silicon, so the arm64 slice is the one that runs. In CI the bundler's
+  # own .dmg is the artifact: the script's local hdiutil fallback never runs here.
+  desktop-macos:
+    name: desktop macos universal dmg
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+      # macOS draws the current window design (its corner radius among it) only for an app built against
+      # the macOS 26 SDK or newer: use the newest Xcode 26+ on the runner, and fail rather than ship the old
+      # look. dev/smoke-desktop-macos.sh checks the binary too. The same step as ../terminal's release.
+      - name: Select Xcode 26 or newer
+        run: |
+          xcode=$(for app in /Applications/Xcode_*.app; do v="${app#/Applications/Xcode_}"; echo "${v%.app}"; done \
+            | grep -E '^[0-9]+(\.[0-9]+)*$' \
+            | awk -F. '$1 >= 26' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+          [[ -n "$xcode" ]] || { echo "::error::no Xcode 26 or newer on this runner"; printf '%s\n' /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "/Applications/Xcode_$xcode.app"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-macos-universal
+      # The desktop window shows the web UI, and tauri.conf.json names web/dist as its frontendDist.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli@2.12.6
+      - name: Package and smoke
+        run: bash dev/package-desktop-macos.sh "${{ steps.version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-desktop-macos-universal
+          if-no-files-found: error
+          path: |
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-macos-universal.dmg
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-macos-universal.dmg.sha256
+
+  # The desktop app's .msi for x86_64. tauri-cli 2.12.6 is pinned, and with it the WiX Toolset its bundler
+  # drives: 3.14.1, fetched by the bundler and checked against the SHA-256 it carries, not the runner's own
+  # (dev/package-desktop-windows.ps1 says more). The UpgradeCode is fixed in tauri.conf.json and the script
+  # refuses a build whose code changed. The .msi is smoked on a fresh runner by desktop-windows-smoke.
+  desktop-windows:
+    name: desktop windows x86_64 msi
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-windows-x86_64
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli@2.12.6
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./dev/package-desktop-windows.ps1 -Version $env:VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-desktop-windows-x86_64
+          if-no-files-found: error
+          path: |
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-windows-x86_64.msi
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-windows-x86_64.msi.sha256
+
+  # A quiet per-machine install of the .msi on a runner that never built it, the magnet protocol and the
+  # .torrent association it registers, `--version` through a pipe (the release exe is a GUI program),
+  # nothing set to start at boot or login, and an uninstall that keeps the user's settings file.
+  desktop-windows-smoke:
+    name: desktop windows smoke x86_64 msi
+    needs: desktop-windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: dev/smoke-desktop-windows.ps1
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: featherbittorrent-desktop-windows-x86_64
+          path: dist
+      - name: Install, run and remove
+        env:
+          VERSION: ${{ needs.desktop-windows.outputs.version }}
+        run: ./dev/smoke-desktop-windows.ps1 dist $env:VERSION
+
+  # The desktop app's Linux .deb, .rpm and .tar.gz, built inside ubuntu:22.04 on native runners of each
+  # arch. Unlike the CLI, the desktop binary links the distribution's webview stack (webkit2gtk 4.1, GTK 3,
+  # GLib, libsoup 3), and Ubuntu 22.04 is the oldest system that has it, so its glibc (2.35) is the desktop
+  # floor; dev/package-desktop-linux.sh holds the binary to it with dev/check-linux-binary.sh --desktop and
+  # runs check_no_service on every artifact. The -dev packages are what the build links; rpm, rpm2cpio,
+  # cpio and binutils are what the script reads the packages back with.
+  desktop-linux:
+    name: desktop linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install build tools and the webview libraries
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config file binutils cpio rpm rpm2cpio xz-utils \
+            libssl-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-linux-${{ matrix.arch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Front end
+        run: npm --prefix web ci && npm --prefix web run build
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli@2.12.6
+      - name: Package
+        run: bash dev/package-desktop-linux.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: featherbittorrent-desktop-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb.sha256
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm.sha256
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+            target/dist/featherbittorrent-desktop-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  # Every desktop Linux artifact installed in a clean container of a system it claims to serve:
+  # ubuntu:22.04 (the floor) and debian:12 for the .deb, fedora:41 for the .rpm, ubuntu:22.04 for the
+  # .tar.gz. dev/smoke-desktop-linux.sh checks the .sha256, installs with no recommends or weak deps (an
+  # unsatisfiable Depends or Requires fails here), runs `--version` under xvfb-run, checks the .desktop
+  # file declares x-scheme-handler/magnet and application/x-bittorrent and that nothing starts at boot or
+  # login, removes the package and asserts the settings the app wrote survived. Native runner per arch.
+  desktop-linux-smoke:
+    name: desktop linux smoke ${{ matrix.arch }} ${{ matrix.target.format }} ${{ matrix.target.image }}
+    needs: desktop-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        target:
+          - { image: "ubuntu:22.04", format: deb }
+          - { image: "debian:12", format: deb }
+          - { image: "fedora:41", format: rpm }
+          - { image: "ubuntu:22.04", format: tar.gz }
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.target.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: dev/smoke-desktop-linux.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: featherbittorrent-desktop-linux-${{ matrix.arch }}
+          path: dist
+      - name: Install, run and remove
+        run: bash dev/smoke-desktop-linux.sh "${{ matrix.target.format }}" dist "${{ needs.desktop-linux.outputs.version }}"
+
   # One release with every system's packages and archives plus the SBOM, published only when every job
-  # passed: any failing build or smoke test skips this one, so nothing untested is published. Only a tag
-  # push publishes; a pull request or manual run builds and checks, never releases. The release is made as
-  # a draft, gets all 38 files, and only then is published, so a failed upload never leaves a half-published
-  # release; a re-run first removes the draft a failed run left.
+  # passed: any failing build or smoke test skips this one, so nothing untested is published, the desktop
+  # app's jobs included. Only a tag push publishes; a pull request or manual run builds and checks, never
+  # releases. The release is made as a draft, gets all 53 files, and only then is published, so a failed
+  # upload never leaves a half-published release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [verify, sbom, linux, linux-smoke, macos, windows]
+    needs:
+      - verify
+      - sbom
+      - linux
+      - linux-smoke
+      - macos
+      - windows
+      - desktop-macos
+      - desktop-windows
+      - desktop-windows-smoke
+      - desktop-linux
+      - desktop-linux-smoke
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -362,7 +601,11 @@ jobs:
         No package installs, enables or starts a service; `docs/autostart.md` shows how to run `serve`
         under systemd, launchd or Windows Task Scheduler, and `docs/web-ui.md` covers the full build's
         browser sign-in and the off switch. `featherbittorrent-${{ needs.verify.outputs.version }}.cdx.json`
-        is this release's CycloneDX SBOM.
+        is this release's CycloneDX SBOM. The desktop app, `featherbittorrent-desktop`, installs beside either
+        build: a universal `.dmg` for macOS 11 or newer, an `.msi` for Windows x86_64, and `.deb`, `.rpm` and
+        `.tar.gz` for Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 41 and later), each for
+        x86_64 and aarch64. Like the CLI it starts nothing at boot or login, and removing it keeps your
+        settings and library.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -420,6 +663,22 @@ jobs:
           dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip
           dist/featherbittorrent-headless-$VERSION-aarch64-pc-windows-msvc.zip.sha256
           dist/featherbittorrent-$VERSION.cdx.json
+          dist/featherbittorrent-desktop-$VERSION-macos-universal.dmg
+          dist/featherbittorrent-desktop-$VERSION-macos-universal.dmg.sha256
+          dist/featherbittorrent-desktop-$VERSION-windows-x86_64.msi
+          dist/featherbittorrent-desktop-$VERSION-windows-x86_64.msi.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.deb
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.deb.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.rpm
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.rpm.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.tar.gz
+          dist/featherbittorrent-desktop-$VERSION-linux-x86_64.tar.gz.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.deb
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.deb.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.rpm
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.rpm.sha256
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.tar.gz
+          dist/featherbittorrent-desktop-$VERSION-linux-aarch64.tar.gz.sha256
           EOF
           missing=0
           while read -r file; do
@@ -431,10 +690,12 @@ jobs:
           # The expected count comes from the build matrix, not from a remembered number: 2 Linux
           # archs x 2 variants x 6 files each (deb, rpm, tar.gz + one .sha256 each), plus 2 macOS
           # variants x 2 files each (tar.gz + .sha256), plus 2 Windows variants x 4 files each
-          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM.
+          # (two zips per variant: x86_64 and arm64, each with its .sha256), plus 1 SBOM, plus the
+          # desktop app: 1 macOS .dmg and 1 Windows .msi with their .sha256 (2 x 2), and 2 Linux archs
+          # x 6 files each (deb, rpm, tar.gz + one .sha256 each).
           # The heredoc above must list exactly that many lines, and dist/ must hold exactly that
           # many files; a line added or dropped in either place is caught here.
-          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 ))
+          expected=$(( 2 * 2 * 6 + 2 * 2 + 2 * 4 + 1 + 2 * 2 + 2 * 6 ))
           listed="$(wc -l < "$RUNNER_TEMP/release-files")"
           echo "release file list holds $listed files, expected $expected"
           [ "$listed" -eq "$expected" ]

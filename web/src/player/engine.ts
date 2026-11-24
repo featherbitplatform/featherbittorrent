@@ -19,6 +19,7 @@
 import { createReadGate, evictRanges } from './buffering'
 import { toMedia, toSource } from './time'
 import type { MediaTrack } from '../api/client'
+import { isAbsolute } from '../endpoint'
 
 /** The engine's state, as the player draws it. */
 export type EngineState = 'loading' | 'waiting' | 'playing' | 'error'
@@ -33,6 +34,12 @@ export interface EngineDeps {
   fetch: typeof fetch
   MediaSource: typeof MediaSource
   managed: boolean
+  /**
+   * The address of one track's body from a point of source time. Unset, it is the route on the
+   * page's own origin; the player hands in the client's `mediaStreamUrl`, which for the desktop is
+   * absolute and carries the token.
+   */
+  streamUrl?: (trackId: number, startMs: number) => string
 }
 
 /** The surface the player drives: seek, change the audio, read the state, go away. */
@@ -401,6 +408,7 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
   }
 
   function streamUrl(trackId: number, startMs: number): string {
+    if (full.streamUrl !== undefined) return full.streamUrl(trackId, startMs)
     const ms = Math.max(0, Math.floor(startMs))
     return `/api/v1/media/${encodeURIComponent(target.id)}/${encodeURIComponent(target.file)}` +
       `/tracks/${encodeURIComponent(trackId)}/stream?start_ms=${ms}`
@@ -472,7 +480,12 @@ export function createEngine(video: VideoLike, target: Target, probe: EngineProb
       if (destroyed || abort.signal.aborted) return
       let response: Response
       try {
-        response = await full.fetch(url, { signal: abort.signal, credentials: 'same-origin' })
+        // A body on the page's own origin rides the cookie; one at another address (the desktop's
+        // engine) has its token in the URL and no cookie of this page's to send.
+        response = await full.fetch(url, {
+          signal: abort.signal,
+          credentials: isAbsolute(url) ? 'omit' : 'same-origin',
+        })
       } catch (cause) {
         // The engine's own abort is not a failure: the stream is being replaced, and the old
         // fetch is the way the engine said so.
