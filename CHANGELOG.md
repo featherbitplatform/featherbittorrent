@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Desktop app: Open in player in the player hands the file to VLC or mpv, for files the window cannot play itself (HEVC without the Windows extension, AC-3, DTS). It works while the file is still downloading. ([#37](https://github.com/featherbitplatform/featherbittorrent/pull/37))
+- Desktop app: the player's Download shows its progress and can be cancelled; closing the player keeps it going, and a cancelled download, or one stopped by quitting, leaves no partial file. ([#40](https://github.com/featherbitplatform/featherbittorrent/pull/40))
 
 ### Changed
 

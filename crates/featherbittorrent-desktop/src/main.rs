@@ -122,6 +122,7 @@ fn main() {
             commands::connect,
             download::choose_download_place,
             download::save_download,
+            download::cancel_download,
             player::open_in_player,
             window::system_title_bar,
             window::set_system_title_bar,

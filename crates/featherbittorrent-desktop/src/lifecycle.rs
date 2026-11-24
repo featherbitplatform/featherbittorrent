@@ -2,7 +2,8 @@
 //!
 //! The decisions are pure functions ([`on_close_requested`], [`initial_window_state`]) tested without a
 //! webview; the rest of this file applies them to the app. Every way out of the app ends in [`quit`],
-//! which stops This computer (the engine's final save) before the process exits: the tray's Quit, a close
+//! which cancels the running downloads (their part files come down) and stops This computer (the
+//! engine's final save) before the process exits: the tray's Quit, a close
 //! that means quit, the page's own answer to the first-close question, a quit signal on Unix, and an exit
 //! request Tauri reports while This computer runs. The system's own quit (Cmd+Q, logging out, shutting
 //! down) reaches [`handle_run_event`] as `RunEvent::Exit` with nothing before it, and the process ends
@@ -180,6 +181,11 @@ pub const STOP_BUDGET: Duration = Duration::from_secs(30);
 /// [`START_WAIT`]) and only then stops the engine, so the exit's wait covers both: a shorter one would end
 /// the process in the middle of the final save of a large library that was slow to start.
 pub const QUIT_WAIT: Duration = START_WAIT.saturating_add(STOP_BUDGET);
+
+/// How long a quit gives the running downloads to notice the cancel and take their part files away
+/// before it goes on to stop This computer. It runs inside a quit only; the exit's wait for that
+/// quit stays bounded by [`QUIT_WAIT`]. A download that has not stopped by then is left to itself.
+const DOWNLOAD_WAIT: Duration = Duration::from_secs(2);
 
 /// Where the app is on its way out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +452,19 @@ pub fn close_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// The two stops a quit runs, at the same time: the running downloads take their part files
+/// down (within `limit`) beside This computer's final save. The quit's total is the longer of
+/// the two, not the sum, so it stays inside the [`QUIT_WAIT`] the event loop's Exit handler
+/// waits for instead of overshooting it by the download cap.
+async fn stop_together<F: std::future::Future>(
+    downloads: &crate::download::Downloads,
+    limit: Duration,
+    engine_stop: F,
+) -> F::Output {
+    let (_, engine) = tokio::join!(downloads.stop_all(limit), engine_stop);
+    engine
+}
+
 /// Quits the app: the window goes away at once, This computer stops (its final save), then the process
 /// exits. A second quit while the first is stopping does nothing, so it cannot exit before the save. A
 /// quit while This computer is still starting waits for the start, then stops it. The exit code is 0, or
@@ -461,7 +480,15 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let lifecycle = app.state::<Lifecycle>();
         let state = app.state::<DesktopState>();
-        lifecycle.stop_for_quit(&state).await;
+        // Running downloads are the part of quitting a person can see: their part files come
+        // down at the same time as This computer's final save, so the whole quit stays inside
+        // the QUIT_WAIT the exit handler waits for.
+        stop_together(
+            &app.state::<crate::download::Downloads>(),
+            DOWNLOAD_WAIT,
+            lifecycle.stop_for_quit(&state),
+        )
+        .await;
         let code = state.startup().exit_code();
         // Stopped before the exit, so the exit request it causes is let through.
         app.state::<Lifecycle>().finish_quit();
@@ -490,9 +517,16 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
             match on_exit(lifecycle.phase()) {
                 ExitAnswer::StopHere => {
                     if lifecycle.begin_quit() {
-                        tauri::async_runtime::block_on(
-                            lifecycle.stop_for_quit(&app.state::<DesktopState>()),
-                        );
+                        tauri::async_runtime::block_on(async {
+                            // The same stop as `quit` runs: the downloads' part files come down
+                            // at the same time as This computer's final save, inside QUIT_WAIT.
+                            stop_together(
+                                &app.state::<crate::download::Downloads>(),
+                                DOWNLOAD_WAIT,
+                                lifecycle.stop_for_quit(&app.state::<DesktopState>()),
+                            )
+                            .await;
+                        });
                         lifecycle.finish_quit();
                     } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
                         eprintln!("The final save did not finish in time; quitting without it.");
@@ -600,7 +634,7 @@ mod tests {
     use super::{
         CloseOutcome, DockIcon, ExitAnswer, ExitRequestAnswer, Lifecycle, QUIT_WAIT, QuitPhase,
         STOP_BUDGET, WindowState, dock_icon, initial_window_state, on_close_requested, on_exit,
-        on_exit_requested, parse_close_action, update_settings,
+        on_exit_requested, parse_close_action, stop_together, update_settings,
     };
     use crate::settings_store::SettingsStore;
     use crate::startup::START_WAIT;
@@ -877,5 +911,30 @@ mod tests {
         assert!(lifecycle.begin_quit());
         assert!(!lifecycle.wait_for_quit(Duration::from_millis(50)));
         assert_eq!(lifecycle.phase(), QuitPhase::Quitting);
+    }
+
+    /// The two stops a quit runs, taking the running downloads' part files down and This
+    /// computer's final save, run at the same time: the quit's total is the longer of the two, not
+    /// the sum, so it stays inside the [`QUIT_WAIT`] the event loop's Exit handler waits for.
+    /// Paused time makes the total exact rather than wall-clock dependent: a 1 s download cap
+    /// beside a 3 s engine stop measures 3 s run together, 4 s run one after the other.
+    #[tokio::test(start_paused = true)]
+    async fn quit_stops_downloads_and_the_engine_at_the_same_time() {
+        let downloads = crate::download::Downloads::new();
+        // A save that does not end on its own: `stop_all` waits out its whole cap.
+        let _watching = downloads.register("place-1");
+        let started = tokio::time::Instant::now();
+        // The engine stop measures its 3 seconds from the moment it is first polled: built at the
+        // call, not before it, the way `stop_for_quit` runs its work only when stopped.
+        stop_together(&downloads, Duration::from_secs(1), async move {
+            tokio::time::sleep(Duration::from_secs(3)).await
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(3),
+            "the two stops ran one after the other: {elapsed:?}"
+        );
     }
 }
