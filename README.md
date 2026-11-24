@@ -14,9 +14,11 @@ the server role (`serve`), the remote backend, authentication and streaming, shi
 [0.2.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.0) adds milestones 3 and 4, and
 [0.2.1](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.1),
 [0.2.2](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2) and
-[0.2.3](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3) fix what came after them, and
+[0.2.3](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3) fix what came after them,
 [0.3.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0) is the first release with the
-web UI.
+web UI, and
+[0.4.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.0) is the first release with the
+desktop app.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
 files, each carrying man pages, shell completions, the licenses and the docs. The web UI, released in 0.3.0,
@@ -28,7 +30,7 @@ and the keyboard shortcuts, and a phone layout, with the off switch in `server.w
 which serves the web UI, and the headless build, `featherbittorrent-headless`, which carries no front end and
 changes nothing for the TUI. Every artifact is built and smoke tested in a clean container or runner before
 anything is published, and the release workflow publishes them all on a `v*` tag. The desktop app,
-`featherbittorrent-desktop`, is not released yet and ships with the next release: the same web UI in its own window, with an engine of its
+`featherbittorrent-desktop`, released in 0.4.0: the same web UI in its own window, with an engine of its
 own on this machine (`This computer`), instances to switch between, a tray, start at login, `magnet:` links
 and `.torrent` files, and changeable keyboard shortcuts, shipped as a `.dmg`, an `.msi`, `.deb`, `.rpm` and
 `.tar.gz` beside the CLI builds ([docs/desktop.md](docs/desktop.md)).
