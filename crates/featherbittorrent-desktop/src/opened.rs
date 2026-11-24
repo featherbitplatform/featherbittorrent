@@ -218,10 +218,18 @@ pub fn forwarded_args(argv: Vec<String>, cwd: &str) -> Vec<OsString> {
 }
 
 /// A second launch: the window comes up, and what it was opened with goes to this copy's page. Nothing
-/// is started here; the second copy exits once the plugin has forwarded its arguments.
+/// is started here; the second copy exits once the plugin has forwarded its arguments. A second launch
+/// with [`lifecycle::BACKGROUND_FLAG`] (the login item, or a script) and nothing to open leaves the
+/// window as it is: it asked for no window, and there is nothing to show in one.
 pub fn on_second_launch(state: &OpenedState, argv: Vec<String>, cwd: &str, page: &impl Page) {
-    page.show();
+    let background = argv
+        .iter()
+        .skip(1)
+        .any(|arg| arg == lifecycle::BACKGROUND_FLAG);
     let items = items_from(opened_from_args(&forwarded_args(argv, cwd)));
+    if !(background && items.is_empty()) {
+        page.show();
+    }
     state.deliver(items, page);
 }
 
@@ -313,6 +321,45 @@ mod tests {
         fn show(&self) {
             self.shown.set(self.shown.get() + 1);
         }
+    }
+
+    /// A second `--background` launch with nothing to open keeps the running copy's window as it is; one
+    /// that opens something still brings it up, since the person is about to be asked about it.
+    #[test]
+    fn a_background_second_launch_with_nothing_to_open_shows_no_window() {
+        let dir = ScratchDir::new("desktop-opened-background");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let state = OpenedState::new();
+        let page = FakePage::default();
+
+        on_second_launch(
+            &state,
+            vec![
+                "featherbittorrent-desktop".to_string(),
+                "--background".to_string(),
+            ],
+            &cwd,
+            &page,
+        );
+        assert_eq!(
+            page.shown.get(),
+            0,
+            "a background launch brought the window up"
+        );
+        assert!(page.emitted.borrow().is_empty(), "and opens nothing");
+
+        on_second_launch(
+            &state,
+            vec![
+                "featherbittorrent-desktop".to_string(),
+                "--background".to_string(),
+                "magnet:?xt=urn:btih:aaa".to_string(),
+            ],
+            &cwd,
+            &page,
+        );
+        assert_eq!(page.shown.get(), 1, "a link to open still shows the window");
+        assert_eq!(state.take().len(), 1, "and the link is kept for the page");
     }
 
     /// A second launch's links and files go to the copy that runs, whose window comes up: kept while its
