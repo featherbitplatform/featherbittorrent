@@ -44,13 +44,34 @@ pub struct SystemKeychain {
 impl SystemKeychain {
     /// The system store, asked once whether it is there: its initialization worked, and a lookup of an
     /// account nobody saves answers "no entry" rather than "cannot reach the store".
+    ///
+    /// On Linux the store is the Secret Service, asked over the session bus before the window exists, so
+    /// the question has a deadline ([`crate::deadline::SESSION_BUS_DEADLINE`]): a bus that does not answer
+    /// in time means no keychain for this run, said on stderr, rather than an app that never opens.
     pub fn probe() -> Self {
-        let available = Entry::store_status().is_ok()
-            && Entry::new(SERVICE, PROBE_ACCOUNT).is_ok_and(|entry| {
-                matches!(entry.get_password(), Ok(_) | Err(KeychainError::NoEntry))
-            });
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let available = crate::deadline::answer_within(
+            crate::deadline::SESSION_BUS_DEADLINE,
+            store_answers,
+        )
+        .unwrap_or_else(|| {
+            eprintln!(
+                "The Secret Service did not answer in time; passwords are not saved this run."
+            );
+            false
+        });
+        #[cfg(any(windows, target_os = "macos"))]
+        let available = store_answers();
         SystemKeychain { available }
     }
+}
+
+/// Whether the system store initializes and answers a lookup of an account nobody saves with "no entry"
+/// rather than "cannot reach the store".
+fn store_answers() -> bool {
+    Entry::store_status().is_ok()
+        && Entry::new(SERVICE, PROBE_ACCOUNT)
+            .is_ok_and(|entry| matches!(entry.get_password(), Ok(_) | Err(KeychainError::NoEntry)))
 }
 
 impl Keychain for SystemKeychain {

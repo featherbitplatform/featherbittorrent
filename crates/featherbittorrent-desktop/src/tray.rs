@@ -72,7 +72,11 @@ fn ask_session_bus() -> Result<bool, String> {
 fn system_has_tray_host() -> bool {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        host_present(ask_session_bus())
+        // A bus that does not answer in time is a desktop with no tray, not a window that never opens.
+        host_present(
+            crate::deadline::answer_within(crate::deadline::SESSION_BUS_DEADLINE, ask_session_bus)
+                .unwrap_or_else(|| Err("it did not answer in time".to_string())),
+        )
     }
     #[cfg(any(windows, target_os = "macos"))]
     {
