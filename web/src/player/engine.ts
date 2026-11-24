@@ -393,7 +393,10 @@ async function errorDetail(response: Response, signal: AbortSignal): Promise<str
     try {
       parsed = JSON.parse(text)
     } catch {
-      // Not JSON: the body's own text is what the server said.
+      // Not JSON. An HTML page (a proxy or a load balancer answering in the server's place) is
+      // not an explanation a person can use - the status line already says the server refused -
+      // so it says nothing. Any other body is the server's own words.
+      if (text.trim().startsWith('<')) return null
       return capDetail(text)
     }
     const message = parsed !== null && typeof parsed === 'object'

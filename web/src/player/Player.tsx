@@ -606,6 +606,9 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       // A playhead that never moved is a video that never landed: the point to come back to is
       // the start this open aimed at, not the zero the element is sitting at.
       resumeMsRef.current = playhead > 0 ? playhead : startMs
+      // Moving picture stays moving: the reload pauses the element, so the play intent goes to
+      // the next open with the position.
+      rememberPlaying()
       setAudioRetry({
         failed: audioRetry === null ? [deadKey] : [...audioRetry.failed, deadKey],
         selected: null,
@@ -636,6 +639,10 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     // The open's own word for "there is data to play": the element can play. The ask happens here,
     // once, so a `canplay` that fires for later data does not ask a second time.
     const onCanPlay = (): void => {
+      // The element may have reloaded since the last word heard - a reopen replaces its `src`,
+      // and a reload pauses without firing `pause` - so the control reads the element as it is
+      // now, not the last state it was reported.
+      setPaused(video.paused)
       if (autoPlayedRef.current) return
       autoPlayedRef.current = true
       void video.play().catch(() => {
@@ -807,6 +814,10 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
 
   const waiting = choice?.kind === 'remux' && state === 'waiting'
   const failed = choice?.kind === 'remux' && state === 'error'
+  // The player's own reopen (the audio-less retry, a replacement track) replaces the engine and
+  // its `src`, and a reload pauses the element: the waiting line covers that loading too, so a
+  // reopen says the picture is coming back instead of holding a stale word for playing.
+  const reopening = choice?.kind === 'remux' && state === 'loading' && audioRetry !== null
   const videoTrack = choice?.kind === 'remux' ? choice.video : null
   const audioTrack = choice?.kind === 'remux' ? choice.audio : null
   // The audio the file plays now: the probe's choice, or the live switch's, and after a failure
@@ -911,6 +922,17 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     }
   }
 
+  /**
+   * The picture was moving: hand that word to the engine about to replace this one. A new
+   * engine sets a new `src`, and a reload pauses the element - silently, with no `pause` the
+   * player could hear - so without the hand-over the next open's first `canplay` is already
+   * marked handled and the person is left with a frozen picture under a Pause control.
+   */
+  function rememberPlaying(): void {
+    const at = videoRef.current
+    if (at !== null && !at.paused) autoPlayedRef.current = false
+  }
+
   function nextAudio(): void {
     if (choice?.kind !== 'remux') return
     // A track that failed on this system is not a next track: it is listed not playable in the
@@ -925,9 +947,13 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     const next = playable[(index + 1) % playable.length].track
     if (audioRetry !== null) {
       // After a failure the switch is a fresh open on the new track, from where the playhead
-      // stands now: the engine that lost the last track has no audio buffer to switch.
+      // stands now: the engine that lost the last track has no audio buffer to switch. The
+      // reopen pauses the element and replaces the picture, so the play intent and the state
+      // both move to the new open with the position.
       rememberPlayhead()
+      rememberPlaying()
       setAudioRetry({ failed: audioRetry.failed, selected: String(next.id) })
+      setState('loading')
       return
     }
     // The engine says whether it switched: a refused switch keeps the track that still plays.
@@ -948,10 +974,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     if (audioRetry !== null) {
       // After a decode failure the switch is a fresh open on the chosen track, from where the
       // playhead stands now: the engine that lost the last track has no audio buffer to switch,
-      // and a track that failed is never asked for again.
+      // and a track that failed is never asked for again. The reopen pauses the element and
+      // replaces the picture, so the play intent and the state both move to the new open with
+      // the position.
       if (audioRetry.failed.includes(key) || audioRetry.selected === key) return
       rememberPlayhead()
+      rememberPlaying()
       setAudioRetry({ failed: audioRetry.failed, selected: key })
+      setState('loading')
       return
     }
     if (engineRef.current?.setAudio(found.track) === true) setAudioKey(key)
@@ -1150,7 +1180,7 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
             {/* `playsInline`: without it iPhone Safari takes the video into its own fullscreen
                 player on `play()`, past the controls, the menus and the subtitles drawn here. */}
             <video ref={videoRef} playsInline className="h-full w-full max-h-full max-w-full object-contain" />
-            {waiting && (
+            {(waiting || reopening) && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <span className="rounded-card bg-canvas/80 px-4 py-2 text-[13px] text-strong">{WAITING_COPY}</span>
               </div>

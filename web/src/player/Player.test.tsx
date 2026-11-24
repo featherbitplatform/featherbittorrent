@@ -3468,3 +3468,213 @@ describe('failure follow-ups', () => {
     ).toBe(true)
   })
 })
+
+/**
+ * Make a rendered player's element report its play state the way a browser's does, and count
+ * its `play()` asks. Its `pause` moves the element without firing `pause`: that is exactly how
+ * a `src` reload pauses an element, which is what an engine reopen does.
+ */
+function drivePlayState(video: HTMLVideoElement): { playCalls(): number } {
+  let playing = false
+  let asks = 0
+  Object.defineProperty(video, 'paused', {
+    get: () => !playing,
+    set: (value: boolean) => {
+      playing = !value
+    },
+    configurable: true,
+  })
+  video.play = (): Promise<void> => {
+    asks += 1
+    playing = true
+    video.dispatchEvent(new Event('play'))
+    return Promise.resolve()
+  }
+  video.pause = (): void => {
+    playing = false
+  }
+  return {
+    playCalls(): number {
+      return asks
+    },
+  }
+}
+
+/** The answers every reopen test needs: all three tracks land at the same 3 s point. */
+function reopensAtThreeSeconds(recorder: ReturnType<typeof fakeFetch>): void {
+  recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+  recorder.answer('/tracks/3/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+}
+
+describe('reopening the file keeps the picture moving', () => {
+  it('the retry keeps playing', async () => {
+    // The audio-less retry replaces the engine and its `src`, and a reload pauses the element
+    // with no `pause` the player could hear. The open that was playing must be asked to play
+    // again on the new engine's first `canplay`.
+    const t = await renderRemux()
+    const drive = drivePlayState(t.video)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the open did not start playback').toBe(1)
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(mediaSources.at(-1) !== first, 'the retry did not make a fresh engine').toBe(true)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+
+    // The other half: the person paused first. The reload pauses the element too - silently -
+    // so the retry must not press play for them, and the control must read the element: paused,
+    // whatever the player last heard.
+    cleanup()
+    const u = await renderRemux()
+    const drive2 = drivePlayState(u.video)
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the open did not start playback').toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await settle()
+    const firstB = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(firstB.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the retry asked for playback the viewer had paused').toBe(1)
+    expect(
+      screen.queryByRole('button', { name: 'Play' }) !== null,
+      'the reopen left the Pause control up while the element was paused',
+    ).toBe(true)
+  })
+
+  it('a replacement track keeps playing', async () => {
+    // Choosing a replacement track after a failure re-opens the file on the chosen track, and
+    // that reopen pauses the element too: the play intent moves to the new open with it.
+    const t = await renderRemux(PROBE, reopensAtThreeSeconds)
+    const drive = drivePlayState(t.video)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the open did not start playback').toBe(1)
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    expect(mediaSources.length, 'the chosen track did not open a fresh engine').toBe(3)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(
+      drive.playCalls(),
+      'choosing the replacement track did not ask the video to play again',
+    ).toBe(3)
+
+    // The other half: the person paused before choosing. The track change must not start the
+    // picture on its own.
+    cleanup()
+    const u = await renderRemux(PROBE, reopensAtThreeSeconds)
+    const drive2 = drivePlayState(u.video)
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    const firstB = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(firstB.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(
+      drive2.playCalls(),
+      'the paused player started playing on its own when the replacement track opened',
+    ).toBe(2)
+  })
+
+  it('a replacement track reopen waits for data', async () => {
+    // The reopen on a chosen track replaces the picture: the player must say it is opening -
+    // the waiting line covers the player's own reopen - rather than holding a stale word for
+    // playing while nothing can play yet.
+    const videoBodies: FakeBody[] = []
+    await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/3/stream', { hang: true })
+      recorder.answer('/tracks/1/stream', () => {
+        const body = new FakeBody()
+        videoBodies.push(body)
+        return videoBodies.length >= 3 ? { hang: true } : { startMs: 3_000, body: () => body }
+      })
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      screen.queryByText('Waiting for data...') === null,
+      'the retry that got its picture showed the waiting line anyway',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    expect(videoBodies.length, 'the chosen track did not open a fresh engine').toBe(3)
+    expect(
+      screen.queryByText('Waiting for data...') !== null,
+      'the reopen on the chosen track does not show the player waiting for its data',
+    ).toBe(true)
+  })
+})
+
+describe('error bodies know an HTML page', () => {
+  it('an html error page gives no detail', async () => {
+    // A proxy or load balancer in front of the server answers in HTML. The overlay line naming
+    // the status already says the server refused; the page itself is noise a person cannot use,
+    // and other plain-text bodies stay as they were.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', {
+      status: 502,
+      text: '<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>',
+    })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 502 HTML refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.kind, 'the 502 refusal was not the server').toBe('server')
+    expect(failure?.status, 'the 502 refusal did not name the status').toBe(502)
+    expect(failure?.detail, 'the HTML error page was shown as a detail').toBe(null)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+})
