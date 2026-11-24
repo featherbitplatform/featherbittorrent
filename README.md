@@ -2,6 +2,8 @@
 
 featherbittorrent is a BitTorrent client built on [fbt-lib](https://github.com/featherbitplatform/fbt-lib), the from-scratch pure-Rust library that does the downloading and seeding. It runs in one of two roles: as a server (`featherbittorrent serve`), headless, downloading and seeding and controlled over the network; or as a TUI in the terminal that either runs the engine itself on the same machine or connects to one server. A typical setup is a Raspberry Pi at home running the server and saving to a NAS or another chosen storage, controlled from a laptop's TUI over the LAN or remotely through a reverse proxy. On the laptop itself the TUI is a complete client with no daemon behind it.
 
+The documentation is on the site at <https://featherbitplatform.github.io/featherbittorrent/>; the same guides are in [docs/](docs/).
+
 The clients that came before it (uTorrent, Deluge, qBittorrent) work, and their shape is the one people expect: a torrent list with a detail pane, a daemon and a thin client. featherbittorrent wants that shape snappier and lighter: keypresses that feel instant, redraws that stay smooth with hundreds of torrents, and memory and CPU use small enough for the server to run comfortably on a Raspberry Pi 2B.
 
 Status: milestone 1, the local client, is complete: `featherbittorrent` in a terminal is a whole

@@ -252,7 +252,7 @@ When the gateway is the door, the connect screen (`c`) has two methods for it:
   rejects; pipe the export through `openssl ec -pubin -param_enc named_curve -pubout`. And set the
   revocation, introspection and pushed-authorization endpoint auth methods to `private_key_jwt` as
   well, or Authelia defaults them to `client_secret_basic` and refuses a client with no secret. The
-  example under [docs/examples/gateway-oidc/](examples/gateway-oidc/) shows a working registration,
+  example under [docs/examples/gateway-oidc/](https://github.com/featherbitplatform/featherbittorrent/tree/develop/docs/examples/gateway-oidc/) shows a working registration,
   and Authelia's own reference for these keys is its
   [OpenID Connect clients configuration page](https://www.authelia.com/configuration/identity-providers/openid-connect/clients/).
 
@@ -325,4 +325,4 @@ gateway release the example was verified against: it reads the host name from th
 only, which HTTP/2 requests do not carry, so they would get `No route matched`.
 
 A worked-out stack, with Authelia as the provider and `featherbittorrent serve` behind it, is
-[docs/examples/gateway-oidc/](examples/gateway-oidc/).
+[docs/examples/gateway-oidc/](https://github.com/featherbitplatform/featherbittorrent/tree/develop/docs/examples/gateway-oidc/).

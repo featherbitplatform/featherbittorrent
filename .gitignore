@@ -6,3 +6,8 @@
 .superpowers/
 # What tauri-build writes on every build of the desktop app (the capability schemas).
 /crates/featherbittorrent-desktop/gen
+/website/node_modules
+/website/build
+/website/.docusaurus
+# Generated from CHANGELOG.md by website/scripts/changelog.mjs before start and build.
+/website/src/pages/changelog.md
