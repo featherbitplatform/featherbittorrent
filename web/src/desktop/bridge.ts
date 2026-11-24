@@ -129,12 +129,14 @@ export async function forgetPassword(id: string): Promise<void> {
   await invoke('forget_password', { id })
 }
 
-/**
- * Asks where to save the file at `url` on instance `id` and streams it there, in the shell. Resolves
- * `true` once saved and `false` when the person cancelled the dialog; rejects with the shell's line.
- */
-export async function saveDownload(id: string, url: string, name: string): Promise<boolean> {
-  return invoke<boolean>('save_download', { instance: id, url, name })
+/** Asks where to save a file called `name`: an opaque handle for the place chosen, or null when the person cancelled. */
+export async function chooseDownloadPlace(name: string): Promise<string | null> {
+  return invoke<string | null>('choose_download_place', { name })
+}
+
+/** Streams the file at `url` on instance `id` to the place `handle` names, in the shell. Rejects with the shell's line. */
+export async function saveDownload(id: string, handle: string, url: string): Promise<void> {
+  await invoke('save_download', { instance: id, handle, url })
 }
 
 /** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */

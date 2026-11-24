@@ -415,27 +415,43 @@ describe('the player', () => {
     ).toBe(true)
   })
 
-  it('download in the desktop app saves through the shell and clicks no cross-origin link', async () => {
+  it('download in the desktop app asks where to save before the token, and clicks no link', async () => {
     // In the app the token route answers an absolute address on the engine's own origin, which is
     // not the page's. Clicking it would navigate the whole window to the media address, so the
-    // player hands it to the shell's save instead and clicks nothing.
+    // shell saves it. The save dialog is answered before the token is asked for: the token lives
+    // 60 seconds, and a person can take longer than that to choose a folder.
     const unplayable: MediaProbe = {
       ...PROBE,
       tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
     }
     const address = 'http://127.0.0.1:53211/api/v1/torrents/abc/files/0/stream?token=abc'
+    const order: string[] = []
+    let answerDialog: (handle: string | null) => void = () => {}
     const recorder = fakeFetch()
     const client: Api = {
       ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
       probe: async () => unplayable,
       cues: async () => ({ cues: [] }),
       subtitleFile: async () => ({ cues: [] }),
-      streamToken: async () => address,
+      streamToken: async () => {
+        order.push('token')
+        return address
+      },
     }
     const saved: Array<[string, string]> = []
-    const save = async (url: string, name: string): Promise<boolean> => {
-      saved.push([url, name])
-      return true
+    const shell = {
+      choose: (name: string) =>
+        new Promise<string | null>((resolve) => {
+          order.push(`dialog ${name}`)
+          answerDialog = (handle) => {
+            order.push('dialog answered')
+            resolve(handle)
+          }
+        }),
+      save: async (handle: string, url: string) => {
+        order.push('save')
+        saved.push([handle, url])
+      },
     }
     const clicked: string[] = []
     const originalClick = HTMLAnchorElement.prototype.click
@@ -444,18 +460,28 @@ describe('the player', () => {
     }
     try {
       render(
-        <DesktopDownloadContext.Provider value={save}>
+        <DesktopDownloadContext.Provider value={shell}>
           <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
         </DesktopDownloadContext.Provider>,
       )
       await settle()
       fireEvent.click(screen.getByRole('button', { name: 'Download' }))
       await settle()
+      expect(order, 'the token was asked for while the dialog was open').toEqual(['dialog movie.mkv'])
+      await act(async () => answerDialog('place-1'))
+      await settle()
+
+      // Cancelled: no token at all.
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+      await act(async () => answerDialog(null))
+      await settle()
     } finally {
       ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
     }
+    expect(order).toEqual(['dialog movie.mkv', 'dialog answered', 'token', 'save', 'dialog movie.mkv', 'dialog answered'])
     expect(clicked, 'a link was clicked').toEqual([])
-    expect(saved, 'the shell was not asked to save the file').toEqual([[address, 'movie.mkv']])
+    expect(saved, 'the shell was not asked to save the file').toEqual([['place-1', address]])
   })
 
   it('download of a cross-origin address with no shell says so and clicks nothing', async () => {

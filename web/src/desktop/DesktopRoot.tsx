@@ -50,7 +50,7 @@ import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { useTitleBarSlots } from '../components/titleBarSlots'
 import { DesktopDownloadContext } from '../desktopDownload'
-import type { SaveDownload } from '../desktopDownload'
+import type { DesktopDownload } from '../desktopDownload'
 import { DesktopSettingsContext } from '../desktopSettings'
 import type { DesktopSettingsSlot, SettingsRequest } from '../desktopSettings'
 import { setOverrides } from '../keys'
@@ -62,6 +62,7 @@ import {
   getShortcuts,
   listInstances,
   LOCAL_ID,
+  chooseDownloadPlace,
   probeInstance,
   saveDownload,
   savePassword,
@@ -163,7 +164,10 @@ function Connected({
     if (refused) onTokenRefused(token)
   }, [refused, token, onTokenRefused])
   // The player's Download, through the shell: a link to the engine's origin would take the window away.
-  const save = useCallback<SaveDownload>((url, name) => saveDownload(id, url, name), [id])
+  const save = useMemo<DesktopDownload>(
+    () => ({ choose: chooseDownloadPlace, save: (handle, url) => saveDownload(id, handle, url) }),
+    [id],
+  )
   if (refused) return <Connecting />
   return (
     <ConnectionContext.Provider value={connection}>

@@ -83,6 +83,7 @@ fn main() {
         ))
         .manage(DesktopState::starting())
         .manage(opened::OpenedState::new())
+        .manage(download::Downloads::new())
         // Read by the Desktop section's commands (`preferences`): shortcuts, closing, start at login.
         .manage(settings_store.clone())
         .manage(serving::Serving::new(paths, settings_store.clone()))
@@ -115,6 +116,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
             commands::connect,
+            download::choose_download_place,
             download::save_download,
             window::system_title_bar,
             window::set_system_title_bar,

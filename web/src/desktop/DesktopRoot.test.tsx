@@ -27,7 +27,8 @@ const shell = vi.hoisted(() => ({
   listInstances: vi.fn(),
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
-  saveDownload: vi.fn(() => Promise.resolve(true)),
+  chooseDownloadPlace: vi.fn(() => Promise.resolve('place-1' as string | null)),
+  saveDownload: vi.fn(() => Promise.resolve()),
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   getShortcuts: vi.fn(() => Promise.resolve([])),
@@ -42,6 +43,7 @@ vi.mock('./bridge', () => ({
   listInstances: shell.listInstances,
   probeInstance: shell.probeInstance,
   savePassword: shell.savePassword,
+  chooseDownloadPlace: shell.chooseDownloadPlace,
   saveDownload: shell.saveDownload,
   addInstance: vi.fn(),
   removeInstance: vi.fn(),
@@ -115,7 +117,12 @@ vi.mock('../App', () => ({
           read torrents
         </button>
         {save !== null && (
-          <button type="button" onClick={() => void save('http://127.0.0.1:53211/stream', 'movie.mkv')}>
+          <button
+            type="button"
+            onClick={() =>
+              void save.choose('movie.mkv').then((handle) => save.save(handle ?? '', 'http://127.0.0.1:53211/stream'))
+            }
+          >
             save a file
           </button>
         )}
@@ -152,6 +159,7 @@ afterEach(() => {
   shell.listInstances.mockReset()
   shell.probeInstance.mockReset()
   shell.savePassword.mockReset()
+  shell.chooseDownloadPlace.mockClear()
   shell.saveDownload.mockClear()
   shell.setTrayInstance.mockClear()
   shell.takeOpened.mockReset()
@@ -202,7 +210,8 @@ it('the_players_download_goes_through_the_shell_for_the_instance_shown', async (
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
   fireEvent.click(screen.getByRole('button', { name: 'save a file' }))
-  expect(shell.saveDownload).toHaveBeenCalledWith('local', `${BASE}/stream`, 'movie.mkv')
+  await waitFor(() => expect(shell.saveDownload).toHaveBeenCalledWith('local', 'place-1', `${BASE}/stream`))
+  expect(shell.chooseDownloadPlace).toHaveBeenCalledWith('movie.mkv')
 })
 
 it('the_page_column_hands_its_height_to_the_screen', async () => {

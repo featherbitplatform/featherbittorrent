@@ -806,19 +806,23 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     if (downloading) return
     setDownloading(true)
     try {
-      // The token is fetched at the click, not at the open: it is good for 60 seconds, and the
-      // click is the moment the person is actually about to take the file.
       setDownloadProblem(null)
+      // In the app the stream address is on the engine's origin, not the page's: a link to it is not a
+      // download (the webview ignores `download` there and navigates the page itself to the media), so
+      // the shell saves it. Where to save is asked first, and the token only after: it is good for 60
+      // seconds, and a person reading a save dialog can take longer than that.
+      if (saveDownload !== null) {
+        const handle = await saveDownload.choose(name)
+        if (handle === null) return
+        await saveDownload.save(handle, await client.streamToken(id, file))
+        return
+      }
+      // The token is fetched at the click, not at the open: it is good for 60 seconds, and the
+      // click is the moment the person is actually about to take the file. Only a same-origin
+      // address is clicked; a browser has no shell to save another one with.
       const path = await client.streamToken(id, file)
-      // A link to another origin is not a download: the webview ignores `download` on it and
-      // navigates the page itself to the media address. Only a same-origin address is clicked;
-      // anything else (the desktop app's engine) is saved by the shell, which streams it to disk.
       if (!sameOriginAddress(path)) {
-        if (saveDownload === null) {
-          setDownloadProblem(NO_DOWNLOAD_COPY)
-          return
-        }
-        await saveDownload(path, name)
+        setDownloadProblem(NO_DOWNLOAD_COPY)
         return
       }
       const anchor = document.createElement('a')

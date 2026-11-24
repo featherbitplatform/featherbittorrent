@@ -3,19 +3,23 @@
 //! In a browser the page clicks an `<a download>` on its own origin and the browser saves the file. In
 //! the app the page's origin (`tauri://localhost`, or `http://tauri.localhost` on Windows) is not the
 //! engine's, and a webview ignores `download` on a link to another origin: the click becomes a navigation
-//! of the main window to the media URL, which shows a bare video in place of the app. So the page hands
-//! the stream address to [`save_download`] instead, and the shell asks where to put the file and streams
-//! it there chunk by chunk. A movie of several gigabytes never sits in memory, which fetching it into a
+//! of the main window to the media URL, which shows a bare video in place of the app. So the shell does
+//! it: [`choose_download_place`] asks where to put the file and answers an opaque handle, and only then
+//! does the page fetch a stream address (its token lives 60 seconds, which a person reading a dialog can
+//! outlast) and hand it, with the handle, to [`save_download`], which streams the file there chunk by
+//! chunk. A movie of several gigabytes never sits in memory, which fetching it into a
 //! `Blob` on the page would have done.
 //!
 //! The shell fetches only what the page could have opened itself: an address on the instance the page
 //! is connected to, at that instance's file-stream route ([`stream_target`]). Anything else is refused
 //! before a request goes out, so the command cannot be used to make the shell fetch some other address.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use fbtt_desktop_core::LOCAL_ID;
+use fbtt_desktop_core::{LOCAL_ID, launch_secret};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::commands::DesktopState;
@@ -155,11 +159,8 @@ pub async fn save_to(
             response.status().as_u16()
         ));
     }
-    let partial = partial_path(destination);
+    let (partial, mut file) = create_partial(destination).await?;
     let result = async {
-        let mut file = tokio::fs::File::create(&partial)
-            .await
-            .map_err(|_| SAVE_FAILED.to_string())?;
         let mut written = 0u64;
         loop {
             let chunk = response
@@ -176,24 +177,100 @@ pub async fn save_to(
             .await
             .map_err(|_| SAVE_FAILED.to_string())?;
         file.sync_all().await.map_err(|_| SAVE_FAILED.to_string())?;
-        drop(file);
-        tokio::fs::rename(&partial, destination)
-            .await
-            .map_err(|_| SAVE_FAILED.to_string())?;
         Ok(written)
     }
     .await;
+    drop(file);
+    let result = match result {
+        Ok(written) => tokio::fs::rename(&partial, destination)
+            .await
+            .map(|()| written)
+            .map_err(|_| SAVE_FAILED.to_string()),
+        Err(problem) => Err(problem),
+    };
     if result.is_err() {
+        // Only the part file this download made itself: it was created new, so it is nobody else's.
         let _ = tokio::fs::remove_file(&partial).await;
     }
     result
 }
 
-/// `destination` with `.part` added to its name.
-fn partial_path(destination: &Path) -> PathBuf {
+/// How many names a part file is tried under before the download gives up.
+const PART_ATTEMPTS: usize = 8;
+
+/// A part file of this download's own next to `destination`: `<name>.<random>.part`, created new, so two
+/// downloads to the same name and a file of the person's own that happens to end `.part` are never
+/// written over. A name that is taken is tried again with another random tag.
+async fn create_partial(destination: &Path) -> Result<(PathBuf, tokio::fs::File), String> {
+    for _ in 0..PART_ATTEMPTS {
+        let partial = partial_path(destination, &random_tag());
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await
+        {
+            Ok(file) => return Ok((partial, file)),
+            Err(problem) if problem.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(SAVE_FAILED.to_string()),
+        }
+    }
+    Err(SAVE_FAILED.to_string())
+}
+
+/// A short random tag for a part file's name: file-name safe (URL-safe base64).
+fn random_tag() -> String {
+    launch_secret().chars().take(12).collect()
+}
+
+/// `destination` with `.<tag>.part` added to its name.
+fn partial_path(destination: &Path, tag: &str) -> PathBuf {
     let mut name = destination.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
+    name.push(format!(".{tag}.part"));
     destination.with_file_name(name)
+}
+
+/// How many chosen places are kept waiting for their download.
+const MAX_PLACES: usize = 16;
+
+/// The places the person chose in the save dialog, each under an opaque handle the page holds until it
+/// has a fresh stream address to fetch. The page never sees a path: it gets the handle, and hands it back
+/// with the address. At most [`MAX_PLACES`] are kept; an older one the page never came back for is
+/// forgotten first.
+#[derive(Debug, Default)]
+pub struct Downloads {
+    places: Mutex<VecDeque<(String, PathBuf)>>,
+}
+
+impl Downloads {
+    /// No place chosen yet.
+    pub fn new() -> Self {
+        Downloads::default()
+    }
+
+    fn places(&self) -> std::sync::MutexGuard<'_, VecDeque<(String, PathBuf)>> {
+        self.places
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Keeps `path` and answers the handle it is kept under.
+    pub fn keep(&self, path: PathBuf) -> String {
+        let handle = launch_secret();
+        let mut places = self.places();
+        if places.len() == MAX_PLACES {
+            places.pop_front();
+        }
+        places.push_back((handle.clone(), path));
+        handle
+    }
+
+    /// The place kept under `handle`, taken out: a handle opens one download.
+    pub fn take(&self, handle: &str) -> Option<PathBuf> {
+        let mut places = self.places();
+        let index = places.iter().position(|(kept, _)| kept == handle)?;
+        places.remove(index).map(|(_, path)| path)
+    }
 }
 
 /// The base address of instance `id`: This computer's while it runs, a saved instance's otherwise.
@@ -237,25 +314,39 @@ async fn ask_where<R: Runtime>(
     Ok(chosen.map(|handle| handle.path().to_path_buf()))
 }
 
-/// Saves the file at `url` on instance `instance` where the person chooses. Answers `true` once it is
-/// saved and `false` when the person cancelled the dialog; a refusal or a failure rejects with the line
-/// to show.
+/// Asks where to save a file called `name`, before anything is fetched. Answers an opaque handle for the
+/// place chosen, or `None` when the person cancelled; the path itself stays in the shell. The page asks
+/// for a stream address only once it has the handle, so the address's short-lived token is not spent
+/// while the dialog is open.
 #[tauri::command]
-pub async fn save_download<R: Runtime>(
+pub async fn choose_download_place<R: Runtime>(
     app: AppHandle<R>,
-    instance: String,
-    url: String,
     name: String,
+    downloads: tauri::State<'_, Downloads>,
+) -> Result<Option<String>, String> {
+    Ok(ask_where(&app, suggested_name(&name))
+        .await?
+        .map(|path| downloads.keep(path)))
+}
+
+/// Saves the file at `url` on instance `instance` to the place [`choose_download_place`] answered
+/// `handle` for. A refusal or a failure rejects with the line to show.
+#[tauri::command]
+pub async fn save_download(
+    instance: String,
+    handle: String,
+    url: String,
     state: tauri::State<'_, DesktopState>,
     instances: tauri::State<'_, Instances>,
-) -> Result<bool, String> {
+    downloads: tauri::State<'_, Downloads>,
+) -> Result<(), String> {
+    let destination = downloads
+        .take(&handle)
+        .ok_or_else(|| "Choose where to save the file again.".to_string())?;
     let base = instance_base(&state, &instances, &instance).await?;
     let target = stream_target(&base, &url).ok_or_else(|| NOT_A_STREAM.to_string())?;
-    let Some(destination) = ask_where(&app, suggested_name(&name)).await? else {
-        return Ok(false);
-    };
     save_to(&client(), target, &destination).await?;
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,7 +356,7 @@ mod tests {
     use fbtt_core::scratch::ScratchDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{client, save_to, stream_target, suggested_name};
+    use super::{Downloads, MAX_PLACES, client, save_to, stream_target, suggested_name};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -376,9 +467,73 @@ mod tests {
 
         assert_eq!(saved, body.len() as u64);
         assert_eq!(std::fs::read(&destination).expect("the saved file"), body);
-        assert!(
-            !dir.path().join("movie.mkv.part").exists(),
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("the folder").count(),
+            1,
             "no part file is left"
+        );
+    }
+
+    /// A file of the person's own called `<name>.part`, and another download's part file, are never
+    /// written over or removed: each download makes a part file of its own, new.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_writes_only_its_own_part_file() {
+        let dir = ScratchDir::new("desktop-download-own-part");
+        let theirs = dir.path().join("movie.mkv.part");
+        std::fs::write(&theirs, b"the person's own").expect("their file");
+        let destination = dir.path().join("movie.mkv");
+        let refusing = answering("403 Forbidden", b"no".to_vec()).await;
+        save_to(
+            &client(),
+            stream_target(&refusing, &stream(&refusing)).expect("a target"),
+            &destination,
+        )
+        .await
+        .expect_err("a 403 is not a file");
+
+        let body: Vec<u8> = (0..70_000u32).map(|n| (n % 7) as u8).collect();
+        let base = answering("200 OK", body.clone()).await;
+        let target = || stream_target(&base, &stream(&base)).expect("a target");
+        let (one, two) = (client(), client());
+        let (first, second) = tokio::join!(
+            save_to(&one, target(), &destination),
+            save_to(&two, target(), &destination),
+        );
+        first.expect("the first download");
+        second.expect("the second download");
+
+        assert_eq!(std::fs::read(&destination).expect("the saved file"), body);
+        assert_eq!(
+            std::fs::read(&theirs).expect("their file"),
+            b"the person's own"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the folder")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "only the file and theirs are left: {left:?}");
+    }
+
+    #[test]
+    fn a_chosen_place_is_handed_out_once_by_its_handle() {
+        let downloads = Downloads::new();
+        let handle = downloads.keep("/somewhere/movie.mkv".into());
+        assert!(!handle.contains("movie"), "the handle names no path");
+        assert_eq!(downloads.take("nope"), None);
+        assert_eq!(
+            downloads.take(&handle),
+            Some(std::path::PathBuf::from("/somewhere/movie.mkv"))
+        );
+        assert_eq!(downloads.take(&handle), None, "a handle opens one download");
+
+        let first = downloads.keep("/a".into());
+        for _ in 0..MAX_PLACES {
+            downloads.keep("/b".into());
+        }
+        assert_eq!(
+            downloads.take(&first),
+            None,
+            "the oldest is forgotten past the cap"
         );
     }
 
@@ -395,6 +550,10 @@ mod tests {
 
         assert!(problem.contains("403"), "{problem}");
         assert!(!destination.exists());
-        assert!(!dir.path().join("movie.mkv.part").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("the folder").count(),
+            0,
+            "no part file is left"
+        );
     }
 }
