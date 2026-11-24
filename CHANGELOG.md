@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server.cors_origins`: the origins of clients served from somewhere else that may call a server's API, empty by default. The desktop app connecting to a remote server needs its own origin listed, `tauri://localhost` on macOS and Linux and `http://tauri.localhost` on Windows. Listing an origin signs nobody in. Beside it, the server has a desktop access mode for the engine the desktop app runs itself: it accepts a launch secret made when the app starts, and exposes the configured `server:` section to the network only when `Serve the web UI` is on. Documented in `docs/server.md`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
 - The web client signs in with a bearer token to any address, not only to the origin it was served from, which is how the desktop app reaches a remote server: the token is kept in memory, with no cookie and no CSRF header, and signing out ends the session on the server. The keyboard shortcuts can be changed in the desktop app (`Change` on a row, `Already used by <action>` for a key another action in the group holds, `Reset to defaults`), and the list stays read-only in a browser. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))
 
+### Changed
+
+- On macOS the desktop app keeps its Dock icon hidden when it starts in the background (at login, or with `--background`): only its menu bar icon shows. Showing the window, from the tray, a second launch, or a `magnet:` link or `.torrent` file opened with the app, puts the Dock icon back, and closing the window to the tray takes it away again. Where there is no tray the Dock icon never hides. Documented in `docs/desktop.md`. ([#32](https://github.com/featherbitplatform/featherbittorrent/pull/32))
+
 ### Fixed
 
 - Dialogs (close, delete, add torrent, limits, move files, remove device and the player) now open centred in the window instead of in its top-left corner. This affected the web UI released in `0.3.0`. ([#30](https://github.com/featherbitplatform/featherbittorrent/pull/30))

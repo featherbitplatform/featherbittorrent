@@ -242,7 +242,9 @@ section changes the answer later under `Close the window`.
 Keeping running means the tray. Its menu is `Show featherbittorrent`, a line with the name of the instance the
 app is connected to (a label, not a button), and `Quit`. On macOS and Windows clicking the tray icon shows the
 window as well; on Linux the menu's `Show featherbittorrent` is the way, because Linux tray hosts send the
-app no click. On macOS, clicking the Dock icon while the window is hidden brings it back too. Quitting from
+app no click. On macOS the Dock icon follows the window: closing the window to the tray takes the app out
+of the Dock, leaving the menu bar icon, and showing the window again puts it back. Opening the app again from
+Finder or Spotlight while the window is hidden brings it back too. Quitting from
 the tray, from `Cmd+Q`, or by logging out or shutting down stops `This computer` cleanly: the last save runs,
 and your torrents resume when the app runs next, the way the terminal client's do when you quit it.
 
@@ -265,9 +267,12 @@ anything at install time, so this setting is the only thing that makes this app 
 because you asked it to.
 
 The entry launches the app with `--background`, so a start at login is quiet: the app connects to its default
-instance and sits in the tray with no window, or with its window minimized where there is no tray.
-`Show featherbittorrent` in the tray menu brings it back, and so does starting the app again, which hands the
-running copy a window rather than starting a second engine.
+instance and sits in the tray with no window, or with its window minimized where there is no tray. On
+macOS it also stays out of the Dock: only its menu bar icon shows. `Show featherbittorrent` in the tray menu
+brings the window back, and so does starting the app again, which hands the running copy a window rather than
+starting a second engine, or opening a `magnet:` link or a `.torrent` file with it. On macOS the Dock icon
+appears with the window, and goes again when the window is closed to the tray. With no tray the window starts
+minimized and the Dock icon stays, since nothing else could bring the window back.
 
 The autostart guide for the server, [docs/autostart.md](autostart.md), is a different thing: it is about
 running `serve` before anybody logs in, under systemd, launchd or Task Scheduler. This setting is about your
