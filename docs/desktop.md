@@ -114,6 +114,15 @@ The player's `Download` asks where to save first, then writes the file there in 
 runs until it finishes; quitting the app before then leaves a `<name>.<random>.part` file next to where the
 file would have gone, which you can delete.
 
+The player's `Open in player` starts VLC or mpv on the file, found the same way the terminal client finds
+them (see [streaming.md](streaming.md)). Reach for it with a file the window cannot play itself: HEVC video
+on a Windows system without the HEVC extension, or an AC-3 or DTS track. It works while the file is still
+downloading, and it needs VLC or mpv installed: with neither the app says so and nothing starts. The address
+reaches the player inside a playlist rather than on its command line, so its short-lived token is not left in
+a process listing: the playlist is `<data dir>/playlists/<random>.m3u`, written fresh for each open and
+readable only by you, taken out once the player has read it, and any one a crashed run left behind is taken
+out the next time the app starts.
+
 ## Where the app's files live
 
 The desktop app keeps its own config and data directories, beside but never shared with the terminal

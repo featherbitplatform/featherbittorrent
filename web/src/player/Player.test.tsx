@@ -11,6 +11,8 @@ import { positionKey } from './positions'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
 import { DesktopDownloadContext } from '../desktopDownload'
+import { DesktopPlayerContext } from '../desktopPlayer'
+import type { DesktopPlayer } from '../desktopPlayer'
 import {
   FakeBody,
   FakeMediaSource,
@@ -3676,5 +3678,88 @@ describe('error bodies know an HTML page', () => {
     expect(failure?.detail, 'the HTML error page was shown as a detail').toBe(null)
     engine.destroy()
     document.body.removeChild(video)
+  })
+})
+
+/**
+ * The player rendered as the desktop app draws it: `shell` behind `DesktopPlayerContext`, or no provider
+ * for a browser. Streams are answered the way `renderRemux` answers them, so a remux playback opens.
+ */
+async function renderInApp(
+  shell?: DesktopPlayer,
+): Promise<{ container: HTMLElement; video: HTMLVideoElement; dialog: HTMLDialogElement }> {
+  const recorder = fakeFetch()
+  recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  vi.stubGlobal('fetch', recorder.fetch)
+  const { client } = probeClient()
+  const player = <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
+  const { container } = render(
+    shell === undefined ? (
+      player
+    ) : (
+      <DesktopPlayerContext.Provider value={shell}>{player}</DesktopPlayerContext.Provider>
+    ),
+  )
+  await settle()
+  const video = container.querySelector('video') as HTMLVideoElement
+  const dialog = container.querySelector('dialog') as HTMLDialogElement
+  return { container, video, dialog }
+}
+
+describe('open in player', () => {
+  it('open in player is offered only in the app', async () => {
+    // A browser has no shell to start a player with, so the control is not drawn at all.
+    await renderInApp()
+    expect(screen.queryByRole('button', { name: 'Open in player' })).toBeNull()
+    cleanup()
+    // In the app the way out to VLC or mpv is there.
+    await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('open in player hands the stream address to the shell', async () => {
+    const calls: Array<[string, string]> = []
+    const shell: DesktopPlayer = {
+      open: async (url, title) => {
+        calls.push([url, title])
+        return 'Opening movie.mkv in VLC'
+      },
+    }
+    const { video } = await renderInApp(shell)
+    makeVideoPlayable(video)
+    video.play()
+    await settle()
+    expect(video.paused, 'the test video was not playing before the click').toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    // The address is the file-stream token fetched at the click, and the file is named for the player.
+    expect(calls).toEqual([['/api/v1/stream/t?token=abc', 'movie.mkv']])
+    // The in-page video yields to the shell's player.
+    expect(video.paused, 'the in-page video kept playing after the open').toBe(true)
+  })
+
+  it("open in player shows the shell's refusal", async () => {
+    const shell: DesktopPlayer = {
+      open: () => Promise.reject('No media player found. Install VLC or mpv.'),
+    }
+    await renderInApp(shell)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    expect(screen.getByRole('alert').textContent).toBe('No media player found. Install VLC or mpv.')
+  })
+
+  it('failed playback offers open in player', async () => {
+    const { video } = await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    act(() => {
+      setElementError(video, 'PIPELINE_ERROR_DECODE', true)
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the failed player did not say why',
+    ).toBe(true)
+    // The way out is right there in the failure, beside its Download.
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
   })
 })

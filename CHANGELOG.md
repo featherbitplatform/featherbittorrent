@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Desktop app: Open in player in the player hands the file to VLC or mpv, for files the window cannot play itself (HEVC without the Windows extension, AC-3, DTS). It works while the file is still downloading.
+
 ### Fixed
 
 - Desktop app: pressing Add torrent while Settings was open left the window unresponsive. It now goes back to the torrent list and opens the Add dialog there. ([#35](https://github.com/featherbitplatform/featherbittorrent/pull/35))
