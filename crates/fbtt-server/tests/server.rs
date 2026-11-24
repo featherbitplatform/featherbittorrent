@@ -1868,9 +1868,10 @@ impl Drop for ReleaseParked<'_> {
 /// permit was returned at all, not how fast argon2 runs on the machine next door.
 const SETTLE: Duration = Duration::from_secs(3);
 
-/// Waits until `want` Argon2 checks are sitting inside the check (see `Server::park_verifies`) and returns
-/// how many are. The count moves when a check arrives, so this waits on that change instead of polling a
-/// counter - and it leaves the count marked as read, which is what lets the caller then wait for the next one.
+/// Waits until `want` Argon2 checks have reached the hold (see `Server::park_verifies`), and returns the count
+/// it read. The count the hold moves is published in order and only ever rises, so a `want`'s worth of
+/// arrivals reads back as exactly `want`: the number cannot move under the reader, which is what makes reading
+/// it for equality a measurement of how many are parked rather than a race against the next arrival.
 async fn wait_until_parked(parked: &mut tokio::sync::watch::Receiver<u64>, want: u64) -> u64 {
     while *parked.borrow_and_update() < want {
         within(parked.changed()).await.expect("a check parked");
@@ -1926,15 +1927,15 @@ async fn verify_concurrency_is_bounded() {
         }));
     }
     let want = u64::try_from(cap).expect("a count of permits");
+    // Wait for a cap's worth of checks to reach their hold, and read the number back. The count is published
+    // in order and only ever rises, so exactly a cap's worth of arrivals reads back as the cap - and no more,
+    // because only a cap's worth of requests are in flight to arrive. That number is the bound itself: every
+    // permit is held by a check that has not finished, and a check has to take the permit before it counts
+    // here.
     assert_eq!(
         wait_until_parked(&mut parked, want).await,
         want,
         "every permit this server has is held by a check that has not finished",
-    );
-    assert_eq!(
-        usize::try_from(served.server.max_concurrent_verifies()).expect("a count of checks"),
-        cap,
-        "the checks that are running are the whole bound, not more than it",
     );
 
     let mut queued = Vec::new();

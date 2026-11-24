@@ -298,10 +298,10 @@ impl Shared {
         self.verify_tally.max_concurrent_verifies()
     }
 
-    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks are sitting
-    /// inside the verify right now, with a change to wait for. Under `test-support` only, and arming it
-    /// twice changes nothing about the checks - both watchers see the same count. See
-    /// [`Server::park_verifies`].
+    /// Arms [`VerifyTally::park_inside_verify`] and returns the count it moves: how many checks have reached
+    /// the hold since it was armed, published in order and only ever rising, with a change to wait for. Under
+    /// `test-support` only, and arming it twice changes nothing about the checks - both watchers see the same
+    /// count. See [`Server::park_verifies`].
     #[cfg(feature = "test-support")]
     pub(crate) fn park_verifies(&self) -> watch::Receiver<u64> {
         self.verify_tally.park()
@@ -433,10 +433,14 @@ impl VerifyTally {
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
 struct VerifyHold {
-    /// How many checks are parked here right now. Every arrival bumps it and sends the new number, so a
-    /// watcher reads a count and waits for the next change instead of polling - which is how a test counts
-    /// what is holding the permits without guessing at how long a hash takes on somebody else's machine.
-    parked: AtomicU64,
+    /// How many checks have reached the hold since it was armed, and the count a watcher waits on. It is
+    /// arrivals ever, not a count of what is parked right now, and it is published in order and only ever
+    /// rises: a check bumps it and tells watchers in one step, so the number a watcher reads cannot go
+    /// backwards - two checks arriving on two blocking threads once bumped and published as two steps, and the
+    /// second to publish could be the first to arrive, which made a watcher read the count fall by one. Every
+    /// arrival bumps it and sends the new number, so a watcher reads a count and waits for the next change
+    /// instead of polling - which is how a test counts what is holding the permits without guessing at how
+    /// long a hash takes on somebody else's machine.
     counts: watch::Sender<u64>,
     /// `false` while checks are being held; [`VerifyHold::release`] makes it `true` for good, so the checks
     /// that arrive afterwards run through without stopping. A condvar rather than a channel because the
@@ -451,7 +455,6 @@ impl VerifyHold {
     fn new() -> Self {
         let (counts, _) = watch::channel(0);
         VerifyHold {
-            parked: AtomicU64::new(0),
             counts,
             open: Mutex::new(false),
             waiting: Condvar::new(),
@@ -460,9 +463,12 @@ impl VerifyHold {
 
     /// Says this check has reached the inside of the verify, then waits there for the test to stop looking.
     fn arrive_and_wait(&self) {
-        let parked = self.parked.fetch_add(1, Ordering::Relaxed) + 1;
-        // The number is what a watcher reads; whether anybody is still watching to be told is not its job.
-        let _ = self.counts.send(parked);
+        // The bump and the publish are one step, under the watch's own lock, so the watched number only ever
+        // rises: two checks arriving on two blocking threads take their turns at it rather than each taking a
+        // number and then racing to publish it, which could publish the second arrival before the first and
+        // send the count backwards. The number is what a watcher reads; whether anybody is still watching to
+        // be told is not its job.
+        self.counts.send_modify(|count| *count += 1);
         let mut open = locked(&self.open);
         while !*open {
             open = self
