@@ -1,15 +1,20 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useState } from 'react'
 import Files from '../components/detail/Files'
 import { createClient } from '../api/client'
 import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
 import { createEngine } from './engine'
 import type { EngineProbe } from './engine'
 import { toSource } from './time'
+import { positionKey } from './positions'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
-import { DesktopDownloadContext } from '../desktopDownload'
+import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
+import type { DesktopDownload, DownloadProgress } from '../desktopDownload'
+import { DesktopPlayerContext } from '../desktopPlayer'
+import type { DesktopPlayer } from '../desktopPlayer'
 import {
   FakeBody,
   FakeMediaSource,
@@ -20,6 +25,7 @@ import {
   fakeVideoBeforeMetadata,
   makeVideoPlayable,
   makeVideoSeekable,
+  setElementError,
 } from './testing'
 import { FOCUSABLE_SELECTOR, MODAL_CENTRED } from '../modal'
 import { KEY_BINDINGS } from '../keys'
@@ -35,11 +41,15 @@ const objectUrls: string[] = []
 let objectUrlCount = 0
 const revokeObjectUrls: string[] = []
 let createObjectUrlCalls = 0
+// Every media source the player's engine makes, in order, so a test can reach the buffers of the
+// engine a render started (and of the one an audio retry starts).
+const mediaSources: FakeMediaSource[] = []
 beforeEach(() => {
   objectUrlCount = 0
   createObjectUrlCalls = 0
   objectUrls.length = 0
   revokeObjectUrls.length = 0
+  mediaSources.length = 0
   // jsdom has no `MediaSource`, so the player's `chooseTracks` would answer `unplayable` for
   // everything. The stub is a `FakeMediaSource` with a browser-shaped `isTypeSupported`: it takes
   // the codecs a real browser takes (h264, aac, opus, vp8, vp9) and refuses the rest (hevc), which
@@ -48,6 +58,10 @@ beforeEach(() => {
   class BrowserMediaSource extends FakeMediaSource {
     static isTypeSupported(mime: string): boolean {
       return /avc1|mp4a|opus|vp8|vp9/.test(mime)
+    }
+    constructor() {
+      super()
+      mediaSources.push(this)
     }
   }
   vi.stubGlobal('MediaSource', BrowserMediaSource)
@@ -439,8 +453,8 @@ describe('the player', () => {
       },
     }
     const saved: Array<[string, string]> = []
-    const shell = {
-      choose: (name: string) =>
+    const shell = createDownloads(
+      (name: string) =>
         new Promise<string | null>((resolve) => {
           order.push(`dialog ${name}`)
           answerDialog = (handle) => {
@@ -448,11 +462,12 @@ describe('the player', () => {
             resolve(handle)
           }
         }),
-      save: async (handle: string, url: string) => {
+      async (handle: string, url: string) => {
         order.push('save')
         saved.push([handle, url])
       },
-    }
+      async () => {},
+    )
     const clicked: string[] = []
     const originalClick = HTMLAnchorElement.prototype.click
     ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
@@ -512,6 +527,351 @@ describe('the player', () => {
     }
     expect(clicked, 'a link was clicked').toEqual([])
     expect(screen.getByRole('alert').textContent).toBe('This file cannot be downloaded here.')
+  })
+
+  /** One save the test drives by hand. */
+  interface HeldSave {
+    url: string
+    progress: (progress: DownloadProgress) => void
+    saved: () => void
+    failed: (line: string) => void
+  }
+
+  /** The downloads tests' stand-in shell: a real download store (`createDownloads`) over saves the
+   * test drives by hand. `held` collects them: `progress` reports bytes, `saved` and `failed` end
+   * the download. */
+  function downloadShell(): {
+    shell: DesktopDownload
+    held: HeldSave[]
+    chooses: string[]
+    cancels: string[]
+  } {
+    const held: HeldSave[] = []
+    const chooses: string[] = []
+    const cancels: string[] = []
+    const shell = createDownloads(
+      async (name: string) => {
+        chooses.push(name)
+        return 'place-1'
+      },
+      (_handle: string, url: string, onProgress: (progress: DownloadProgress) => void) =>
+        new Promise<void>((resolve, reject) => {
+          held.push({
+            url,
+            progress: onProgress,
+            saved: () => {
+              resolve()
+            },
+            failed: (line: string) => {
+              reject(line)
+            },
+          })
+        }),
+      async (handle: string) => {
+        cancels.push(handle)
+      },
+    )
+    return { shell, held, chooses, cancels }
+  }
+
+  /** The shell, the store, and the hevc file the Download button lives on: the unplayable screen. */
+  function downloadHarness(): {
+    shell: DesktopDownload
+    client: Api
+    held: HeldSave[]
+    chooses: string[]
+    cancels: string[]
+  } {
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    return { ...downloadShell(), client: probeClient(unplayable).client }
+  }
+
+  /** The player opens and closes again on the same store: a download lives above it, not inside it. */
+  function Harness({ shell, client }: { shell: DesktopDownload; client: Api }) {
+    const [open, setOpen] = useState(true)
+    return (
+      <DesktopDownloadContext.Provider value={shell}>
+        {open ? (
+          <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => setOpen(false)} />
+        ) : (
+          <button type="button" onClick={() => setOpen(true)}>Open player</button>
+        )}
+      </DesktopDownloadContext.Provider>
+    )
+  }
+
+  it('download shows its progress', async () => {
+    // Sizes chosen so the formats land where the copy reads: 1.2 GiB of 2.9 GiB, 42%.
+    const SIZE = 3_113_851_290
+    const WRITTEN = 1_307_713_542
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(held.length, 'the shell was not asked to save').toBe(1)
+    act(() => {
+      held[0]!.progress({ received: 0, total: SIZE })
+    })
+    expect(
+      screen.getByText('Downloading 0% (0 B of 2.9 GiB)') !== null,
+      'the start of the download was not shown',
+    ).toBe(true)
+    act(() => {
+      held[0]!.progress({ received: WRITTEN, total: SIZE })
+    })
+    expect(
+      screen.getByText('Downloading 42% (1.2 GiB of 2.9 GiB)') !== null,
+      'the download did not show its progress',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download stayed on screen while the file was downloading',
+    ).toBeNull()
+    const bar = screen.getByLabelText('Download progress')
+    expect(bar.tagName).toBe('PROGRESS')
+    expect(bar.getAttribute('value'), 'the progress bar got no value').toBe(String(WRITTEN))
+    expect(bar.getAttribute('max'), 'the progress bar got no max').toBe(String(SIZE))
+    const line = screen.getByText('Downloading 42% (1.2 GiB of 2.9 GiB)')
+    expect(line.getAttribute('role'), 'the progress line sits in a live region').toBeNull()
+    expect(line.getAttribute('aria-live'), 'the progress line announces on every update').toBeNull()
+    act(() => {
+      held[0]!.saved()
+    })
+    await settle()
+    expect(
+      screen.getByText('Saved.') !== null,
+      'the saved file was not announced',
+    ).toBe(true)
+    expect(screen.getByText('Saved.').getAttribute('role'), 'Saved. is not announced politely').toBe('status')
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'the Download button did not come back',
+    ).toBe(true)
+  })
+
+  it('download without a size shows bytes only', async () => {
+    const WRITTEN = 1_307_713_542
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: WRITTEN, total: null })
+    })
+    expect(
+      screen.getByText('Downloading 1.2 GiB') !== null,
+      'the download with no size did not say the bytes alone',
+    ).toBe(true)
+    expect(
+      screen.getByText('Downloading 1.2 GiB').textContent,
+      'a percent crept into a size-less download',
+    ).toBe('Downloading 1.2 GiB')
+    const bar = screen.getByLabelText('Download progress')
+    expect(bar.tagName).toBe('PROGRESS')
+    expect(bar.getAttribute('value'), 'a size-less download got a value').toBeNull()
+    expect(bar.getAttribute('max'), 'a size-less download got a max').toBeNull()
+  })
+
+  it('cancel download asks the shell and says so', async () => {
+    const { shell, held, cancels, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: 4096, total: 65_536 })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel download' }))
+    await settle()
+    expect(cancels, 'the shell was not asked to stop the download by its handle').toEqual(['place-1'])
+    act(() => {
+      held[0]!.failed('Download cancelled.')
+    })
+    await settle()
+    const line = screen.getByText('Download cancelled.')
+    expect(line.getAttribute('role'), 'the cancel is not announced politely').toBe('status')
+    expect(line.className.includes('text-muted'), 'the cancel line is not muted').toBe(true)
+    expect(line.className.includes('text-error'), 'the cancel line wears the error colour').toBe(false)
+    expect(screen.queryByRole('alert'), 'the cancel went to the failure alert').toBeNull()
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'the Download button did not come back',
+    ).toBe(true)
+  })
+
+  it('closing the player keeps the download', async () => {
+    const { shell, held, cancels, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: 1_307_713_542, total: null })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    expect(screen.queryByRole('dialog'), 'the player did not close').toBeNull()
+    expect(cancels, 'closing the player cancelled the download').toEqual([])
+    // The download goes on with the player gone, and its bytes keep landing in the store.
+    act(() => {
+      held[0]!.progress({ received: 1_610_612_736, total: null })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByText('Downloading 1.5 GiB') !== null,
+      'reopening the player did not show where the download got to',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download came back while the file was still downloading',
+    ).toBeNull()
+    expect(cancels, 'reopening changed nothing the shell was asked for').toEqual([])
+    act(() => {
+      held[0]!.saved()
+    })
+    await settle()
+    expect(screen.getByText('Saved.') !== null, 'the save that finished while closed was not said').toBe(true)
+    expect(screen.getByRole('button', { name: 'Download' }) !== null).toBe(true)
+  })
+
+  it('a file that is downloading cannot be downloaded twice', async () => {
+    const { shell, held, chooses, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download offered a second start while the file was downloading',
+    ).toBeNull()
+    // A failure is the shell's line in the alert, and Download comes back for another go.
+    act(() => {
+      held[0]!.failed('The download broke off.')
+    })
+    await settle()
+    expect(screen.getByRole('alert').textContent).toBe('The download broke off.')
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'a failed download left no way to try again',
+    ).toBe(true)
+    // Starting again and closing the player: the reopened player shows the same download running,
+    // not a fresh start, and no second save was asked for.
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(held.length, 'the second download did not start').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByRole('button', { name: 'Cancel download' }) !== null,
+      'the reopened player does not offer to cancel the running download',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'the reopened player offered a start for a file that is still downloading',
+    ).toBeNull()
+    expect(held.length, 'a second download was started for the file').toBe(2)
+    expect(chooses.length, 'the place was chosen more than twice for the file').toBe(2)
+  })
+
+  it('a file whose save dialog is open cannot be downloaded twice', async () => {
+    // The store records the save from the moment the dialog is asked, not from the moment it is
+    // answered: a player opened while an unanswered dialog stands must not start a second one.
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const { client } = probeClient(unplayable)
+    const held: HeldSave[] = []
+    const chooses: string[] = []
+    let answer: (place: string | null) => void = () => {}
+    const shell = createDownloads(
+      (name: string) =>
+        new Promise<string | null>((resolve) => {
+          chooses.push(name)
+          answer = resolve
+        }),
+      (_handle: string, url: string, onProgress: (progress: DownloadProgress) => void) =>
+        new Promise<void>((resolve, reject) => {
+          held.push({
+            url,
+            progress: onProgress,
+            saved: () => {
+              resolve()
+            },
+            failed: (line: string) => {
+              reject(line)
+            },
+          })
+        }),
+      async () => {},
+    )
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(chooses.length, 'no save dialog was opened').toBe(1)
+    // The player closes and opens again on the same store while that dialog is still open.
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    const offered = screen.getByRole<HTMLButtonElement>('button', { name: 'Download' })
+    expect(offered.disabled, 'a second start was offered while the dialog was open').toBe(true)
+    fireEvent.click(offered)
+    await settle()
+    expect(chooses.length, 'a second save dialog was opened for the same file').toBe(1)
+    // Answered with no place, the file is downloadable again.
+    await act(async () => {
+      answer(null)
+    })
+    await settle()
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Download' }).disabled,
+      'the file stayed blocked after the dialog was answered with no place',
+    ).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(chooses.length, 'a cancelled dialog left the file undownloadable').toBe(2)
+    await act(async () => {
+      answer('place-1')
+    })
+    await settle()
+    expect(held.length, 'no save was started for the file').toBe(1)
+  })
+
+  it('a download that failed while the player was closed is shown on reopening', async () => {
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    act(() => {
+      held[0]!.failed('The download broke off.')
+    })
+    // The failure happened with no player open: it waits in the store for the next one to show.
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByRole('alert').textContent,
+      'the failure that happened while closed was not shown',
+    ).toBe('The download broke off.')
+    // Dismissing it takes the record down for good.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert'), 'dismissing left the alert up').toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(screen.queryByRole('alert'), 'the dismissed failure came back').toBeNull()
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Download' }).disabled,
+      'the file stayed blocked after its failure was dismissed',
+    ).toBe(false)
   })
 
   it('managed media source attaches by srcObject', async () => {
@@ -2507,19 +2867,31 @@ const NATIVE_PROBE: MediaProbe = {
   external_subtitles: [],
 }
 
-/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. */
-async function renderNative(): Promise<{ container: HTMLElement; restore(): void }> {
+/** Render the player on the native path: jsdom's `canPlayType` answers nothing, so WebM is said to play. `shell` renders it as the desktop app draws it. */
+async function renderNative(
+  shell?: DesktopPlayer,
+): Promise<{ container: HTMLElement; restore(): void }> {
   const spy = vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockImplementation((mime: string) =>
     mime.startsWith('video/webm') ? 'maybe' : '',
   )
   const { client } = probeClient(NATIVE_PROBE)
-  const { container } = render(<Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />)
+  const player = <Player id="a" file={0} name="clip.webm" client={client} onClose={() => {}} />
+  const { container } = render(
+    shell === undefined ? (
+      player
+    ) : (
+      <DesktopPlayerContext.Provider value={shell}>{player}</DesktopPlayerContext.Provider>
+    ),
+  )
   await settle()
   return { container, restore: () => spy.mockRestore() }
 }
 
 /** Render the remuxed player over a fake `fetch` the engine reads as `window.fetch`. */
-async function renderRemux(probe: MediaProbe = PROBE): Promise<{
+async function renderRemux(
+  probe: MediaProbe = PROBE,
+  beforeRender?: (recorder: ReturnType<typeof fakeFetch>) => void,
+): Promise<{
   container: HTMLElement
   recorder: ReturnType<typeof fakeFetch>
   video: HTMLVideoElement
@@ -2532,6 +2904,7 @@ async function renderRemux(probe: MediaProbe = PROBE): Promise<{
     return { startMs: videoCalls === 1 ? 0 : 3000, body: () => new FakeBody() }
   })
   recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  beforeRender?.(recorder)
   vi.stubGlobal('fetch', recorder.fetch)
   const { client } = probeClient(probe)
   const { container } = render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
@@ -2883,5 +3256,935 @@ describe('the final review fixes', () => {
     expect(seek.value, 'the bar jumped back on release').toBe('3')
     await settle()
     expect(seek.value, 'the bar jumped back while waiting for data').toBe('3')
+  })
+})
+
+/** Write `navigator.userAgent` the way a test needs it, and hand back the undo. */
+function setUserAgent(userAgent: string): () => void {
+  const own = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent')
+  Object.defineProperty(window.navigator, 'userAgent', {
+    value: userAgent,
+    configurable: true,
+    writable: true,
+  })
+  return (): void => {
+    if (own !== undefined) {
+      Object.defineProperty(window.navigator, 'userAgent', own)
+    } else {
+      delete (window.navigator as unknown as Record<string, unknown>).userAgent
+    }
+  }
+}
+
+describe('player failures say why', () => {
+  it('element decode error reports the codec', async () => {
+    // Chrome's real Windows failure: the element raises `error` (code 3) with its own words, and
+    // the player must say which codec broke and show the system's message, not just the old line.
+    const t = await renderRemux()
+    act(() => {
+      setElementError(t.video, 'PIPELINE_ERROR_DECODE', true)
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the failed player did not name the codec it could not decode',
+    ).toBe(true)
+    expect(
+      screen.getByText('PIPELINE_ERROR_DECODE') !== null,
+      'the failed player did not show the system error message',
+    ).toBe(true)
+  })
+
+  it('append after element error is a decode failure', async () => {
+    // The engine's real sequence on a dead decoder: the element fails first, and the next
+    // `appendBuffer` throws `InvalidStateError`. The append throw must not be filed as the cause:
+    // the element's error is, with the element's own message.
+    const t = await openEngine()
+    t.body(1).push(new Uint8Array([1]))
+    await settle()
+    expect(t.engine.state(), 'the first append did not land').not.toBe('error')
+    setElementError(t.video, 'PIPELINE_ERROR_DECODE')
+    t.videoBuffer.makeNextAppendThrow('InvalidStateError', 'The source buffer is in the invalid state.')
+    t.body(1).push(new Uint8Array([2]))
+    await settle()
+    expect(t.engine.state(), 'an append after a decode failure was not an error').toBe('error')
+    const failure = t.engine.failure()
+    expect(failure !== null, 'the throw after the element error recorded nothing').toBe(true)
+    expect(failure?.kind, 'a throw after an element error was not called a decode failure').toBe('decode')
+    expect(failure?.role, 'the decode failure did not say which track').toBe('video')
+    expect(failure?.detail, 'the element message was not kept').toBe('PIPELINE_ERROR_DECODE')
+    t.close()
+  })
+
+  it('sourcebuffer error event is not a success', async () => {
+    // A `SourceBuffer` that fires `error` ends the stream: its `updateend` after the failed append
+    // is the end of the failure, not a success, and the engine must say which track broke.
+    const t = await openEngine()
+    t.videoBuffer.dispatchEvent(new Event('error'))
+    await settle()
+    expect(t.engine.state(), 'a sourcebuffer error left the engine going').toBe('error')
+    const failure = t.engine.failure()
+    expect(failure !== null, 'the sourcebuffer error recorded nothing').toBe(true)
+    expect(failure?.role, 'the sourcebuffer error did not say which track').toBe('video')
+    expect(failure?.kind, 'a sourcebuffer error was not a decode failure').toBe('decode')
+    expect(failure?.mime).toBe('video/mp4; codecs="avc1.64000A"')
+    t.close()
+  })
+
+  it('addSourceBuffer throw is an error, not loading forever', async () => {
+    // A source that refuses the buffer leaves the engine with nothing to append to: it is done,
+    // and it must say so with the track and the browser's own words, not sit in `loading`.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.makeNextAddSourceBufferThrow('NotSupportedError', 'the mime is not supported here')
+    source.open()
+    await settle()
+    expect(engine.state(), 'a refused addSourceBuffer left the player loading forever').toBe('error')
+    const failure = engine.failure()
+    expect(failure !== null, 'the refused buffer recorded nothing').toBe(true)
+    expect(failure?.role, 'the refused buffer did not say which track').toBe('video')
+    expect(failure?.kind, 'a refused addSourceBuffer was not a buffer failure').toBe('buffer')
+    expect(failure?.mime).toBe('video/mp4; codecs="avc1.64000A"')
+    expect(failure?.status).toBe(null)
+    expect(failure?.detail).toBe('the mime is not supported here')
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('server error names the status', async () => {
+    // The video stream answers 415 with the route's own JSON error body: the player names the
+    // status, shows the server's message, and keeps the file downloadable.
+    await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/1/stream', {
+        status: 415,
+        json: { error: 'unsupported_media', message: 'x' },
+      })
+    })
+    expect(
+      screen.getByText('Playback failed: the server answered 415.') !== null,
+      'the failed player did not name the status the server answered',
+    ).toBe(true)
+    expect(screen.getByText('x') !== null, 'the server message was not shown').toBe(true)
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'a failed video offers no way to download it',
+    ).toBe(true)
+  })
+
+  it('audio failure retries without audio once', async () => {
+    // The real Windows 11 24H2 case: an AC-3 track with no decoder. The picture is fine, so the
+    // player re-opens the file once with no audio, says the video plays without sound, and keeps
+    // the failure from killing the video; a second failure is the final word.
+    const t = await renderRemux()
+    const first = mediaSources.at(-1) as FakeMediaSource
+    const audioBuffer = first.activeSourceBuffers[1] as FakeSourceBuffer
+    act(() => {
+      audioBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    const videoCalls = t.recorder.callsFor('/tracks/1/stream')
+    expect(videoCalls.length, 'the audio failure did not start the video again').toBe(2)
+    expect(videoCalls[1]?.url, 'the retry did not resume the video where it was').toContain('start_ms=0')
+    expect(t.recorder.callsFor('/tracks/2/stream').length, 'the retry fetched the audio again').toBe(1)
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the retry played without telling the person there is no sound',
+    ).toBe(true)
+    const second = mediaSources.at(-1) as FakeMediaSource
+    expect(second !== first, 'the retry re-used the first media source').toBe(true)
+    expect(second.activeSourceBuffers.length, 'the retry opened an audio buffer').toBe(1)
+    const videoBuffer2 = second.activeSourceBuffers[0] as FakeSourceBuffer
+    act(() => {
+      videoBuffer2.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the second failure did not show the final error',
+    ).toBe(true)
+  })
+
+  it('windows hevc hint', async () => {
+    // The Windows case the bug was filed from: `isTypeSupported` says yes to HEVC, the decoder is
+    // missing, and the fix is a purchase. The hint belongs on Windows and nowhere else.
+    const hevcProbe: MediaProbe = {
+      ...PROBE,
+      tracks: [
+        track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'], default: true }),
+      ],
+    }
+    class HevcBrowserMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /hvc1|mp4a|opus/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+    }
+    vi.stubGlobal('MediaSource', HevcBrowserMediaSource)
+    const hint = 'On Windows, HEVC video needs the HEVC Video Extensions from the Microsoft Store.'
+    const restoreWindows = setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      const windows = await renderRemux(hevcProbe)
+      act(() => {
+        setElementError(windows.video, 'PIPELINE_ERROR_DECODE', true)
+      })
+      await settle()
+      expect(
+        screen.getByText('Playback failed: this system could not decode the hevc video.') !== null,
+        'the HEVC player did not name the codec',
+      ).toBe(true)
+      expect(screen.getByText(hint) !== null, 'a Windows HEVC decode failure did not name the extension').toBe(true)
+    } finally {
+      restoreWindows()
+    }
+    cleanup()
+    const restoreMac = setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      const mac = await renderRemux(hevcProbe)
+      act(() => {
+        setElementError(mac.video, 'PIPELINE_ERROR_DECODE', true)
+      })
+      await settle()
+      expect(screen.queryByText(hint) === null, 'the Windows HEVC hint showed on a Mac').toBe(true)
+    } finally {
+      restoreMac()
+    }
+  })
+})
+
+describe('failure follow-ups', () => {
+  it('an endless error body times out into an error', async () => {
+    // A 500 whose body never ends must not hold the player in `loading` forever and must not
+    // grow memory without end: the read is capped, the timer answers, and the stream is closed.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, endlessBody: true })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    vi.useFakeTimers()
+    try {
+      source.open()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(engine.state(), 'the video did not start while the audio refused').toBe('playing')
+      await vi.advanceTimersByTimeAsync(1_400)
+      expect(engine.state(), 'the endless error body was already answered').toBe('playing')
+      await vi.advanceTimersByTimeAsync(300)
+      expect(engine.state(), 'a 500 with an endless body never reached the error state').toBe('error')
+      const failure = engine.failure()
+      expect(failure?.kind, 'the endless body failure was not the server').toBe('server')
+      expect(failure?.status, 'the endless body failure did not name the status').toBe(500)
+      expect(failure?.detail, 'a body that never said anything became a detail').toBe(null)
+      const call = recorder.callsFor('/tracks/2/stream')[0]
+      expect(
+        (call?.response as unknown as { canceled: boolean } | undefined)?.canceled === true,
+        'the unread error body was left open',
+      ).toBe(true)
+    } finally {
+      engine.destroy()
+      document.body.removeChild(video)
+      vi.useRealTimers()
+    }
+  })
+
+  it('a plain text error body says its own words', async () => {
+    // Not every refusal is JSON. When the body is plain words, those words are what the person
+    // should see - the old code threw the body away for failing to parse.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, text: 'the audio route gave up' })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 500 refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.role, 'the 500 refusal did not say the audio').toBe('audio')
+    expect(failure?.kind, 'the 500 refusal was not the server').toBe('server')
+    expect(failure?.detail, 'the plain text body was thrown away').toBe('the audio route gave up')
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('an error body past the cap keeps its raw head', async () => {
+    // An error body far past the read cap is truncated, so it no longer parses as JSON: the
+    // player then shows the body's own opening words rather than the message it cannot reach.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    const message = 'a'.repeat(4_300)
+    const raw = JSON.stringify({ error: 'unsupported_media', message })
+    expect(raw.length > 4_096, 'the fixture body was not past the cap').toBe(true)
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', { status: 500, text: raw })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a large refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.detail, 'the capped body did not surface as its own text').toBe(raw.slice(0, 300))
+    const call = recorder.callsFor('/tracks/2/stream')[0]
+    expect(
+      (call?.response as unknown as { canceled: boolean } | undefined)?.canceled === true,
+      'the capped error body was left open',
+    ).toBe(true)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+
+  it('a destroyed engine stops listening to its buffers', async () => {
+    // The teardown takes the buffer `error` listener off: a SourceBuffer that still has the
+    // listener, or an engine that answers it after being destroyed, reports failures nobody is
+    // listening for any more.
+    const t = await openEngine()
+    const wasPlaying = t.engine.state()
+    t.close()
+    // jsdom's `EventTarget` has no `listenerCount`, so the listener's absence is read the way
+    // the engine would feel it: an event that finds no listener changes nothing at all.
+    t.videoBuffer.dispatchEvent(new Event('error'))
+    expect(t.engine.state(), 'a destroyed engine still answers its buffers').toBe(wasPlaying)
+    expect(t.engine.failure(), 'a destroyed engine recorded a failure nobody asked for').toBe(null)
+  })
+
+  it('audio menu after a drop offers the other tracks', async () => {
+    // The failed track is not playable on this system and must not be shown as the chosen one:
+    // the menu marks it dead, marks nothing playing, and offers the other track.
+    const t = await renderRemux()
+    const first = mediaSources.at(-1) as FakeMediaSource
+    const audioBuffer = first.activeSourceBuffers[1] as FakeSourceBuffer
+    act(() => {
+      audioBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the dropped file does not say it is playing without sound',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const options = screen.getAllByRole('option')
+    const failedOption = options.find((option) => (option.textContent ?? '').startsWith('eng')) as
+      | HTMLButtonElement
+      | undefined
+    expect(failedOption !== undefined, 'the Audio menu lost the failed track').toBe(true)
+    expect(failedOption!.disabled === true, 'the failed track is still offered as playable').toBe(true)
+    expect(
+      (failedOption!.textContent ?? '').includes('not playable here'),
+      'the failed track does not say why it cannot be chosen',
+    ).toBe(true)
+    const ita = options.find((option) => (option.textContent ?? '').startsWith('ita')) as
+      | HTMLButtonElement
+      | undefined
+    expect(ita !== undefined && ita.disabled === false, 'the other track is not offered').toBe(true)
+    expect(
+      options.filter((option) => option.getAttribute('aria-selected') === 'true').length,
+      'the menu still marks the dead track as playing',
+    ).toBe(0)
+    expect(
+      t.recorder.callsFor('/tracks/1/stream').length,
+      'the retry did not ask for the video again',
+    ).toBe(2)
+  })
+
+  it('choosing another track after a drop restarts with it', async () => {
+    // Once a track has failed, choosing another one is a fresh open on the chosen track, at the
+    // point the playhead stands: the engine with the dead track has no buffer to switch.
+    const t = await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/3/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    const retry = mediaSources.at(-1) as FakeMediaSource
+    expect(retry !== first, 'the audio-less retry did not make a fresh engine').toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    const chosen = mediaSources.at(-1) as FakeMediaSource
+    expect(chosen !== retry, 'choosing the other track did not re-open the file on it').toBe(true)
+    const audioCalls = t.recorder.callsFor('/tracks/3/stream')
+    expect(audioCalls.length, 'choosing the other track did not ask for its audio').toBe(1)
+    expect(
+      audioCalls[0]?.url,
+      'the chosen track did not start where the playhead stands',
+    ).toContain('start_ms=3000')
+    expect(
+      chosen.activeSourceBuffers.map((buffer) => buffer.mimeType),
+      'the engine did not open the buffer of the chosen track',
+    ).toEqual(['video/mp4; codecs="avc1.64000A"', 'audio/mp4; codecs="opus"'])
+    expect(
+      screen.queryByText('This audio track cannot be played here, so the video plays without sound.') === null,
+      'the no-sound notice stayed while the chosen track plays',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    const options = screen.getAllByRole('option')
+    expect(
+      options.filter((option) => option.getAttribute('aria-selected') === 'true').map((option) => option.textContent ?? ''),
+      'the chosen track is not marked as playing',
+    ).toEqual(['ita'])
+    const eng = options.find((option) => (option.textContent ?? '').includes('not playable here'))
+    expect(eng !== undefined, 'the failed track came back as playable').toBe(true)
+  })
+
+  it('the error overlay leaves while the retry opens the file', async () => {
+    // The audio-less retry replaces the engine; until the new one's video answers, the old
+    // failure's overlay (and its Download) must come down: the file is opening again, not failed.
+    const t = await renderRemux(PROBE, (recorder) => {
+      let videoCalls = 0
+      recorder.answer('/tracks/1/stream', () => {
+        videoCalls += 1
+        return videoCalls === 1 ? { startMs: 0, body: () => new FakeBody() } : { hang: true }
+      })
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      t.recorder.callsFor('/tracks/1/stream').length,
+      'the retry did not ask for the video again',
+    ).toBe(2)
+    expect(
+      screen.queryByText(/Playback failed/) === null,
+      'the stale error overlay stayed while the file was re-opening',
+    ).toBe(true)
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the re-opening file does not say it is playing without sound',
+    ).toBe(true)
+  })
+
+  it('no hevc hint on an audio server failure', async () => {
+    // The HEVC hint belongs to a video decode failure on Windows: a 500 on the audio route is
+    // neither, and shopping for a video extension would send the person after the wrong fix.
+    const hevcProbe: MediaProbe = {
+      ...PROBE,
+      tracks: [
+        track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'], default: true }),
+        track({ id: 2, kind: 'audio', codec: 'aac', mime_codecs: ['mp4a.40.2'], language: 'eng', default: true }),
+      ],
+    }
+    class HevcBrowserMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /hvc1|mp4a|opus/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+    }
+    vi.stubGlobal('MediaSource', HevcBrowserMediaSource)
+    const hint = 'On Windows, HEVC video needs the HEVC Video Extensions from the Microsoft Store.'
+    const restoreWindows = setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+    )
+    try {
+      await renderRemux(hevcProbe, (recorder) => {
+        recorder.answer('/tracks/2/stream', { status: 500, json: { error: 'unsupported_media' } })
+      })
+      expect(
+        screen.getByText('Playback failed: the server answered 500.') !== null,
+        'the audio refusal did not name the status',
+      ).toBe(true)
+      expect(
+        screen.queryByText(hint) === null,
+        'a server failure on the audio track showed the HEVC purchase hint',
+      ).toBe(true)
+    } finally {
+      restoreWindows()
+    }
+  })
+
+  it('a replaced engine does not put its error back', async () => {
+    // The player switches files: the old engine is gone, and a `SourceBuffer` that still carries
+    // its listener must not bring its failure back onto the new file's screen.
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    vi.stubGlobal('fetch', recorder.fetch)
+    const { client } = probeClient()
+    const { rerender } = render(
+      <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />,
+    )
+    await settle()
+    const first = mediaSources[0] as FakeMediaSource
+    const firstBuffer = first.activeSourceBuffers[0] as FakeSourceBuffer
+    rerender(<Player id="a" file={1} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    expect(mediaSources.length, 'the new file did not get its own engine').toBe(2)
+    act(() => {
+      firstBuffer.dispatchEvent(new Event('error'))
+    })
+    await settle()
+    expect(
+      screen.queryByText(/Playback failed/) === null,
+      'a replaced engine put its error back on the screen',
+    ).toBe(true)
+    expect(
+      screen.getByRole('dialog') !== null,
+      'the player lost the file it was opened on',
+    ).toBe(true)
+  })
+
+  it('an audio server failure is a plain error, not a silent retry', async () => {
+    // Retrying without audio is the answer to a track this system cannot decode. A 500 from the
+    // audio route is the server's failure: it shows the server line, keeps every track offered,
+    // and does not mute the video.
+    const t = await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/2/stream', {
+        status: 500,
+        json: { error: 'boom', message: 'the audio route exploded' },
+      })
+    })
+    expect(
+      screen.getByText('Playback failed: the server answered 500.') !== null,
+      'the audio refusal did not name the server and status',
+    ).toBe(true)
+    expect(
+      screen.getByText('the audio route exploded') !== null,
+      'the server message was not shown',
+    ).toBe(true)
+    expect(
+      screen.queryByText('This audio track cannot be played here, so the video plays without sound.') === null,
+      'a server failure took the video sound away without being asked',
+    ).toBe(true)
+    expect(mediaSources.length, 'the server failure started an unasked audio-less retry').toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    expect(
+      screen.getAllByRole('option').some((option) => (option.textContent ?? '').startsWith('eng')),
+      'a server refusal marked the track itself as not playable',
+    ).toBe(true)
+    expect(t.container.querySelector('video') !== null, 'the player lost its video').toBe(true)
+  })
+
+  it('a retry that never landed resumes from the remembered start', async () => {
+    // The audio buffer fails at the source open, before the video landed, so the playhead never
+    // moved off zero: the point to resume from is the remembered start the open was aimed at,
+    // not the zero the element is sitting at.
+    class RefusesAudioMediaSource extends FakeMediaSource {
+      static isTypeSupported(mime: string): boolean {
+        return /avc1|mp4a/.test(mime)
+      }
+      constructor() {
+        super()
+        mediaSources.push(this)
+      }
+      addSourceBuffer(mime: string): FakeSourceBuffer {
+        if (mime.startsWith('audio/')) {
+          throw new DOMException('this system will not open an audio buffer for that codec', 'NotSupportedError')
+        }
+        return super.addSourceBuffer(mime)
+      }
+    }
+    vi.stubGlobal('MediaSource', RefusesAudioMediaSource)
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+    vi.stubGlobal('fetch', recorder.fetch)
+    window.localStorage.setItem(positionKey('a', 0), '3')
+    const { client } = probeClient()
+    render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+    await settle()
+    await settle()
+    expect(mediaSources.length, 'the retry after the audio refused at open did not make a new engine').toBe(2)
+    expect(mediaSources[1].activeSourceBuffers.length, 'the audio-less retry opened an audio buffer').toBe(1)
+    const asked = recorder.callsFor('/tracks/1/stream')
+    expect(asked.length, 'the retry did not ask for the video again').toBe(1)
+    expect(
+      asked[0]?.url,
+      'the retry lost the remembered start the video never reached',
+    ).toContain('start_ms=3000')
+    expect(
+      screen.getByText('This audio track cannot be played here, so the video plays without sound.') !== null,
+      'the no-sound retry did not say it is playing without sound',
+    ).toBe(true)
+  })
+})
+
+/**
+ * Make a rendered player's element report its play state the way a browser's does, and count
+ * its `play()` asks. Its `pause` moves the element without firing `pause`: that is exactly how
+ * a `src` reload pauses an element, which is what an engine reopen does.
+ */
+function drivePlayState(video: HTMLVideoElement): { playCalls(): number } {
+  let playing = false
+  let asks = 0
+  Object.defineProperty(video, 'paused', {
+    get: () => !playing,
+    set: (value: boolean) => {
+      playing = !value
+    },
+    configurable: true,
+  })
+  video.play = (): Promise<void> => {
+    asks += 1
+    playing = true
+    video.dispatchEvent(new Event('play'))
+    return Promise.resolve()
+  }
+  video.pause = (): void => {
+    playing = false
+  }
+  return {
+    playCalls(): number {
+      return asks
+    },
+  }
+}
+
+/** The answers every reopen test needs: all three tracks land at the same 3 s point. */
+function reopensAtThreeSeconds(recorder: ReturnType<typeof fakeFetch>): void {
+  recorder.answer('/tracks/1/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+  recorder.answer('/tracks/3/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+}
+
+describe('reopening the file keeps the picture moving', () => {
+  it('the retry keeps playing', async () => {
+    // The audio-less retry replaces the engine and its `src`, and a reload pauses the element
+    // with no `pause` the player could hear. The open that was playing must be asked to play
+    // again on the new engine's first `canplay`.
+    const t = await renderRemux()
+    const drive = drivePlayState(t.video)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the open did not start playback').toBe(1)
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(mediaSources.at(-1) !== first, 'the retry did not make a fresh engine').toBe(true)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+
+    // The other half: the person paused first. The reload pauses the element too - silently -
+    // so the retry must not press play for them, and the control must read the element: paused,
+    // whatever the player last heard.
+    cleanup()
+    const u = await renderRemux()
+    const drive2 = drivePlayState(u.video)
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the open did not start playback').toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await settle()
+    const firstB = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(firstB.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the retry asked for playback the viewer had paused').toBe(1)
+    expect(
+      screen.queryByRole('button', { name: 'Play' }) !== null,
+      'the reopen left the Pause control up while the element was paused',
+    ).toBe(true)
+  })
+
+  it('a replacement track keeps playing', async () => {
+    // Choosing a replacement track after a failure re-opens the file on the chosen track, and
+    // that reopen pauses the element too: the play intent moves to the new open with it.
+    const t = await renderRemux(PROBE, reopensAtThreeSeconds)
+    const drive = drivePlayState(t.video)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the open did not start playback').toBe(1)
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    expect(mediaSources.length, 'the chosen track did not open a fresh engine').toBe(3)
+    t.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(
+      drive.playCalls(),
+      'choosing the replacement track did not ask the video to play again',
+    ).toBe(3)
+
+    // The other half: the person paused before choosing. The track change must not start the
+    // picture on its own.
+    cleanup()
+    const u = await renderRemux(PROBE, reopensAtThreeSeconds)
+    const drive2 = drivePlayState(u.video)
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    const firstB = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(firstB.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(drive2.playCalls(), 'the retry did not ask the video to play again').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    u.video.dispatchEvent(new Event('canplay'))
+    await settle()
+    expect(
+      drive2.playCalls(),
+      'the paused player started playing on its own when the replacement track opened',
+    ).toBe(2)
+  })
+
+  it('a replacement track reopen waits for data', async () => {
+    // The reopen on a chosen track replaces the picture: the player must say it is opening -
+    // the waiting line covers the player's own reopen - rather than holding a stale word for
+    // playing while nothing can play yet.
+    const videoBodies: FakeBody[] = []
+    await renderRemux(PROBE, (recorder) => {
+      recorder.answer('/tracks/2/stream', () => ({ startMs: 3_000, body: () => new FakeBody() }))
+      recorder.answer('/tracks/3/stream', { hang: true })
+      recorder.answer('/tracks/1/stream', () => {
+        const body = new FakeBody()
+        videoBodies.push(body)
+        return videoBodies.length >= 3 ? { hang: true } : { startMs: 3_000, body: () => body }
+      })
+    })
+    const first = mediaSources.at(-1) as FakeMediaSource
+    act(() => {
+      ;(first.activeSourceBuffers[1] as FakeSourceBuffer).dispatchEvent(new Event('error'))
+    })
+    await settle()
+    await settle()
+    expect(
+      screen.queryByText('Waiting for data...') === null,
+      'the retry that got its picture showed the waiting line anyway',
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Audio' }))
+    await settle()
+    fireEvent.click(screen.getByRole('option', { name: 'ita' }))
+    await settle()
+    await settle()
+    expect(videoBodies.length, 'the chosen track did not open a fresh engine').toBe(3)
+    expect(
+      screen.queryByText('Waiting for data...') !== null,
+      'the reopen on the chosen track does not show the player waiting for its data',
+    ).toBe(true)
+  })
+})
+
+describe('error bodies know an HTML page', () => {
+  it('an html error page gives no detail', async () => {
+    // A proxy or load balancer in front of the server answers in HTML. The overlay line naming
+    // the status already says the server refused; the page itself is noise a person cannot use,
+    // and other plain-text bodies stay as they were.
+    const source = new FakeMediaSource()
+    const recorder = fakeFetch()
+    recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+    recorder.answer('/tracks/2/stream', {
+      status: 502,
+      text: '<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>',
+    })
+    const video = fakeVideo()
+    document.body.appendChild(video)
+    const engine = createEngine(video, { id: 'a', file: 0 }, engineProbe(), fakeDeps(source, recorder))
+    source.open()
+    await settle()
+    expect(engine.state(), 'a 502 HTML refusal was not an error').toBe('error')
+    const failure = engine.failure()
+    expect(failure?.kind, 'the 502 refusal was not the server').toBe('server')
+    expect(failure?.status, 'the 502 refusal did not name the status').toBe(502)
+    expect(failure?.detail, 'the HTML error page was shown as a detail').toBe(null)
+    engine.destroy()
+    document.body.removeChild(video)
+  })
+})
+
+/**
+ * The player rendered as the desktop app draws it: `shell` behind `DesktopPlayerContext`, or no provider
+ * for a browser. Streams are answered the way `renderRemux` answers them, so a remux playback opens.
+ */
+async function renderInApp(
+  shell?: DesktopPlayer,
+  probe: MediaProbe = PROBE,
+): Promise<{ container: HTMLElement; video: HTMLVideoElement; dialog: HTMLDialogElement }> {
+  const recorder = fakeFetch()
+  recorder.answer('/tracks/1/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  recorder.answer('/tracks/2/stream', () => ({ startMs: 0, body: () => new FakeBody() }))
+  vi.stubGlobal('fetch', recorder.fetch)
+  const { client } = probeClient(probe)
+  const player = <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
+  const { container } = render(
+    shell === undefined ? (
+      player
+    ) : (
+      <DesktopPlayerContext.Provider value={shell}>{player}</DesktopPlayerContext.Provider>
+    ),
+  )
+  await settle()
+  const video = container.querySelector('video') as HTMLVideoElement
+  const dialog = container.querySelector('dialog') as HTMLDialogElement
+  return { container, video, dialog }
+}
+
+describe('open in player', () => {
+  it('open in player is offered only in the app', async () => {
+    // A browser has no shell to start a player with, so the control is not drawn at all.
+    await renderInApp()
+    expect(screen.queryByRole('button', { name: 'Open in player' })).toBeNull()
+    cleanup()
+    // In the app the way out to VLC or mpv is there.
+    await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('open in player hands the stream address to the shell', async () => {
+    const calls: Array<[string, string]> = []
+    const shell: DesktopPlayer = {
+      open: async (url, title) => {
+        calls.push([url, title])
+        return 'Opening movie.mkv in VLC'
+      },
+    }
+    const { video } = await renderInApp(shell)
+    makeVideoPlayable(video)
+    video.play()
+    await settle()
+    expect(video.paused, 'the test video was not playing before the click').toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    // The address is the file-stream token fetched at the click, and the file is named for the player.
+    expect(calls).toEqual([['/api/v1/stream/t?token=abc', 'movie.mkv']])
+    // The in-page video yields to the shell's player.
+    expect(video.paused, 'the in-page video kept playing after the open').toBe(true)
+  })
+
+  it("open in player shows the shell's refusal", async () => {
+    const shell: DesktopPlayer = {
+      open: () => Promise.reject('No media player found. Install VLC or mpv.'),
+    }
+    await renderInApp(shell)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    expect(screen.getByRole('alert').textContent).toBe('No media player found. Install VLC or mpv.')
+  })
+
+  it('failed playback offers open in player', async () => {
+    const { video } = await renderInApp({ open: async () => 'Opening movie.mkv in VLC' })
+    act(() => {
+      setElementError(video, 'PIPELINE_ERROR_DECODE', true)
+    })
+    await settle()
+    expect(
+      screen.getByText('Playback failed: this system could not decode the h264 video.') !== null,
+      'the failed player did not say why',
+    ).toBe(true)
+    // The way out is right there in the failure, beside its Download.
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('open in player ignores a second click while opening', async () => {
+    const calls: Array<[string, string]> = []
+    // An `open` the shell has not answered yet: the answer arrives only when `release` is called, so
+    // everything below happens while the shell is still working.
+    let release = () => {}
+    const shell: DesktopPlayer = {
+      open: (url, title) =>
+        new Promise<string>((done) => {
+          calls.push([url, title])
+          release = () => done('Opening movie.mkv in VLC')
+        }),
+    }
+    await renderInApp(shell)
+    const button = screen.getByRole('button', {
+      name: 'Open in player',
+    }) as HTMLButtonElement
+    fireEvent.click(button)
+    await settle()
+    expect(calls.length, 'the first click did not ask the shell').toBe(1)
+    expect(button.disabled, 'the button was not busy while the open was in flight').toBe(true)
+    // Impatient, the person clicks again while VLC is being started: nothing is asked for twice.
+    fireEvent.click(button)
+    await settle()
+    expect(calls.length, 'a second click while opening asked the shell again').toBe(1)
+    release()
+    await settle()
+  })
+
+  it('open in player pauses the video', async () => {
+    const shell: DesktopPlayer = { open: async () => 'Opening movie.mkv in VLC' }
+    const { video } = await renderInApp(shell)
+    makeVideoPlayable(video)
+    video.play()
+    await settle()
+    expect(video.paused, 'the test video was not playing before the click').toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Open in player' }))
+    await settle()
+    // Two players on one file: the window's own picture stops as the shell's starts.
+    expect(video.paused, 'the in-page video was still playing after the open').toBe(true)
+  })
+
+  it('unplayable file offers open in player', async () => {
+    const hevc: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    await renderInApp({ open: async () => 'Opening movie.mkv in VLC' }, hevc)
+    expect(
+      screen.getByText('This browser cannot play hevc video.') !== null,
+      'the unplayable screen did not say which codec it cannot play',
+    ).toBe(true)
+    // The screen that says the window cannot play this file is the screen that offers the way out.
+    expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+  })
+
+  it('native video offers open in player', async () => {
+    const native = await renderNative({ open: async () => 'Opening clip.webm in VLC' })
+    try {
+      // A file the browser plays by itself still has the shell's players beside it.
+      const video = native.container.querySelector('video') as HTMLVideoElement
+      expect(video.hasAttribute('controls'), 'the native path did not render').toBe(true)
+      expect(screen.getByRole('button', { name: 'Open in player' })).not.toBeNull()
+    } finally {
+      native.restore()
+    }
   })
 })

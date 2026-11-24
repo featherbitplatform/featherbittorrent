@@ -18,11 +18,13 @@
 //!
 //! What this module does not own is the snapshot: what the engine looks like to a screen belongs
 //! to whoever shows it ([`crate::local`]), and the crate-internal `map` submodule inside here is
-//! how the engine's words become table rows.
+//! how the engine's words become table rows. What the two roles ask the engine to do for the same
+//! piece of news - a person pressing Play - is written once here for the same reason
+//! ([`prefer_for_playback`]).
 
 use std::time::Duration;
 
-use fbt::{InfoHashes, Session, SessionError, SessionState, Settings};
+use fbt::{InfoHashes, Priority, Session, SessionError, SessionState, Settings, TorrentHandle};
 use tokio::sync::mpsc;
 
 use crate::client::Notice;
@@ -241,6 +243,89 @@ impl Engine {
         for (hashes, error) in left_out {
             let _ = reporter.try_send(Notice::Error(map::left_out(hashes, error)));
         }
+    }
+}
+
+/// What a play does to the file it plays: the file goes to High priority if it is below it, and its
+/// pieces download in order. The other files keep their priorities. Best effort: a failure is logged at
+/// debug and never fails the request that is about to stream.
+///
+/// Both roles do this, in the same words: `s` in a terminal driving its own engine
+/// ([`LocalBackend::stream`](crate::local)), the web player's track stream route and the stream-token
+/// route the desktop app's Open in player and `s` against a server both go through
+/// (`fbtt_server::routes`). Playing a file is the person asking for that file now, so the engine is told
+/// to ask for it first and to ask for its pieces front to back; neither is what a person sets on purpose
+/// somewhere else, and the file pane changes either of them back.
+///
+/// The in-order part lasts until it is turned off, the torrent is removed or the session restarts; it is
+/// not saved in resume data (fbt-lib's own rule for
+/// [`set_file_in_order`](fbt::TorrentHandle::set_file_in_order)), which is the right lifetime for a
+/// decision made by one press of a key.
+pub async fn prefer_for_playback(torrent: &TorrentHandle, file: usize) {
+    // The priorities to keep are the ones the engine holds right now, so they are read back rather than
+    // guessed at: a file the person set to Low stays Low, and the one being played is the only row that
+    // changes. A list whose read failed says nothing about any of them, so nothing is sent.
+    let files = match torrent.files().await {
+        Ok(files) => files,
+        Err(problem) => {
+            tracing::debug!(
+                torrent = %torrent.info_hashes(),
+                file,
+                problem = %map::clean(&problem.to_string()),
+                "a play could not read the file list it would have raised",
+            );
+            return;
+        }
+    };
+    let Some(row) = files.iter().find(|row| row.index == file) else {
+        tracing::debug!(
+            torrent = %torrent.info_hashes(),
+            file,
+            "a play named a file this torrent does not have",
+        );
+        return;
+    };
+    // The file goes to the top of the queue unless it is already there: playing a file the person pushed
+    // to the top themselves must not put it back down, and playing one they set to Skip does raise it,
+    // because pressing Play is them asking for that file. `Priority` is non_exhaustive, so a value a
+    // later fbt-lib adds above High is left where it is too.
+    let at_the_top = matches!(row.priority, Priority::High);
+    if !at_the_top {
+        // One entry per file, pad files included: the list is read back, this one entry changed, and the
+        // whole thing sent again (the same shape `LocalBackend::set_file_priority` uses).
+        let mut priorities: Vec<Priority> = vec![Priority::Normal; files.len()];
+        for entry in &files {
+            if let Some(slot) = priorities.get_mut(entry.index) {
+                *slot = entry.priority;
+            }
+        }
+        let Some(slot) = priorities.get_mut(file) else {
+            // The row above was found in this very list, so this list is not indexed by its own rows'
+            // `index` field; there is no entry to raise, and the in-order call answers for itself.
+            tracing::debug!(
+                torrent = %torrent.info_hashes(),
+                file,
+                "a play's file is not a position in its own torrent's priority list",
+            );
+            return;
+        };
+        *slot = Priority::High;
+        if let Err(problem) = torrent.set_file_priorities(priorities).await {
+            tracing::debug!(
+                torrent = %torrent.info_hashes(),
+                file,
+                problem = %map::clean(&problem.to_string()),
+                "a play could not put the file it plays first in the queue",
+            );
+        }
+    }
+    if let Err(problem) = torrent.set_file_in_order(file, true).await {
+        tracing::debug!(
+            torrent = %torrent.info_hashes(),
+            file,
+            problem = %map::clean(&problem.to_string()),
+            "a play could not ask for the file's pieces in order",
+        );
     }
 }
 

@@ -110,9 +110,29 @@ library, a second app pointed at the same directories through the two variables 
 with `featherbittorrent is already running.` and a `Quit` button, and quitting from there exits with code 3,
 the terminal client's code for the same thing.
 
-The player's `Download` asks where to save first, then writes the file there in the background. A download
-runs until it finishes; quitting the app before then leaves a `<name>.<random>.part` file next to where the
-file would have gone, which you can delete.
+The player's `Download` asks where to save first, then writes the file there in the background. Where it
+has gotten shows in the player (`Downloading 42% (1.2 GiB of 2.9 GiB)`, or the bytes so far where the
+server gives no file size), and `Cancel download` stops it. Closing the player keeps a download running;
+reopen it on the same file and the download is shown where it stands, and only one download runs per file
+at a time. A cancelled download leaves no partial file: quitting the app stops the downloads that are
+running and takes their partial files away; a crash can leave one behind, named `<name>.<random>.part`
+next to the place you chose.
+
+Playing a file here does what it does in a browser: the file
+goes to High priority and downloads in order, the torrent's other files keep their priorities, and the
+`Priority` column of the Files tab shows it and changes it back.
+
+The player's `Open in player` starts VLC or mpv on the file, found the same way the terminal client finds
+them (see [streaming.md](streaming.md)). Reach for it with a file the window cannot play itself: HEVC video
+on a Windows system without the HEVC extension, or an AC-3 or DTS track. It works while the file is still
+downloading, and it needs VLC or mpv installed: with neither the app says so and nothing starts. The address
+reaches the player inside a playlist rather than on its command line, so its token is not left in a process
+listing: the playlist is `<data dir>/playlists/<random>.m3u`, written fresh for each open, readable only by
+you on macOS and Linux (the folder is inside your own app data folder on Windows, where there is no such
+mode), and it is removed when the player exits or 30 seconds after it starts, whichever comes first. A
+playlist a crashed run left behind is taken out the next time the app starts. What is in it is the
+short-lived token issued for that one file, or nothing where the instance needs no credential: the app's own
+launch secret, which stands for the whole library while the app runs, is taken out of the address first.
 
 ## Where the app's files live
 

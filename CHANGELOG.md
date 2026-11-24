@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-24
+
+### Added
+
+- Desktop app: Open in player in the player hands the file to VLC or mpv, for files the window cannot play itself (HEVC without the Windows extension, AC-3, DTS). It works while the file is still downloading. ([#37](https://github.com/featherbitplatform/featherbittorrent/pull/37))
+- Desktop app: the player's Download shows its progress and can be cancelled; closing the player keeps it going, and a cancelled download, or one stopped by quitting, leaves no partial file. ([#40](https://github.com/featherbitplatform/featherbittorrent/pull/40))
+
+### Changed
+
+- Playing a file (the web player, the desktop app's Open in player, or s in the terminal client) now raises it to High priority and downloads its pieces in order, so playback can start sooner; the torrent's other files keep their priorities. Built on fbt-lib 0.12.0. ([#38](https://github.com/featherbitplatform/featherbittorrent/pull/38))
+
+### Fixed
+
+- Remote client: the snapshot that says the link is lost - or that it came back - is published before the notice about it, so the two are seen together instead of the line arriving against the state from before. ([#39](https://github.com/featherbitplatform/featherbittorrent/pull/39))
+- Desktop app: pressing Add torrent while Settings was open left the window unresponsive. It now goes back to the torrent list and opens the Add dialog there. ([#35](https://github.com/featherbitplatform/featherbittorrent/pull/35))
+- Player: a video that fails to play now says why (the codec and the system's own message) instead of only "Playback failed.", hints at the HEVC Video Extensions on Windows, and keeps playing without sound when only the audio track cannot be decoded. ([#36](https://github.com/featherbitplatform/featherbittorrent/pull/36))
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
@@ -96,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/reverse-proxy.md` covers running the server behind the featherbit gateway or another reverse proxy, three ways to combine gateway logins with featherbittorrent's own (TLS and rate limits only; gateway OIDC first; gateway only with auth off), the TUI's private-key and gateway-password methods, and why `/api/v1/events` and file streams must never be buffered; `docs/examples/gateway-oidc/` is a runnable stack of gateway, Authelia and server. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 - The release workflow publishes archives on a `v*` tag (and refuses any other tag): a universal macOS `.tar.gz`, Linux `.tar.gz` for x86_64 and aarch64 built inside Debian 12 so they run on Raspberry Pi OS 12, Windows `.zip` for x86_64 and aarch64, each holding the binary beside `LICENSE`, `NOTICE` and `README.md`, plus a CycloneDX SBOM and release notes taken from this file. ([#2](https://github.com/featherbitplatform/featherbittorrent/pull/2))
 
+[0.4.1]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.1
 [0.4.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.0
 [0.3.0]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0
 [0.2.3]: https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3

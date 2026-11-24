@@ -114,6 +114,10 @@ The web UI plays video files in the browser, with no media player to install. Fi
 player modal and starts playback immediately; a torrent's pieces can still be downloading when
 playback begins.
 
+Pressing `Play` also puts that file first: it goes to High priority and its pieces download in order, so
+playback can start sooner, while the torrent's other files keep their priorities; the `Priority` column
+of the Files tab shows it, and changing it there changes it back.
+
 ### How a file is played
 
 The player tries one of three ways in the order listed below:

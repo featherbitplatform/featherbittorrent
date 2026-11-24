@@ -16,9 +16,10 @@ the server role (`serve`), the remote backend, authentication and streaming, shi
 [0.2.2](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.2) and
 [0.2.3](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.2.3) fix what came after them,
 [0.3.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.3.0) is the first release with the
-web UI, and
+web UI,
 [0.4.0](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.0) is the first release with the
-desktop app.
+desktop app, and
+[0.4.1](https://github.com/featherbitplatform/featherbittorrent/releases/tag/v0.4.1) fixes what came after it.
 Milestone 3 streams a file to mpv or VLC with `s` and draws the featherbit mark as an image in terminals
 that can show one ([docs/streaming.md](docs/streaming.md)). Milestone 4 ships packages: `.deb` and `.rpm` for x86_64 and aarch64, one universal macOS `.tar.gz` and Windows `.zip`
 files, each carrying man pages, shell completions, the licenses and the docs. The web UI, released in 0.3.0,

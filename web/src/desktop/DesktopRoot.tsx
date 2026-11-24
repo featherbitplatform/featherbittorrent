@@ -49,8 +49,10 @@ import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { useTitleBarSlots } from '../components/titleBarSlots'
-import { DesktopDownloadContext } from '../desktopDownload'
+import { createDownloads, DesktopDownloadContext, scopedDownloads } from '../desktopDownload'
 import type { DesktopDownload } from '../desktopDownload'
+import { DesktopPlayerContext } from '../desktopPlayer'
+import type { DesktopPlayer } from '../desktopPlayer'
 import { DesktopSettingsContext } from '../desktopSettings'
 import type { DesktopSettingsSlot, SettingsRequest } from '../desktopSettings'
 import { setOverrides } from '../keys'
@@ -62,7 +64,9 @@ import {
   getShortcuts,
   listInstances,
   LOCAL_ID,
+  cancelDownload,
   chooseDownloadPlace,
+  openInPlayer,
   probeInstance,
   saveDownload,
   savePassword,
@@ -163,17 +167,17 @@ function Connected({
   useEffect(() => {
     if (refused) onTokenRefused(token)
   }, [refused, token, onTokenRefused])
-  // The player's Download, through the shell: a link to the engine's origin would take the window away.
-  const save = useMemo<DesktopDownload>(
-    () => ({ choose: chooseDownloadPlace, save: (handle, url) => saveDownload(id, handle, url) }),
+  // The player's Open in player: the shell starts VLC or mpv on a file the window cannot play itself.
+  const player = useMemo<DesktopPlayer>(
+    () => ({ open: (url, title) => openInPlayer(id, url, title) }),
     [id],
   )
   if (refused) return <Connecting />
   return (
     <ConnectionContext.Provider value={connection}>
-      <DesktopDownloadContext.Provider value={save}>
+      <DesktopPlayerContext.Provider value={player}>
         <App />
-      </DesktopDownloadContext.Provider>
+      </DesktopPlayerContext.Provider>
     </ConnectionContext.Provider>
   )
 }
@@ -221,6 +225,26 @@ function DesktopScreens() {
   useEffect(() => {
     phaseNow.current = phase
   }, [phase])
+
+  // The player's Download, through the shell: a link to the engine's origin would take the
+  // window away. The store of running downloads lives above the per-instance page: switching
+  // instances, or reconnecting This computer after a new launch token, remounts the page and not
+  // the store, so a running download survives it with its Cancel. Its records are composed with
+  // the instance the page shows: a save belongs to the instance shown when it runs, which the
+  // scoped view hands down to the store with every call.
+  const downloadStore = useMemo(
+    () =>
+      createDownloads(
+        chooseDownloadPlace,
+        (handle, url, onProgress, instanceId) => saveDownload(instanceId ?? LOCAL_ID, handle, url, onProgress),
+        cancelDownload,
+      ),
+    [],
+  )
+  const downloads = useMemo<DesktopDownload>(
+    () => scopedDownloads(downloadStore, phase.id),
+    [downloadStore, phase.id],
+  )
 
   const askSettings = useCallback((section: string) => {
     requests.current += 1
@@ -485,9 +509,11 @@ function DesktopScreens() {
         shown={{ id: phase.id, connection: phase.phase === 'ready' ? phase.connection : null }}
       />
       <div className="relative flex min-h-0 flex-1 flex-col overflow-auto">
-        <DesktopSettingsContext.Provider value={desktopSettings}>
-          <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
-        </DesktopSettingsContext.Provider>
+        <DesktopDownloadContext.Provider value={downloads}>
+          <DesktopSettingsContext.Provider value={desktopSettings}>
+            <SavePasswordContext.Provider value={offer}>{body}</SavePasswordContext.Provider>
+          </DesktopSettingsContext.Provider>
+        </DesktopDownloadContext.Provider>
       </div>
     </>
   )

@@ -5,6 +5,7 @@ import App from './App'
 import { UNREACHABLE_COPY } from './live'
 import { SESSION_ENDED, session } from './session'
 import { ConnectionContext, createConnection } from './connection'
+import { installDialogShim } from './dialog-shim'
 
 // The `api` and `session` singletons read `globalThis.fetch` the moment their modules load,
 // so the controllable fetch must exist before this file's imports run.
@@ -44,6 +45,7 @@ function alive(url: string): Promise<unknown> {
 }
 
 afterEach(cleanup)
+installDialogShim()
 
 describe('the page as a whole', () => {
   it('the_live_regions_outlive_the_screens_in_the_page', async () => {
@@ -234,6 +236,39 @@ describe('the Settings screen in the page', () => {
     ).toBeNull()
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
     push.mockRestore()
+    world.behavior = null
+  })
+})
+
+describe('the Add dialog over the torrents screen', () => {
+  it('add torrent from settings opens the dialog on the torrents screen', async () => {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(
+      screen.getByRole('heading', { name: 'Server' }) !== null,
+      'Settings did not open',
+    ).toBe(true)
+
+    // The desktop app portals the header's actions into the title bar, where Settings does not
+    // cover them, so this Add torrent click is one a person really can make with Settings up.
+    // Here the same button sits in the wrapper hidden under Settings, so the role query has to
+    // include hidden elements to reach it.
+    fireEvent.click(screen.getByRole('button', { name: 'Add torrent', hidden: true }))
+
+    expect(
+      screen.queryByRole('heading', { name: 'Server' }),
+      'pressing Add left Settings on screen',
+    ).toBeNull()
+    const dialog = screen.getByRole('dialog', { name: 'Add torrent' })
+    expect(dialog.hasAttribute('open'), 'the Add dialog mounted without opening').toBe(true)
+    expect(dialog.closest('[hidden]'), 'the Add dialog opened inside a hidden subtree').toBeNull()
+    const active = document.activeElement
+    expect(
+      active !== null && active !== document.body && dialog.contains(active),
+      'the focus did not land inside the Add dialog',
+    ).toBe(true)
     world.behavior = null
   })
 })

@@ -8,13 +8,14 @@
  *
  * @module desktop/bridge
  */
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { Window } from '@tauri-apps/api/window'
 import { normaliseBase } from '../endpoint'
 import type { Endpoint } from '../endpoint'
 import type { ShortcutOverride } from '../keys'
+import type { DownloadProgress } from '../desktopDownload'
 
 /** The shell's id for This computer, the app's own engine, and the instance the page opens on until saved instances arrive. */
 export const LOCAL_ID = 'local'
@@ -134,9 +135,32 @@ export async function chooseDownloadPlace(name: string): Promise<string | null> 
   return invoke<string | null>('choose_download_place', { name })
 }
 
-/** Streams the file at `url` on instance `id` to the place `handle` names, in the shell. Rejects with the shell's line. */
-export async function saveDownload(id: string, handle: string, url: string): Promise<void> {
-  await invoke('save_download', { instance: id, handle, url })
+/**
+ * Streams the file at `url` on instance `id` to the place `handle` names, in the shell, and hands
+ * `onProgress` every progress line the shell reports as it writes. The lines arrive over a Tauri
+ * `Channel`; the arg name `onProgress` is the command's `on_progress` parameter in camelCase.
+ * Rejects with the shell's line, including `Download cancelled.` for a cancelled download.
+ */
+export async function saveDownload(
+  id: string,
+  handle: string,
+  url: string,
+  onProgress: (progress: DownloadProgress) => void,
+): Promise<void> {
+  const channel = new Channel<DownloadProgress>((progress) => {
+    onProgress(progress)
+  })
+  await invoke('save_download', { instance: id, handle, url, onProgress: channel })
+}
+
+/** Stops the download running under `handle` in the shell. */
+export async function cancelDownload(handle: string): Promise<void> {
+  await invoke('cancel_download', { handle })
+}
+
+/** Starts the system's media player on the file at `url` on instance `id` and answers the line saying what was opened. Rejects with the shell's line. */
+export async function openInPlayer(id: string, url: string, title: string): Promise<string> {
+  return invoke<string>('open_in_player', { instance: id, url, title })
 }
 
 /** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */

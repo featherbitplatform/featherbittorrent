@@ -8,7 +8,7 @@
  * @module desktop/DesktopRoot.test
  */
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TitleBarSlotsContext } from '../components/titleBarSlots'
@@ -29,6 +29,7 @@ const shell = vi.hoisted(() => ({
   savePassword: vi.fn(),
   chooseDownloadPlace: vi.fn(() => Promise.resolve('place-1' as string | null)),
   saveDownload: vi.fn(() => Promise.resolve()),
+  cancelDownload: vi.fn(() => Promise.resolve()),
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   getShortcuts: vi.fn(() => Promise.resolve([])),
@@ -45,6 +46,7 @@ vi.mock('./bridge', () => ({
   savePassword: shell.savePassword,
   chooseDownloadPlace: shell.chooseDownloadPlace,
   saveDownload: shell.saveDownload,
+  cancelDownload: shell.cancelDownload,
   addInstance: vi.fn(),
   removeInstance: vi.fn(),
   setDefaultInstance: vi.fn(),
@@ -104,6 +106,10 @@ vi.mock('../App', () => ({
     const endpoint = connection.endpoint
     const offer = useSavePassword()
     const save = useDesktopDownload()
+    const downloadState = useSyncExternalStore(
+      save === null ? noSubscribers : save.subscribe,
+      () => save?.current('a:0')?.state ?? 'nothing',
+    )
     const desktop = useDesktopSettings()
     const request = desktop?.request ?? null
     return (
@@ -120,12 +126,17 @@ vi.mock('../App', () => ({
           <button
             type="button"
             onClick={() =>
-              void save.choose('movie.mkv').then((handle) => save.save(handle ?? '', 'http://127.0.0.1:53211/stream'))
+              void save.choose('movie.mkv').then((handle) =>
+                handle === null
+                  ? Promise.resolve()
+                  : save.run('a:0', handle, 'http://127.0.0.1:53211/stream'),
+              )
             }
           >
             save a file
           </button>
         )}
+        {save !== null && <span>download {downloadState}</span>}
         {offer !== null && (
           <button type="button" onClick={() => void offer.save('alice', 'hunter2')}>
             keep password
@@ -161,6 +172,7 @@ afterEach(() => {
   shell.savePassword.mockReset()
   shell.chooseDownloadPlace.mockClear()
   shell.saveDownload.mockClear()
+  shell.cancelDownload.mockClear()
   shell.setTrayInstance.mockClear()
   shell.takeOpened.mockReset()
   shell.takeOpened.mockResolvedValue([])
@@ -191,6 +203,12 @@ function renderRoot() {
   )
 }
 
+/** A `subscribe` for `useSyncExternalStore` where the context has no store: it never calls back. */
+function noSubscribers(notify: () => void): () => void {
+  void notify
+  return () => {}
+}
+
 /** What a `401` does to a session: the client ends the generation it was sent under. */
 function rejectToken(connection: Connection): void {
   act(() => {
@@ -210,8 +228,54 @@ it('the_players_download_goes_through_the_shell_for_the_instance_shown', async (
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
   fireEvent.click(screen.getByRole('button', { name: 'save a file' }))
-  await waitFor(() => expect(shell.saveDownload).toHaveBeenCalledWith('local', 'place-1', `${BASE}/stream`))
+  await waitFor(() =>
+    expect(shell.saveDownload).toHaveBeenCalledWith(
+      'local',
+      'place-1',
+      `${BASE}/stream`,
+      expect.any(Function),
+    ),
+  )
   expect(shell.chooseDownloadPlace).toHaveBeenCalledWith('movie.mkv')
+})
+
+it('switching instances keeps a running download', async () => {
+  // The store of running downloads lives above the per-instance page: switching away and back
+  // neither loses a running download nor shows one instance's download as another instance's.
+  shell.listInstances.mockResolvedValue(list('local'))
+  shell.chooseDownloadPlace.mockResolvedValueOnce('place-1')
+  let finishSave: () => void = () => {}
+  shell.saveDownload.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finishSave = resolve
+      }),
+  )
+  shell.connect
+    .mockResolvedValueOnce(bearer('first'))
+    .mockResolvedValueOnce({ kind: 'bearer', base: PI, token: null })
+    .mockResolvedValueOnce(bearer('again'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'save a file' }))
+  await screen.findByText('download saving')
+  // The download keeps running on This computer while the page shows the Pi.
+  switchTo(/Pi at home/)
+  await screen.findByText(`workspace ${PI} signed out`)
+  expect(
+    screen.getByText('download nothing') !== null,
+    'the running download leaked onto the other instance',
+  ).toBe(true)
+  switchTo(/This computer/)
+  await screen.findByText(`workspace ${BASE} again`)
+  expect(
+    screen.getByText('download saving') !== null,
+    'switching away and back lost the running download',
+  ).toBe(true)
+  act(() => {
+    finishSave()
+  })
+  await screen.findByText('download saved')
 })
 
 it('the_page_column_hands_its_height_to_the_screen', async () => {

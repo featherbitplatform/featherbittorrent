@@ -29,7 +29,7 @@ use crate::client::{
     LiveLimits, Notice, PlaySource, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::config::{Config, ConfigLoad, Limits};
-use crate::engine::{Engine, SAVE_EVERY, map};
+use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
@@ -626,6 +626,13 @@ impl Backend {
                 "the file index is not a playable file".to_owned(),
             ));
         };
+        // Playing a file is the person asking for that file now: it goes to High priority if it is below
+        // it and its pieces are asked for in order, and the torrent's other files keep what they had. The
+        // server's two play routes do the same thing for the same reason
+        // ([`crate::engine::prefer_for_playback`]). Asked for before the source is chosen, so the file the
+        // player is about to read is the one this run is already pulling by the time the answer is on its
+        // way.
+        prefer_for_playback(&torrent, index).await;
         // The length of what is on disk, read off the blocking pool: this task
         // answers commands and does not wait on a disk (see `save_config`).
         let path = status.save_path.join(&file.path);

@@ -87,6 +87,26 @@ async fn torrent_for(path: &Path) -> Vec<u8> {
     .expect("the hashing task ran")
 }
 
+/// The piece length the in-order test hashes its torrent with: 64 KiB, four 16 KiB blocks, so each of
+/// its 1 MiB files is exactly 16 pieces. `CreateTorrent`'s own choice for a 3 MiB torrent is the 16 KiB
+/// floor, which would make each file 64 pieces and the whole torrent 192 of them, so the test names the
+/// length it wants instead of taking the automatic one.
+const PIECE64: u32 = 64 * 1024;
+
+/// The `.torrent` for the file or directory at `path`, hashed with an explicit piece length.
+async fn torrent_with_piece_len(path: &Path, piece_len: u32) -> Vec<u8> {
+    let path = path.to_path_buf();
+    within(tokio::task::spawn_blocking(move || {
+        fbt::CreateTorrent::new(path)
+            .version(fbt::TorrentVersion::V1)
+            .piece_len(piece_len)
+            .build(&mut |_done, _total| ControlFlow::Continue(()))
+            .expect("hash the test torrent")
+    }))
+    .await
+    .expect("the hashing task ran")
+}
+
 /// `path` with `suffix` on its file name: `session.state` becomes
 /// `session.state.bad`.
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -1010,6 +1030,275 @@ async fn set_file_priority_skip() {
         drop(snapshot);
     }
 
+    shutdown(client, task).await;
+}
+
+/// Playing a file puts it first: the `s` key on one file of a three-file torrent raises that file to High
+/// and leaves the other two exactly as they were, the skipped one still skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_play_raises_the_file() {
+    let lib = Library::new("local_play_priority");
+    let source = lib.dir.path().join("payload");
+    write_file(&source, "a.bin", &sample(64 * 1024 + 7));
+    write_file(&source, "b.bin", &sample(33 * 1024 + 5));
+    write_file(&source, "c.bin", &sample(12 * 1024 + 3));
+    let bytes = torrent_for(&source).await;
+    let id = id_of(
+        &fbt::Metainfo::from_bytes(&bytes)
+            .expect("the torrent")
+            .info_hashes,
+    );
+
+    let (mut client, task, _) = lib.start().await;
+    assert!(
+        client.send(Command::Add {
+            source: AddSource::File(bytes),
+            dir: Some(lib.config.download_dir.clone()),
+        }),
+        "the queue takes the torrent"
+    );
+    assert_eq!(info_text(notice(&mut client).await), "Added payload");
+    assert!(client.send(Command::Watch(Some((id.clone(), DetailTab::Files)))));
+    let snapshot = wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| rows.len() == 3)
+    })
+    .await;
+    let rows = files_of(&snapshot, &id).expect("the file list");
+    drop(snapshot);
+    let index_of = |name: &str| {
+        rows.iter()
+            .find(|row| row.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} is not in the file list: {rows:?}"))
+            .index
+    };
+    let (other, played, skipped) = (index_of("a.bin"), index_of("b.bin"), index_of("c.bin"));
+
+    assert!(client.send(Command::SetFilePriority {
+        id: id.clone(),
+        file: skipped,
+        priority: FilePriority::Skip,
+    }));
+    wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.index == skipped && row.priority == FilePriority::Skip)
+        })
+    })
+    .await;
+
+    // `s` on the file the person picked, with the torrent nowhere near finished.
+    assert!(client.send(Command::Stream {
+        id: id.clone(),
+        file: Some(played),
+    }));
+    let target = notice(&mut client).await;
+    assert!(
+        matches!(target, Notice::Play(_)),
+        "pressing Play did not produce a play target: {target:?}"
+    );
+
+    let snapshot = wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.index == played && row.priority == FilePriority::High)
+        })
+    })
+    .await;
+    let rows = files_of(&snapshot, &id).expect("the file list");
+    drop(snapshot);
+    let priority_of = |index: usize| {
+        rows.iter()
+            .find(|row| row.index == index)
+            .unwrap_or_else(|| panic!("file {index} is not in the file list: {rows:?}"))
+            .priority
+    };
+    assert_eq!(
+        priority_of(played),
+        FilePriority::High,
+        "the played file is not the one the engine is asked for first: {rows:?}"
+    );
+    assert_eq!(
+        priority_of(other),
+        FilePriority::Normal,
+        "playing one file changed another: {rows:?}"
+    );
+    assert_eq!(
+        priority_of(skipped),
+        FilePriority::Skip,
+        "playing one file un-skipped another: {rows:?}"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// The pieces of the file a play picked arrive in order.
+///
+/// Two sessions on loopback: one seeding a three-file torrent, one downloading it with nothing on disk.
+/// The two files nobody plays are skipped, so the only pieces this downloader wants are the 16 of the
+/// played file, all of them the same priority and all of them held by the one peer it dials. That is the
+/// state the picker's tie-break decides in: with no file marked in order it takes a random starting point
+/// inside that bucket of equal pieces, with the played file marked it starts at the front of it. The
+/// torrent is hashed at 64 KiB pieces so each file owns exactly 16 of them, and the seed is connected
+/// only after the play, so every piece this torrent asks for is asked for after the file was raised.
+#[tokio::test(flavor = "multi_thread")]
+async fn played_file_downloads_its_pieces_in_order() {
+    let lib = Library::new("local_play_in_order");
+    let seed_dir = lib.dir.path().join("seed");
+    let source = seed_dir.join("payload");
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        write_file(&source, name, &sample(MIB));
+    }
+    let bytes = torrent_with_piece_len(&source, PIECE64).await;
+    let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
+    let id = id_of(&metainfo.info_hashes);
+    let info = &metainfo.info;
+    assert_eq!(
+        info.piece_len, PIECE64,
+        "the torrent was not hashed at the piece length the test asks for"
+    );
+    assert_eq!(
+        info.files.len(),
+        3,
+        "three files and no pad file is what the piece arithmetic below assumes: {:?}",
+        info.files
+    );
+    // A v1 torrent lays its files end to end in torrent order, so file 1 - the 1 MiB `b.bin`, a whole
+    // number of pieces on each side - owns pieces 16 to 31.
+    let first = (info.files[0].len / u64::from(PIECE64)) as u32;
+    let count = (info.files[1].len / u64::from(PIECE64)) as u32;
+    assert!(
+        count > 1,
+        "the played file has to span pieces for an order to be a fact about it"
+    );
+
+    let seed = fbt::Session::new(loopback(&lib.config))
+        .await
+        .expect("a session to seed with");
+    seed.add_torrent(fbt::AddTorrent::new(metainfo.clone(), seed_dir))
+        .await
+        .expect("seed the torrent");
+    wait_until_seeding(&seed).await;
+    let seed_addr = seed.local_addr();
+
+    let (mut client, task, engine) = lib.start().await;
+    assert!(
+        client.send(Command::Add {
+            source: AddSource::File(bytes),
+            dir: Some(lib.config.download_dir.clone()),
+        }),
+        "the queue takes the torrent"
+    );
+    assert_eq!(info_text(notice(&mut client).await), "Added payload");
+    assert!(client.send(Command::Watch(Some((id.clone(), DetailTab::Files)))));
+    let snapshot = wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| rows.len() == 3)
+    })
+    .await;
+    let rows = files_of(&snapshot, &id).expect("the file list");
+    drop(snapshot);
+    let index_of = |name: &str| {
+        rows.iter()
+            .find(|row| row.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} is not in the file list: {rows:?}"))
+            .index
+    };
+    let played = index_of("b.bin");
+
+    // Nothing but the played file is wanted: the other two files are skipped, so the only pieces this
+    // run asks for are the ones whose order the test reads.
+    for file in [index_of("a.bin"), index_of("c.bin")] {
+        assert!(client.send(Command::SetFilePriority {
+            id: id.clone(),
+            file,
+            priority: FilePriority::Skip,
+        }));
+    }
+    wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| {
+            rows.iter()
+                .filter(|row| row.priority == FilePriority::Skip)
+                .count()
+                == 2
+        })
+    })
+    .await;
+
+    let torrent = engine
+        .torrent(&fbt::InfoHashes::from_v1(wire_of(&id)))
+        .expect("the session holds the torrent it added");
+    let hashes = torrent.info_hashes();
+    let mut pieces = engine.subscribe(fbt::EventMask::PIECE);
+
+    assert!(client.send(Command::Stream {
+        id: id.clone(),
+        file: Some(played),
+    }));
+    let target = notice(&mut client).await;
+    assert!(
+        matches!(target, Notice::Play(_)),
+        "pressing Play did not produce a play target: {target:?}"
+    );
+    // The priority is what the engine was told before the first piece was asked for, and waiting for it
+    // here is also what keeps the peer connection - the thing that starts the requests - behind it.
+    wait_for(&mut client, |snapshot| {
+        files_of(snapshot, &id).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.index == played && row.priority == FilePriority::High)
+        })
+    })
+    .await;
+
+    torrent
+        .add_peer(seed_addr)
+        .await
+        .expect("the seed is a peer");
+    let order = within(async {
+        let mut order = Vec::new();
+        while (order.len() as u32) < count {
+            let event = pieces
+                .recv()
+                .await
+                .expect("the engine kept its events open");
+            if let fbt::Event::PieceFinished { torrent, piece } = event
+                && torrent == hashes
+                && (first..first + count).contains(&piece)
+            {
+                order.push(piece);
+            }
+        }
+        order
+    })
+    .await;
+    assert_eq!(
+        order.first(),
+        Some(&first),
+        "the first piece of the played file to arrive was not its first: {order:?}"
+    );
+    // Blocks arrive in the order they were asked for on the one connection, so how far the completion
+    // order can stray from the ask order is the number of pieces in flight at once. fbt-lib's own
+    // in-order test, on this same geometry, allows eight.
+    let inversion = order
+        .windows(2)
+        .map(|pair| {
+            if pair[0] > pair[1] {
+                usize::try_from(pair[0] - pair[1]).expect("a piece index fits")
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        inversion <= 8,
+        "the played file's pieces came in out of order by more than the pipeline allows: {order:?}"
+    );
+    assert_eq!(
+        torrent.files().await.expect("the file list")[played].priority,
+        fbt::Priority::High,
+        "the played file was not the one the engine asked for first"
+    );
+
+    seed.shutdown().await;
     shutdown(client, task).await;
 }
 
