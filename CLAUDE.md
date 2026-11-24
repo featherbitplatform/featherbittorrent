@@ -202,6 +202,8 @@ on the real system, by eye, before a release (the plan's last step is a pass on 
   the `.tar.gz` plus its two `xdg-mime` commands. The Linux launcher is listed as `featherbittorrent-desktop`
   from the packages and `featherbittorrent desktop` from the tarball.
 - MSE playback of a video in WebView2, WKWebView and WebKitGTK.
+- Download from the player (a file the webview cannot play): the save dialog opens, the file is written where
+  chosen, and the window stays on the app.
 - Saved passwords in the macOS keychain, the Windows credential manager and a Linux Secret Service, and the
   `This system has no keychain` line where there is none.
 - Serving the web UI to a phone on the same network.

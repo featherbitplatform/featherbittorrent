@@ -102,7 +102,9 @@ and what the app shows when a connection is refused for its origin.
 `Serve the web UI` in the desktop app's settings puts this page on an address of its own for other machines,
 where a phone signs in with the cookie session described above, while the app itself keeps using its private
 loopback address. Video plays through the system's own webview, so where that webview cannot play a codec the
-player shows the same `This browser cannot play` line and `Download` button it shows in a browser.
+player shows the same `This browser cannot play` line and `Download` button it shows in a browser. In the
+app, `Download` opens the system's save dialog and the app writes the file where you choose; the window
+stays on the app.
 
 ## Playing media
 

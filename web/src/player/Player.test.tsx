@@ -9,6 +9,7 @@ import type { EngineProbe } from './engine'
 import { toSource } from './time'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
+import { DesktopDownloadContext } from '../desktopDownload'
 import {
   FakeBody,
   FakeMediaSource,
@@ -412,6 +413,79 @@ describe('the player', () => {
       followed.includes('/api/v1/stream/x?token=abc'),
       `the anchor did not follow the returned path (got ${followed})`,
     ).toBe(true)
+  })
+
+  it('download in the desktop app saves through the shell and clicks no cross-origin link', async () => {
+    // In the app the token route answers an absolute address on the engine's own origin, which is
+    // not the page's. Clicking it would navigate the whole window to the media address, so the
+    // player hands it to the shell's save instead and clicks nothing.
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const address = 'http://127.0.0.1:53211/api/v1/torrents/abc/files/0/stream?token=abc'
+    const recorder = fakeFetch()
+    const client: Api = {
+      ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
+      probe: async () => unplayable,
+      cues: async () => ({ cues: [] }),
+      subtitleFile: async () => ({ cues: [] }),
+      streamToken: async () => address,
+    }
+    const saved: Array<[string, string]> = []
+    const save = async (url: string, name: string): Promise<boolean> => {
+      saved.push([url, name])
+      return true
+    }
+    const clicked: string[] = []
+    const originalClick = HTMLAnchorElement.prototype.click
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
+      clicked.push(this.href)
+    }
+    try {
+      render(
+        <DesktopDownloadContext.Provider value={save}>
+          <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />
+        </DesktopDownloadContext.Provider>,
+      )
+      await settle()
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+    } finally {
+      ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
+    }
+    expect(clicked, 'a link was clicked').toEqual([])
+    expect(saved, 'the shell was not asked to save the file').toEqual([[address, 'movie.mkv']])
+  })
+
+  it('download of a cross-origin address with no shell says so and clicks nothing', async () => {
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    const recorder = fakeFetch()
+    const client: Api = {
+      ...(createClient(recorder.fetch, () => null, () => 0, () => {}) as Api),
+      probe: async () => unplayable,
+      cues: async () => ({ cues: [] }),
+      subtitleFile: async () => ({ cues: [] }),
+      streamToken: async () => 'http://127.0.0.1:53211/api/v1/torrents/abc/files/0/stream?token=abc',
+    }
+    const clicked: string[] = []
+    const originalClick = HTMLAnchorElement.prototype.click
+    ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
+      clicked.push(this.href)
+    }
+    try {
+      render(<Player id="a" file={0} name="movie.mkv" client={client} onClose={() => {}} />)
+      await settle()
+      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      await settle()
+    } finally {
+      ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = originalClick
+    }
+    expect(clicked, 'a link was clicked').toEqual([])
+    expect(screen.getByRole('alert').textContent).toBe('This file cannot be downloaded here.')
   })
 
   it('managed media source attaches by srcObject', async () => {

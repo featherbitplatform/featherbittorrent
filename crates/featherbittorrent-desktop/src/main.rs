@@ -9,10 +9,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod download;
 mod instances;
 mod keychain;
 mod lifecycle;
 mod local;
+mod navigation;
 mod opened;
 mod preferences;
 mod serving;
@@ -56,6 +58,11 @@ fn main() {
     // locked.
     let serve = settings.serve.enabled;
 
+    let context = tauri::generate_context!();
+    // The main window never leaves the app's own origin (`navigation`): the origins are read off the
+    // context before the builder takes it.
+    let own_origins = navigation::own_origins(context.config().build.dev_url.as_ref());
+
     let app = tauri::Builder::default()
         // First among the plugins, as its documentation requires: a second launch forwards what it was
         // opened with to this copy, which shows its window, and exits without starting anything.
@@ -67,6 +74,7 @@ fn main() {
                 &opened::AppPage(app),
             );
         }))
+        .plugin(navigation::guard(own_origins))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -106,6 +114,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::desktop_info,
             commands::connect,
+            download::save_download,
             window::system_title_bar,
             window::set_system_title_bar,
             instances::list_instances,
@@ -129,7 +138,7 @@ fn main() {
             serving::serving_status,
             serving::set_serving
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .unwrap_or_else(|problem| {
             refuse(
                 &format!("The window could not open: {problem}"),

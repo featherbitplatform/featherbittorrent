@@ -29,6 +29,8 @@ import {
   X,
 } from 'lucide-react'
 import { useConnection } from '../connection'
+import { useDesktopDownload } from '../desktopDownload'
+import { isAbsolute } from '../endpoint'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
 import { displaySafe } from '../format'
 import { matches } from '../keys'
@@ -311,6 +313,20 @@ function IconButton({
   )
 }
 
+/** What Download says where a file on another origin has nothing to save it with. */
+const NO_DOWNLOAD_COPY = 'This file cannot be downloaded here.'
+
+/** Whether `address` is on the page's own origin, where an `<a download>` saves rather than navigates. */
+function sameOriginAddress(address: string): boolean {
+  // A path is on the page's own origin by definition (the browser build's token route answers one).
+  if (!isAbsolute(address) && !address.startsWith('//')) return true
+  try {
+    return new URL(address, window.location.href).origin === window.location.origin
+  } catch {
+    return false
+  }
+}
+
 export default function Player({ id, file, name, client: given, onClose }: PlayerProps) {
   const connection = useConnection()
   const client = given ?? connection.api
@@ -326,6 +342,8 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   const [subtitleKey, setSubtitleKey] = useState('off')
   const [nativeSrc, setNativeSrc] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  const [downloadProblem, setDownloadProblem] = useState<string | null>(null)
+  const saveDownload = useDesktopDownload()
   // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
   // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
   // the buffer restarts the streams, and a drag writes dozens of values.
@@ -790,13 +808,27 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
     try {
       // The token is fetched at the click, not at the open: it is good for 60 seconds, and the
       // click is the moment the person is actually about to take the file.
+      setDownloadProblem(null)
       const path = await client.streamToken(id, file)
+      // A link to another origin is not a download: the webview ignores `download` on it and
+      // navigates the page itself to the media address. Only a same-origin address is clicked;
+      // anything else (the desktop app's engine) is saved by the shell, which streams it to disk.
+      if (!sameOriginAddress(path)) {
+        if (saveDownload === null) {
+          setDownloadProblem(NO_DOWNLOAD_COPY)
+          return
+        }
+        await saveDownload(path, name)
+        return
+      }
       const anchor = document.createElement('a')
       anchor.href = path
       anchor.download = name
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()
+    } catch (problem) {
+      setDownloadProblem(problem instanceof Error ? problem.message : String(problem))
     } finally {
       setDownloading(false)
     }
@@ -931,6 +963,11 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
             <Download className="h-4 w-4" aria-hidden="true" />
             Download
           </button>
+          {downloadProblem !== null && (
+            <p role="alert" className="max-w-sm text-[13px] text-error">
+              {displaySafe(downloadProblem)}
+            </p>
+          )}
         </div>
       )}
 

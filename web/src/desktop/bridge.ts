@@ -129,6 +129,14 @@ export async function forgetPassword(id: string): Promise<void> {
   await invoke('forget_password', { id })
 }
 
+/**
+ * Asks where to save the file at `url` on instance `id` and streams it there, in the shell. Resolves
+ * `true` once saved and `false` when the person cancelled the dialog; rejects with the shell's line.
+ */
+export async function saveDownload(id: string, url: string, name: string): Promise<boolean> {
+  return invoke<boolean>('save_download', { instance: id, url, name })
+}
+
 /** Asks the shell whether a saved instance answers, and whether it lets this app's origin in. */
 export async function probeInstance(id: string): Promise<Probe> {
   return invoke<Probe>('probe_instance', { id })

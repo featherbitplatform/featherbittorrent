@@ -15,6 +15,7 @@ import { TitleBarSlotsContext } from '../components/titleBarSlots'
 import type { TitleBarSlots } from '../components/titleBarSlots'
 import { useConnection } from '../connection'
 import { useSavePassword } from '../savePassword'
+import { useDesktopDownload } from '../desktopDownload'
 import { useDesktopSettings } from '../desktopSettings'
 import { effectiveBindings, KEY_BINDINGS, setOverrides } from '../keys'
 import type { Connection } from '../connection'
@@ -26,6 +27,7 @@ const shell = vi.hoisted(() => ({
   listInstances: vi.fn(),
   probeInstance: vi.fn(),
   savePassword: vi.fn(),
+  saveDownload: vi.fn(() => Promise.resolve(true)),
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   getShortcuts: vi.fn(() => Promise.resolve([])),
@@ -40,6 +42,7 @@ vi.mock('./bridge', () => ({
   listInstances: shell.listInstances,
   probeInstance: shell.probeInstance,
   savePassword: shell.savePassword,
+  saveDownload: shell.saveDownload,
   addInstance: vi.fn(),
   removeInstance: vi.fn(),
   setDefaultInstance: vi.fn(),
@@ -98,6 +101,7 @@ vi.mock('../App', () => ({
     }, [])
     const endpoint = connection.endpoint
     const offer = useSavePassword()
+    const save = useDesktopDownload()
     const desktop = useDesktopSettings()
     const request = desktop?.request ?? null
     return (
@@ -110,6 +114,11 @@ vi.mock('../App', () => ({
         <button type="button" onClick={() => void connection.api.torrents().catch(() => {})}>
           read torrents
         </button>
+        {save !== null && (
+          <button type="button" onClick={() => void save('http://127.0.0.1:53211/stream', 'movie.mkv')}>
+            save a file
+          </button>
+        )}
         {offer !== null && (
           <button type="button" onClick={() => void offer.save('alice', 'hunter2')}>
             keep password
@@ -143,6 +152,7 @@ afterEach(() => {
   shell.listInstances.mockReset()
   shell.probeInstance.mockReset()
   shell.savePassword.mockReset()
+  shell.saveDownload.mockClear()
   shell.setTrayInstance.mockClear()
   shell.takeOpened.mockReset()
   shell.takeOpened.mockResolvedValue([])
@@ -185,6 +195,14 @@ it('connects_to_this_computer_and_renders_the_app_on_its_endpoint', async () => 
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
   expect(shell.connect).toHaveBeenCalledWith('local')
+})
+
+it('the_players_download_goes_through_the_shell_for_the_instance_shown', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'save a file' }))
+  expect(shell.saveDownload).toHaveBeenCalledWith('local', `${BASE}/stream`, 'movie.mkv')
 })
 
 it('the_page_column_hands_its_height_to_the_screen', async () => {

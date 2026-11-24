@@ -263,6 +263,11 @@ impl Instances {
         })
     }
 
+    /// The base address of saved instance `id`, in the spelling every request is built on.
+    pub fn base(&self, id: &str) -> Result<String, String> {
+        Ok(normalise_base(&self.usable(id)?.url))
+    }
+
     /// The endpoint for remote instance `id`: its address, and a session token when a password is saved
     /// and the server takes it. No token means the page shows its sign-in screen. A server that gives no
     /// answer at all is [`UNREACHABLE`].
