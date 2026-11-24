@@ -15,7 +15,7 @@
  *
  * @module player/Player
  */
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { KeyboardEvent, ReactNode } from 'react'
 import {
   Download,
@@ -29,10 +29,11 @@ import {
   X,
 } from 'lucide-react'
 import { useConnection } from '../connection'
-import { useDesktopDownload } from '../desktopDownload'
+import { CANCELLED_COPY, useDesktopDownload } from '../desktopDownload'
+import type { FileDownload } from '../desktopDownload'
 import { isAbsolute } from '../endpoint'
 import type { Api, Cue, MediaProbe, MediaTrack } from '../api/client'
-import { displaySafe } from '../format'
+import { displaySafe, formatBytes, formatPercent } from '../format'
 import { matches } from '../keys'
 import { MODAL_CENTRED, useModalDialog } from '../modal'
 import { mergeCues, nextWindow } from './cues'
@@ -381,6 +382,95 @@ function sameOriginAddress(address: string): boolean {
   }
 }
 
+/** What watching downloads looks like with no shell: there is none, and nothing to watch. */
+function noShellSubscribe(notify: () => void): () => void {
+  void notify
+  return () => {}
+}
+
+function noShellDownload(): FileDownload | null {
+  return null
+}
+
+/**
+ * The line that replaces the Download button while the shell writes the file: with a size
+ * `Downloading 42% (1.2 GiB of 2.9 GiB)`, with none `Downloading 1.2 GiB`. The numbers come from
+ * `formatPercent` and `formatBytes`, so they read the way every other size on the page does.
+ */
+function downloadProgressCopy(download: FileDownload): string {
+  if (download.total !== null) {
+    return `Downloading ${formatPercent(download.received / download.total)} (${formatBytes(download.received)} of ${formatBytes(download.total)})`
+  }
+  return `Downloading ${formatBytes(download.received)}`
+}
+
+/** The Download button, as the unplayable screen and the playback failure drew it. */
+const OFFER_BUTTON =
+  'flex h-10 cursor-pointer items-center gap-2 rounded-control bg-accent px-4 text-[13px] font-medium text-strong hover:bg-accent-hover disabled:cursor-default disabled:opacity-55'
+
+/** The secondary weight, for the lesser action: the ruled outline the desktop page uses elsewhere. */
+const CANCEL_BUTTON =
+  'inline-flex h-10 cursor-pointer items-center justify-center rounded-control border border-rule bg-raised px-4 text-[13px] font-medium text-strong transition-colors hover:bg-ink-700'
+
+/**
+ * The player's Download offer. While a download of this file runs, the Download button is replaced
+ * by a progress line, a bar, and a Cancel; the line and bar report what the shell has written.
+ * After it ends the button is back, with `Saved.` or `Download cancelled.` beside it in the quiet
+ * colour; those come from the download's final state, kept above the player, so they are there for
+ * a person who closed the player during the download and came back. Any other ending is the
+ * failure alert's, fed by the shell's own line.
+ */
+function DownloadOffer({
+  download,
+  disabled,
+  onDownload,
+  onCancel,
+}: {
+  download: FileDownload | null
+  disabled: boolean
+  onDownload(): void
+  onCancel(): void
+}) {
+  const saving = download !== null && download.state === 'saving'
+  return (
+    <>
+      {saving && download !== null && (
+        <>
+          <p role="status" aria-live="polite" className="max-w-sm text-center text-[13px] text-strong">
+            {downloadProgressCopy(download)}
+            <progress
+              aria-label="Download progress"
+              {...(download.total === null ? {} : { value: download.received, max: download.total })}
+              className="mx-auto mt-2 block h-2 w-full max-w-sm accent-accent"
+            />
+          </p>
+          <button type="button" aria-label="Cancel download" onClick={onCancel} className={CANCEL_BUTTON}>
+            Cancel download
+          </button>
+        </>
+      )}
+      {!saving && (
+        <>
+          <button type="button" aria-label="Download" onClick={onDownload} disabled={disabled} className={OFFER_BUTTON}>
+            <Download className="h-4 w-4" aria-hidden="true" />
+            Download
+          </button>
+          {download?.state === 'saved' && (
+            <p role="status" aria-live="polite" className="max-w-sm text-[13px] text-muted">
+              Saved.
+            </p>
+          )}
+          {download?.state === 'cancelled' && (
+            <p role="status" aria-live="polite" className="max-w-sm text-[13px] text-muted">
+              {CANCELLED_COPY}
+            </p>
+          )}
+        </>
+      )}
+    </>
+  )
+}
+
 export default function Player({ id, file, name, client: given, onClose }: PlayerProps) {
   const connection = useConnection()
   const client = given ?? connection.api
@@ -401,7 +491,15 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   const [audioRetry, setAudioRetry] = useState<AudioRetry | null>(null)
   const [downloading, setDownloading] = useState(false)
   const [downloadProblem, setDownloadProblem] = useState<string | null>(null)
-  const saveDownload = useDesktopDownload()
+  const shell = useDesktopDownload()
+  // The app's download of this file, kept by the desktop page above the player: closing the player
+  // neither cancels it nor forgets it, and opening this file again shows the download where it
+  // stands. A browser has no shell, so it has no download kept here either.
+  const fileKey = `${id}:${file}`
+  const fileDownload = useSyncExternalStore(
+    shell === null ? noShellSubscribe : shell.subscribe,
+    shell === null ? noShellDownload : () => shell.current(fileKey),
+  )
   // The Seek bar's value while a pointer drags it, in source seconds, or null when it is not
   // being dragged. A drag shows where it is going and seeks once, on release: every seek outside
   // the buffer restarts the streams, and a drag writes dozens of values.
@@ -988,18 +1086,22 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
   }
 
   async function download(): Promise<void> {
-    if (downloading) return
+    // One download per file at a time: the store's `saving` covers a download that started before
+    // this player opened, and `downloading` the moment between the click and the store's entry.
+    if (downloading || fileDownload?.state === 'saving') return
     setDownloading(true)
     try {
       setDownloadProblem(null)
       // In the app the stream address is on the engine's origin, not the page's: a link to it is not a
       // download (the webview ignores `download` there and navigates the page itself to the media), so
       // the shell saves it. Where to save is asked first, and the token only after: it is good for 60
-      // seconds, and a person reading a save dialog can take longer than that.
-      if (saveDownload !== null) {
-        const handle = await saveDownload.choose(name)
+      // seconds, and a person reading a save dialog can take longer than that. `run` keeps the store
+      // entry fresh (progress for the screen, the ending for whoever opens the player next) and
+      // swallows a cancel; any other failure gets rethrown, and its line goes to the alert below.
+      if (shell !== null) {
+        const handle = await shell.choose(name)
         if (handle === null) return
-        await saveDownload.save(handle, await client.streamToken(id, file))
+        await shell.run(fileKey, handle, await client.streamToken(id, file))
         return
       }
       // The token is fetched at the click, not at the open: it is good for 60 seconds, and the
@@ -1020,6 +1122,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
       setDownloadProblem(problem instanceof Error ? problem.message : String(problem))
     } finally {
       setDownloading(false)
+    }
+  }
+
+  function cancelFileDownload(): void {
+    if (shell !== null && fileDownload !== null) {
+      shell.cancel(fileDownload.handle).catch(() => {
+        // Nothing else to do: the save fails or finishes on its own, and the store shows that.
+      })
     }
   }
 
@@ -1146,18 +1256,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
               ? unplayableCopy(displaySafe(choice.codec))
               : NO_VIDEO_COPY}
           </p>
-          <button
-            type="button"
-            aria-label="Download"
-            onClick={() => {
+          <DownloadOffer
+            download={fileDownload}
+            disabled={downloading}
+            onDownload={() => {
               void download()
             }}
-            className="flex h-10 cursor-pointer items-center gap-2 rounded-control bg-accent px-4 text-[13px] font-medium text-strong hover:bg-accent-hover disabled:cursor-default disabled:opacity-55"
-            disabled={downloading}
-          >
-            <Download className="h-4 w-4" aria-hidden="true" />
-            Download
-          </button>
+            onCancel={cancelFileDownload}
+          />
           {downloadProblem !== null && (
             <p role="alert" className="max-w-sm text-[13px] text-error">
               {displaySafe(downloadProblem)}
@@ -1194,18 +1300,14 @@ export default function Player({ id, file, name, client: given, onClose }: Playe
                 {showHevcHint && <span className="max-w-md text-[12px] text-muted">{HEVC_WINDOWS_COPY}</span>}
                 {/* A video that will not play here is still the person's file: the Download offer
                     the unplayable screen gives stays reachable from the failure. */}
-                <button
-                  type="button"
-                  aria-label="Download"
-                  onClick={() => {
+                <DownloadOffer
+                  download={fileDownload}
+                  disabled={downloading}
+                  onDownload={() => {
                     void download()
                   }}
-                  className="flex h-10 cursor-pointer items-center gap-2 rounded-control bg-accent px-4 text-[13px] font-medium text-strong hover:bg-accent-hover disabled:cursor-default disabled:opacity-55"
-                  disabled={downloading}
-                >
-                  <Download className="h-4 w-4" aria-hidden="true" />
-                  Download
-                </button>
+                  onCancel={cancelFileDownload}
+                />
                 {downloadProblem !== null && (
                   <p role="alert" className="max-w-sm text-[13px] text-error">
                     {displaySafe(downloadProblem)}

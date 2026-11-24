@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useState } from 'react'
 import Files from '../components/detail/Files'
 import { createClient } from '../api/client'
 import type { Api, FileInfo, MediaProbe, MediaTrack } from '../api/client'
@@ -10,7 +11,8 @@ import { toSource } from './time'
 import { positionKey } from './positions'
 import { installDialogShim } from '../dialog-shim'
 import Player from './Player'
-import { DesktopDownloadContext } from '../desktopDownload'
+import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
+import type { DesktopDownload, DownloadProgress } from '../desktopDownload'
 import {
   FakeBody,
   FakeMediaSource,
@@ -449,8 +451,8 @@ describe('the player', () => {
       },
     }
     const saved: Array<[string, string]> = []
-    const shell = {
-      choose: (name: string) =>
+    const shell = createDownloads(
+      (name: string) =>
         new Promise<string | null>((resolve) => {
           order.push(`dialog ${name}`)
           answerDialog = (handle) => {
@@ -458,11 +460,12 @@ describe('the player', () => {
             resolve(handle)
           }
         }),
-      save: async (handle: string, url: string) => {
+      async (handle: string, url: string) => {
         order.push('save')
         saved.push([handle, url])
       },
-    }
+      async () => {},
+    )
     const clicked: string[] = []
     const originalClick = HTMLAnchorElement.prototype.click
     ;(HTMLAnchorElement.prototype as unknown as { click(): void }).click = function (this: HTMLAnchorElement) {
@@ -522,6 +525,252 @@ describe('the player', () => {
     }
     expect(clicked, 'a link was clicked').toEqual([])
     expect(screen.getByRole('alert').textContent).toBe('This file cannot be downloaded here.')
+  })
+
+  /** One save the test drives by hand. */
+  interface HeldSave {
+    url: string
+    progress: (progress: DownloadProgress) => void
+    saved: () => void
+    failed: (line: string) => void
+  }
+
+  /** The downloads tests' stand-in shell: a real download store (`createDownloads`) over saves the
+   * test drives by hand. `held` collects them: `progress` reports bytes, `saved` and `failed` end
+   * the download. */
+  function downloadShell(): {
+    shell: DesktopDownload
+    held: HeldSave[]
+    chooses: string[]
+    cancels: string[]
+  } {
+    const held: HeldSave[] = []
+    const chooses: string[] = []
+    const cancels: string[] = []
+    const shell = createDownloads(
+      async (name: string) => {
+        chooses.push(name)
+        return 'place-1'
+      },
+      (_handle: string, url: string, onProgress: (progress: DownloadProgress) => void) =>
+        new Promise<void>((resolve, reject) => {
+          held.push({
+            url,
+            progress: onProgress,
+            saved: () => {
+              resolve()
+            },
+            failed: (line: string) => {
+              reject(line)
+            },
+          })
+        }),
+      async (handle: string) => {
+        cancels.push(handle)
+      },
+    )
+    return { shell, held, chooses, cancels }
+  }
+
+  /** The shell, the store, and the hevc file the Download button lives on: the unplayable screen. */
+  function downloadHarness(): {
+    shell: DesktopDownload
+    client: Api
+    held: HeldSave[]
+    chooses: string[]
+    cancels: string[]
+  } {
+    const unplayable: MediaProbe = {
+      ...PROBE,
+      tracks: [track({ id: 1, kind: 'video', codec: 'hevc', mime_codecs: ['hvc1.1.6.L93.B8'] })],
+    }
+    return { ...downloadShell(), client: probeClient(unplayable).client }
+  }
+
+  /** The player opens and closes again on the same store: a download lives above it, not inside it. */
+  function Harness({ shell, client }: { shell: DesktopDownload; client: Api }) {
+    const [open, setOpen] = useState(true)
+    return (
+      <DesktopDownloadContext.Provider value={shell}>
+        {open ? (
+          <Player id="a" file={0} name="movie.mkv" client={client} onClose={() => setOpen(false)} />
+        ) : (
+          <button type="button" onClick={() => setOpen(true)}>Open player</button>
+        )}
+      </DesktopDownloadContext.Provider>
+    )
+  }
+
+  it('download shows its progress', async () => {
+    // Sizes chosen so the formats land where the copy reads: 1.2 GiB of 2.9 GiB, 42%.
+    const SIZE = 3_113_851_290
+    const WRITTEN = 1_307_713_542
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(held.length, 'the shell was not asked to save').toBe(1)
+    act(() => {
+      held[0]!.progress({ received: 0, total: SIZE })
+    })
+    expect(
+      screen.getByText('Downloading 0% (0 B of 2.9 GiB)') !== null,
+      'the start of the download was not shown',
+    ).toBe(true)
+    act(() => {
+      held[0]!.progress({ received: WRITTEN, total: SIZE })
+    })
+    expect(
+      screen.getByText('Downloading 42% (1.2 GiB of 2.9 GiB)') !== null,
+      'the download did not show its progress',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download stayed on screen while the file was downloading',
+    ).toBeNull()
+    const bar = screen.getByLabelText('Download progress')
+    expect(bar.tagName).toBe('PROGRESS')
+    expect(bar.getAttribute('value'), 'the progress bar got no value').toBe(String(WRITTEN))
+    expect(bar.getAttribute('max'), 'the progress bar got no max').toBe(String(SIZE))
+    act(() => {
+      held[0]!.saved()
+    })
+    await settle()
+    expect(
+      screen.getByText('Saved.') !== null,
+      'the saved file was not announced',
+    ).toBe(true)
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'the Download button did not come back',
+    ).toBe(true)
+  })
+
+  it('download without a size shows bytes only', async () => {
+    const WRITTEN = 1_307_713_542
+    const { shell, held, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: WRITTEN, total: null })
+    })
+    expect(
+      screen.getByText('Downloading 1.2 GiB') !== null,
+      'the download with no size did not say the bytes alone',
+    ).toBe(true)
+    expect(
+      screen.getByText('Downloading 1.2 GiB').textContent,
+      'a percent crept into a size-less download',
+    ).toBe('Downloading 1.2 GiB')
+    const bar = screen.getByLabelText('Download progress')
+    expect(bar.tagName).toBe('PROGRESS')
+    expect(bar.getAttribute('value'), 'a size-less download got a value').toBeNull()
+    expect(bar.getAttribute('max'), 'a size-less download got a max').toBeNull()
+  })
+
+  it('cancel download asks the shell and says so', async () => {
+    const { shell, held, cancels, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: 4096, total: 65_536 })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel download' }))
+    await settle()
+    expect(cancels, 'the shell was not asked to stop the download by its handle').toEqual(['place-1'])
+    act(() => {
+      held[0]!.failed('Download cancelled.')
+    })
+    await settle()
+    const line = screen.getByText('Download cancelled.')
+    expect(line.getAttribute('role'), 'the cancel is not announced politely').toBe('status')
+    expect(line.className.includes('text-muted'), 'the cancel line is not muted').toBe(true)
+    expect(line.className.includes('text-error'), 'the cancel line wears the error colour').toBe(false)
+    expect(screen.queryByRole('alert'), 'the cancel went to the failure alert').toBeNull()
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'the Download button did not come back',
+    ).toBe(true)
+  })
+
+  it('closing the player keeps the download', async () => {
+    const { shell, held, cancels, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    act(() => {
+      held[0]!.progress({ received: 1_307_713_542, total: null })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    expect(screen.queryByRole('dialog'), 'the player did not close').toBeNull()
+    expect(cancels, 'closing the player cancelled the download').toEqual([])
+    // The download goes on with the player gone, and its bytes keep landing in the store.
+    act(() => {
+      held[0]!.progress({ received: 1_610_612_736, total: null })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByText('Downloading 1.5 GiB') !== null,
+      'reopening the player did not show where the download got to',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download came back while the file was still downloading',
+    ).toBeNull()
+    expect(cancels, 'reopening changed nothing the shell was asked for').toEqual([])
+    act(() => {
+      held[0]!.saved()
+    })
+    await settle()
+    expect(screen.getByText('Saved.') !== null, 'the save that finished while closed was not said').toBe(true)
+    expect(screen.getByRole('button', { name: 'Download' }) !== null).toBe(true)
+  })
+
+  it('a file that is downloading cannot be downloaded twice', async () => {
+    const { shell, held, chooses, client } = downloadHarness()
+    render(<Harness shell={shell} client={client} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'Download offered a second start while the file was downloading',
+    ).toBeNull()
+    // A failure is the shell's line in the alert, and Download comes back for another go.
+    act(() => {
+      held[0]!.failed('The download broke off.')
+    })
+    await settle()
+    expect(screen.getByRole('alert').textContent).toBe('The download broke off.')
+    expect(
+      screen.getByRole('button', { name: 'Download' }) !== null,
+      'a failed download left no way to try again',
+    ).toBe(true)
+    // Starting again and closing the player: the reopened player shows the same download running,
+    // not a fresh start, and no second save was asked for.
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    await settle()
+    expect(held.length, 'the second download did not start').toBe(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open player' }))
+    await settle()
+    expect(
+      screen.getByRole('button', { name: 'Cancel download' }) !== null,
+      'the reopened player does not offer to cancel the running download',
+    ).toBe(true)
+    expect(
+      screen.queryByRole('button', { name: 'Download' }),
+      'the reopened player offered a start for a file that is still downloading',
+    ).toBeNull()
+    expect(held.length, 'a second download was started for the file').toBe(2)
+    expect(chooses.length, 'the place was chosen more than twice for the file').toBe(2)
   })
 
   it('managed media source attaches by srcObject', async () => {

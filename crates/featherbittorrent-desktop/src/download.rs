@@ -8,7 +8,9 @@
 //! does the page fetch a stream address (its token lives 60 seconds, which a person reading a dialog can
 //! outlast) and hand it, with the handle, to [`save_download`], which streams the file there chunk by
 //! chunk. A movie of several gigabytes never sits in memory, which fetching it into a
-//! `Blob` on the page would have done.
+//! `Blob` on the page would have done. The page watches the file being written (each
+//! [`Progress`] goes to it over a channel) and can stop it by the same handle it started it with;
+//! quitting the app stops the running downloads and takes their part files away.
 //!
 //! The shell fetches only what the page could have opened itself: an address on the instance the page
 //! is connected to, at that instance's file-stream route ([`stream_target`]). Anything else is refused
@@ -42,6 +44,21 @@ pub const NOT_A_STREAM: &str = "That is not a file of this instance.";
 
 /// What the page is told when the file could not be saved.
 const SAVE_FAILED: &str = "The file could not be saved.";
+
+/// What the page is told, and shows, when the person stops a running download.
+pub const CANCELLED: &str = "Download cancelled.";
+
+/// How often at most a running download reports what it has written, besides the reports at
+/// the start (nothing written yet) and at the end (the whole file).
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// What a running download reports: `received` bytes written so far, and `total`, the answer's
+/// Content-Length when it brings one, which the person's file may not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Progress {
+    pub received: u64,
+    pub total: Option<u64>,
+}
 
 /// The address to fetch, when `url` is a file-stream address on the instance at `base`: the same
 /// scheme, host and port, `base`'s own path (if it has one) followed by
@@ -140,14 +157,24 @@ pub fn client() -> reqwest::Client {
         .expect("the download client builds with its timeouts and no redirects")
 }
 
-/// Fetches `url` with `client` into `destination`, chunk by chunk. The bytes go to a `.part` file next to
-/// it first, which takes the final name only once the whole answer arrived, so a broken download never
-/// leaves a short file under the name the person chose. Answers how many bytes were saved.
+/// Fetches `url` with `client` into `destination`, chunk by chunk, telling `on_progress` what has
+/// been written and watching `cancel` for the person stopping it. The bytes go to a `.part` file
+/// next to the destination first, which takes the final name only once the whole answer arrived,
+/// so a broken or cancelled download never leaves a short file under the name the person chose.
+/// Progress goes out at most [`PROGRESS_EVERY`] apart, plus once at the start and once at the end.
+/// A cancel stops reading, drops the answer (which closes the connection), and takes the part
+/// file away. Answers how many bytes were saved.
 pub async fn save_to(
     client: &reqwest::Client,
     url: url::Url,
     destination: &Path,
+    mut on_progress: impl FnMut(Progress),
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<u64, String> {
+    // A cancel that arrived before the fetch even started leaves nothing to take away.
+    if *cancel.borrow() {
+        return Err(CANCELLED.to_string());
+    }
     let mut response = client
         .get(url)
         .send()
@@ -159,20 +186,43 @@ pub async fn save_to(
             response.status().as_u16()
         ));
     }
+    let total = response.content_length();
     let (partial, mut file) = create_partial(destination).await?;
     let result = async {
         let mut written = 0u64;
+        on_progress(Progress { received: 0, total });
+        let mut since = tokio::time::Instant::now();
+        let mut watching = true;
         loop {
-            let chunk = response
-                .chunk()
-                .await
-                .map_err(|_| "The download broke off.".to_string())?;
+            let chunk = tokio::select! {
+                result = response.chunk() => result.map_err(|_| "The download broke off.".to_string())?,
+                changed = cancel.changed(), if watching => {
+                    match changed {
+                        Ok(()) if *cancel.borrow_and_update() => return Err(CANCELLED.to_string()),
+                        Ok(_) => {}
+                        // The sender is gone: nothing can cancel this any more, and asking
+                        // again would only spin. Stop watching.
+                        Err(_) => watching = false,
+                    }
+                    continue;
+                }
+            };
             let Some(chunk) = chunk else { break };
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
                 .await
                 .map_err(|_| SAVE_FAILED.to_string())?;
             written += chunk.len() as u64;
+            if since.elapsed() >= PROGRESS_EVERY {
+                since = tokio::time::Instant::now();
+                on_progress(Progress { received: written, total });
+            }
         }
+        // A cancel that arrived after the last byte still cancels: the part file comes down
+        // rather than being renamed into the name the person chose.
+        if *cancel.borrow_and_update() {
+            return Err(CANCELLED.to_string());
+        }
+        on_progress(Progress { received: written, total });
         tokio::io::AsyncWriteExt::flush(&mut file)
             .await
             .map_err(|_| SAVE_FAILED.to_string())?;
@@ -180,6 +230,8 @@ pub async fn save_to(
         Ok(written)
     }
     .await;
+    // The answer goes with a cancelled or broken read: dropping it closes the connection.
+    drop(response);
     drop(file);
     let result = match result {
         Ok(written) => tokio::fs::rename(&partial, destination)
@@ -236,20 +288,34 @@ const MAX_PLACES: usize = 16;
 /// The places the person chose in the save dialog, each under an opaque handle the page holds until it
 /// has a fresh stream address to fetch. The page never sees a path: it gets the handle, and hands it back
 /// with the address. At most [`MAX_PLACES`] are kept; an older one the page never came back for is
-/// forgotten first.
+/// forgotten first. Beside the places, the running downloads: each registered handle carries the
+/// switch [`cancel`](Self::cancel) throws, so the page can stop a download by the same handle it
+/// started it with, and quitting can stop them all.
 #[derive(Debug, Default)]
 pub struct Downloads {
     places: Mutex<VecDeque<(String, PathBuf)>>,
+    running: Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>,
 }
 
 impl Downloads {
-    /// No place chosen yet.
+    /// No place chosen yet, no download running.
     pub fn new() -> Self {
         Downloads::default()
     }
 
     fn places(&self) -> std::sync::MutexGuard<'_, VecDeque<(String, PathBuf)>> {
         self.places
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn running(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>,
+    > {
+        self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -270,6 +336,74 @@ impl Downloads {
         let mut places = self.places();
         let index = places.iter().position(|(kept, _)| kept == handle)?;
         places.remove(index).map(|(_, path)| path)
+    }
+
+    /// Starts watching for the cancel of the download the page opened under `handle`: the answer
+    /// is the switch [`save_to`](save_to) reads, and [`cancel`](Self::cancel) throws, until
+    /// [`finish`](Self::finish) takes the handle back out.
+    pub fn register(&self, handle: &str) -> tokio::sync::watch::Receiver<bool> {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        self.running().insert(handle.to_string(), sender);
+        receiver
+    }
+
+    /// The download under `handle` is over (saved, failed, or cancelled): the handle stops
+    /// meaning "running".
+    pub fn finish(&self, handle: &str) {
+        self.running().remove(handle);
+    }
+
+    /// Stops the download running under `handle`. False when none is running under it: a finished
+    /// download is not cancellable.
+    pub fn cancel(&self, handle: &str) -> bool {
+        match self.running().get(handle) {
+            Some(sender) => {
+                let _ = sender.send(true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Throws the switch of every running download: the way out of the app stops them all.
+    pub fn cancel_all(&self) {
+        for sender in self.running().values() {
+            let _ = sender.send(true);
+        }
+    }
+
+    /// Cancels every running download and then waits, for at most `limit`, for them to finish
+    /// taking their part files away. A save that has not stopped by then is left to itself:
+    /// quitting cannot wait on it forever.
+    pub async fn stop_all(&self, limit: Duration) {
+        self.cancel_all();
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            // Never hold the lock across the wait: the running downloads finish themselves.
+            let quiet = self.running().is_empty();
+            if quiet {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
+        }
+    }
+}
+
+/// Takes `handle` out of [`Downloads::finish`] on the way out of the save that registered it, on
+/// any way out: success, refusal, failure, or cancel. A running download is never left in the map
+/// because a command returned early.
+struct Running<'a> {
+    downloads: &'a Downloads,
+    handle: String,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.downloads.finish(&self.handle);
     }
 }
 
@@ -330,12 +464,16 @@ pub async fn choose_download_place<R: Runtime>(
 }
 
 /// Saves the file at `url` on instance `instance` to the place [`choose_download_place`] answered
-/// `handle` for. A refusal or a failure rejects with the line to show.
+/// `handle` for, reporting each [`Progress`] to the page through `on_progress` (a page that has gone
+/// away simply stops receiving them: the download goes on). The handle is registered as running
+/// before the fetch, so [`cancel_download`] can stop it by that same handle until the save is over.
+/// A refusal or a failure rejects with the line to show, including [`CANCELLED`] for a cancel.
 #[tauri::command]
 pub async fn save_download(
     instance: String,
     handle: String,
     url: String,
+    on_progress: tauri::ipc::Channel<Progress>,
     state: tauri::State<'_, DesktopState>,
     instances: tauri::State<'_, Instances>,
     downloads: tauri::State<'_, Downloads>,
@@ -343,10 +481,32 @@ pub async fn save_download(
     let destination = downloads
         .take(&handle)
         .ok_or_else(|| "Choose where to save the file again.".to_string())?;
+    let cancel = downloads.register(&handle);
+    let _running = Running {
+        downloads: &downloads,
+        handle: handle.clone(),
+    };
     let base = instance_base(&state, &instances, &instance).await?;
     let target = stream_target(&base, &url).ok_or_else(|| NOT_A_STREAM.to_string())?;
-    save_to(&client(), target, &destination).await?;
+    save_to(
+        &client(),
+        target,
+        &destination,
+        |progress| {
+            // A failed send means the page is gone; the download is the person's file and goes on.
+            let _ = on_progress.send(progress);
+        },
+        cancel,
+    )
+    .await?;
     Ok(())
+}
+
+/// Stops the download running under `handle` (the one [`choose_download_place`] answered to the
+/// page). False when none is running under it: a finished download is not cancellable.
+#[tauri::command]
+pub fn cancel_download(handle: String, downloads: tauri::State<'_, Downloads>) -> bool {
+    downloads.cancel(&handle)
 }
 
 #[cfg(test)]
@@ -355,8 +515,9 @@ mod tests {
 
     use fbtt_core::scratch::ScratchDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::watch;
 
-    use super::{Downloads, MAX_PLACES, client, save_to, stream_target, suggested_name};
+    use super::{Downloads, MAX_PLACES, Progress, client, save_to, stream_target, suggested_name};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -456,10 +617,11 @@ mod tests {
         let base = answering("200 OK", body.clone()).await;
         let target = stream_target(&base, &format!("{}?token=t", stream(&base))).expect("a target");
         let destination = dir.path().join("movie.mkv");
+        let (_keep, cancel) = watch::channel(false);
 
         let saved = tokio::time::timeout(
             Duration::from_secs(30),
-            save_to(&client(), target, &destination),
+            save_to(&client(), target, &destination, |_| {}, cancel),
         )
         .await
         .expect("within the deadline")
@@ -483,10 +645,13 @@ mod tests {
         std::fs::write(&theirs, b"the person's own").expect("their file");
         let destination = dir.path().join("movie.mkv");
         let refusing = answering("403 Forbidden", b"no".to_vec()).await;
+        let (_keep, refused_cancel) = watch::channel(false);
         save_to(
             &client(),
             stream_target(&refusing, &stream(&refusing)).expect("a target"),
             &destination,
+            |_| {},
+            refused_cancel,
         )
         .await
         .expect_err("a 403 is not a file");
@@ -495,9 +660,11 @@ mod tests {
         let base = answering("200 OK", body.clone()).await;
         let target = || stream_target(&base, &stream(&base)).expect("a target");
         let (one, two) = (client(), client());
+        let (_one_keep, cancel_one) = watch::channel(false);
+        let (_two_keep, cancel_two) = watch::channel(false);
         let (first, second) = tokio::join!(
-            save_to(&one, target(), &destination),
-            save_to(&two, target(), &destination),
+            save_to(&one, target(), &destination, |_| {}, cancel_one),
+            save_to(&two, target(), &destination, |_| {}, cancel_two),
         );
         first.expect("the first download");
         second.expect("the second download");
@@ -543,8 +710,9 @@ mod tests {
         let base = answering("403 Forbidden", b"no".to_vec()).await;
         let target = stream_target(&base, &stream(&base)).expect("a target");
         let destination = dir.path().join("movie.mkv");
+        let (_keep, cancel) = watch::channel(false);
 
-        let problem = save_to(&client(), target, &destination)
+        let problem = save_to(&client(), target, &destination, |_| {}, cancel)
             .await
             .expect_err("a 403 is not a file");
 
@@ -555,5 +723,266 @@ mod tests {
             0,
             "no part file is left"
         );
+    }
+
+    /// A stand-in instance that answers `body` with no Content-Length: the answer ends when the
+    /// connection does, so the client has no size to report against.
+    async fn answering_without_length(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: video/x-matroska\r\nconnection: close\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        base
+    }
+
+    /// A stand-in instance that answers with `bytes`-sized chunked frames `every` apart, forever:
+    /// the answer has no end, so only a cancel (or the stall timeout) stops a download from it.
+    async fn streaming_chunks(bytes: usize, every: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: video/x-matroska\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let body = vec![7u8; bytes];
+                    let frame_head = format!("{:x}\r\n", bytes);
+                    loop {
+                        tokio::time::sleep(every).await;
+                        if socket.write_all(frame_head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if socket.write_all(&body).await.is_err() {
+                            return;
+                        }
+                        if socket.write_all(b"\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    /// A 1 MiB answer with a Content-Length: progress starts at 0, never decreases, and its last
+    /// line is the whole file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_is_reported_and_ends_at_the_size() {
+        let dir = ScratchDir::new("desktop-download-progress");
+        let body: Vec<u8> = (0..1_048_576u32).map(|n| (n % 251) as u8).collect();
+        let base = answering("200 OK", body.clone()).await;
+        let target = stream_target(&base, &stream(&base)).expect("a target");
+        let destination = dir.path().join("movie.mkv");
+        let (_keep, cancel) = watch::channel(false);
+        let reports = std::sync::Mutex::new(Vec::new());
+
+        let saved = tokio::time::timeout(
+            Duration::from_secs(30),
+            save_to(
+                &client(),
+                target,
+                &destination,
+                |progress| reports.lock().expect("the reports").push(progress),
+                cancel,
+            ),
+        )
+        .await
+        .expect("within the deadline")
+        .expect("the file is saved");
+
+        let reports = reports.into_inner().expect("the reports");
+        let size = body.len() as u64;
+        assert_eq!(saved, size);
+        assert_eq!(
+            reports.first(),
+            Some(&Progress {
+                received: 0,
+                total: Some(size),
+            }),
+            "progress starts at 0, with the answer's size: {reports:?}"
+        );
+        assert!(
+            reports
+                .windows(2)
+                .all(|pair| pair[0].received <= pair[1].received),
+            "progress never decreases: {reports:?}"
+        );
+        assert_eq!(
+            reports.last(),
+            Some(&Progress {
+                received: size,
+                total: Some(size),
+            }),
+            "the last progress is the whole file: {reports:?}"
+        );
+    }
+
+    /// An answer with no Content-Length: every progress line says bytes only, with no total.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_without_a_length_has_no_total() {
+        let dir = ScratchDir::new("desktop-download-no-length");
+        let body: Vec<u8> = (0..70_000u32).map(|n| (n % 7) as u8).collect();
+        let base = answering_without_length(body.clone()).await;
+        let target = stream_target(&base, &stream(&base)).expect("a target");
+        let destination = dir.path().join("movie.mkv");
+        let (_keep, cancel) = watch::channel(false);
+        let reports = std::sync::Mutex::new(Vec::new());
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            save_to(
+                &client(),
+                target,
+                &destination,
+                |progress| reports.lock().expect("the reports").push(progress),
+                cancel,
+            ),
+        )
+        .await
+        .expect("within the deadline")
+        .expect("the file is saved");
+
+        let reports = reports.into_inner().expect("the reports");
+        assert!(
+            reports.iter().all(|progress| progress.total.is_none()),
+            "an answer with no Content-Length made a total: {reports:?}"
+        );
+        assert_eq!(
+            reports.last(),
+            Some(&Progress {
+                received: body.len() as u64,
+                total: None,
+            }),
+            "the last progress is the whole file, with no total: {reports:?}"
+        );
+    }
+
+    /// A server that sends chunked frames forever: the cancel that follows the first progress
+    /// with bytes in it ends the download well before the stall timeout, and the part file it
+    /// made is taken away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_stops_the_download_and_leaves_no_file() {
+        let dir = ScratchDir::new("desktop-download-cancel");
+        let base = streaming_chunks(4096, Duration::from_millis(40)).await;
+        let target = stream_target(&base, &stream(&base)).expect("a target");
+        let destination = dir.path().join("movie.mkv");
+        let (sender, cancel) = watch::channel(false);
+        let reports = std::sync::Mutex::new(Vec::new());
+
+        let mut asked = false;
+        let problem = tokio::time::timeout(
+            // Ten seconds, where the stall timeout is sixty: the cancel must end this on its own.
+            Duration::from_secs(10),
+            save_to(
+                &client(),
+                target,
+                &destination,
+                |progress| {
+                    reports.lock().expect("the reports").push(progress);
+                    if progress.received > 0 && !asked {
+                        asked = true;
+                        let _ = sender.send(true);
+                    }
+                },
+                cancel,
+            ),
+        )
+        .await
+        .expect("the download was cancelled, not stalled out")
+        .expect_err("a cancelled download is not a file");
+
+        assert_eq!(problem, "Download cancelled.");
+        let seen = reports.into_inner().expect("the reports");
+        assert!(
+            seen.iter().any(|progress| progress.received > 0),
+            "the download was cancelled before any byte arrived: {seen:?}"
+        );
+        assert!(!destination.exists(), "a cancelled download left the file");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the folder")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "a cancelled download left {left:?}");
+    }
+
+    #[test]
+    fn cancel_finds_the_running_download_by_its_handle() {
+        let downloads = Downloads::new();
+        let one = downloads.register("handle-one");
+        let two = downloads.register("handle-two");
+        assert!(
+            !downloads.cancel("handle-three"),
+            "a handle with no download running under it cancels nothing"
+        );
+        assert!(
+            !*one.borrow() && !*two.borrow(),
+            "nothing was cancelled yet"
+        );
+        assert!(
+            downloads.cancel("handle-one"),
+            "the running download is found by its handle"
+        );
+        assert!(*one.borrow(), "the flag the download watches is up");
+        assert!(!*two.borrow(), "the other download goes on");
+        downloads.cancel_all();
+        assert!(*two.borrow(), "cancel_all stops every running download");
+    }
+
+    #[test]
+    fn a_finished_download_is_no_longer_cancellable() {
+        let downloads = Downloads::new();
+        let receiver = downloads.register("place-1");
+        assert!(
+            downloads.cancel("place-1"),
+            "while it runs, the handle finds it"
+        );
+        downloads.finish("place-1");
+        assert!(
+            !downloads.cancel("place-1"),
+            "a finished download is forgotten and cannot be cancelled again"
+        );
+        assert!(
+            *receiver.borrow(),
+            "the cancel that came first still stands"
+        );
+        let untouched = downloads.register("place-2");
+        downloads.finish("place-2");
+        assert!(
+            !*untouched.borrow(),
+            "finishing on its own does not cancel what it watched"
+        );
+        let fresh = downloads.register("place-1");
+        assert!(!*fresh.borrow(), "a download started again is uncancelled");
     }
 }

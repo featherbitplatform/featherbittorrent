@@ -118,6 +118,7 @@ fn main() {
             commands::connect,
             download::choose_download_place,
             download::save_download,
+            download::cancel_download,
             window::system_title_bar,
             window::set_system_title_bar,
             instances::list_instances,

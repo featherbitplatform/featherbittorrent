@@ -29,6 +29,7 @@ const shell = vi.hoisted(() => ({
   savePassword: vi.fn(),
   chooseDownloadPlace: vi.fn(() => Promise.resolve('place-1' as string | null)),
   saveDownload: vi.fn(() => Promise.resolve()),
+  cancelDownload: vi.fn(() => Promise.resolve()),
   setTrayInstance: vi.fn(() => Promise.resolve()),
   takeOpened: vi.fn(() => Promise.resolve([] as unknown[])),
   getShortcuts: vi.fn(() => Promise.resolve([])),
@@ -45,6 +46,7 @@ vi.mock('./bridge', () => ({
   savePassword: shell.savePassword,
   chooseDownloadPlace: shell.chooseDownloadPlace,
   saveDownload: shell.saveDownload,
+  cancelDownload: shell.cancelDownload,
   addInstance: vi.fn(),
   removeInstance: vi.fn(),
   setDefaultInstance: vi.fn(),
@@ -120,7 +122,11 @@ vi.mock('../App', () => ({
           <button
             type="button"
             onClick={() =>
-              void save.choose('movie.mkv').then((handle) => save.save(handle ?? '', 'http://127.0.0.1:53211/stream'))
+              void save.choose('movie.mkv').then((handle) =>
+                handle === null
+                  ? Promise.resolve()
+                  : save.run('a:0', handle, 'http://127.0.0.1:53211/stream'),
+              )
             }
           >
             save a file
@@ -161,6 +167,7 @@ afterEach(() => {
   shell.savePassword.mockReset()
   shell.chooseDownloadPlace.mockClear()
   shell.saveDownload.mockClear()
+  shell.cancelDownload.mockClear()
   shell.setTrayInstance.mockClear()
   shell.takeOpened.mockReset()
   shell.takeOpened.mockResolvedValue([])
@@ -210,7 +217,14 @@ it('the_players_download_goes_through_the_shell_for_the_instance_shown', async (
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
   fireEvent.click(screen.getByRole('button', { name: 'save a file' }))
-  await waitFor(() => expect(shell.saveDownload).toHaveBeenCalledWith('local', 'place-1', `${BASE}/stream`))
+  await waitFor(() =>
+    expect(shell.saveDownload).toHaveBeenCalledWith(
+      'local',
+      'place-1',
+      `${BASE}/stream`,
+      expect.any(Function),
+    ),
+  )
   expect(shell.chooseDownloadPlace).toHaveBeenCalledWith('movie.mkv')
 })
 

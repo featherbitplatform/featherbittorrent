@@ -49,7 +49,7 @@ import Button from '../components/Button'
 import { ConnectionContext, createConnection } from '../connection'
 import type { Connection } from '../connection'
 import { useTitleBarSlots } from '../components/titleBarSlots'
-import { DesktopDownloadContext } from '../desktopDownload'
+import { createDownloads, DesktopDownloadContext } from '../desktopDownload'
 import type { DesktopDownload } from '../desktopDownload'
 import { DesktopSettingsContext } from '../desktopSettings'
 import type { DesktopSettingsSlot, SettingsRequest } from '../desktopSettings'
@@ -62,6 +62,7 @@ import {
   getShortcuts,
   listInstances,
   LOCAL_ID,
+  cancelDownload,
   chooseDownloadPlace,
   probeInstance,
   saveDownload,
@@ -163,9 +164,17 @@ function Connected({
   useEffect(() => {
     if (refused) onTokenRefused(token)
   }, [refused, token, onTokenRefused])
-  // The player's Download, through the shell: a link to the engine's origin would take the window away.
+  // The player's Download, through the shell: a link to the engine's origin would take the window
+  // away. The store of running downloads lives here, above the screens, so closing the player
+  // neither cancels a download nor forgets it; remounting for a new instance or token starts a
+  // store afresh, as it starts a connection afresh.
   const save = useMemo<DesktopDownload>(
-    () => ({ choose: chooseDownloadPlace, save: (handle, url) => saveDownload(id, handle, url) }),
+    () =>
+      createDownloads(
+        chooseDownloadPlace,
+        (handle, url, onProgress) => saveDownload(id, handle, url, onProgress),
+        cancelDownload,
+      ),
     [id],
   )
   if (refused) return <Connecting />

@@ -110,9 +110,12 @@ library, a second app pointed at the same directories through the two variables 
 with `featherbittorrent is already running.` and a `Quit` button, and quitting from there exits with code 3,
 the terminal client's code for the same thing.
 
-The player's `Download` asks where to save first, then writes the file there in the background. A download
-runs until it finishes; quitting the app before then leaves a `<name>.<random>.part` file next to where the
-file would have gone, which you can delete.
+The player's `Download` asks where to save first, then writes the file there in the background. Where it
+has gotten shows in the player (`Downloading 42% (1.2 GiB of 2.9 GiB)`, or the bytes so far where the
+server gives no file size), and `Cancel download` stops it. Closing the player keeps a download running;
+reopen it on the same file and the download is shown where it stands, and only one download runs per file
+at a time. A cancelled download, and any download that did not finish, leaves no partial file: quitting
+the app cancels the downloads that are running and takes their `<name>.<random>.part` files away.
 
 ## Where the app's files live
 

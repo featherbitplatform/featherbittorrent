@@ -2,7 +2,8 @@
 //!
 //! The decisions are pure functions ([`on_close_requested`], [`initial_window_state`]) tested without a
 //! webview; the rest of this file applies them to the app. Every way out of the app ends in [`quit`],
-//! which stops This computer (the engine's final save) before the process exits: the tray's Quit, a close
+//! which cancels the running downloads (their part files come down) and stops This computer (the
+//! engine's final save) before the process exits: the tray's Quit, a close
 //! that means quit, the page's own answer to the first-close question, a quit signal on Unix, and an exit
 //! request Tauri reports while This computer runs. The system's own quit (Cmd+Q, logging out, shutting
 //! down) reaches [`handle_run_event`] as `RunEvent::Exit` with nothing before it, and the process ends
@@ -180,6 +181,11 @@ pub const STOP_BUDGET: Duration = Duration::from_secs(30);
 /// [`START_WAIT`]) and only then stops the engine, so the exit's wait covers both: a shorter one would end
 /// the process in the middle of the final save of a large library that was slow to start.
 pub const QUIT_WAIT: Duration = START_WAIT.saturating_add(STOP_BUDGET);
+
+/// How long a quit gives the running downloads to notice the cancel and take their part files away
+/// before it goes on to stop This computer. It runs inside a quit only; the exit's wait for that
+/// quit stays bounded by [`QUIT_WAIT`]. A download that has not stopped by then is left to itself.
+const DOWNLOAD_WAIT: Duration = Duration::from_secs(2);
 
 /// Where the app is on its way out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +467,11 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let lifecycle = app.state::<Lifecycle>();
         let state = app.state::<DesktopState>();
+        // Running downloads are the part of quitting a person can see: their part files come
+        // down before the process does. The wait is capped, so it cannot lean on QUIT_WAIT.
+        app.state::<crate::download::Downloads>()
+            .stop_all(DOWNLOAD_WAIT)
+            .await;
         lifecycle.stop_for_quit(&state).await;
         let code = state.startup().exit_code();
         // Stopped before the exit, so the exit request it causes is let through.
@@ -490,9 +501,14 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
             match on_exit(lifecycle.phase()) {
                 ExitAnswer::StopHere => {
                     if lifecycle.begin_quit() {
-                        tauri::async_runtime::block_on(
-                            lifecycle.stop_for_quit(&app.state::<DesktopState>()),
-                        );
+                        tauri::async_runtime::block_on(async {
+                            // The same stop as `quit` runs: downloads first (their part files come
+                            // down, capped by DOWNLOAD_WAIT), then This computer's final save.
+                            app.state::<crate::download::Downloads>()
+                                .stop_all(DOWNLOAD_WAIT)
+                                .await;
+                            lifecycle.stop_for_quit(&app.state::<DesktopState>()).await;
+                        });
                         lifecycle.finish_quit();
                     } else if !lifecycle.wait_for_quit(QUIT_WAIT) {
                         eprintln!("The final save did not finish in time; quitting without it.");
