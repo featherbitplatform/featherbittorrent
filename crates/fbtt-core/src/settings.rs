@@ -318,15 +318,25 @@ fn batch_problem(_program: &Path) -> Option<SettingsProblem> {
 }
 
 /// Whether `program`'s file name ends in a Windows batch file's extension, read case-insensitively
-/// because Windows spells extensions whichever way it likes.
-#[cfg(any(windows, test))]
-fn batch_file(program: &Path) -> bool {
+/// because Windows spells extensions whichever way it likes, and from the end of the name with any run of
+/// trailing dots and spaces dropped.
+///
+/// The trimming is Windows' own: when it matches a name to a program to run it throws away a name's
+/// trailing dots and spaces, so `notify.bat.` and `NOTIFY.BAT ` are that batch file to `cmd.exe` however
+/// the person spelled them. Nothing before the end is trimmed - a space in the middle of a name is part
+/// of the name, and `notify.bat.txt` is a text file with `.bat` in the middle of it.
+///
+/// `pub(crate)` rather than private to this module because [`crate::downloads`] asks the same question
+/// before it starts a program, and a rule about what a file *is* that two places answer differently is
+/// two rules.
+pub(crate) fn batch_file(program: &Path) -> bool {
     let Some(name) = program
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
     else {
         return false;
     };
+    let name = name.trim_end_matches(['.', ' ']);
     name.ends_with(".bat") || name.ends_with(".cmd")
 }
 
@@ -720,6 +730,37 @@ mod tests {
                 "this host runs a .bat as a program like any other"
             );
         }
+    }
+
+    /// Windows drops trailing dots and spaces when it matches a name to a program to run, so `notify.bat.`
+    /// and `NOTIFY.BAT ` are batch files to `cmd.exe` however the person spelled them. The trimming is
+    /// only ever from the end of the name: everything before it is the name itself.
+    #[test]
+    fn batch_file_rule_reads_trailing_dots_and_spaces() {
+        assert!(
+            batch_file(Path::new("/srv/hooks/notify.bat.")),
+            "a name that ends in a dot is that name without the dot to Windows"
+        );
+        assert!(
+            batch_file(Path::new("NOTIFY.BAT ")),
+            "and so is one that ends in a space, spelled whichever way"
+        );
+        assert!(
+            batch_file(Path::new("/srv/hooks/run.cmd... ")),
+            "a run of dots and spaces at the end hides the extension behind it"
+        );
+        assert!(
+            batch_file(Path::new("/srv/hooks/notify .bat")),
+            "a space in the middle of a name is part of the name, not a reason it is not a batch file"
+        );
+        assert!(
+            !batch_file(Path::new("/srv/hooks/notify.bat.txt")),
+            "but only from the end: this is a text file with `.bat` in the middle of its name"
+        );
+        assert!(
+            !batch_file(Path::new("/srv/hooks/...")),
+            "and a name that is nothing but dots is not a batch file either"
+        );
     }
 
     /// A change that leaves `on_complete` out keeps the program the config has. That is what a web UI

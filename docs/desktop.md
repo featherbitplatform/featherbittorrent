@@ -187,26 +187,35 @@ the last piece arrives, so an unfinished torrent is not mixed in among finished 
 not copied, so this costs no more for a large download than for a small one, and nothing is left in the
 folder they came from. Choose a folder in the Add dialog and the files go there and stay there: the
 unfinished folder only moves what would have gone to the Downloads folder anyway, so a torrent you put
-somewhere on purpose is never moved out of it.
+somewhere on purpose is never moved out of it. The setting itself does not fetch from folders it used to
+name: change `downloads.unfinished_dir` and what an older unfinished folder holds stays there - the new
+folder takes what arrives from now on, and a torrent already working there, or already whole there, keeps
+that folder to the end.
 
 **`.torrent` files you drop in a folder.** `downloads.watch_dir` is read once when the app starts and every
 two seconds after that. A `.torrent` that has stopped growing is added to the Downloads folder and renamed
-`<name>.torrent.added`; one bigger than 16 MiB, or one whose bytes are not a torrent, is renamed
-`<name>.torrent.invalid`. A marker name somebody has already taken comes back numbered, `.added.2`, `.3`
-and on. Nothing in that folder is copied, moved elsewhere, or deleted, and a `.torrent` for something the
-library already has adds nothing a second time, so this is a folder to put things in and not one to take
-things out of: empty it when you want to.
+`<name>.torrent.added`; one bigger than 16 MiB, one whose bytes are not a torrent, or one that is a link or
+somebody else's file by the time the folder reads it, is renamed `<name>.torrent.invalid`. A marker name
+somebody has already taken comes back numbered, `.added.2`, `.3` and on. Nothing in that folder is copied,
+moved elsewhere, or deleted, and a `.torrent` for something the library already has adds nothing a second
+time, so this is a folder to put things in and not one to take things out of: empty it when you want to.
 
 **Start paused.** With `downloads.start_paused` on, a torrent the watch folder brings in waits for you to
 start it. What you add from the window starts when you add it, whatever this says.
 
-**A program when a torrent finishes.** `downloads.on_complete` names a program by its full path. It is
-started with exactly two arguments, the torrent's name and the folder its files ended up in, and never
-through a shell, so a name holding a space or a `;` arrives as one argument and cannot turn into a command.
-It is given nowhere to print, and the app does not wait for it to finish. On `This computer` that is a
-program on your own machine, started as you. For an instance that is a server it is that server's own
-program: it runs where that server runs, as whoever runs it, the window cannot change it, and the server is
-restarted after its file changes.
+**A program when a torrent finishes.** `downloads.on_complete` names a program by its full path, and the
+whole path is what works: a relative one or a bare name is refused rather than started, because which file
+either one means depends on where the app or server was started, and the line that says so is a warning
+line like any other (see the next paragraph); on Windows a `.bat` or `.cmd` is refused too, because Windows
+starts those through a shell. A program runs for a finish only - a torrent that arrives whole gets nothing
+for the add. It is started with exactly two arguments, the torrent's name and the folder its files ended up
+in, and never through a shell, so a name holding a space or a `;` arrives as one argument and cannot turn
+into a command; a torrent's name can begin with `-`, though, which to a program that takes options reads
+like one. It is given nowhere to print, and the app does not wait for it to finish. On `This computer` that
+is a program on your own machine, started as you, with the app's own environment and the folder the app was
+launched from as its working directory. For an instance that is a server it is that server's own program:
+it runs where that server runs, as whoever runs it, in that server's environment, the window cannot change
+it, and the server is restarted after its file changes.
 
 **Where a problem is said.** A watch folder that cannot be read, a `.torrent` that was refused, a move the
 engine would not make, a program that would not start: on a server each of those is a warning line in its

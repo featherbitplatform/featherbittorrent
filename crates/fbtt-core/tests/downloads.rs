@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use fbtt_core::downloads::WATCH_EVERY;
+use fbtt_core::downloads::{WATCH_EVERY, test_support};
 use fbtt_core::{
     AddSource, Client, Command, Config, DownloadsConfig, LiveLimits, Notice, RowState, TorrentId,
     TorrentRow,
@@ -498,6 +498,10 @@ async fn program_gets_name_and_final_folder() {
     drop(done);
 
     let log = default.join(FAKE_LOG);
+    // A run owed to this torrent has had every chance to happen by now: the answer to the move back, and
+    // three watch folder passes on top of the second the torrent has been whole for. A second run would
+    // be in the log by now too.
+    tokio::time::sleep(3 * WATCH_EVERY).await;
     let text = recorded(&log).await;
     let lines: Vec<&str> = text
         .lines()
@@ -559,6 +563,10 @@ async fn program_that_does_not_exist_is_a_notice() {
         line.len() > COULD_NOT_START.len(),
         "the line carries a reason: {line}"
     );
+    assert!(
+        line.contains(&missing.display().to_string()),
+        "the line names the program nobody could start, which is the thing to fix: {line}"
+    );
     assert_eq!(
         handle.problems().1.as_deref(),
         Some(line.as_str()),
@@ -568,6 +576,483 @@ async fn program_that_does_not_exist_is_a_notice() {
         handle.problems().0,
         None,
         "nothing else went wrong, so nothing else is blamed"
+    );
+
+    shutdown(client, task).await;
+    seed.stop().await;
+}
+
+/// A library whose unfinished folder already holds a complete torrent's files, with the `.torrent` that
+/// names them and the id they are the same thing as.
+///
+/// What the automation finds sitting whole in the unfinished folder is its fastest way to a completion
+/// program: there is no download to wait for, because handing the torrent back to the default folder *is*
+/// the finish. The default folder is made here too, since a move to a folder that is not there is a
+/// different problem from the one a test is asking about.
+async fn whole_in_unfinished(lib: &Library, name: &str, unfinished: &Path) -> (Vec<u8>, TorrentId) {
+    fs::create_dir_all(&lib.config.download_dir).expect("the default folder");
+    fs::create_dir_all(unfinished).expect("the unfinished folder");
+    let payload = write_file(unfinished, name, &sample(64 * 1024));
+    let bytes = torrent_for(&payload).await;
+    let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
+    (bytes, id_of(&metainfo.info_hashes))
+}
+
+/// Waits until the automation is parked in a watch folder pass, which is the moment a test knows the loop
+/// is in the middle of a wake and cannot act on anything the session says in the meantime.
+async fn wait_until_parked() {
+    within(async {
+        loop {
+            if test_support::watch_folder_is_parked() {
+                return;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+}
+
+/// The reason a refused program is told with: the words that name the program itself, which is what a
+/// person has to see to fix the line they wrote.
+const NOT_ABSOLUTE: &str = "not an absolute path";
+
+/// A program named by a relative path is refused before anything is started, with the same line and the
+/// same field as a program that would not start.
+///
+/// `Config` leaves `on_complete` exactly as it was written - it names a program, not a folder to root in
+/// the library - and a server reads its own `config.yaml`, which a person edits by hand between two
+/// starts with nothing validating it. A name like this one means "below whatever directory this process
+/// was started in", which is not where the person meant and not the same run twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn relative_program_is_refused_at_run_time() {
+    let lib = Library::new("dl_relative_program");
+    let unfinished = lib.dir.path().join("incomplete");
+    let default = lib.config.download_dir.clone();
+    let program = PathBuf::from("hooks/notify-torrent");
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            unfinished_dir: Some(unfinished.clone()),
+            on_complete: Some(program.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (bytes, id) = whole_in_unfinished(&lib, "payload.bin", &unfinished).await;
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    add(&mut client, bytes, Some(unfinished.clone()), "payload.bin").await;
+
+    // The torrent is whole and in the unfinished folder, so handing it back is the finish, and the
+    // program is what the settings asked for after it.
+    let placed = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    let row = row_of(&placed, &id).expect("the placed torrent");
+    assert_eq!(
+        row.state,
+        RowState::Seeding,
+        "and it is whole where it belongs: {row:?}"
+    );
+    drop(placed);
+    wait_for_settle().await;
+
+    assert!(
+        !fs::exists(default.join(FAKE_LOG)).unwrap_or(false),
+        "a program that is not an absolute path is never started, so the stand-in never wrote its record: {:?}",
+        list_dir(&default),
+    );
+
+    let line = notice_where(&mut client, |text| text.starts_with(COULD_NOT_START)).await;
+    assert!(
+        line.contains(NOT_ABSOLUTE),
+        "the reason is that the name is not a path from the root of the filesystem: {line}"
+    );
+    assert!(
+        line.contains(&program.display().to_string()),
+        "and it names the program it refused: {line}"
+    );
+    assert_eq!(
+        handle.problems().1.as_deref(),
+        Some(line.as_str()),
+        "the settings screen shows the same line beside the field"
+    );
+    assert_eq!(
+        handle.problems().0,
+        None,
+        "nothing else went wrong, so nothing else is blamed"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A bare program name is refused too, for the same reason in a different shape: with no path in it, the
+/// name is looked up on `PATH` - which on a server is whatever the service user's `PATH` happens to be,
+/// not the folder the person was thinking of, and a torrent finishing is not the time to guess.
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_program_name_is_refused_at_run_time() {
+    let lib = Library::new("dl_bare_program");
+    let unfinished = lib.dir.path().join("incomplete");
+    let default = lib.config.download_dir.clone();
+    let program = PathBuf::from("notify-torrent-not-on-any-path");
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            unfinished_dir: Some(unfinished.clone()),
+            on_complete: Some(program.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (bytes, id) = whole_in_unfinished(&lib, "payload.bin", &unfinished).await;
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    add(&mut client, bytes, Some(unfinished.clone()), "payload.bin").await;
+
+    let placed = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    drop(placed);
+    wait_for_settle().await;
+
+    assert!(
+        !fs::exists(default.join(FAKE_LOG)).unwrap_or(false),
+        "a name with no path in it is refused rather than searched for on PATH: {:?}",
+        list_dir(&default),
+    );
+
+    let line = notice_where(&mut client, |text| text.starts_with(COULD_NOT_START)).await;
+    assert!(
+        line.contains(NOT_ABSOLUTE),
+        "the reason is the name, not an operating system's search: {line}"
+    );
+    assert!(
+        line.contains(&program.display().to_string()),
+        "and it names the program it refused: {line}"
+    );
+    assert_eq!(handle.problems().1.as_deref(), Some(line.as_str()));
+    assert_eq!(handle.problems().0, None);
+
+    shutdown(client, task).await;
+}
+
+/// On Windows a `.bat` or a `.cmd` is refused as well, because Windows starts those through `cmd.exe`:
+/// the remote-controlled torrent name would arrive as an argument to a shell rather than to a program.
+/// Everywhere else a `.bat` is an executable file like any other and is run, which is why this test is
+/// Windows-only while the extension rule itself is checked on every host in `settings.rs`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_program_is_refused_at_run_time() {
+    let lib = Library::new("dl_batch_program");
+    let unfinished = lib.dir.path().join("incomplete");
+    let default = lib.config.download_dir.clone();
+    // An absolute path to a file that really is there: the extension is the whole problem, so nothing
+    // else may be wrong with it.
+    let program = write_file(&lib.dir.path().join("hooks"), "notify.bat", "@echo off\r\n");
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            unfinished_dir: Some(unfinished.clone()),
+            on_complete: Some(program.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (bytes, id) = whole_in_unfinished(&lib, "payload.bin", &unfinished).await;
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    add(&mut client, bytes, Some(unfinished.clone()), "payload.bin").await;
+
+    let placed = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    drop(placed);
+    wait_for_settle().await;
+
+    assert!(
+        !fs::exists(default.join(FAKE_LOG)).unwrap_or(false),
+        "the batch file is not started, so nothing ran it: {:?}",
+        list_dir(&default),
+    );
+
+    let line = notice_where(&mut client, |text| text.starts_with(COULD_NOT_START)).await;
+    assert!(
+        line.contains("batch file"),
+        "the reason is what a batch file is on Windows: {line}"
+    );
+    assert!(
+        line.contains(&program.display().to_string()),
+        "and it names the program it refused: {line}"
+    );
+    assert_eq!(handle.problems().1.as_deref(), Some(line.as_str()));
+
+    shutdown(client, task).await;
+}
+
+/// A torrent added already whole gets no completion program: it never finished here, it arrived finished,
+/// and the settings say one run per finish.
+///
+/// The park matters: the session says "added" before the torrent's actor even exists, so the only way this
+/// task ever sees such a torrent as whole is by being busy while the engine checked its data. Parked, the
+/// torrent is checked and reported whole with the loop still holding its last wake; released, the loop
+/// takes the add it has been holding and looks at a torrent that was whole from the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn program_does_not_run_for_a_torrent_added_whole() {
+    let lib = Library::new("dl_added_whole");
+    let watch = lib.dir.path().join("watch");
+    let default = lib.config.download_dir.clone();
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            watch_dir: Some(watch.clone()),
+            on_complete: Some(PathBuf::from(FAKE)),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (bytes, id) = {
+        let payload = write_file(&default, "held.bin", &sample(64 * 1024));
+        let bytes = torrent_for(&payload).await;
+        let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
+        (bytes, id_of(&metainfo.info_hashes))
+    };
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    fs::create_dir_all(&watch).expect("the watch folder");
+
+    test_support::park_the_watch_folder();
+    wait_until_parked().await;
+    add(&mut client, bytes, None, "held.bin").await;
+
+    // The engine has checked it: the files were already here, so it is whole before the loop is let go.
+    let whole = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &id)
+            .is_some_and(|row| row.state == RowState::Seeding && row.progress == 1.0)
+    })
+    .await;
+    let row = row_of(&whole, &id).expect("the added torrent");
+    assert_eq!(
+        row.save_path, default,
+        "and it is where it was added: {row:?}"
+    );
+    drop(whole);
+    test_support::release_the_watch_folder();
+
+    // A few passes over everything the settings do, in case a program was owed to it by some other route.
+    wait_for_settle().await;
+    let last = client.snapshot();
+    assert_eq!(
+        row_of(&last, &id).expect("the torrent is still here").state,
+        RowState::Seeding,
+        "the torrent is here and whole: {:?}",
+        last.torrents
+    );
+    drop(last);
+    assert!(
+        !fs::exists(default.join(FAKE_LOG)).unwrap_or(false),
+        "a torrent that arrived whole never finished here, so its program does not run: {:?}",
+        list_dir(&default),
+    );
+    assert_eq!(
+        handle.problems(),
+        (None, None),
+        "and nothing went wrong on the way"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A move back that fails for a reason the next wake will not fix - a file of somebody else's already at
+/// the target - is still one warning line, and the program still runs, with the folder the files are
+/// actually in.
+///
+/// Leaving a finished torrent without its program because a *move* went wrong would be the app punishing
+/// the person for the torrent they finished: the files are whole where they are, and a program that plays
+/// or notifies has no interest in which folder it was asked from.
+#[tokio::test(flavor = "multi_thread")]
+async fn program_runs_in_place_when_the_move_back_fails() {
+    let seed = Seed::start("dl_move_failed").await;
+    let lib = Library::new("dl_move_failed_leech");
+    let unfinished = lib.dir.path().join("incomplete");
+    let default = lib.config.download_dir.clone();
+    // Somebody else's file, wearing the name this torrent's payload would take in the default folder: the
+    // engine is told never to replace what is at the target, so this move cannot work.
+    let other = write_file(&default, "payload.bin", b"not this torrent's file\n");
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            unfinished_dir: Some(unfinished.clone()),
+            on_complete: Some(PathBuf::from(FAKE)),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, engine, handle) = lib.start_with_automation(config).await;
+    slow_down(&mut client);
+    add(
+        &mut client,
+        seed.bytes.clone(),
+        Some(unfinished.clone()),
+        "payload.bin",
+    )
+    .await;
+
+    let done = finish(&mut client, &engine, &seed.id, seed.addr).await;
+    assert_eq!(
+        done.save_path, unfinished,
+        "it finished where it was downloading: {done:?}"
+    );
+    drop(done);
+
+    let line = notice_where(&mut client, |text| text.starts_with("Could not move ")).await;
+    assert!(
+        line.contains("payload.bin"),
+        "the line names the torrent whose move failed: {line}"
+    );
+    assert!(
+        line.contains("download folder"),
+        "and the folder it could not get into: {line}"
+    );
+
+    // The program runs, once, with the folder the files are really in.
+    let log = unfinished.join(FAKE_LOG);
+    let text = recorded(&log).await;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one run for one finish, wherever it was: {text}"
+    );
+    let recording: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("the stand-in writes one JSON line");
+    assert_eq!(
+        args_of(&recording),
+        ["payload.bin".to_string(), unfinished.display().to_string(),],
+        "the name, and the folder the files are actually in"
+    );
+
+    assert_eq!(
+        fs::read(&other).expect("the other person's file"),
+        b"not this torrent's file\n",
+        "a failed move wrote nothing over anything"
+    );
+    assert!(
+        !fs::exists(default.join(FAKE_LOG)).unwrap_or(false),
+        "and the record is beside the folder the program was run for: {:?}",
+        list_dir(&default),
+    );
+    assert_eq!(
+        handle.problems().1,
+        None,
+        "a program that ran has nothing to complain about, even beside a move that failed"
+    );
+
+    shutdown(client, task).await;
+    seed.stop().await;
+}
+
+/// A lost event does not lose a torrent its finish.
+///
+/// The session drops events for a subscriber that cannot keep up - a `TorrentFinished` among them, which
+/// is the one thing this task cannot do without - and the recovery is to look at what the session holds
+/// now and finish the torrents that clearly finished in the gap: move them back, then run their programs.
+/// The hook here drops the finish itself, which is what an overflowed queue does to it, and the 1 MiB
+/// download runs under its own throttle while it is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn lagged_events_still_finish_and_run_the_program() {
+    let seed = Seed::start("dl_lagged").await;
+    let lib = Library::new("dl_lagged_leech");
+    let unfinished = lib.dir.path().join("incomplete");
+    let default = lib.config.download_dir.clone();
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            unfinished_dir: Some(unfinished.clone()),
+            on_complete: Some(PathBuf::from(FAKE)),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, engine, handle) = lib.start_with_automation(config).await;
+    slow_down(&mut client);
+    add(&mut client, seed.bytes.clone(), None, "payload.bin").await;
+    // The torrent's own info hashes, which are what the event carries: a torrent made by these tests is a
+    // hybrid, so a v1-only hash would name a different torrent and the queue would lose nothing at all.
+    let hashes = fbt::Metainfo::from_bytes(&seed.bytes)
+        .expect("the seed's torrent")
+        .info_hashes;
+    // Armed while the download is still about eight seconds from its last piece: this torrent's finish is
+    // the event the queue is about to lose.
+    test_support::lag_when_it_finishes(hashes);
+
+    let moved = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &seed.id).is_some_and(|row| row.save_path == unfinished)
+    })
+    .await;
+    drop(moved);
+
+    let done = finish(&mut client, &engine, &seed.id, seed.addr).await;
+    assert_eq!(done.progress, 1.0, "the last piece landed: {done:?}");
+    drop(done);
+    assert!(
+        test_support::lag_was_injected(),
+        "this test is about a finish that never arrived, so the hook has to have dropped it",
+    );
+
+    // A few wakes' worth of grace, which is what the recovery needs: it is a look at what the session holds,
+    // and it happens on the next wake, not on the drop of the event.
+    wait_for_settle().await;
+    wait_for_settle().await;
+
+    // Nothing was listening for the finish, so the whole files come back on the recovery's say-so and on
+    // nobody else's: the unfinished folder is empty of them, and the default folder has them.
+    let left_behind = list_dir(&unfinished);
+    assert!(
+        !left_behind.iter().any(|name| name == "payload.bin"),
+        "a lost event did not leave the finished files where they were downloaded: {left_behind:?}"
+    );
+
+    let placed = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &seed.id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    let row = row_of(&placed, &seed.id).expect("the placed torrent");
+    assert_eq!(
+        row.progress, 1.0,
+        "whole, and back where it belongs: {row:?}"
+    );
+    drop(placed);
+
+    let log = default.join(FAKE_LOG);
+    let text = recorded(&log).await;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the missed finish is run once, not once for the recovery and once for a later event: {text}"
+    );
+    let recording: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("the stand-in writes one JSON line");
+    assert_eq!(
+        args_of(&recording),
+        ["payload.bin".to_string(), default.display().to_string(),],
+        "the name, and the folder the recovery moved it into"
+    );
+    assert!(
+        !fs::exists(unfinished.join(FAKE_LOG)).unwrap_or(false),
+        "the record is beside the folder it was run for: {:?}",
+        list_dir(&unfinished),
+    );
+    assert_eq!(
+        handle.problems(),
+        (None, None),
+        "and a recovered finish reports nothing wrong"
     );
 
     shutdown(client, task).await;
@@ -759,6 +1244,293 @@ async fn watch_folder_refuses_a_file_past_the_size_limit() {
     );
     drop(snapshot);
     assert_eq!(handle.problems().0.as_deref(), Some(line.as_str()));
+
+    shutdown(client, task).await;
+}
+
+/// A candidate that is a link by the time its bytes are read is refused, and nothing is read from behind
+/// it.
+///
+/// The look that accepted this name saw a regular file; between that look and the read something put a
+/// link in its place, and a read that follows links would take whatever the link stands for - a file in
+/// another folder, `/dev/zero`, a FIFO nobody is writing to - into memory, or never finish at all. What
+/// the folder is told to add is the file it looked at, not whatever answers to that name a moment later.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_folder_refuses_a_symlink_swapped_in() {
+    let lib = Library::new("watch_swapped");
+    let watch = lib.dir.path().join("watch");
+    let (bytes, id) = torrent_in_seed_dir(&lib, "swapped", "swapped.bin").await;
+    // A torrent the watch folder was never told about, in a folder of its own, which is what the link
+    // stands for by the time the read comes.
+    let target = write_file(&lib.dir.path().join("elsewhere"), "other.torrent", &bytes);
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            watch_dir: Some(watch.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    write_file(&watch, "swapped.torrent", &bytes);
+    test_support::when_the_watch_folder_reads(
+        watch.join("swapped.torrent"),
+        test_support::AtRead::SwapToSymlink {
+            target: target.clone(),
+        },
+    );
+
+    // The complaint is caught the moment it appears. The field only carries the folder's current complaint
+    // - a pass after the refusal finds the name already renamed out of the way, has nothing left to say,
+    // and clears it - so "this same line is what the field shows" can only be asked while the refusal is
+    // what happened this very pass, which is the moment the notice goes out.
+    let line = notice_where(&mut client, |text| text.contains("swapped.torrent")).await;
+    assert!(
+        line.contains("changed between the look and the read"),
+        "the reason is that the name stands for a different file than the one that was looked at: {line}"
+    );
+    assert_eq!(
+        handle.problems().0.as_deref(),
+        Some(line.as_str()),
+        "the same line is what the watch folder's field shows"
+    );
+    wait_for_file(watch.join("swapped.torrent.invalid"), true).await;
+
+    let snapshot = client.snapshot();
+    assert!(
+        row_of(&snapshot, &id).is_none(),
+        "the torrent behind the link was not added: {:?}",
+        snapshot.torrents
+    );
+    drop(snapshot);
+    assert_eq!(
+        fs::metadata(&target)
+            .expect("the file the link stands for is still where it was")
+            .len(),
+        bytes.len() as u64,
+        "and nothing was read out of it or moved with it"
+    );
+    assert_eq!(
+        handle.problems().0.as_deref(),
+        Some(line.as_str()),
+        "the same line is what the watch folder's field shows"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A file that grew past the size limit after it settled is refused by the size the read found, not by the
+/// size the settling look saw.
+///
+/// Two looks saying the same thing is the folder's whole answer to "is somebody still writing this?", and
+/// it is a look at a name, not at the bytes: a file appended to between the look and the read is bigger
+/// than the folder decided it was, and the limit is about how much is read into memory, so it is the size
+/// at the read that has to be the one asked about.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_folder_refuses_a_file_grown_past_the_limit_after_settling() {
+    use fbtt_core::downloads::MAX_WATCHED_FILE;
+
+    let lib = Library::new("watch_grown");
+    let watch = lib.dir.path().join("watch");
+    let (bytes, id) = torrent_in_seed_dir(&lib, "grown", "grown.bin").await;
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            watch_dir: Some(watch.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    write_file(&watch, "grown.torrent", &bytes);
+    // Appended to, after the two looks agreed and while the read of it is what is left to do: the look
+    // that accepted this candidate still says it is a few hundred bytes.
+    test_support::when_the_watch_folder_reads(
+        watch.join("grown.torrent"),
+        test_support::AtRead::GrowTo {
+            bytes: MAX_WATCHED_FILE + 1024 * 1024,
+        },
+    );
+
+    let line = notice_where(&mut client, |text| text.contains("grown.torrent")).await;
+    assert!(
+        line.contains("bytes now"),
+        "the reason is the size there at the read, not the size the look saw: {line}"
+    );
+    assert!(
+        line.contains("16 MiB"),
+        "named in the units the limit is set in: {line}"
+    );
+    wait_for_file(watch.join("grown.torrent.invalid"), true).await;
+
+    let snapshot = client.snapshot();
+    assert!(
+        row_of(&snapshot, &id).is_none(),
+        "nothing was added from it: {:?}",
+        snapshot.torrents
+    );
+    drop(snapshot);
+    assert_eq!(handle.problems().0.as_deref(), Some(line.as_str()));
+
+    shutdown(client, task).await;
+}
+
+/// A link whose target is not there is a taken name, and the added file goes on to the next number instead
+/// of replacing it.
+///
+/// `Path::exists` follows a link, so a dangling one looks like nobody is using the name - and the file
+/// that arrives would then be renamed *over* it, which is a deletion in a folder that does not delete. The
+/// name is somebody's arrangement, dangling or not: what is there is asked about with a look at the name
+/// itself, and the rename fails rather than replacing what it finds.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn dangling_symlink_name_is_not_overwritten() {
+    let lib = Library::new("watch_dangling");
+    let watch = lib.dir.path().join("watch");
+    let (bytes, id) = torrent_in_seed_dir(&lib, "dangling", "dangling.bin").await;
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            watch_dir: Some(watch.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    fs::create_dir_all(&watch).expect("the watch folder");
+    // The name the added file would have taken, worn by a link to a file that is not there.
+    let link = watch.join("show.torrent.added");
+    let nowhere = lib.dir.path().join("nowhere.torrent");
+    std::os::unix::fs::symlink(&nowhere, &link).expect("a dangling link where the added name goes");
+    write_file(&watch, "show.torrent", &bytes);
+
+    let added = wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+    assert_eq!(
+        row_of(&added, &id).expect("the added torrent").save_path,
+        lib.config.download_dir,
+        "the torrent was added, which is all this folder is for"
+    );
+    drop(added);
+    // The candidate has been moved out of the way, which is the moment the name it left behind is the
+    // question: `Path::exists` follows the dangling link, so a folder that trusts it thinks this name is
+    // free and renames straight onto it.
+    wait_for_file(watch.join("show.torrent"), false).await;
+
+    let kept = fs::symlink_metadata(&link).expect("the link is still where it was");
+    assert!(
+        kept.file_type().is_symlink(),
+        "the dangling link was not replaced by the added file: {kept:?}"
+    );
+    assert_eq!(
+        fs::read_link(&link).expect("the link still points where its owner pointed it"),
+        nowhere,
+        "and it still points at the same missing file"
+    );
+    wait_for_file(watch.join("show.torrent.added.2"), true).await;
+    assert_eq!(
+        list_dir(&watch),
+        vec![
+            "show.torrent.added".to_string(),
+            "show.torrent.added.2".to_string()
+        ],
+        "the added file stepped on to the next number"
+    );
+    assert_eq!(
+        handle.problems(),
+        (None, None),
+        "stepping over a name is not a problem to report"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A file the folder could not move is read once, not once every two seconds.
+///
+/// A file whose rename failed has been read, parsed, offered to the engine and complained about already,
+/// and the rename is not going to work any better at the next look: a folder whose `.added` numbers are
+/// all used up, or one nobody can write into. Reading and parsing it again every two seconds buys nothing,
+/// so the folder remembers what it looked like when it was read and leaves it while it still looks like
+/// that - the same size and the same modification time - and says the same thing about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn unrenameable_file_is_not_reread_every_scan() {
+    let lib = Library::new("watch_unrenameable");
+    let watch = lib.dir.path().join("watch");
+    // Every name this file could be renamed to is already taken, so the rename that would keep it from
+    // being offered again is the one that cannot work.
+    write_file(&watch, "show.torrent.added", b"copy");
+    for number in 2..=999 {
+        write_file(&watch, &format!("show.torrent.added.{number}"), b"copy");
+    }
+    let (bytes, id) = torrent_in_seed_dir(&lib, "sticky", "sticky.bin").await;
+    let (second, second_id) = torrent_in_seed_dir(&lib, "swapped_in", "second.bin").await;
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            watch_dir: Some(watch.clone()),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    let path = write_file(&watch, "show.torrent", &bytes);
+
+    let added = wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+    assert_eq!(
+        row_of(&added, &id).expect("the torrent it held").save_path,
+        lib.config.download_dir,
+        "the engine took it, which is why it was read at all"
+    );
+    drop(added);
+    // Looks enough that this file is on the list of ones the folder has already dealt with.
+    wait_for_settle().await;
+
+    // A different torrent, the same size, with the modification time put back: the look that made this
+    // file a candidate is unchanged, so the only way `second_id` gets into the library is by the bytes
+    // being read again.
+    assert_eq!(
+        second.len(),
+        bytes.len(),
+        "the two torrents have to be the same size for the look to match"
+    );
+    let look = fs::metadata(&path).expect("the candidate's look");
+    let modified = look.modified().expect("the candidate's modification time");
+    fs::write(&path, &second).expect("put another torrent in the same file");
+    let back = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open it to put its time back");
+    back.set_modified(modified)
+        .expect("put the modification time back");
+
+    wait_for_settle().await;
+    wait_for_settle().await;
+
+    let last = client.snapshot();
+    assert!(
+        row_of(&last, &id).is_some(),
+        "the torrent that was added from it is still in the library: {:?}",
+        last.torrents
+    );
+    assert!(
+        row_of(&last, &second_id).is_none(),
+        "and its bytes were not read a second time: {:?}",
+        last.torrents
+    );
+    drop(last);
+    assert!(
+        fs::exists(&path).unwrap_or(false),
+        "the file is still where it was, which is what the failed rename means"
+    );
+    assert_eq!(
+        list_dir(&watch).len(),
+        1000,
+        "all 999 taken names, and the file that could not be renamed into one of them"
+    );
+    assert!(
+        handle.problems().0.is_some(),
+        "the folder still has the same thing to say about that file"
+    );
 
     shutdown(client, task).await;
 }
