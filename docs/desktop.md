@@ -166,6 +166,54 @@ addresses, logins or folders; those are the library's own `server:` section, and
 as `serve` follows it. A file that does not parse is shown as an error naming the file and what is wrong in
 it, and nothing is written over it, because the app has no way of guessing what your bytes meant.
 
+## Downloads
+
+Four settings say what happens to a torrent once it is added: the folder its files work in while they
+arrive, whether a new torrent starts on its own, a folder whose `.torrent` files are picked up as they land
+there, and a program to start when one finishes. None of them are in the window yet. They are the
+`downloads:` keys of a `config.yaml`: the app's own, the one beside `desktop.yaml`, decides what
+`This computer` does (see [Where the app's files live](#where-the-apps-files-live)); an instance that is a
+server follows its own file, which is the file [server.md](server.md) describes, and the section after its
+config table is what each of these four does in full. What follows is the short version, plus the parts an
+app user needs and that document does not spell out.
+
+An engine reads this file when it starts, so restart the app for a change you made in it to take effect. A
+`downloads:` section the app did not write is left alone when the app saves that file itself, so a section
+you keep there survives a settings save.
+
+**Where files work while they arrive.** Name `downloads.unfinished_dir` and a torrent downloading into the
+Downloads folder works below a folder of its own, and is moved, in one piece, into the Downloads folder when
+the last piece arrives, so an unfinished torrent is not mixed in among finished ones. The files are moved,
+not copied, so this costs no more for a large download than for a small one, and nothing is left in the
+folder they came from. Choose a folder in the Add dialog and the files go there and stay there: the
+unfinished folder only moves what would have gone to the Downloads folder anyway, so a torrent you put
+somewhere on purpose is never moved out of it.
+
+**`.torrent` files you drop in a folder.** `downloads.watch_dir` is read once when the app starts and every
+two seconds after that. A `.torrent` that has stopped growing is added to the Downloads folder and renamed
+`<name>.torrent.added`; one bigger than 16 MiB, or one whose bytes are not a torrent, is renamed
+`<name>.torrent.invalid`. A marker name somebody has already taken comes back numbered, `.added.2`, `.3`
+and on. Nothing in that folder is copied, moved elsewhere, or deleted, and a `.torrent` for something the
+library already has adds nothing a second time, so this is a folder to put things in and not one to take
+things out of: empty it when you want to.
+
+**Start paused.** With `downloads.start_paused` on, a torrent the watch folder brings in waits for you to
+start it. What you add from the window starts when you add it, whatever this says.
+
+**A program when a torrent finishes.** `downloads.on_complete` names a program by its full path. It is
+started with exactly two arguments, the torrent's name and the folder its files ended up in, and never
+through a shell, so a name holding a space or a `;` arrives as one argument and cannot turn into a command.
+It is given nowhere to print, and the app does not wait for it to finish. On `This computer` that is a
+program on your own machine, started as you. For an instance that is a server it is that server's own
+program: it runs where that server runs, as whoever runs it, the window cannot change it, and the server is
+restarted after its file changes.
+
+**Where a problem is said.** A watch folder that cannot be read, a `.torrent` that was refused, a move the
+engine would not make, a program that would not start: on a server each of those is a warning line in its
+own log (see [server.md](server.md)). On `This computer` the window has nothing to show them on yet, and the
+app writes no log of its own, so one of those is silent here for now. None of them fails a download: a
+torrent whose move or program failed keeps the files it has, where they are, and stays in the library.
+
 ## Instances
 
 The switcher in the title bar lists `This computer` first, then every instance you added, with a mark on the

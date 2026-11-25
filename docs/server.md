@@ -85,6 +85,72 @@ keep the annotations somewhere else.
 | `server.cookie_secure` | `auto` | When the browser session cookie carries the `Secure` flag. `auto` adds it when the request arrived over https (which behind a proxy means when the proxy sends `X-Forwarded-Proto: https`); `always` adds it whatever the request says. A proxy that terminates TLS but does not send `X-Forwarded-Proto` needs `always`. See [docs/web-ui.md](web-ui.md). |
 | `server.cors_origins` | empty | Origins of clients served from somewhere else that may call this API, answered by its CORS layer. This is for the featherbittorrent desktop app connecting to this server: list `tauri://localhost` (macOS and Linux) and `http://tauri.localhost` (Windows). Write each entry as a whole origin, scheme included. Listing an origin grants nothing by itself: a client from it still signs in with a password or a device key like any other, and the web UI's cookie session keeps its own origin rule. Empty means no cross-origin caller at all. |
 
+### What the `downloads:` keys do
+
+Two of these move a torrent's files, one starts a program, and none of them deletes anything. Everything
+they run into is one warning line naming the torrent or file and what went wrong, and none of it fails a
+download.
+
+**`downloads.unfinished_dir`** is where a torrent works, and it gives the torrent up as soon as it is
+whole: the engine is told to move the files to `download_dir` on the last piece. It moves the folder
+rather than copying it, which is why a 200 GiB download changes folders as cheaply as a 200 MiB one and
+leaves nothing behind in the folder it came from. Two cases move anything at all: a torrent still arriving
+and saving in `download_dir` goes to the unfinished folder, and a torrent whole and sitting in the
+unfinished folder comes back. A torrent you put somewhere else when you added it, a folder picked in the
+Add dialog or a `save_path` named in the request, downloads there and stays there, because you chose it,
+and a torrent whole in some other folder is left alone. A move the engine refuses, most often because it
+is still checking that torrent's data, is a warning line and files left where they are; it is asked again
+at the next event for that torrent, and again at the next start. Everything already in the library is put
+where the settings want it before the first two seconds are out, so naming a new folder and restarting
+applies it to the torrents that were waiting on one, a torrent that finished while this server was stopped
+included - and that one gets its completion program run then, once, because it was never reported
+finished.
+
+**`downloads.start_paused`** decides what a torrent this run brings in by itself does: on, it waits for you
+to start it. Torrents the watch folder adds obey it, and so do the terminal client's own adds. An add over
+the API is not covered by it. `POST /api/v1/torrents` starts whatever it adds unless the request itself
+says otherwise: its `paused` field, in the JSON body or in the query string, means add it paused, and
+leaving it out means start it.
+
+**`downloads.watch_dir`** is looked at every two seconds, the first look within two seconds of the run
+starting. Only its own files are candidates: a regular file sitting directly in it, whose name ends
+`.torrent` in either case, and not one whose name starts with `.` (which is how the `._show.torrent` macOS
+writes beside a downloaded file hides itself). A candidate is read only after two consecutive looks have
+seen the same size and the same modification time, so a `.torrent` somebody is still copying in is not
+added half-written; one that has stopped growing is added within about four seconds of arriving. Then it is
+added and renamed `<name>.torrent.added`, or it is refused and gets the `.invalid` rename with a line
+saying why: the file is bigger than 16 MiB, which is decided from its size alone without reading a byte of
+it; its bytes are not a torrent; or the engine will not take it. What is added goes to `download_dir`,
+paused or not per `start_paused`. A `.torrent` for a torrent the library already has puts nothing new in
+the library: the file gets its `.added` name like any other, and nothing is said about it. Nothing is
+copied and nothing is deleted, so what you put in that folder stays yours under a different name, and the
+rename is also what keeps a file from being added a second time after a restart. A marker name that is
+already taken comes back numbered, `<name>.torrent.added.2`, `.3` and on to `.999`, and a folder holding
+all of those leaves the file where it is with a line saying its numbered names are all taken, rather than
+replacing somebody's file. A watch folder that is not there, or that goes away while the server runs, is
+named once rather than every two seconds; it is named again if it comes back and goes away again, and a
+look that works clears the reason: what there is to say about this folder is what went wrong the last time
+it was read.
+
+**`downloads.on_complete`** starts a program when a torrent finishes, after the unfinished folder has given
+it up, so the folder the program is handed is where the files ended up. It is started with two arguments
+and nothing else: the torrent's name, and that folder. No shell is involved, so nothing is re-parsed on the
+way and there is nothing to quote: a name carrying a space, a `;` or `$(...)` arrives as one argument and
+cannot become a command. Its standard input, output and error are the null device, so it has nowhere to
+print and nobody to answer, and the app does not wait for it to exit: one torrent finishing does not hold
+up another, and a program that never returns is no trouble for the library. One finish is one run. A
+program that will not start, because there is nothing at that path or because it is not executable, is one
+warning line beginning `Could not start the program run on completion` and naming the program; it is not
+retried. The program runs on the machine this server is on, as whoever this server runs as. The two folder
+keys and `download_dir` name places on that machine too, and the watch folder is scanned there: a folder
+set on a LAN server is a folder on that server's disk, not on the machine you are browsing from.
+
+A server reads `on_complete` from `config.yaml` and nowhere else. It belongs to the machine the program
+would run on, so nothing over the API changes it, and a program you change in the file takes effect when
+the server is restarted, as a new or changed user does. The desktop app's `This computer` follows these
+same four keys in the `config.yaml` the app keeps for its own engine: see
+[desktop.md](desktop.md).
+
 A LAN server that anyone on the network signs in to:
 
 ```yaml
