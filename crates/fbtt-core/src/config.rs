@@ -16,6 +16,7 @@
 //! the file it could not read is kept aside as `config.yaml.bad` so the next save cannot
 //! overwrite what we never understood.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use serde_norway::Value;
 use thiserror::Error;
 
 use crate::paths::Paths;
@@ -209,6 +211,41 @@ impl Default for Limits {
     }
 }
 
+/// Where downloads go besides the download folder, and what finishes one.
+///
+/// The four settings the settings screen's Downloads section shows. Each is left out of the file until
+/// somebody chooses it, and the two folders follow `download_dir`'s rule - a relative one means below
+/// the library, and is made absolute by [`Config::resolve`] - because a run that put files below
+/// whatever directory it happened to be started in is not the same run twice. `on_complete` is the
+/// exception: it names a program to start, not a folder to put files in, and it stays exactly as the
+/// person wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    /// Where a torrent's files live until it is whole. `None`: straight into `download_dir`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfinished_dir: Option<PathBuf>,
+    /// Whether a new torrent starts paused, so nothing arrives until somebody starts it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_paused: bool,
+    /// A folder whose `.torrent` files are added as they appear. `None`: no watch folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_dir: Option<PathBuf>,
+    /// A program to start when a torrent finishes, named by its full path. Its two arguments are the
+    /// torrent's name and its folder; it is started and left to run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_complete: Option<PathBuf>,
+}
+
+impl DownloadsConfig {
+    /// Whether this section says nothing at all: `Config`'s `skip_serializing_if` uses it, so a config
+    /// that never touched the downloads settings keeps writing no `downloads:` key, and a file written
+    /// by an older version keeps the shape it had.
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Where `featherbittorrent serve` listens, which folders its API may name, which host names it answers
 /// when nobody signs in, who has to sign in to use it, and whether the browser UI rides along on the
 /// API's own origin.
@@ -373,7 +410,9 @@ pub struct DeviceEntry {
 /// The settings one library runs on.
 ///
 /// Every field has a default, so a config that names one setting keeps the rest
-/// as they are; see [`Config::load`].
+/// as they are; see [`Config::load`]. A key this version does not know is kept as
+/// it was read and written back by [`Config::save`], so one file can carry settings
+/// from a version newer than the one editing it; see [`Config::unknown_keys`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -400,6 +439,20 @@ pub struct Config {
     pub player: PlayerConfig,
     /// Whether the image logo is drawn.
     pub logo: LogoSetting,
+    /// Where the unfinished files go, whether a new torrent starts paused, the folder watched for
+    /// `.torrent` files, and the program to run when one finishes. See [`DownloadsConfig`].
+    #[serde(skip_serializing_if = "DownloadsConfig::is_default")]
+    pub downloads: DownloadsConfig,
+    /// The keys this version does not know, kept as they were read and written back on the next save.
+    ///
+    /// One `config.yaml` is written by more than one version of this product, and by a person who leaves
+    /// a note in it, and a key nobody recognised is no evidence about what it meant: dropping it would
+    /// be this version erasing a setting it has never seen, so a limits save made by an older app would
+    /// quietly delete what a newer one had written into the same file. Flattened, so these keys sit at
+    /// the top level of the file exactly where they were read. Comments are the one thing a save does
+    /// not keep: a save writes new bytes rather than editing the ones that were there.
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, Value>,
 }
 
 impl Default for Config {
@@ -438,6 +491,11 @@ impl Config {
     /// what the backend holds, what a snapshot offers the add dialog, and what a
     /// save writes back are all rooted in the library.
     ///
+    /// `downloads.unfinished_dir` and `downloads.watch_dir` go through the same rule, because they are
+    /// folders a run puts files in too: a person who wrote `incomplete` means the one below this
+    /// library, whichever directory the app was launched from. `downloads.on_complete` is left as
+    /// written - it names a program to start, not a folder to root in the library.
+    ///
     /// `server.allowed_roots` is put through the same rule, and an empty list becomes
     /// the download folder alone: the folders the API may name have to be absolute
     /// directories for the server to confine requests to them, and a config that names
@@ -445,6 +503,12 @@ impl Config {
     /// `server` section at all gets none added here: resolving is not deciding to serve.
     pub fn resolve(mut self, paths: &Paths) -> Config {
         self.download_dir = absolute_dir(&self.download_dir, paths);
+        if let Some(dir) = &self.downloads.unfinished_dir {
+            self.downloads.unfinished_dir = Some(absolute_dir(dir, paths));
+        }
+        if let Some(dir) = &self.downloads.watch_dir {
+            self.downloads.watch_dir = Some(absolute_dir(dir, paths));
+        }
         if let Some(server) = self.server.as_mut() {
             server.allowed_roots = resolved_roots(&server.allowed_roots, &self.download_dir, paths);
         }
@@ -463,6 +527,10 @@ impl Config {
             server: None,
             player: PlayerConfig::default(),
             logo: LogoSetting::default(),
+            // No downloads settings chosen either: files go straight into `download_dir`, new
+            // torrents start at once, nothing is watched and nothing is run at the end.
+            downloads: DownloadsConfig::default(),
+            unknown_keys: BTreeMap::new(),
         }
     }
 
@@ -860,14 +928,20 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, CookieSecure, DOWNLOADS_DIR_NAME, Limits,
-        LogoSetting, PlayerConfig, ServerConfig, UserEntry, suffixed, user_download_dir,
-        web_ui_env_override,
+        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, CookieSecure, DOWNLOADS_DIR_NAME,
+        DeviceEntry, DownloadsConfig, Limits, LogoSetting, PlayerConfig, ServerConfig, UserEntry,
+        suffixed, user_download_dir, web_ui_env_override,
     };
     use crate::paths::Paths;
     use crate::scratch::ScratchDir;
+    use serde_norway::Value;
     use std::fs;
     use std::path::PathBuf;
+
+    /// A `config.yaml` exactly as featherbittorrent 0.4.1 wrote it, kept as a file under
+    /// `tests/fixtures` so a person can read what this reads: every key that version knew, and a
+    /// `server:` section with one user and one device.
+    const FIXTURE_0_4_1: &str = include_str!("../tests/fixtures/config-0.4.1.yaml");
 
     /// The scratch directory stands in for a whole library: config side and data
     /// side in the same place, which is all `Config::load` needs to know.
@@ -1996,5 +2070,304 @@ mod tests {
             "an existing directory's own mode stands: {:o}",
             mode & 0o777
         );
+    }
+
+    /// A file written by 0.4.1 still reads as the config 0.4.1 read: every key it names lands in the
+    /// field it always landed in, and the sections this version added say nothing - the downloads
+    /// settings are the defaults and there is no unknown key to keep. This is the file a person
+    /// upgrading from 0.4.1 actually has.
+    #[test]
+    fn config_0_4_1_reads_unchanged() {
+        let config: Config = serde_norway::from_str(FIXTURE_0_4_1).expect("the 0.4.1 file parses");
+
+        let expected = Config {
+            download_dir: PathBuf::from("/srv/downloads/alice"),
+            listen_port: 7946,
+            limits: Limits {
+                download_kib: 512,
+                upload_kib: 128,
+                active_downloads: Some(3),
+                active_seeds: Some(5),
+                active_total: Some(20),
+            },
+            cache_size_mib: 64,
+            server: Some(ServerConfig {
+                bind: "0.0.0.0:8090".parse().expect("the address the file named"),
+                allowed_roots: vec![
+                    PathBuf::from("/srv/downloads/alice"),
+                    PathBuf::from("/srv/media/share"),
+                ],
+                allowed_hosts: vec!["bit.local".to_string()],
+                auth: AuthConfig {
+                    enabled: Some(true),
+                    users: vec![UserEntry {
+                        name: "alice".to_string(),
+                        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_string(),
+                    }],
+                    devices: vec![DeviceEntry {
+                        name: "studio laptop".to_string(),
+                        public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIwtqQz7782qggJ1rY610dkc\
+                                      cxudLbzX0ogqN5wu98zj"
+                            .to_string(),
+                    }],
+                },
+                web_ui: Some(true),
+                cookie_secure: CookieSecure::Always,
+                cors_origins: vec!["tauri://localhost".to_string()],
+            }),
+            player: PlayerConfig {
+                program: "mpv".to_string(),
+                args: vec!["--no-osd".to_string()],
+            },
+            logo: LogoSetting::Off,
+            downloads: DownloadsConfig::default(),
+            unknown_keys: Default::default(),
+        };
+        assert_eq!(
+            config, expected,
+            "a key 0.4.1 wrote no longer reads into its field"
+        );
+        assert_eq!(
+            config.downloads,
+            DownloadsConfig::default(),
+            "a file from before the downloads settings sets none of them"
+        );
+        assert!(
+            config.unknown_keys.is_empty(),
+            "and it leaves nothing this version has to keep: {:?}",
+            config.unknown_keys
+        );
+    }
+
+    /// Keys this version does not know are not evidence about what they meant, so a save writes them
+    /// back exactly as it read them: the scalar keeps its value and the section keeps its shape.
+    /// Without this, a settings save from a TUI on 0.5 would quietly drop the settings a 0.6 app
+    /// wrote into the same file.
+    #[test]
+    fn unknown_keys_survive_a_save() {
+        let dir = ScratchDir::new("config_unknown_keys");
+        let paths = library(&dir);
+        let path = paths.config_file();
+        fs::write(
+            &path,
+            "listen_port: 51413\nseeding: { ratio: 2 }\nfuture_key: 1\n",
+        )
+        .expect("write a file with keys this version does not know");
+
+        let edited = Config::load_for_edit(&path)
+            .expect("a key this version does not know is not a parse failure")
+            .expect("the file is there");
+        assert_eq!(
+            edited.listen_port, 51413,
+            "the part of the file this version knows reads as usual"
+        );
+        assert_eq!(
+            edited.unknown_keys.get("future_key"),
+            Some(&Value::Number(1.into())),
+            "the scalar key is kept as it was read: {:?}",
+            edited.unknown_keys
+        );
+        assert!(
+            matches!(edited.unknown_keys.get("seeding"), Some(Value::Mapping(_))),
+            "so is a whole section nobody recognised: {:?}",
+            edited.unknown_keys
+        );
+
+        edited
+            .save(&path)
+            .expect("save the config with its unknown keys");
+        let again = Config::load_for_edit(&path)
+            .expect("read the save back")
+            .expect("the save wrote a file");
+        assert_eq!(
+            again.unknown_keys.get("future_key"),
+            Some(&Value::Number(1.into())),
+            "the scalar key is written back: {:?}",
+            again.unknown_keys
+        );
+        assert!(
+            matches!(again.unknown_keys.get("seeding"), Some(Value::Mapping(_))),
+            "and so is the section: {:?}",
+            again.unknown_keys
+        );
+        assert_eq!(again, edited, "the save is the identity on this file");
+    }
+
+    /// A config that never chose a downloads setting writes no `downloads:` key at all, so a save
+    /// from this version does not add lines to a file that never had them - which is what keeps a
+    /// 0.4.1 file byte-for-byte the shape 0.4.1 wrote.
+    #[test]
+    fn default_downloads_write_no_downloads_key() {
+        let dir = ScratchDir::new("config_quiet_section");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        Config::default().save(&path).expect("save the defaults");
+        let saved = fs::read_to_string(&path).expect("read the save back");
+        assert_eq!(
+            yaml_value(&saved, "downloads"),
+            None,
+            "a config that chose nothing about downloads names no downloads section: {saved}"
+        );
+
+        // The same through a config that did choose a server: the new section is silent on its own,
+        // and it does not leak into the section beside it.
+        let serving = Config {
+            server: Some(ServerConfig::default()),
+            ..Config::default()
+        }
+        .resolve(&paths);
+        serving.save(&path).expect("save a config with a server");
+        let saved = fs::read_to_string(&path).expect("read the save back");
+        assert_eq!(
+            yaml_value(&saved, "downloads"),
+            None,
+            "having a server section does not invent a downloads one: {saved}"
+        );
+    }
+
+    /// All four downloads keys survive a save: what a person sets in the settings screen is what the
+    /// next run reads back, and a section that names one key keeps the rest at their defaults exactly
+    /// like every other section in the file.
+    #[test]
+    fn downloads_round_trip() {
+        let dir = ScratchDir::new("config_downloads_round_trip");
+        let paths = library(&dir);
+        let path = paths.config_file();
+        let chosen = Config {
+            downloads: DownloadsConfig {
+                unfinished_dir: Some(PathBuf::from("/srv/incomplete/alice")),
+                start_paused: true,
+                watch_dir: Some(PathBuf::from("/srv/watch/alice")),
+                on_complete: Some(PathBuf::from("/usr/local/bin/notify")),
+            },
+            ..Config::default()
+        };
+
+        chosen.save(&path).expect("save the downloads settings");
+        let written = fs::read_to_string(&path).expect("read the save back");
+        assert_eq!(
+            yaml_value(&written, "unfinished_dir"),
+            Some("/srv/incomplete/alice"),
+            "the unfinished folder is written as the config has it: {written}"
+        );
+        assert_eq!(
+            yaml_value(&written, "start_paused"),
+            Some("true"),
+            "a switch somebody turned on is written: {written}"
+        );
+        let again = Config::load_for_edit(&path)
+            .expect("read the save back")
+            .expect("the save wrote a file");
+        assert_eq!(
+            again.downloads, chosen.downloads,
+            "all four keys come back as they were set"
+        );
+        assert_eq!(again, chosen, "the whole config round-trips");
+
+        // A section naming one key: the keys the file leaves out are the defaults, not a parse
+        // failure, and not a reason to write them all back.
+        fs::write(&path, "downloads:\n  start_paused: true\n").expect("write a partial section");
+        let partial = Config::load_for_edit(&path)
+            .expect("a partial section reads")
+            .expect("the file is there");
+        assert_eq!(
+            partial.downloads,
+            DownloadsConfig {
+                start_paused: true,
+                ..DownloadsConfig::default()
+            },
+            "the keys the file leaves out stay the defaults"
+        );
+        assert_eq!(
+            partial.unknown_keys.get("downloads"),
+            None,
+            "a section this version knows is not an unknown key: {:?}",
+            partial.unknown_keys
+        );
+    }
+
+    /// The downloads folders follow `download_dir`'s rule, because they are folders a run puts files
+    /// in: a relative one means below the library and is made absolute when the config is resolved,
+    /// so a save and the next start agree on where the files are wherever the app was launched from.
+    /// The program is the exception - it is a path to start, not a folder to root in the library, and
+    /// a person naming one names it however they named it.
+    #[test]
+    fn resolve_roots_relative_unfinished_and_watch_dirs() {
+        let dir = ScratchDir::new("config_relative_downloads");
+        let paths = library(&dir);
+        fs::write(
+            paths.config_file(),
+            "download_dir: dl\n\
+             downloads:\n  \
+               unfinished_dir: incomplete\n  \
+               watch_dir: watch\n  \
+               on_complete: hooks/notify.sh\n",
+        )
+        .expect("write folders relative to the library");
+
+        let ConfigLoad::Loaded(config) = Config::load(&paths).expect("read the file as written")
+        else {
+            panic!("relative folders are still a config");
+        };
+        assert_eq!(
+            config.downloads.watch_dir,
+            Some(PathBuf::from("watch")),
+            "the file is read as it was written and resolved afterwards"
+        );
+
+        let resolved = config.resolve(&paths);
+        assert_eq!(
+            resolved.downloads.watch_dir,
+            Some(paths.data_dir.join("watch"))
+        );
+        assert_eq!(
+            resolved.downloads.unfinished_dir,
+            Some(paths.data_dir.join("incomplete"))
+        );
+        assert_eq!(
+            resolved.downloads.on_complete,
+            Some(PathBuf::from("hooks/notify.sh")),
+            "the program is left exactly as the person wrote it"
+        );
+        assert!(
+            resolved
+                .downloads
+                .watch_dir
+                .expect("a watch folder")
+                .is_absolute(),
+            "a resolved folder must not depend on where the process was started"
+        );
+        assert!(
+            resolved.unknown_keys.is_empty(),
+            "`downloads:` is a section this version knows: {:?}",
+            resolved.unknown_keys
+        );
+
+        // An absolute folder is the person's own choice and stays as written, and resolving twice
+        // changes nothing, exactly as it does for `download_dir`.
+        let chosen = Config {
+            downloads: DownloadsConfig {
+                unfinished_dir: Some(paths.data_dir.join("parts")),
+                watch_dir: Some(paths.data_dir.join("watch")),
+                ..DownloadsConfig::default()
+            },
+            ..Config::default()
+        }
+        .resolve(&paths);
+        assert_eq!(
+            chosen.downloads.unfinished_dir,
+            Some(paths.data_dir.join("parts"))
+        );
+        assert_eq!(
+            chosen.clone().resolve(&paths).downloads,
+            chosen.downloads,
+            "resolving twice is resolving once"
+        );
+
+        // A key nobody set stays unset: resolving invents no folder.
+        let unset = Config::default().resolve(&paths);
+        assert_eq!(unset.downloads.unfinished_dir, None);
+        assert_eq!(unset.downloads.watch_dir, None);
     }
 }

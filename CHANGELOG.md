@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Saving settings keeps keys in `config.yaml` that this version does not know about. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+
 ## [0.4.1] - 2026-11-24
 
 ### Added

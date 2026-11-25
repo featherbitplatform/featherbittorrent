@@ -1,0 +1,35 @@
+# A config.yaml exactly as featherbittorrent 0.4.1 wrote it: every key that version knew,
+# a server section with one user and one device. The names and folders are placeholders.
+download_dir: /srv/downloads/alice
+listen_port: 7946
+limits:
+  download_kib: 512
+  upload_kib: 128
+  active_downloads: 3
+  active_seeds: 5
+  active_total: 20
+cache_size_mib: 64
+server:
+  bind: 0.0.0.0:8090
+  allowed_roots:
+    - /srv/downloads/alice
+    - /srv/media/share
+  allowed_hosts:
+    - bit.local
+  auth:
+    enabled: true
+    users:
+      - name: alice
+        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+    devices:
+      - name: studio laptop
+        public_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIwtqQz7782qggJ1rY610dkccxudLbzX0ogqN5wu98zj
+  web_ui: true
+  cookie_secure: always
+  cors_origins:
+    - tauri://localhost
+player:
+  program: mpv
+  args:
+    - "--no-osd"
+logo: off

@@ -23,6 +23,7 @@ pub mod lock;
 pub mod paths;
 pub mod player;
 pub mod remote;
+pub mod settings;
 pub mod stream;
 pub mod ui_state;
 
@@ -34,14 +35,18 @@ pub use client::{
     TrackerRow,
 };
 pub use config::{
-    AuthConfig, Config, ConfigError, ConfigLoad, CookieSecure, DeviceEntry, LogoSetting,
-    PlayerConfig, ServerConfig, UserEntry, web_ui_env_override,
+    AuthConfig, Config, ConfigError, ConfigLoad, CookieSecure, DeviceEntry, DownloadsConfig,
+    LogoSetting, PlayerConfig, ServerConfig, UserEntry, web_ui_env_override,
 };
 pub use engine::Engine;
 pub use local::LocalBackend;
 pub use lock::{LibraryLock, LockError};
 pub use paths::Paths;
 pub use remote::{RemoteBackend, Secret};
+pub use settings::{
+    DownloadsChange, DownloadsView, OnCompleteSet, OnCompleteView, SettingsProblem, SettingsView,
+    validate_downloads,
+};
 pub use ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
 
 /// A directory under the system temp dir, removed when the test that made it is done.
