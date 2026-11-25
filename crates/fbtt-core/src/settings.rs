@@ -115,8 +115,10 @@ pub struct OnCompleteSet {
 /// shows, so the refusal a person reads is decided here once rather than reworded per surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsProblem {
-    /// A folder is not inside a root this server may name, or is not an absolute path at all.
+    /// A folder is a full path, but not inside a root this server may name.
     OutsideRoots,
+    /// A folder is named by something other than its full path.
+    NotAbsolute,
     /// The unfinished folder is the default folder, which would make it the same folder twice.
     UnfinishedIsDefault,
     /// The watch folder is one of the download folders, so a saved torrent would feed itself.
@@ -139,6 +141,7 @@ impl SettingsProblem {
     pub fn message(&self) -> &'static str {
         match self {
             SettingsProblem::OutsideRoots => "Choose a folder inside the server's allowed folders.",
+            SettingsProblem::NotAbsolute => "Choose a folder by its full path.",
             SettingsProblem::UnfinishedIsDefault => {
                 "The unfinished folder must be different from the default folder."
             }
@@ -175,14 +178,17 @@ impl DownloadsConfig {
 
 /// Whether a submitted downloads section may be written, or which one line to answer it with.
 ///
-/// Every folder in it has to be absolute (a relative one means different things to the run that saves
-/// it and the run that reads it back, which is the mistake [`Config::resolve`](crate::Config::resolve)
-/// exists to keep out of a config file) and, when the caller names the folders it serves, inside one of
-/// them. The check is lexical and folds `..` first, so `/srv/downloads/../etc` cannot pass itself as
-/// being under `/srv/downloads`; the server adds its own canonical check on top of this one when it
-/// writes. Then the folders have to be three different places: an unfinished folder that is the default
-/// folder splits nothing, and a watch folder that is a download folder is a loop that adds a torrent,
-/// saves its `.torrent` in the same folder, and adds it again.
+/// Every folder in it has to be given by its full path: a relative one means different things to the
+/// run that saves it and the run that reads it back, which is the mistake
+/// [`Config::resolve`](crate::Config::resolve) exists to keep out of a config file. It also has to be
+/// inside one of the served folders, when the caller names them. Every folder is folded before any
+/// of these comparisons - `.` dropped, `..` resolved against the directory before it, without asking
+/// the filesystem - so `/srv/downloads/../etc` cannot pass itself as being under `/srv/downloads` and
+/// `/srv/x/../d` cannot pass itself as a folder other than `/srv/d`; the server adds its own
+/// canonical check on top of this one when it writes. Then the folders have to be three different
+/// places: an unfinished folder that is the default folder splits nothing, and a watch folder that is
+/// a download folder is a loop that adds a torrent, saves its `.torrent` in the same folder, and adds
+/// it again.
 ///
 /// A program, when the change names one, is a path to start: absolute, and a file that is really there.
 /// On Windows it may not be a batch file, because Windows starts those through a shell and a person
@@ -195,32 +201,42 @@ pub fn validate_downloads(
     change: &DownloadsChange,
     roots: Option<&[PathBuf]>,
 ) -> Result<(), SettingsProblem> {
+    // Fold every submitted folder first. A `PathBuf` comparison answers about the spelling, not the
+    // folder, so the root list and the "different folder" rules all run on the folded paths or a `..`
+    // walks round them. A relative folder is not a folder anybody served: it means "below whatever
+    // directory this process was started in", which is the mistake `resolve` exists to keep out of a
+    // config file.
+    let default_dir = lexical_absolute(&change.default_dir).ok_or(SettingsProblem::NotAbsolute)?;
+    let unfinished_dir = change
+        .unfinished_dir
+        .as_ref()
+        .map(|dir| lexical_absolute(dir).ok_or(SettingsProblem::NotAbsolute))
+        .transpose()?;
+    let watch_dir = change
+        .watch_dir
+        .as_ref()
+        .map(|dir| lexical_absolute(dir).ok_or(SettingsProblem::NotAbsolute))
+        .transpose()?;
     for dir in [
-        Some(&change.default_dir),
-        change.unfinished_dir.as_ref(),
-        change.watch_dir.as_ref(),
+        Some(&default_dir),
+        unfinished_dir.as_ref(),
+        watch_dir.as_ref(),
     ]
     .into_iter()
     .flatten()
     {
-        // A relative folder is not a folder anybody served: it means "below whatever directory this
-        // process was started in", which is the mistake `resolve` exists to keep out of a config file.
-        let Some(folded) = lexical_absolute(dir) else {
-            return Err(SettingsProblem::OutsideRoots);
-        };
-        if !inside_one_root(&folded, roots) {
+        if !inside_one_root(dir, roots) {
             return Err(SettingsProblem::OutsideRoots);
         }
     }
-    if let Some(unfinished) = &change.unfinished_dir
-        && unfinished == &change.default_dir
+    if let Some(unfinished) = &unfinished_dir
+        && unfinished == &default_dir
     {
         return Err(SettingsProblem::UnfinishedIsDefault);
     }
-    if let Some(watch) = &change.watch_dir
-        && (watch == &change.default_dir
-            || change
-                .unfinished_dir
+    if let Some(watch) = &watch_dir
+        && (watch == &default_dir
+            || unfinished_dir
                 .as_ref()
                 .is_some_and(|unfinished| watch == unfinished))
     {
@@ -468,16 +484,17 @@ mod tests {
             SettingsProblem::OutsideRoots,
         );
         // A folder the run cannot root anywhere: relative means "below whatever the process was
-        // started in", which is not a folder anybody served.
+        // started in", which is not a folder anybody served, and the person spelling it relative has
+        // not chosen to be outside a root list, so the line they get is about the spelling.
         refused(
             &change(Path::new("dl/downloads"), None, None, None),
             None,
-            SettingsProblem::OutsideRoots,
+            SettingsProblem::NotAbsolute,
         );
         refused(
             &change(&default_dir, Some(Path::new("incomplete")), None, None),
             Some(&roots),
-            SettingsProblem::OutsideRoots,
+            SettingsProblem::NotAbsolute,
         );
         // The program: named by something other than a full path, and named at a path with nothing
         // there.
@@ -504,6 +521,10 @@ mod tests {
             "Choose a folder inside the server's allowed folders."
         );
         assert_eq!(
+            SettingsProblem::NotAbsolute.message(),
+            "Choose a folder by its full path."
+        );
+        assert_eq!(
             SettingsProblem::UnfinishedIsDefault.message(),
             "The unfinished folder must be different from the default folder."
         );
@@ -522,6 +543,101 @@ mod tests {
         assert_eq!(
             SettingsProblem::NotEditable.message(),
             "Set in the server's config file"
+        );
+    }
+
+    /// `/srv/x/../d` and `/srv/d` are two spellings of one folder, and a `PathBuf` comparison answers
+    /// about the spelling, not the folder: a person who sets the unfinished folder one `..` away from
+    /// the default would keep every torrent's files in the folder they are supposed to be moved out
+    /// of, and the check would never notice.
+    #[test]
+    fn validate_unfinished_equal_after_dotdot_is_refused() {
+        let outcome = validate_downloads(
+            &change(
+                Path::new("/srv/d"),
+                Some(Path::new("/srv/x/../d")),
+                None,
+                Some(Path::new("/usr/bin/tool")),
+            ),
+            None,
+        );
+        assert_eq!(
+            outcome,
+            Err(SettingsProblem::UnfinishedIsDefault),
+            "/srv/x/../d is the folder the default already names"
+        );
+    }
+
+    /// The same spelling trick against the watch folder: spelled with a `..` that walks back, the
+    /// watch folder is still the default folder, or still the unfinished one, and a torrent saved
+    /// there re-enters the engine that was watching for it.
+    #[test]
+    fn validate_watch_equal_after_dotdot_is_refused() {
+        let outcome = validate_downloads(
+            &change(
+                Path::new("/srv/d"),
+                Some(Path::new("/srv/x/../e")),
+                Some(Path::new("/srv/x/../d")),
+                Some(Path::new("/usr/bin/tool")),
+            ),
+            None,
+        );
+        assert_eq!(
+            outcome,
+            Err(SettingsProblem::WatchIsDownloads),
+            "the watch folder spelled with a `..` is the default folder"
+        );
+        let outcome = validate_downloads(
+            &change(
+                Path::new("/srv/d"),
+                Some(Path::new("/srv/x/e")),
+                Some(Path::new("/srv/x/e/../e")),
+                Some(Path::new("/usr/bin/tool")),
+            ),
+            None,
+        );
+        assert_eq!(
+            outcome,
+            Err(SettingsProblem::WatchIsDownloads),
+            "and the same trick against the unfinished folder"
+        );
+    }
+
+    /// A relative folder means "below whatever directory the process was started in", which is a
+    /// different folder on every machine, and it is the spelling that is wrong whether or not a
+    /// server has a list of allowed folders to be inside: a person running their own engine has
+    /// never seen such a list, and telling them about it would send them looking for a setting that
+    /// is not the one they got wrong.
+    #[test]
+    fn validate_relative_folder_is_not_absolute() {
+        let outcome = validate_downloads(
+            &change(
+                Path::new("Downloads/Shows"),
+                None,
+                None,
+                Some(Path::new("/usr/bin/tool")),
+            ),
+            None,
+        );
+        let problem = outcome.expect_err("a relative folder is not a folder this run can name");
+        assert_eq!(problem, SettingsProblem::NotAbsolute);
+        assert_eq!(problem.message(), "Choose a folder by its full path.");
+
+        // A run on a server refuses the same folder the same way: what it fails is the spelling, not
+        // the list, and the root-list line is for folders that are full paths going outside it.
+        let roots = [PathBuf::from("/srv")];
+        assert_eq!(
+            validate_downloads(
+                &change(
+                    Path::new("Downloads/Shows"),
+                    None,
+                    None,
+                    Some(Path::new("/usr/bin/tool")),
+                ),
+                Some(&roots),
+            ),
+            Err(SettingsProblem::NotAbsolute),
+            "the list is not what the relative path fails"
         );
     }
 
