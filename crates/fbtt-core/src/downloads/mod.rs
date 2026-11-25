@@ -154,9 +154,13 @@ struct Shared {
     /// ever started on it is not one of these, however its progress number read while being checked - it
     /// has no finish this run missed (see [`is_downloading`]).
     seen_unfinished: HashSet<InfoHashes>,
-    /// Torrents whose completion program this run has already been asked for - started, or refused, or lost
-    /// to a program that would not start - which is what keeps one finish to one run.
-    program_ran: HashSet<InfoHashes>,
+    /// Torrents whose finish this run has already handled - the program started, or refused, or lost to a
+    /// program that would not start, or nothing configured to run at all - which is what keeps one finish
+    /// to one run. "Nothing configured" counts as handled on purpose: a person who sets a program after a
+    /// dozen torrents finished does not get twelve runs for finishes this run already saw and answered.
+    /// A torrent leaves the set when it leaves the session (see [`Worker::place_what_is_here`]), so the
+    /// same torrent re-added later is new to this run and earns its program.
+    finish_handled: HashSet<InfoHashes>,
     /// The latest complaint about the watch folder and about the completion program, which is what the
     /// settings screen shows beside each of those two fields.
     watch_problem: Option<String>,
@@ -185,16 +189,38 @@ struct Move {
 struct Moved {
     /// The torrent.
     id: InfoHashes,
-    /// Where its files were being taken, which is what the completion program is told when they arrive.
+    /// Where its files were being taken. The answer is read against the move the entry wants now, and
+    /// this is the only way to tell this move's answer from the answer of the one that replaced it; the
+    /// folder is also what the completion program is told when the files arrive.
     target: PathBuf,
     /// The torrent's name as it was when the move started, for the line about a move that failed and for
     /// the program's first argument.
     name: String,
-    /// Whether the completion program was owed to this torrent once the files landed.
-    program_after: bool,
     /// What the engine said: `Ok` for the files having arrived, `Busy` for asking while it is still
     /// checking that torrent's data, and anything else for a move that is not going to work.
     outcome: Result<(), SessionError>,
+}
+
+/// What an answer to a running move says about the entry table, once [`answer_for`] has applied it:
+/// `Landed` means the entry is gone, `Busy` and `Refused` keep it, and `Stale` means the entry was about
+/// something else entirely.
+#[derive(Debug)]
+enum Answered {
+    /// The answer's folder is not the folder the entry wants, or the torrent has no entry: the answer is
+    /// about a superseded move, and nothing outside the entry's in-flight claim changed.
+    Stale,
+    /// The files arrived where the entry wanted them; the entry is removed. `true` is a completion
+    /// program owed to the torrent that just got its files home.
+    Landed { program_after: bool },
+    /// The engine was not ready for this torrent yet; the entry waits, claim cleared, for the next ask.
+    Busy,
+    /// The move is not going to work; the entry stays and gives up. `problem` is the engine's reason for
+    /// the line, and `true` is a completion program owed to a torrent that will keep its files where
+    /// they are.
+    Refused {
+        problem: SessionError,
+        program_after: bool,
+    },
 }
 
 /// The way in: [`spawn`](Self::spawn) starts the task, and everything it knows afterwards is reachable
@@ -213,6 +239,10 @@ struct Worker {
     /// per move attempt, and an attempt is only started by a wake that has room for its answer.
     moves_tx: mpsc::UnboundedSender<Moved>,
     moves_rx: mpsc::UnboundedReceiver<Moved>,
+    /// The flags of this automation's test park, shared with its handle: per automation, so a test parks
+    /// the loop of the handle it holds and not the loop of whichever test happened to ask last.
+    #[cfg(feature = "test-support")]
+    park: Arc<test_support::ParkFlags>,
 }
 
 impl Automation {
@@ -242,6 +272,16 @@ impl Automation {
             ..Shared::default()
         }));
         let (stop, stopped) = signal::channel(false);
+        #[cfg(feature = "test-support")]
+        let park = Arc::new(test_support::ParkFlags::default());
+        #[cfg(feature = "test-support")]
+        let handle = AutomationHandle {
+            shared: Arc::clone(&shared),
+            editable,
+            stop,
+            park: Arc::clone(&park),
+        };
+        #[cfg(not(feature = "test-support"))]
         let handle = AutomationHandle {
             shared: Arc::clone(&shared),
             editable,
@@ -260,6 +300,8 @@ impl Automation {
             shared,
             moves_tx,
             moves_rx,
+            #[cfg(feature = "test-support")]
+            park,
         };
         tokio::spawn(worker.run(stream, stopped));
         handle
@@ -296,8 +338,9 @@ impl Worker {
                 Work::Event(event) => {
                     #[cfg(feature = "test-support")]
                     // A test's stand-in for a queue this task fell behind in, which is what a session
-                    // busy enough to overflow one actually does to a finish.
-                    let event = test_support::lag_instead_of(event);
+                    // busy enough to overflow one actually does to a finish - or to a removal.
+                    let event =
+                        test_support::remove_instead_of(test_support::lag_instead_of(event));
                     self.act_on(&event);
                 }
                 Work::Pass => {}
@@ -367,7 +410,7 @@ impl Worker {
                 let mut shared = self.lock();
                 shared.moves.remove(torrent);
                 shared.seen_unfinished.remove(torrent);
-                shared.program_ran.remove(torrent);
+                shared.finish_handled.remove(torrent);
             }
             // The queue this task subscribes to dropped events, a `TorrentFinished` among them: nothing to
             // catch up on, because every wake re-reads what the session holds, and that is where a torrent
@@ -400,14 +443,20 @@ impl Worker {
     /// never finished here, and this is the one place that could mistake it for having.
     fn place_what_is_here(&self) {
         let settings = self.settings();
+        let mut present: HashSet<InfoHashes> = HashSet::new();
         for torrent in self.session.torrents() {
             let status = torrent.status();
             let id = torrent.info_hashes();
+            present.insert(id);
             let whole = status.progress >= 1.0;
             if !whole && is_downloading(&status) {
                 // A torrent this run catches with pieces on their way is one whose finish it has come
                 // to expect - whether or not the add itself happened to be sampled mid-check - so the
                 // recovery below knows to go looking for that finish if its event is ever dropped.
+                // One gap this look does not close, and does not try to: a torrent whose entire stay in
+                // the downloading states fell between two wakes - checking, then downloading, then
+                // whole, all in one gap - and whose `TorrentFinished` was dropped along with it, was
+                // never seen downloading by any wake here and so is not enrolled to be grieved for.
                 self.lock().seen_unfinished.insert(id);
             }
             match wanted(status.progress, &status.save_path, &settings) {
@@ -426,6 +475,15 @@ impl Worker {
                 None => {}
             }
         }
+        // A removal this task never got - the queue dropped it, which is the same event loss every
+        // other rule here plans around - has to lose its claims here too, because the session says the
+        // torrent is gone: a `seen_unfinished` or a `finish_handled` outliving the torrent it describes
+        // would tell the *same torrent re-added later* that its program had run already, which is a
+        // finish the person never got. Whatever the session still holds keeps its claims; everything
+        // else was removed while nobody was listening.
+        let mut shared = self.lock();
+        shared.seen_unfinished.retain(|id| present.contains(id));
+        shared.finish_handled.retain(|id| present.contains(id));
     }
 
     /// Queues what the settings want done with one torrent's files, and starts it if nothing is doing it
@@ -439,33 +497,62 @@ impl Worker {
         }
     }
 
+    /// Records what the settings now want from one torrent's files, and says whether this look should
+    /// try to start the move (`start_move` asks the entry itself whether it is still waiting).
+    ///
+    /// A move already queued for the same folder is left as it is, a refused one included: its reason has
+    /// not changed and asking again every two seconds is what `given_up` exists to stop. A queued move
+    /// heading for a *different* folder is replaced - the settings changed underneath this torrent and
+    /// the new folder is what they want now - but its in-flight claim carries over: the move that is
+    /// running now is one `move_storage` the engine is copying under its old goal, and a second asked for
+    /// mid-copy is the engine refusing its own work. The running move's answer clears the claim (see
+    /// [`answer_for`]), and the entry's own move starts then, one wake at most away.
+    fn record_move(
+        shared: &mut Shared,
+        id: &InfoHashes,
+        target: PathBuf,
+        program_after: bool,
+    ) -> bool {
+        match shared.moves.get_mut(id) {
+            Some(entry) if entry.target == target => {
+                // A torrent that became whole while its move was running is owed its program when the
+                // move lands, so this is where a move queued for an arriving torrent is upgraded.
+                entry.program_after |= program_after;
+            }
+            Some(entry) => {
+                entry.target = target;
+                entry.program_after = program_after;
+                // A new folder is a new attempt: the old one's dead end says nothing about this one.
+                entry.given_up = false;
+            }
+            None => {
+                shared.moves.insert(
+                    *id,
+                    Move {
+                        target,
+                        program_after,
+                        in_flight: false,
+                        given_up: false,
+                    },
+                );
+            }
+        }
+        let entry = shared.moves.get(id).expect("recorded just above");
+        !entry.in_flight && !entry.given_up
+    }
+
     /// Records one torrent's move and starts it, unless something is already doing it.
     ///
-    /// A move already queued for the same folder is left as it is, a refused one included: its reason has not
-    /// changed and asking again every two seconds is what `given_up` exists to stop. A queued move heading for
-    /// a *different* folder is replaced, because the settings changed underneath this torrent and the new
-    /// folder is what they want now.
+    /// [`record_move`] decides from the entry table; this turns a "yes, start" into the engine call,
+    /// outside the lock, the way every start here happens.
     fn queue_move_to(&self, id: &InfoHashes, target: PathBuf, program_after: bool) {
-        let mut shared = self.lock();
-        if let Some(queued) = shared.moves.get_mut(id)
-            && queued.target == target
-        {
-            // A torrent that became whole while its move was running is owed its program when the move
-            // lands, so this is where a move queued for an arriving torrent is upgraded.
-            queued.program_after |= program_after;
-            return;
+        let start_now = {
+            let mut shared = self.lock();
+            Self::record_move(&mut shared, id, target, program_after)
+        };
+        if start_now {
+            self.start_move(id);
         }
-        shared.moves.insert(
-            *id,
-            Move {
-                target,
-                program_after,
-                in_flight: false,
-                given_up: false,
-            },
-        );
-        drop(shared);
-        self.start_move(id);
     }
 
     /// Starts one waiting move, if it is waiting, not already running, and still what the settings want.
@@ -500,9 +587,9 @@ impl Worker {
                 return;
             }
             queued.in_flight = true;
-            Some((queued.target.clone(), queued.program_after))
+            Some(queued.target.clone())
         };
-        let Some((target, program_after)) = claimed else {
+        let Some(target) = claimed else {
             return;
         };
         let id = *id;
@@ -518,7 +605,6 @@ impl Worker {
                 id,
                 target,
                 name,
-                program_after,
                 outcome,
             });
         });
@@ -550,60 +636,113 @@ impl Worker {
         }
     }
 
+    /// What one move's answer means for the entry table, applied to it, and what it means outside the
+    /// table: see [`Answered`].
+    ///
+    /// The answer carries the folder *that move* was heading for. If the entry wants a different one -
+    /// the settings moved the goal while the copy was running - the answer is about a move nobody wants
+    /// any more: it neither completes the new entry nor condemns it, and all it may do is release the
+    /// in-flight claim the new entry is still wearing from the move it replaced, so the entry's own move
+    /// can start. An answer for a torrent with no entry is the same shape from the other side: the
+    /// torrent left the library mid-move, and with it went everything it owed.
+    fn answer_for(
+        shared: &mut Shared,
+        id: &InfoHashes,
+        target: &Path,
+        outcome: Result<(), SessionError>,
+    ) -> Answered {
+        let Some(entry) = shared.moves.get_mut(id) else {
+            return Answered::Stale;
+        };
+        if entry.target != target {
+            entry.in_flight = false;
+            return Answered::Stale;
+        }
+        // The entry is what has been tracking this torrent since before the move started; whether its
+        // program is owed is its fact, not something the answer carries. A torrent that became whole
+        // mid-move is owed a program its queued move never heard about.
+        let program_after = entry.program_after;
+        match outcome {
+            Ok(()) => {
+                shared.moves.remove(id);
+                Answered::Landed { program_after }
+            }
+            // Still checking this torrent's data: ask again at the next wake.
+            Err(SessionError::Busy) => {
+                entry.in_flight = false;
+                Answered::Busy
+            }
+            Err(problem) => {
+                // A target that is somebody else's file, or a folder that cannot be moved into, is not
+                // going to change because this task asked again: said once, and left alone until the
+                // settings change, the torrent goes, or the torrent ends up somewhere else.
+                entry.in_flight = false;
+                entry.given_up = true;
+                Answered::Refused {
+                    problem,
+                    program_after,
+                }
+            }
+        }
+    }
+
     /// What one move's answer means: the program for files that arrived, another try for files the engine
-    /// was not ready to move, and one line plus a program run where the files are for a move that is not
-    /// going to work.
+    /// was not ready to move, one line plus a program run where the files are for a move that is not
+    /// going to work, and nothing at all for an answer the entry table no longer wants.
+    ///
+    /// `Busy` - the engine is still checking that torrent's data, which is ordinary just after an add -
+    /// leaves the move queued, so this wake or the next one, at most [`WATCH_EVERY`] away, asks again. Any
+    /// other refusal is about a folder that is not going to start working on its own: it is said once, the
+    /// files stay where they are, and a whole torrent's program still runs, for the folder they are in. A
+    /// finished torrent does not go without its program because a *move* could not be done, and the folder it
+    /// did finish in is the folder a program wants to be told about.
     fn answer_move(&self, moved: Moved) {
         let Moved {
             id,
             target,
             name,
-            program_after,
             outcome,
         } = moved;
-        let settings = self.settings();
-        let problem = match outcome {
-            Ok(()) => {
-                self.lock().moves.remove(&id);
+        let answered = {
+            let mut shared = self.lock();
+            Self::answer_for(&mut shared, &id, &target, outcome)
+        };
+        match answered {
+            Answered::Stale => {
+                tracing::debug!(
+                    torrent = %map::clean(&name),
+                    target = %map::clean(&target.display().to_string()),
+                    "a move this automation no longer wants answered; the entry's own move will report",
+                );
+            }
+            Answered::Landed { program_after } => {
                 if program_after {
                     // The folder this move put the files in is the folder they finished in, and that is what
                     // the program is told. Asking the engine again here could read a folder somebody else
                     // moved them into in between.
                     self.run_program(&id, &name, &target);
                 }
-                return;
             }
-            // Still checking this torrent's data: ask again at the next wake.
-            Err(SessionError::Busy) => {
-                let mut shared = self.lock();
-                if let Some(queued) = shared.moves.get_mut(&id) {
-                    queued.in_flight = false;
+            // The entry stays queued; `ask_moves` starts it again, this wake or the next.
+            Answered::Busy => {}
+            Answered::Refused {
+                problem,
+                program_after,
+            } => {
+                let settings = self.settings();
+                let line = format!(
+                    "Could not move {} into the {}: {}",
+                    map::clean(&name),
+                    folder_name(&target, &settings),
+                    map::clean(&problem.to_string()),
+                );
+                self.notify(Notice::Error(line));
+                if program_after {
+                    let here = self.session.torrent(&id).map(|t| t.status().save_path);
+                    if let Some(here) = here {
+                        self.run_program(&id, &name, &here);
+                    }
                 }
-                return;
-            }
-            Err(problem) => problem,
-        };
-        let line = format!(
-            "Could not move {} into the {}: {}",
-            map::clean(&name),
-            folder_name(&target, &settings),
-            map::clean(&problem.to_string()),
-        );
-        self.notify(Notice::Error(line));
-        let mut shared = self.lock();
-        let Some(queued) = shared.moves.get_mut(&id) else {
-            return; // the torrent is gone, and so is anything it owed
-        };
-        queued.in_flight = false;
-        // A target that is somebody else's file, or a folder that cannot be moved into, is not going to
-        // change because this task asked again: said once, and left alone until the settings change, the
-        // torrent goes, or the torrent ends up somewhere else.
-        queued.given_up = true;
-        drop(shared);
-        if program_after {
-            let here = self.session.torrent(&id).map(|t| t.status().save_path);
-            if let Some(here) = here {
-                self.run_program(&id, &name, &here);
             }
         }
     }
@@ -612,6 +751,10 @@ impl Worker {
     /// listing, a candidate's bytes, the parse, the renames - happens on the blocking pool, and the
     /// engine taking the torrent is the only thing awaited.
     async fn scan_watch_folder(&self) {
+        #[cfg(feature = "test-support")]
+        // A park this automation's test asked for, if it asked: the wake holds where it is, asleep in
+        // the runtime rather than on a thread, until the test lets it go.
+        test_support::park_the_pass(&self.park).await;
         let Some(dir) = self.settings().config.watch_dir.clone() else {
             return;
         };
@@ -784,25 +927,30 @@ impl Worker {
         }
     }
 
-    /// Starts the program this config names for a finished torrent, and says so only if it would not start.
-    /// What it did after that - how long it ran, what it exited with - is in the log and is nobody's
-    /// business here.
+    /// Records the finish and starts the program this config names, saying nothing unless the program
+    /// would not start. What it did after that - how long it ran, what it exited with - is in the log and
+    /// is nobody's business here.
     ///
-    /// One torrent gets one attempt at its program, however many wakes find it finished: the claim is taken
-    /// before anything is started, so a finish that arrives twice, or is found again on the next look, does
-    /// not play the film twice. A run with no program configured does not claim anything: there is nothing
-    /// to run, and a torrent that finishes before the person sets a program is not owed one.
+    /// One torrent gets one attempt at its program, however many wakes find it finished: the claim is
+    /// taken before anything is looked at - including before the settings are asked whether a program is
+    /// configured at all - so a finish that arrives twice, or is found again on the next look, does not
+    /// play the film twice, and a finish that found nothing configured is *handled*, not merely skipped.
+    /// A person who sets a program afterwards gets it for the next finish, not a chorus of runs for
+    /// every finish this run already watched pass without one.
     fn run_program(&self, id: &InfoHashes, name: &str, folder: &Path) {
-        let Some(program) = self.settings().config.on_complete.clone() else {
-            return;
-        };
-        if !self.lock().program_ran.insert(*id) {
+        if !self.lock().finish_handled.insert(*id) {
+            let program = self.settings().config.on_complete;
             tracing::debug!(
-                program = %map::clean(&program.display().to_string()),
-                "this torrent's completion program has been asked for already",
+                program = %program
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.display().to_string()),
+                "this torrent's finish has been handled already",
             );
             return;
         }
+        let Some(program) = self.settings().config.on_complete.clone() else {
+            return;
+        };
         if let Err(problem) = program::run(&program, name, folder) {
             // The program's own path goes in the line: a name that is refused is fixed by changing that
             // line in `config.yaml`, and a person who is told only "would not start" has to guess which of
@@ -876,6 +1024,9 @@ pub struct AutomationHandle {
     shared: Arc<Mutex<Shared>>,
     editable: bool,
     stop: signal::Sender<bool>,
+    /// The park flags this automation's worker also holds; see [`park_the_watch_folder`](Self::park_the_watch_folder).
+    #[cfg(feature = "test-support")]
+    park: Arc<test_support::ParkFlags>,
 }
 
 impl AutomationHandle {
@@ -925,6 +1076,32 @@ impl AutomationHandle {
         self.editable
     }
 
+    /// Holds this automation's next watch folder pass in the middle of its wake:
+    /// [`watch_folder_is_parked`](Self::watch_folder_is_parked) says when it has, and nothing the session
+    /// says afterwards is acted on until [`release_the_watch_folder`](Self::release_the_watch_folder).
+    ///
+    /// Only this automation is parked - the flags belong to it - so a test holding two handles (or a
+    /// test running beside another test's automation in the same process) parks exactly the loop it is
+    /// testing. Test-support builds only; see [`crate::downloads::test_support`] for what a test does
+    /// with a wake it can hold.
+    #[cfg(feature = "test-support")]
+    pub fn park_the_watch_folder(&self) {
+        test_support::ask_for_park(&self.park);
+    }
+
+    /// Whether this automation's pass is parked right now: while it is, the loop is in the middle of a
+    /// wake. Test-support builds only.
+    #[cfg(feature = "test-support")]
+    pub fn watch_folder_is_parked(&self) -> bool {
+        test_support::pass_is_parked(&self.park)
+    }
+
+    /// Lets this automation's parked pass finish its look at the folder. Test-support builds only.
+    #[cfg(feature = "test-support")]
+    pub fn release_the_watch_folder(&self) {
+        test_support::release_the_park(&self.park);
+    }
+
     /// Stops the task, after whatever pass it is in.
     ///
     /// A completion program that is already running keeps running: it was started and left alone, and
@@ -944,7 +1121,7 @@ impl AutomationHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, wanted};
+    use super::{Answered, InfoHashes, Move, Settings, Shared, Worker, wanted};
     use crate::config::DownloadsConfig;
     use std::path::{Path, PathBuf};
 
@@ -1008,5 +1185,205 @@ mod tests {
         let twice = settings(Some(Path::new("/downloads")));
         assert_eq!(wanted(0.4, Path::new("/downloads"), &twice), None);
         assert_eq!(wanted(1.0, Path::new("/downloads"), &twice), None);
+    }
+
+    /// A made-up torrent id, distinguishable from every other one a test here builds.
+    fn torrent_number(n: u8) -> InfoHashes {
+        let hex = format!("{:0>40x}", n);
+        fbt::InfoHashes::from_v1(hex.parse().expect("a made-up 40-hex info hash"))
+    }
+
+    /// One entry table, holding one entry, exactly as the worker would hold it.
+    fn one_entry(shared: &mut Shared, id: &InfoHashes, entry: Move) {
+        shared.moves.insert(*id, entry);
+    }
+
+    /// Re-pointing a move that is already running replaces the entry - the settings moved the goal -
+    /// but does not start a second `move_storage` behind the first: the in-flight claim carries over,
+    /// and only the running move's own answer, once it is answered, clears it.
+    #[test]
+    fn replacing_a_running_move_waits_for_the_running_one() {
+        let id = torrent_number(7);
+        let old = PathBuf::from("/first");
+        let new = PathBuf::from("/second");
+        let mut shared = Shared::default();
+        one_entry(
+            &mut shared,
+            &id,
+            Move {
+                target: old.clone(),
+                program_after: false,
+                in_flight: true,
+                given_up: false,
+            },
+        );
+
+        assert!(
+            !Worker::record_move(&mut shared, &id, new.clone(), true),
+            "a copy asked for while the engine is still copying under the old goal waits, it does not start: \
+             the engine would only refuse the second one mid-copy",
+        );
+        let queued = shared.moves.get(&id).expect("the new goal is recorded");
+        assert_eq!(
+            queued.target, new,
+            "the entry now points where the settings want"
+        );
+        assert!(
+            queued.program_after,
+            "and the entry, not the running copy, is what carries the program"
+        );
+        assert!(!queued.given_up, "a new folder is a new attempt");
+        assert!(
+            queued.in_flight,
+            "the in-flight claim carries over: the superseded move has to answer first"
+        );
+
+        // The superseded move answers, naming its own folder. It may release the claim and nothing else:
+        // it does not complete the new entry, does not condemn it, and does not speak for its program.
+        let answered = Worker::answer_for(&mut shared, &id, &old, Ok(()));
+        assert!(
+            matches!(answered, Answered::Stale),
+            "an answer for a folder the entry no longer wants is spent quietly: {answered:?}"
+        );
+        let queued = shared
+            .moves
+            .get(&id)
+            .expect("the superseded answer does not remove the entry");
+        assert_eq!(
+            queued.target, new,
+            "the entry keeps the folder the settings want"
+        );
+        assert!(
+            queued.program_after,
+            "and keeps the program the settings made it owed"
+        );
+        assert!(
+            !queued.given_up,
+            "a superseded landing is not this entry's failure"
+        );
+        assert!(
+            !queued.in_flight,
+            "but the claim the entry borrowed from the superseded move is released"
+        );
+
+        // With the claim released the entry is startable, and an ask for the same folder only ever
+        // upgrades its program flag.
+        assert!(
+            Worker::record_move(&mut shared, &id, new.clone(), false),
+            "with the claim gone the entry is startable again",
+        );
+        assert!(
+            shared
+                .moves
+                .get(&id)
+                .expect("still the same entry")
+                .program_after,
+            "and asking for the folder it already wants never clears the program it owes",
+        );
+    }
+
+    /// An answer is taken for what the entry wants now: a matching folder completes or condemns the
+    /// entry and its own `program_after`; a folder the entry does not want, or a torrent that has no
+    /// entry at all (it left the library mid-move), is stale.
+    #[test]
+    fn an_answer_is_read_against_the_entry_not_against_the_move() {
+        let id = torrent_number(12);
+        let here = PathBuf::from("/downloads");
+
+        // The move lands where the entry wants, on a torrent the entry owes a program to: the entry is
+        // done and the program is owed.
+        let mut shared = Shared::default();
+        one_entry(
+            &mut shared,
+            &id,
+            Move {
+                target: here.clone(),
+                program_after: true,
+                in_flight: true,
+                given_up: false,
+            },
+        );
+        let answered = Worker::answer_for(&mut shared, &id, &here, Ok(()));
+        assert!(
+            matches!(
+                answered,
+                Answered::Landed {
+                    program_after: true
+                }
+            ),
+            "files home on a torrent owed its program: {answered:?}"
+        );
+        assert!(
+            shared.moves.is_empty(),
+            "the entry that landed is gone: {:?}",
+            shared.moves
+        );
+
+        // The engine is not ready: the entry stays, claim released, for the next ask.
+        let mut shared = Shared::default();
+        one_entry(
+            &mut shared,
+            &id,
+            Move {
+                target: here.clone(),
+                program_after: true,
+                in_flight: true,
+                given_up: false,
+            },
+        );
+        let answered = Worker::answer_for(&mut shared, &id, &here, Err(fbt::SessionError::Busy));
+        assert!(
+            matches!(answered, Answered::Busy),
+            "not ready yet: {answered:?}"
+        );
+        let queued = shared.moves.get(&id).expect("a busy answer waits");
+        assert!(
+            !queued.in_flight,
+            "the claim is released so the next ask can take it"
+        );
+        assert!(!queued.given_up, "and nothing was given up over a busy");
+
+        // A folder nobody can move into: the entry gives up once, and its program is still owed -
+        // somewhere else, for the folder the files are in, which is the caller's to look up.
+        let mut shared = Shared::default();
+        one_entry(
+            &mut shared,
+            &id,
+            Move {
+                target: here.clone(),
+                program_after: true,
+                in_flight: true,
+                given_up: false,
+            },
+        );
+        let answered =
+            Worker::answer_for(&mut shared, &id, &here, Err(fbt::SessionError::Shutdown));
+        let Answered::Refused {
+            problem,
+            program_after,
+        } = answered
+        else {
+            panic!("a refusal is a refusal: {answered:?}");
+        };
+        assert_eq!(problem.to_string(), fbt::SessionError::Shutdown.to_string());
+        assert!(
+            program_after,
+            "a dead move does not cancel the owed program"
+        );
+        let queued = shared.moves.get(&id).expect("a given-up entry stays put");
+        assert!(queued.given_up, "the reason is not going to fix itself");
+        assert!(
+            !queued.in_flight,
+            "and no second asking burns the same dead end"
+        );
+
+        // A torrent with no entry - gone from the library while its move ran - has nothing left for an
+        // answer to do.
+        let mut shared = Shared::default();
+        let answered = Worker::answer_for(&mut shared, &id, &here, Ok(()));
+        assert!(
+            matches!(answered, Answered::Stale),
+            "a gone torrent went with everything it owed: {answered:?}"
+        );
     }
 }

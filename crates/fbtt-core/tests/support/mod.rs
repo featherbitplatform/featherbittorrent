@@ -63,8 +63,28 @@ pub fn loopback(config: &Config) -> fbt::Settings {
 /// Deterministic file content, so a download can be compared with what was
 /// seeded. A xorshift keeps it varied without a dependency.
 pub fn sample(len: usize) -> Vec<u8> {
+    sample_for(len, "")
+}
+
+/// `sample`'s content shifted by `tag`: two libraries seeded under two tags hold two
+/// different torrents, not one torrent in two folders.
+///
+/// The info hash is a hash of the content (and the names), so a payload every test shares gives
+/// every test the same torrent - and a hook that fires per torrent, like the ones in
+/// `crates/fbtt-core/src/downloads/test_support.rs`, then arms one test's torrent and fires on
+/// another's. Folding the tag into the xorshift's starting state costs nothing and makes each
+/// test's hashes its own.
+pub fn sample_for(len: usize, tag: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     let mut state: u32 = 0x2545_f491;
+    for byte in tag.as_bytes() {
+        // The same mixing the generator below runs, applied once per tag byte: a different tag
+        // is a different point on the same orbit, not a small offset from another's.
+        state ^= u32::from(*byte);
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+    }
     while out.len() < len {
         state ^= state << 13;
         state ^= state >> 17;
@@ -262,7 +282,13 @@ pub async fn seeding_library(
     PathBuf,
 ) {
     let lib = Library::new(tag);
-    let file = write_file(&lib.config.download_dir, "payload.bin", &sample(MIB));
+    // The tag names the payload too: a library seeded under this tag holds a torrent nobody else's
+    // hooks are armed for (see [`sample_for`]).
+    let file = write_file(
+        &lib.config.download_dir,
+        "payload.bin",
+        &sample_for(MIB, tag),
+    );
     let bytes = torrent_for(&file).await;
     let metainfo = fbt::Metainfo::from_bytes(&bytes).expect("the torrent we just made");
     let id = id_of(&metainfo.info_hashes);

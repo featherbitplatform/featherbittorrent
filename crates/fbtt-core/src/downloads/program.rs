@@ -11,7 +11,8 @@
 //! in", and a bare name means a search of `PATH`, which on a service is not the `PATH` of the person who
 //! wrote the line. Both are refused with a line naming the program, rather than started somewhere
 //! surprising - or, on Windows, handed to `cmd.exe`, which is what a `.bat` is started with and which
-//! would read the torrent's name as its own argument.
+//! would read the torrent's name as its own argument, or started at the bytes of an alternate data
+//! stream, where `X:stream` means "the stream `stream` of file `X`" and there is no program to run.
 //!
 //! It is started and left alone. It is not waited for (a program that plays something for an hour would
 //! hold the automation), and it is not killed when this program forgets it (nobody wants quitting the
@@ -69,6 +70,13 @@ pub(crate) enum Refused {
         "is a Windows batch file, which Windows starts through a shell: name a program to start directly"
     )]
     BatchFile,
+    /// A `:` beyond the drive prefix, on Windows: NTFS reads the bytes after one as an alternate data
+    /// stream of the file before it, and a stream is bytes somebody filed under a name, not a program
+    /// that can be run, replaced or seen. The drive letter's own colon is not one of these.
+    #[error(
+        "names an alternate data stream of its file on Windows, which is bytes, not a program: name the program itself"
+    )]
+    AlternateStream,
     /// Nothing to start at that path, or something there that is not a program this run can start.
     #[error("would not start: {reason}")]
     WouldNotStart {
@@ -77,16 +85,37 @@ pub(crate) enum Refused {
     },
 }
 
+/// Whether this path, read the way Windows reads it, names an alternate data stream: a `:` anywhere
+/// after the leading drive prefix, if there is one.
+///
+/// A leading `X:` - one letter and a colon - is a drive letter, the one colon a Windows path may carry
+/// at its front. Every other colon means the bytes after it are somebody's stream inside the file
+/// before it. The check is on the path's own text, not on the filesystem: a stream name parses the
+/// same whether or not the stream exists, and nothing here touches the disk anyway.
+fn has_alternate_stream(program: &Path) -> bool {
+    let name = program.as_os_str().to_string_lossy();
+    let bytes = name.as_bytes();
+    let rest = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        &name[2..]
+    } else {
+        &name
+    };
+    rest.contains(':')
+}
+
 /// Whether `program` is a name this run refuses, without touching the filesystem and without starting
 /// anything.
 ///
-/// `windows` is a parameter rather than a `cfg` so that the batch rule - a rule about what *Windows*
-/// does with a `.bat` - can be checked from any host by saying which platform to answer for. The path
-/// rule comes first: a relative batch file is refused for being relative, which is the more immediate
-/// mistake and the one that has nothing to do with the file's type.
+/// `windows` is a parameter rather than a `cfg` so that the rules about what *Windows* does with a
+/// name - a `.bat`, an alternate data stream - can be checked from any host by saying which platform
+/// to answer for. The path rule comes first: a relative batch file is refused for being relative,
+/// which is the more immediate mistake and the one that has nothing to do with the file's type.
 pub(crate) fn refusal(program: &Path, windows: bool) -> Option<Refused> {
     if !program.is_absolute() {
         return Some(Refused::NotAbsolute);
+    }
+    if windows && has_alternate_stream(program) {
+        return Some(Refused::AlternateStream);
     }
     (windows && settings::batch_file(program)).then_some(Refused::BatchFile)
 }
@@ -191,7 +220,7 @@ fn log_exit(child: &Arc<Mutex<Child>>, program: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Refused, completion_args, refusal};
+    use super::{Refused, completion_args, has_alternate_stream, refusal};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -297,12 +326,64 @@ mod tests {
              directly"
         );
         assert_eq!(
+            Refused::AlternateStream.to_string(),
+            "names an alternate data stream of its file on Windows, which is bytes, not a program: \
+             name the program itself"
+        );
+        assert_eq!(
             Refused::WouldNotStart {
                 reason: "No such file or directory (os error 2)".to_owned(),
             }
             .to_string(),
             "would not start: No such file or directory (os error 2)",
             "the operating system's own reason, which is the thing a person can act on",
+        );
+    }
+
+    /// Windows reads the bytes after a `:` - once a drive prefix is skipped - as an alternate data
+    /// stream of the file before it, and starts a program at such a name without admitting the name is
+    /// not the program. Refused on Windows, run nowhere else, and the whole-path rule still gets asked
+    /// first: `hooks/tool:x` is a mistake about the path before it is a mistake about streams.
+    #[test]
+    fn alternate_data_streams_are_refused_on_windows_only() {
+        let streamed = program("notify:sideload");
+        assert_eq!(
+            refusal(&streamed, true),
+            Some(Refused::AlternateStream),
+            "Windows is told, in the words it needs, that the name is a stream and not a program",
+        );
+        assert_eq!(
+            refusal(&streamed, false),
+            None,
+            "on a unix filesystem a `:` in a name is just a colon in a name, and this program runs",
+        );
+        assert_eq!(
+            refusal(Path::new("hooks/notify:x"), true),
+            Some(Refused::NotAbsolute),
+            "a relative stream name is refused for being relative first - the path is the whole error",
+        );
+
+        // The rule itself, spelled out: the drive prefix's colon is the one that may sit at the front,
+        // and every other colon is the stream marker wherever it lands.
+        assert!(
+            has_alternate_stream(Path::new("C:\\hooks\\tool.exe:ads")),
+            "the classic shape: a stream named under somebody's program",
+        );
+        assert!(
+            !has_alternate_stream(Path::new("C:\\hooks\\tool.exe")),
+            "a drive prefix is not a stream marker",
+        );
+        assert!(
+            has_alternate_stream(Path::new(":stream-without-a-file")),
+            "a colon with no letter in front of it is no drive letter",
+        );
+        assert!(
+            has_alternate_stream(&program("hooks/tool:x")),
+            "a colon anywhere after the front marks a stream, however far in it sits",
+        );
+        assert!(
+            !has_alternate_stream(&program("plain-tool")),
+            "and an ordinary name carries none",
         );
     }
 }

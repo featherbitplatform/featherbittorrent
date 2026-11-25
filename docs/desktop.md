@@ -207,7 +207,9 @@ start it. What you add from the window starts when you add it, whatever this say
 whole path is what works: a relative one or a bare name is refused rather than started, because which file
 either one means depends on where the app or server was started, and the line that says so is a warning
 line like any other (see the next paragraph); on Windows a `.bat` or `.cmd` is refused too, because Windows
-starts those through a shell. A program runs for a finish only - a torrent that arrives whole gets nothing
+starts those through a shell, and so is a name with a `:` after the drive letter, which to Windows names an
+alternate data stream - bytes filed under a name, not a program. A program runs for a finish only - a torrent
+that arrives whole gets nothing
 for the add. It is started with exactly two arguments, the torrent's name and the folder its files ended up
 in, and never through a shell, so a name holding a space or a `;` arrives as one argument and cannot turn
 into a command; a torrent's name can begin with `-`, though, which to a program that takes options reads

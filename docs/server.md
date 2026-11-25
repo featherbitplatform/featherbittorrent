@@ -162,7 +162,9 @@ was started in, and a bare name is looked up on `PATH`, which on a service is no
 who wrote the line, so anything that is not a whole path is refused before anything is tried. On Windows a
 name ending `.bat` or `.cmd` - trailing dots and spaces count, capitalisation makes no difference - is
 refused the same way, because Windows starts those through `cmd.exe`, where arguments are re-parsed and a
-torrent's own name stops being safely one argument. The program runs on the machine this server is on, as
+torrent's own name stops being safely one argument; so is a name carrying a `:` after the drive letter,
+which to Windows names an alternate data stream of a file - bytes stored under a name, not a program to
+start. The program runs on the machine this server is on, as
 whoever this server runs as, with the server's own environment and the directory the server was started in
 as its own: variables the server holds are the program's, and a path the program opens relatively is
 opened against that directory. The torrent's name arrives as the first argument, and BitTorrent names can

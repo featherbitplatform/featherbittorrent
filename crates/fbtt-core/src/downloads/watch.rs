@@ -29,6 +29,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+
 use super::MAX_WATCHED_FILE;
 
 /// The suffix of a torrent file the watch folder added, and of the copy it renamed out of the way.
@@ -43,6 +46,33 @@ const LAST_NUMBER: u32 = 999;
 const TORRENT_SUFFIX: &str = ".torrent";
 /// The same limit in the units the setting and the notice are stated in.
 const MAX_WATCHED_MIB: u64 = MAX_WATCHED_FILE / (1024 * 1024);
+/// `O_NONBLOCK` as the platform this builds for spells it, for the open of a watch folder candidate
+/// ([`read_candidate`]): this crate carries no libc to ask, so each family names its own value. A
+/// platform outside the listed ones gets `0` - the flag is then simply absent, and the identity check
+/// at the open keeps answering for swapped-in shapes the read cannot wait on.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const OPEN_NONBLOCK: i32 = 0o4_000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const OPEN_NONBLOCK: i32 = 0x4;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const OPEN_NONBLOCK: i32 = 0;
 
 /// What one scan saw of one candidate - its bytes and its modification time - and, keyed by path in
 /// a `BTreeMap`, what a whole scan saw, in name order. [`settled`] compares two scans with it.
@@ -187,8 +217,6 @@ pub(crate) fn sweep(
     previous: &Scan,
     unmoved: &UnmovedMap,
 ) -> Result<Sweep, std::io::Error> {
-    #[cfg(feature = "test-support")]
-    super::test_support::park_the_pass();
     let entries = fs::read_dir(dir)?;
     let mut scan = Scan::new();
     let mut ready = Vec::new();
@@ -310,7 +338,9 @@ pub(crate) fn mark(path: &Path, suffix: &str) -> Result<(), String> {
 ///
 /// A file that is unreadable in itself - its name gone between the look and here, a folder it cannot
 /// open - is refused with the operating system's reason, which is what the `.invalid` rename is filed
-/// under.
+/// under. A name that became a FIFO (a named pipe) is refused too, the same answer as for a link: the
+/// open carries `O_NONBLOCK` precisely so that it *can* answer, rather than wait inside the open for a
+/// writer who may never come and stall the pass - and every folder and torrent behind it - indefinitely.
 fn read_candidate(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     let looked_at = fs::symlink_metadata(path).map_err(|problem| problem.to_string())?;
     if !looked_at.is_file() {
@@ -326,6 +356,12 @@ fn read_candidate(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     // follow a link that was not there when the name was looked at. std has no name for this flag, and
     // the crate does not carry a Windows crate to get one.
     open.custom_flags(0x0020_0000);
+    #[cfg(unix)]
+    // `O_NONBLOCK`, spelled per platform just above because this crate carries no libc to ask: a name
+    // that was the agreed regular file at the look and a FIFO by the time this open runs would stop a
+    // blocking open from ever coming back - and a watch folder stuck in one file's read is a watch
+    // folder that adds nobody. A regular file opens and reads exactly as it would without the flag.
+    open.custom_flags(OPEN_NONBLOCK);
     let mut file = open.open(path).map_err(|problem| problem.to_string())?;
 
     let opened = file.metadata().map_err(|problem| problem.to_string())?;
@@ -394,6 +430,24 @@ fn read_capped(file: &mut dyn std::io::Read, cap: u64) -> std::io::Result<Option
     Ok((filled as u64 <= cap).then_some(bytes))
 }
 
+/// Whether a hard link that answered `problem` is a link this folder cannot use at all, so the plain
+/// rename is the only move it has.
+///
+/// `Unsupported` is the filesystem saying it has no hard links - some network mounts and some FUSE
+/// readers answer that way. `PermissionDenied` matters because Linux answers `hard_link` that way - not
+/// `Unsupported` - on vfat and exFAT, which is to say on most USB sticks and SD cards: without falling
+/// back for it too, a watch folder on such a drive could not rename anything `.added` or `.invalid` at
+/// all. A truly read-only folder answers the link `PermissionDenied` for the same reason it answers the
+/// rename - and then fails the rename identically, said out loud - so falling back gives up nothing.
+/// `AlreadyExists` deliberately does not qualify: that is a name somebody is using, and the answer to
+/// that is the next number, never a rename over the top of it.
+fn link_unusable(problem: &std::io::Error) -> bool {
+    matches!(
+        problem.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// Moves `<dir><file>` under `target`, without replacing anything that is in the way.
 ///
 /// A hard link rather than a rename, because of what each does to a name that turns out to be taken:
@@ -402,10 +456,11 @@ fn read_capped(file: &mut dyn std::io::Read, cap: u64) -> std::io::Result<Option
 /// number. A link's own name is moved with a plain rename: a hard link would follow it, so the link's
 /// owner would find a file where their link was and their target's bytes duplicated in the watch folder.
 ///
-/// A filesystem with no hard links - some network mounts and some FUSE readers answer `Unsupported` -
-/// gets the plain rename, which is the only move that folder has. It can replace a name that appeared in
-/// the microseconds between the look and the move; the failure is reported rather than swallowed, and a
-/// folder that cannot link is not a folder that can promise not to.
+/// A filesystem with no usable hard links - [`link_unusable`] spells which answers mean that: no links
+/// at all (`Unsupported`), or the refusal a vfat/exFAT stick answers instead of admitting it has none
+/// (`PermissionDenied`) - gets the plain rename, which is the only move that folder has. It can replace
+/// a name that appeared in the microseconds between the look and the move; the failure is reported
+/// rather than swallowed, and a folder that cannot link is not a folder that can promise not to.
 ///
 /// The link and the name it came from are in the same folder, so a link never crosses a filesystem.
 fn move_name(from: &Path, target: &Path, is_link: bool) -> Result<(), std::io::Error> {
@@ -423,10 +478,9 @@ fn move_name(from: &Path, target: &Path, is_link: bool) -> Result<(), std::io::E
                 Err(problem)
             }
         },
-        // A filesystem with no hard links at all: the plain rename is the only move this folder has.
-        Err(problem) if problem.kind() == std::io::ErrorKind::Unsupported => {
-            fs::rename(from, target)
-        }
+        // A filesystem this folder cannot link on at all - see [`link_unusable`]: the plain rename is
+        // the only move this folder has.
+        Err(problem) if link_unusable(&problem) => fs::rename(from, target),
         Err(problem) => Err(problem),
     }
 }
@@ -464,11 +518,12 @@ fn rename_to_free(dir: &Path, file: &str, suffix: &str) -> Result<PathBuf, std::
 mod tests {
     use super::{
         ADDED, INVALID, LAST_NUMBER, NOT_THE_SAME, Scan, Unmoved, UnmovedMap, candidate,
-        first_free_name, name_taken, numbered, read_candidate, read_capped, settled, sweep,
+        first_free_name, link_unusable, name_taken, numbered, read_candidate, read_capped, settled,
+        sweep,
     };
     use crate::scratch::ScratchDir;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{Cursor, Error, ErrorKind};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -897,6 +952,67 @@ mod tests {
             names(dir.path()),
             vec!["show.torrent.invalid".to_owned()],
             "and it was read, refused and renamed once more, as a new file is"
+        );
+    }
+
+    /// The fallback rule that keeps a watch folder working on the drives people actually carry. The two
+    /// answers a filesystem gives when it cannot make a hard link - saying so (`Unsupported`) and the
+    /// `PermissionDenied` Linux answers instead of saying so on vfat and exFAT - both fall back to the
+    /// rename. The answer that means "somebody is using that name" never does: that is a step to the
+    /// next number, never a licence to rename over the top of somebody's file.
+    #[test]
+    fn a_link_the_filesystem_refuses_falls_back_to_the_rename() {
+        assert!(
+            link_unusable(&Error::from(ErrorKind::Unsupported)),
+            "a filesystem with no hard links at all gets the rename, the only move it has",
+        );
+        assert!(
+            link_unusable(&Error::from(ErrorKind::PermissionDenied)),
+            "the answer Linux gives for `hard_link` on a vfat or exFAT stick - most USB drives and SD \
+             cards - is the same refusal wearing different clothes, and must fall back too",
+        );
+        assert!(
+            !link_unusable(&Error::from(ErrorKind::AlreadyExists)),
+            "a taken name steps on to the next number rather than replacing what is there",
+        );
+        assert!(
+            !link_unusable(&Error::from(ErrorKind::NotFound)),
+            "and a name that cannot be linked to at all is a failure to report, not a licence to rename",
+        );
+    }
+
+    /// A name that was the agreed regular file at the look and a FIFO by the time the open runs is
+    /// refused, not waited on.
+    ///
+    /// The read is asked from a thread of its own with a clock on the answer, because the bug this test
+    /// is for is a read that never comes back: an ordinary read-mode open of a FIFO with no writer
+    /// inside blocks until one appears, and a folder that blocks there blocks its whole pass - every
+    /// other file in it, and every torrent behind it - with it.
+    #[cfg(all(unix, feature = "test-support"))]
+    #[test]
+    fn a_name_that_turned_into_a_fifo_is_refused_without_waiting() {
+        use crate::downloads::test_support::{self as hooks, AtRead};
+
+        let dir = ScratchDir::new("watch_fifo_at_read");
+        let path = dir.path().join("pipe.torrent");
+        fs::write(&path, b"the regular file the two looks agreed to").expect("write the test file");
+        hooks::when_the_watch_folder_reads(path.clone(), AtRead::SwapToFifo);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = read_candidate(&path, 4096).map(|bytes| bytes.len());
+            let _ = tx.send(answer);
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the read of a FIFO answered inside 10 seconds instead of waiting inside the open for a \
+             writer who may never come",
+        );
+        let why = answer.expect_err(
+            "a pipe is not the regular file the look agreed to, so the read has to refuse it",
+        );
+        assert!(
+            why.contains(NOT_THE_SAME),
+            "the reason is that the name is no longer the file that was looked at: {why}",
         );
     }
 }
