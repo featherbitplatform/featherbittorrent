@@ -56,6 +56,11 @@ the rest as they are. Rates are whole KiB/s and the cache whole MiB because that
 them. A file that cannot be parsed is moved aside as `config.yaml.bad` and the run starts on defaults,
 with the problem logged after the first line; a file that cannot be read at all stops the run (exit 1).
 
+Keys this version does not know are kept when the app rewrites the file. Comments are not kept. So a
+setting a newer version wrote into this file survives a save made by this one, and a note you left
+beside a setting is gone the first time the app saves it - keep your own copy of an annotated file, or
+keep the annotations somewhere else.
+
 | Field | Default | What it means |
 | --- | --- | --- |
 | `download_dir` | the machine's Downloads folder, or `<data dir>/downloads` where there is none | Where torrent contents go. A relative value like `dl` means below the library directory and is made absolute at startup. |
@@ -66,6 +71,10 @@ with the problem logged after the first line; a file that cannot be read at all 
 | `limits.active_seeds` | the engine's own count | Torrents seeding at once; `null` for no limit. |
 | `limits.active_total` | the engine's own count | Torrents running at once, either kind; `null` for no limit. |
 | `cache_size_mib` | `32` | The engine's write cache, in MiB. |
+| `downloads.unfinished_dir` | the download folder | Where a torrent's files live until it is whole, so a partial torrent is not mixed in with finished ones. A relative value means below the library directory, as `download_dir` does. It must be a different folder from `download_dir`. |
+| `downloads.start_paused` | `false` | Whether a new torrent starts paused: nothing arrives until you start it. |
+| `downloads.watch_dir` | none | A folder whose `.torrent` files are added as they appear. A relative value means below the library directory. It must be a different folder from `download_dir` and from `downloads.unfinished_dir`. |
+| `downloads.on_complete` | none | A program to start when a torrent finishes, named by its full path. It is handed the torrent's name and its folder as two separate arguments, and the app does not wait for it. Left as written, so a relative value means whatever the program's own directory is. |
 | `server.bind` | `127.0.0.1:8090` | The address and port the API listens on, as `<ip>:<port>`. `0.0.0.0:8090` serves every interface this machine has. |
 | `server.allowed_roots` | the download folder alone | The directories the API may name in a request: save paths, move targets, folders to browse through `/api/v1/fs/roots` and `/api/v1/fs/list`. An empty list means the download folder alone; entries are made absolute. |
 | `server.allowed_hosts` | empty | Names this server answers, beside `localhost` and any literal address. With logins off these are the whole host-name defence, and every request's name is checked against them. With logins on they still decide one thing, the web UI: a browser that reaches the server at the server's own name needs nothing listed (its `Origin` is the name the request arrived at, and the sign-in and the cookie's changes accept that), but behind a proxy that rewrites `Host`, which the featherbit gateway does, the public name must be listed or the web UI's sign-in is refused. Spell each entry a bare name (`bit.local`, not `https://bit.local:8090`). At startup, an entry no request could ever carry is named in a warning line. |

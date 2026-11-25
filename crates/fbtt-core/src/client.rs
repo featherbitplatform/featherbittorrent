@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
@@ -119,8 +120,9 @@ pub struct Totals {
 /// The limits the running session is under, in the units a person states them in.
 ///
 /// A rate of 0 KiB/s is unlimited and a queue count of `None` is unlimited, as in
-/// [`Limits`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`Limits`]. This is also the `speed` half of what a settings screen shows, so it crosses
+/// the wire to a browser in the same shape it is read in ([`crate::SettingsView`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveLimits {
     /// Download rate in KiB/s (0: unlimited).
     pub download_kib: u64,

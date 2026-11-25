@@ -322,6 +322,10 @@ pub async fn run() -> ExitCode {
 }
 
 /// What the run starts on, once `ui.yaml`, this library and the keychain have been asked about.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "built once at start-up; variant sizes differ by platform"
+)]
 enum Opening {
     /// Drive this library's engine, on `config`, holding its lock.
     Engine { config: Config, lock: LibraryLock },

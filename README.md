@@ -142,7 +142,7 @@ cache_size_mib: 32                   # the engine's write cache, in MiB
 
 Rates are whole KiB/s and the cache whole MiB, because that is how people state them. A queue count left out of the file takes the number above (the engine's own); write `null` for no limit. Both address families listen on the one port, and `0` asks the operating system for one instead of claiming 6881; a run that gets no listener at all prints why it could not start and exits 1.
 
-Changing limits in the settings dialog (`S`) applies them to the running session and writes them back to this file, so they are still there next run. Everything else in the file survives that save unchanged.
+Changing limits in the settings dialog (`S`) applies them to the running session and writes them back to this file, so they are still there next run. Keys this version does not know are kept when the app rewrites the file. Comments are not kept, so an annotated file is worth keeping your own copy of.
 
 A `config.yaml` that is not valid YAML does not stop the app: it is moved aside as `config.yaml.bad`, the run starts on the defaults, and one line about what was wrong appears on screen. The state file follows the same rule. An unreadable `session.state` becomes `session.state.bad` rather than being overwritten, and resume data that cannot all be turned back into torrents is copied to `session.state.bak` first, so the missing ones are not lost to the next save.
 

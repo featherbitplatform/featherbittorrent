@@ -386,7 +386,7 @@ impl Server {
     /// Stops every Argon2 password check this server starts inside the check, and returns a count of how many
     /// have reached that stopping point since it was armed - a count a test waits on rather than polls, and
     /// releases with [`release_parked_verifies`](Self::release_parked_verifies). The count is arrivals ever,
-    /// not how many are held right now, and it is published in order and only ever rises (see [`VerifyTally`]),
+    /// not how many are held right now, and it is published in order and only ever rises (see `VerifyTally`),
     /// so a test can wait for a check to arrive and read the number back without it moving under it. Only a
     /// test does this, and it is how that test says the bound is real without timing somebody else's hashing:
     /// hold the checks that are holding every permit, hang up on their connections, and see whether anything
