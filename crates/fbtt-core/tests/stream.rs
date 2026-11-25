@@ -107,17 +107,20 @@ impl Library {
     }
 
     /// Takes the library lock and starts a backend on it. The returned session is
-    /// the same engine the backend drives, so a test can point it at a peer.
+    /// the same engine the backend drives, so a test can point it at a peer. The settings automation
+    /// it starts beside the engine is left here: this test's config chooses no downloads setting, and
+    /// the backend holds its own handle on it.
     async fn start(&self) -> (Client, JoinHandle<Result<(), String>>, fbt::Session) {
         let lock = LibraryLock::acquire(&self.paths.lock_file()).expect("lock the library");
-        within(LocalBackend::start_for_test(
+        let (client, task, session, _automation) = within(LocalBackend::start_for_test(
             loopback(&self.config),
             self.config.clone(),
             &self.paths,
             lock,
         ))
         .await
-        .expect("start the backend")
+        .expect("start the backend");
+        (client, task, session)
     }
 }
 

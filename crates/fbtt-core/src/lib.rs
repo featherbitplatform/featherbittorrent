@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod downloads;
 pub mod engine;
 pub mod fs_list;
 pub mod local;

@@ -103,3 +103,10 @@ required-features = ["test-support"]
 [[test]]
 name = "play"
 required-features = ["test-support"]
+
+# The unfinished folder, the watch folder and the program run on completion. These move real files
+# under a scratch folder and hand the finished torrent to `fbtt-fake-player`, so they need both the
+# scenario helper and that binary (`CARGO_BIN_EXE_fbtt-fake-player`).
+[[test]]
+name = "downloads"
+required-features = ["test-support"]

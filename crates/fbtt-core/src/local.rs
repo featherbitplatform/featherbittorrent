@@ -29,6 +29,7 @@ use crate::client::{
     LiveLimits, Notice, PlaySource, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::config::{Config, ConfigLoad, Limits};
+use crate::downloads::{Automation, AutomationHandle};
 use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
 use crate::lock::LibraryLock;
@@ -74,7 +75,10 @@ impl LocalBackend {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<(Client, JoinHandle<Result<(), String>>), SessionError> {
-        let (client, task, _) = spawn(config.session_settings(), config, paths, lock).await?;
+        // The session and the downloads automation come back too and are dropped here: the engine the
+        // task owns already holds the session, and so does the task's own handle on the automation (see
+        // `crate::downloads`).
+        let (client, task, ..) = spawn(config.session_settings(), config, paths, lock).await?;
         Ok((client, task))
     }
 
@@ -86,19 +90,29 @@ impl LocalBackend {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<(Client, JoinHandle<Result<(), String>>), SessionError> {
-        let (client, task, _) = spawn(settings, config, paths, lock).await?;
+        let (client, task, ..) = spawn(settings, config, paths, lock).await?;
         Ok((client, task))
     }
 
     /// [`start_with`](Self::start_with), plus a clone of the session it started so that
-    /// a test can hand the engine a peer of its own. Needs the `test-support` feature.
+    /// a test can hand the engine a peer of its own, and the handle on the downloads automation
+    /// started beside it, which is how a test changes those settings without a config file.
+    /// Needs the `test-support` feature.
     #[cfg(feature = "test-support")]
     pub async fn start_for_test(
         settings: Settings,
         config: Config,
         paths: &Paths,
         lock: LibraryLock,
-    ) -> Result<(Client, JoinHandle<Result<(), String>>, Session), SessionError> {
+    ) -> Result<
+        (
+            Client,
+            JoinHandle<Result<(), String>>,
+            Session,
+            AutomationHandle,
+        ),
+        SessionError,
+    > {
         spawn(settings, config, paths, lock).await
     }
 }
@@ -108,13 +122,23 @@ impl LocalBackend {
 /// The engine's own problems with the state file - what it could not read, what it kept aside,
 /// what it therefore refuses to write - come back with it as notices, one line each, and go out on
 /// the new client before its first snapshot is anything a screen could act on. The engine clone
-/// comes back with the client so a caller can drive the same session.
+/// comes back with the client so a caller can drive the same session, and so does the handle on the
+/// downloads automation that starts beside the engine: the task owns its own handle and stops that
+/// before it stops the engine (see `crate::downloads`).
 async fn spawn(
     settings: Settings,
     config: Config,
     paths: &Paths,
     lock: LibraryLock,
-) -> Result<(Client, JoinHandle<Result<(), String>>, Session), SessionError> {
+) -> Result<
+    (
+        Client,
+        JoinHandle<Result<(), String>>,
+        Session,
+        AutomationHandle,
+    ),
+    SessionError,
+> {
     // Whatever the config file named for downloads, this run works on an absolute
     // directory (`Config::resolve`), so a snapshot's default folder, an add with no
     // folder typed in, and the fallback a save writes are all the same place.
@@ -150,6 +174,19 @@ async fn spawn(
     #[cfg(feature = "test-support")]
     let client = client.with_session(&session);
 
+    // The downloads settings, acted on: the unfinished folder, the watch folder and the program a
+    // finished torrent runs. It works beside the engine rather than inside the task below, it reports on
+    // the same queue the engine reports on, and the task stops it when the engine stops. `editable` is
+    // true because a library running in this process is one this person runs themselves, which is the
+    // answer the settings screen needs for the program field (see `crate::OnCompleteView`).
+    let automation = Automation::spawn(
+        session.clone(),
+        config.download_dir.clone(),
+        config.downloads.clone(),
+        true,
+        channels.notices.clone(),
+    );
+
     let backend = Backend {
         engine,
         config,
@@ -158,12 +195,13 @@ async fn spawn(
         dirs: None,
         stalled,
         stream: None,
+        automation: automation.clone(),
         published: initial,
         snapshot_tx: channels.snapshot,
         notices: channels.notices,
     };
     let task = tokio::spawn(backend.run(channels.commands));
-    Ok((client, task, session))
+    Ok((client, task, session, automation))
 }
 
 /// The table and the header totals for the session as it is now.
@@ -286,6 +324,10 @@ struct Backend {
     /// The loopback stream endpoint, started on the first `Stream` command that
     /// needs it and reused after that; shut down before the engine on `Shutdown`.
     stream: Option<LocalEndpoint>,
+    /// The unfinished folder, the watch folder and the completion program, running beside the engine.
+    /// It reports on this task's notice queue, and it is stopped before the engine is: it should not be
+    /// asking a session to move files while that session is being saved and closed.
+    automation: AutomationHandle,
     /// The snapshot the screen is looking at, so that only a change publishes.
     published: Arc<Snapshot>,
     /// Where snapshots go out.
@@ -337,6 +379,11 @@ impl Backend {
                 // stream endpoint goes first: its streams read through the engine's session, so the
                 // endpoint must be done before the session is.
                 Wake::Command(Command::Shutdown) => {
+                    // Put off any move or watch add that has not started yet: this task's handle goes
+                    // with the engine's, and the automation must not be asking for a move while its
+                    // session is being saved and closed. A pass already in flight is answered by the
+                    // session's own "shut down", which the automation does not retry.
+                    self.automation.shutdown();
                     if let Some(endpoint) = self.stream.take() {
                         endpoint.shutdown().await;
                     }
@@ -438,10 +485,14 @@ impl Backend {
                 .map(|metainfo| AddTorrent::new(metainfo, save_path))
                 .map_err(|error| error.to_string()),
         };
-        let params = match params {
+        let mut params = match params {
             Ok(params) => params,
             Err(problem) => return self.notify(Notice::Error(map::clean(&problem))),
         };
+        // `start_paused` is about how a torrent gets added, whichever way it got here: the watch folder
+        // passes the same switch (see `crate::downloads`), and the Add dialog's own choice is that
+        // dialog's to send once it has one.
+        params.paused = self.config.downloads.start_paused;
         match self.engine.session().add_torrent(params).await {
             // The name is the engine's own: for a magnet its `dn`, until peers confirm
             // what the torrent actually is. A magnet with no `dn` has nothing to call it
