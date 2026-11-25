@@ -109,6 +109,12 @@ pub(crate) struct Shared {
     /// hands out and the stream route that serves it look at one library. Not in the `Debug` printing below:
     /// what a session prints is every torrent in it, which is not what a `Debug` line here is for.
     session: fbt::Session,
+    /// The unfinished folder, the watch folder and the completion program this server runs beside the
+    /// engine it serves. The settings routes read its two complaints - what went wrong with the watch
+    /// folder last time it was read, and with the program last time it was run - so a browser sees them
+    /// beside the fields they belong to, and [`crate::Server::shutdown`] stops it. Not in the `Debug`
+    /// printing below: what it would print is the watch folder's last scan and the moves waiting.
+    automation: fbtt_core::downloads::AutomationHandle,
     /// The hash an unknown user name is verified against, so that answering "no such account" costs
     /// what answering "wrong password" costs. `None` when no account could have been found anyway -
     /// with no users, or with nobody signing in, there is no name worth hiding. See [`login`].
@@ -165,6 +171,7 @@ impl Shared {
         dummy_password_hash: Option<String>,
         session: fbt::Session,
         launch: Option<(String, bool)>,
+        automation: fbtt_core::downloads::AutomationHandle,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
         // what `Server::build` serves on in the same case.
@@ -182,6 +189,7 @@ impl Shared {
             paths,
             roots: roots.into(),
             session,
+            automation,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             verify_tally: Arc::new(VerifyTally::new()),
@@ -202,6 +210,13 @@ impl Shared {
     /// torrents exist.
     pub(crate) fn session(&self) -> &fbt::Session {
         &self.session
+    }
+
+    /// The unfinished folder, the watch folder and the completion program this run acts on, for the two
+    /// things that need it: [`crate::Server::shutdown`] stops it before the session is written out, and
+    /// the settings routes (Task A3) read its complaints beside the fields they belong to.
+    pub(crate) fn automation(&self) -> &fbtt_core::downloads::AutomationHandle {
+        &self.automation
     }
 
     /// The pool the media routes take a place from before they start demuxing: `media`'s `media_permit` is
