@@ -341,6 +341,15 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    /// On Windows a path without a drive letter is not absolute, so tests build absolute paths this way.
+    fn abs(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{p}"))
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
     /// The four keys a surface always sends, with the program left to the caller: the shape a change
     /// arrives in, spelled once for these tests.
     fn change(
@@ -447,14 +456,14 @@ mod tests {
         );
         // A folder outside the one folder this server may name.
         refused(
-            &change(Path::new("/not-under-the-root/downloads"), None, None, None),
+            &change(&abs("/not-under-the-root/downloads"), None, None, None),
             Some(&roots),
             SettingsProblem::OutsideRoots,
         );
         refused(
             &change(
                 &default_dir,
-                Some(Path::new("/elsewhere/incomplete")),
+                Some(&abs("/elsewhere/incomplete")),
                 None,
                 None,
             ),
@@ -554,10 +563,10 @@ mod tests {
     fn validate_unfinished_equal_after_dotdot_is_refused() {
         let outcome = validate_downloads(
             &change(
-                Path::new("/srv/d"),
-                Some(Path::new("/srv/x/../d")),
+                &abs("/srv/d"),
+                Some(&abs("/srv/x/../d")),
                 None,
-                Some(Path::new("/usr/bin/tool")),
+                Some(&abs("/usr/bin/tool")),
             ),
             None,
         );
@@ -575,10 +584,10 @@ mod tests {
     fn validate_watch_equal_after_dotdot_is_refused() {
         let outcome = validate_downloads(
             &change(
-                Path::new("/srv/d"),
-                Some(Path::new("/srv/x/../e")),
-                Some(Path::new("/srv/x/../d")),
-                Some(Path::new("/usr/bin/tool")),
+                &abs("/srv/d"),
+                Some(&abs("/srv/x/../e")),
+                Some(&abs("/srv/x/../d")),
+                Some(&abs("/usr/bin/tool")),
             ),
             None,
         );
@@ -589,10 +598,10 @@ mod tests {
         );
         let outcome = validate_downloads(
             &change(
-                Path::new("/srv/d"),
-                Some(Path::new("/srv/x/e")),
-                Some(Path::new("/srv/x/e/../e")),
-                Some(Path::new("/usr/bin/tool")),
+                &abs("/srv/d"),
+                Some(&abs("/srv/x/e")),
+                Some(&abs("/srv/x/e/../e")),
+                Some(&abs("/usr/bin/tool")),
             ),
             None,
         );
@@ -615,7 +624,7 @@ mod tests {
                 Path::new("Downloads/Shows"),
                 None,
                 None,
-                Some(Path::new("/usr/bin/tool")),
+                Some(&abs("/usr/bin/tool")),
             ),
             None,
         );
@@ -625,14 +634,14 @@ mod tests {
 
         // A run on a server refuses the same folder the same way: what it fails is the spelling, not
         // the list, and the root-list line is for folders that are full paths going outside it.
-        let roots = [PathBuf::from("/srv")];
+        let roots = [abs("/srv")];
         assert_eq!(
             validate_downloads(
                 &change(
                     Path::new("Downloads/Shows"),
                     None,
                     None,
-                    Some(Path::new("/usr/bin/tool")),
+                    Some(&abs("/usr/bin/tool")),
                 ),
                 Some(&roots),
             ),
