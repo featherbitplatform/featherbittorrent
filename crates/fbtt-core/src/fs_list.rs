@@ -111,6 +111,62 @@ pub fn inside_lexically(roots: &[Root], path: &Path) -> bool {
             .any(|root| path.starts_with(&root.given) || path.starts_with(&root.canonical))
 }
 
+/// Whether `canonical`, a path the file system has already resolved, is inside one of `roots` by their
+/// canonical spellings.
+///
+/// This is the comparison that cannot be fooled by a link: two paths that differ only in how they were
+/// spelled compare equal once resolved. Every place that acts on a folder makes it once the links in the
+/// path are followed - [`resolve_folder`] for a folder that is there, [`inside_roots`] for one that is
+/// not yet, a listing for what it may name - so all of them refuse a link that leads out of every root
+/// the same way, and there is one such comparison rather than a copy per caller.
+pub fn inside_resolved(roots: &[Root], canonical: &Path) -> bool {
+    roots
+        .iter()
+        .any(|root| canonical.starts_with(&root.canonical))
+}
+
+/// Whether `path` is inside one of `roots` once resolved, for the folder case [`resolve_folder`] cannot
+/// answer: a path that is not there yet, which a settings change may name before anything has made it.
+///
+/// [`inside_lexically`] first - absolute, no `..`, below a root as spelled - and then the *deepest
+/// ancestor of `path` that exists* is resolved and required to be inside a root
+/// ([`inside_resolved`]). So a path that is not there yet is judged by the folder it would be made in,
+/// which is the only thing on disk that can be checked, and a link anywhere above it that leads out is
+/// what this refuses: asked as `<root>/out/new` where `<root>/out` is a link to `/etc`, the spelling is
+/// below a root and the resolved ancestor is not, so the answer is no. A link that is there but cannot be
+/// followed - a dangling one - is no folder to put anything in either, so it is refused rather than
+/// stepped over.
+///
+/// This blocks: it asks the file system. Call it from a blocking thread when something else is waiting.
+pub fn inside_roots(roots: &[Root], path: &Path) -> bool {
+    if !inside_lexically(roots, path) {
+        return false;
+    }
+    resolved_existing_ancestor(path).is_some_and(|resolved| inside_resolved(roots, &resolved))
+}
+
+/// The deepest ancestor of `path` - `path` itself included - that exists, resolved, or `None` when none
+/// of them does or one of them is a link that cannot be followed. The walk up is what lets a path that is
+/// not there yet be judged by the part of it that is.
+fn resolved_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path;
+    loop {
+        match candidate.canonicalize() {
+            Ok(resolved) => return Some(resolved),
+            // Nothing at this spelling: judge the folder above it instead. An entry that *is* there and
+            // still resolves to nothing - a link whose target is gone - is not a folder to put anything
+            // in, so the walk stops there rather than stepping over it.
+            Err(problem) if problem.kind() == ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(candidate).is_ok() {
+                    return None;
+                }
+                candidate = candidate.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Why one folder could not be listed.
 ///
 /// Each variant answers a different question, so each caller gives it the shape its own users read: the
@@ -182,10 +238,7 @@ pub fn resolve_folder(roots: &[Root], path: &Path) -> Result<PathBuf, ListingErr
     };
     // The links are resolved now, so a folder reached through one that leads outside every root is
     // refused here although its spelling was inside: this is the check that cannot be fooled by an alias.
-    if !roots
-        .iter()
-        .any(|root| canonical.starts_with(&root.canonical))
-    {
+    if !inside_resolved(roots, &canonical) {
         return Err(ListingError::Outside(shown));
     }
     if !canonical.is_dir() {
@@ -273,9 +326,7 @@ fn listed_dir(roots: &[Root], entry: &std::fs::DirEntry) -> bool {
         Ok(kind) if !kind.is_symlink() => false,
         // A link, or a platform that will not say: ask the path, which resolves it.
         _ => match entry.path().canonicalize() {
-            Ok(target) => {
-                target.is_dir() && roots.iter().any(|root| target.starts_with(&root.canonical))
-            }
+            Ok(target) => target.is_dir() && inside_resolved(roots, &target),
             Err(_) => false,
         },
     }
@@ -283,7 +334,7 @@ fn listed_dir(roots: &[Root], entry: &std::fs::DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Root, browse_roots, inside_lexically, list_dirs};
+    use super::{Root, browse_roots, inside_lexically, inside_roots, list_dirs};
     use crate::scratch::ScratchDir;
     use std::fs;
     use std::path::PathBuf;
@@ -365,5 +416,56 @@ mod tests {
         // answer for whatever directory this program happened to be started in.
         assert!(list_dirs(&roots, &dir.path().join("outside")).is_err());
         assert!(list_dirs(&roots, PathBuf::from("alpha").as_path()).is_err());
+    }
+
+    /// A folder that is not there yet is judged by the deepest part of it that is, so a settings change
+    /// may name a folder before anything has made it - and a link that leads out is refused even when the
+    /// path continues past it into folders that do not exist.
+    #[test]
+    fn a_folder_that_is_not_there_yet_is_judged_by_the_part_that_is() {
+        let dir = ScratchDir::new("fs_list_not_yet");
+        let given = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(given.join("alpha")).expect("make the root and a folder in it");
+        fs::create_dir_all(&outside).expect("make a folder outside the root");
+        let roots = browse_roots(std::slice::from_ref(&given));
+
+        assert!(
+            inside_roots(&roots, &given.join("alpha").join("deep").join("deeper")),
+            "a folder below one that is there is inside the root",
+        );
+        assert!(
+            !inside_roots(&roots, &outside.join("made-up")),
+            "a folder below somewhere else is not",
+        );
+        assert!(
+            !inside_roots(&roots, &given.join("..").join("outside")),
+            "`..` is refused before anything is resolved",
+        );
+
+        // A link inside the root that leads out: the spelling is below the root, the resolved ancestor is
+        // not, and a path that carries on past the link is refused for the same reason.
+        #[cfg(unix)]
+        {
+            let link = given.join("out");
+            std::os::unix::fs::symlink(&outside, &link).expect("a link that leads out of the root");
+            assert!(
+                !inside_roots(&roots, &link),
+                "a link to somewhere else is not inside the root",
+            );
+            assert!(
+                !inside_roots(&roots, &link.join("deeper")),
+                "and neither is a folder named past it",
+            );
+
+            // A link whose target is gone is no folder to put anything in either.
+            let dangling = given.join("gone");
+            std::os::unix::fs::symlink(dir.path().join("never"), &dangling)
+                .expect("a link to nothing");
+            assert!(
+                !inside_roots(&roots, &dangling),
+                "a link that leads nowhere is not a folder to make anything in",
+            );
+        }
     }
 }

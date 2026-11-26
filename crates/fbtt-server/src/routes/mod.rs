@@ -18,6 +18,7 @@ mod devices;
 pub(crate) mod fs;
 mod login;
 mod media;
+mod settings;
 mod stream;
 mod web_session;
 
@@ -37,7 +38,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -88,14 +89,27 @@ pub(crate) struct Shared {
     users: Vec<UserEntry>,
     /// The devices a key login recognises, swapped whole whenever `config.yaml` is rewritten.
     devices: Mutex<DeviceTable>,
-    /// One device change at a time: the routes read `config.yaml`, change one field of it and write it
-    /// back, and two requests doing that at once would lose one another's device. Held across the disk
-    /// work, which is why it is an async lock - nothing blocking runs inside it.
-    changing_devices: tokio::sync::Mutex<()>,
+    /// One config change at a time: the routes read `config.yaml`, change one field of it and write it
+    /// back, and two requests doing that at once would lose one another's change - whichever read first
+    /// would write its own copy of a file the other had already changed. Every product route that writes
+    /// the file goes through [`Shared::write_config`] and therefore through this one lock: the devices,
+    /// the speed and the downloads. Held across the disk work, which is why it is an async lock -
+    /// nothing blocking runs inside it.
+    changing_config: tokio::sync::Mutex<()>,
     /// What this run started on, its folders already rooted in the library. The config to write back
     /// when `config.yaml` is not there yet, so that saving a device cannot invent a different library
     /// than the one being served.
     base_config: Config,
+    /// The config as the last write left it, this run's own to begin with: what the settings route
+    /// reports the downloads section from, so a screen reads back what a save wrote rather than what the
+    /// file said before it. Swapped whole under [`changing_config`](Self::changing_config).
+    current: Mutex<Config>,
+    /// Whether this run has a launch secret at all: the desktop app started this engine, so a request
+    /// carrying that secret may name the program a finished torrent runs. A plain `serve` reads the
+    /// program from its own `config.yaml` and a browser may not name one, so this is false there and the
+    /// route answers `403 set_in_config_file`. What a *request* carries is asked separately
+    /// ([`Shared::program_is_editable`]).
+    program_editable: bool,
     /// Where `config.yaml` is.
     paths: Paths,
     /// The folders the file routes may name, as configured and canonicalised: what a request names is
@@ -132,6 +146,10 @@ pub(crate) struct Shared {
     /// [`VerifyTally`] for why both the permit and this have to travel with the work rather than with the
     /// request, and [`login::verify_password`] for the check that does it.
     verify_tally: Arc<VerifyTally>,
+    /// What the config saves report to while they run: the hold a test arms, and nothing a run touches
+    /// (see [`ConfigSaves`]). Its own `Arc` because the save carries it down to the blocking pool with the
+    /// job, while the test that arms it holds the other end.
+    config_saves: Arc<ConfigSaves>,
     /// How many of the media routes may run at once, across all four of them: [`media::MEDIA_PERMITS`].
     ///
     /// Every media request is a thread on the blocking pool holding a container demuxer, a file reader and
@@ -177,6 +195,11 @@ impl Shared {
         // what `Server::build` serves on in the same case.
         let server = config.server.clone().unwrap_or_default();
         let devices = Mutex::new(DeviceTable::build(&server.auth.devices));
+        // A launch secret means the desktop app started this engine - with `expose` off it is the app's
+        // own alone, with it on the secret is accepted beside the config's logins - and only then may a
+        // request that carries it name the program a finished torrent runs (see `program_editable`).
+        let program_editable = launch.is_some();
+        let current = Mutex::new(config.clone());
         Shared {
             auth: Arc::new(match launch {
                 Some((secret, only)) => FbttAuth::new(&server).with_launch_secret(secret, only),
@@ -184,8 +207,10 @@ impl Shared {
             }),
             users: server.auth.users.clone(),
             devices,
-            changing_devices: tokio::sync::Mutex::new(()),
+            changing_config: tokio::sync::Mutex::new(()),
             base_config: config,
+            current,
+            program_editable,
             paths,
             roots: roots.into(),
             session,
@@ -193,6 +218,7 @@ impl Shared {
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             verify_tally: Arc::new(VerifyTally::new()),
+            config_saves: Arc::new(ConfigSaves::new()),
             media_permits: Arc::new(tokio::sync::Semaphore::new(media::MEDIA_PERMITS)),
             media_read_ms: AtomicU64::new(media::READ_TIMEOUT.as_millis() as u64),
         }
@@ -217,6 +243,200 @@ impl Shared {
     /// the settings routes (Task A3) read its complaints beside the fields they belong to.
     pub(crate) fn automation(&self) -> &fbtt_core::downloads::AutomationHandle {
         &self.automation
+    }
+
+    /// Reads `config.yaml`, gives `change` the config to alter, writes it back atomically, keeps it as
+    /// what this run reports its settings from and only then hands it to `apply` - all under one lock, so
+    /// every write and everything it makes happen to this run is one change at a time.
+    ///
+    /// Every product route that writes the file goes through here and therefore through
+    /// [`changing_config`](Self::changing_config): the devices, the speed and the downloads. Two of them
+    /// that each read the file, changed their own field and wrote it back would leave one with a change
+    /// nobody asked for and the other with none - a speed save and a device add started together must both
+    /// survive. Held while the disk work runs on the blocking pool and while `apply` runs, which is why it
+    /// is an async lock.
+    ///
+    /// `apply` is the in-memory half of a change - the session put under new limits, the downloads
+    /// automation given the settings the file now holds, the device list logins check against replaced -
+    /// and it runs with the guard still held, after the save has landed. That order is the guarantee: with
+    /// the apply outside the lock, two changes written in one order could take effect in the other, leaving
+    /// the run under limits (or a device list) the file no longer has. Nothing an `apply` may do may wait
+    /// on anything that takes this lock, or the server would wait on itself; the three applies are local
+    /// calls on the session, the automation and the device list, so none of them does. `apply` is
+    /// synchronous for the same reason.
+    ///
+    /// With no file yet, what `change` alters is the config this run started on, so a save cannot invent a
+    /// different library than the one being served. The bytes go into a temp file beside the target and are
+    /// renamed over it ([`Config::save`]), so a crash leaves the old file or the new one and never half of
+    /// each. `change` refusing - a device that is already there, a name that is not - writes nothing and
+    /// applies nothing.
+    ///
+    /// A file that cannot be read is answered and left exactly where it is, with nothing written and
+    /// nothing applied: reading is [`Config::load_for_edit`], which renames nothing, unlike
+    /// [`Config::load`](fbtt_core::Config::load), whose job is to let a *run* start on something. A request
+    /// has no such need - it can fail - and an ordinary save renaming somebody's hand-edited file is not
+    /// this route's to do. The path and the reason go to the log; the answer keeps one sentence. A read
+    /// failure is a plain `500 internal` for a route to give its own name to, and a save failure is
+    /// `500 config_unwritable`, which says what an operator would have to fix.
+    ///
+    /// A request that is dropped halfway through - the browser tab that asked for a change closes while the
+    /// save is being written - still leaves the file and the run in step. The change does not run in the
+    /// request's own future, which hyper drops on a disconnect, but in a task of its own that owns the state
+    /// it needs and is not dropped with what awaits it: the save that has already started finishes, the
+    /// config this run reports from is stored, and `apply` runs, whether or not anybody is left to read the
+    /// answer. This request only awaits that task, and holding nothing but the [`Arc`] means the drop takes
+    /// the request away and leaves the change running. A task that panicked is the same plain `500` a save
+    /// failure gives, and its join error is never unwrapped.
+    pub(crate) async fn write_config(
+        self: &Arc<Self>,
+        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
+        apply: impl FnOnce(&Config) + Send + 'static,
+    ) -> Result<Config, RouteError> {
+        // What the task needs: the state, and one more handle on the same `Arc` the request holds.
+        let shared = Arc::clone(self);
+        // Test-support only, and it lives in *this* future rather than in the task's: what a test waits on
+        // is the request being gone, and this is the request (see [`ChangeGuard`]).
+        #[cfg(feature = "test-support")]
+        let _ending = ChangeGuard(Arc::clone(&self.config_saves));
+        tokio::spawn(async move { shared.change_config(change, apply).await })
+            .await
+            .map_err(|problem| {
+                tracing::warn!(problem = %problem, "the config change task did not finish");
+                RouteError::internal("the server could not change its config; see the server log")
+            })?
+    }
+
+    /// The body of [`write_config`](Self::write_config), its only caller: the guard, the read, `change`, the
+    /// save, `current` and `apply`, in that order, all with the guard held. It runs inside the task
+    /// `write_config` spawns, so it runs to the end whether or not the request that asked for it is still
+    /// there, and the guard is what keeps two changes from taking effect in the reverse of the order they
+    /// were written.
+    async fn change_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
+        apply: impl FnOnce(&Config) + Send,
+    ) -> Result<Config, RouteError> {
+        let _guard = self.changing_config.lock().await;
+        // Read on the blocking pool, like every other disk call here. Each call takes a copy of the path
+        // of its own and `file` stays here, because the log line about a failure wants the file this
+        // request actually used.
+        let file = self.paths.config_file();
+        let reading = file.clone();
+        let read = tokio::task::spawn_blocking(move || Config::load_for_edit(&reading))
+            .await
+            .map_err(|problem| {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config read task failed",
+                );
+                RouteError::internal("the server could not read its config; see the server log")
+            })?;
+        let mut config = match read {
+            Ok(Some(config)) => config,
+            // Nothing there yet: this run's own config is the only one to change.
+            Ok(None) => self.base_config.clone(),
+            Err(problem) => {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config could not be read or applied",
+                );
+                return Err(RouteError::internal(
+                    "the server's config has a setting to fix; see the server log",
+                ));
+            }
+        };
+        change(&mut config)?;
+        // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`). A
+        // folder this server has no write permission on, a disk with no room left, a path somebody made
+        // read-only: this is an operator's problem, not a client's mistake, so it is answered
+        // `500 config_unwritable` with what the operating system said - the one thing whoever runs this
+        // server can act on - and the whole path goes into the log line beside it.
+        let saving = file.clone();
+        let writing = config.clone();
+        let saves = Arc::clone(&self.config_saves);
+        tokio::task::spawn_blocking(move || {
+            // Test-support only, and a no-op in a run: a save a test has armed the hold on stops here,
+            // inside the job, so a test can drop the request that asked for it and watch the change finish
+            // anyway. See [`ConfigSaves`].
+            saves.park_inside_save();
+            writing.save(&saving)
+        })
+        .await
+        .map_err(|problem| {
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config save task failed",
+            );
+            config_unwritable(&problem.to_string())
+        })?
+        .map_err(|problem| {
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config could not be saved",
+            );
+            config_unwritable(&save_reason(&problem))
+        })?;
+        // What this run reports from, what an `apply` is handed and what the caller gets back is the config
+        // as this run would use it: the same resolve the startup makes, so a relative folder in the file
+        // becomes the folder the run works in rather than the spelling the file happened to use. Stored and
+        // applied here, before the guard is released, so two changes take effect in the order they were
+        // written and never in the reverse.
+        let resolved = config.resolve(&self.paths);
+        *locked(&self.current) = resolved.clone();
+        apply(&resolved);
+        Ok(resolved)
+    }
+
+    /// The config as the last write left it, this run's own to begin with: what a settings screen reads
+    /// the downloads section from. A clone, so the caller does not hold the lock while it builds a view.
+    pub(crate) fn current_config(&self) -> Config {
+        locked(&self.current).clone()
+    }
+
+    /// The folders this run serves, as `config.yaml` spells them: what a submitted downloads folder has to
+    /// be inside, and what gets pinned into the file before a change moves the download folder.
+    pub(crate) fn served_roots(&self) -> Vec<std::path::PathBuf> {
+        self.roots.iter().map(|root| root.given.clone()).collect()
+    }
+
+    /// The folders this run serves in both spellings, given and canonical: what a submitted downloads
+    /// folder is judged against before anything touches the disk.
+    ///
+    /// Both are needed because a folder reaches this server in whichever spelling the client has: the one
+    /// the file names, or the one the file system resolves it to. They differ for an ordinary folder on
+    /// some platforms - on macOS `/var` is a link to `/private/var`, so a root below a temp directory has
+    /// two absolute spellings that are not prefixes of one another, and a client that resolved the path
+    /// before sending it would be refused for a folder the server serves. Case is deliberately not
+    /// repaired: on Windows two spellings differing only in case are one folder, and a client that gets
+    /// that wrong is refused rather than walked through a guess.
+    pub(crate) fn served_roots_for_validation(&self) -> Vec<std::path::PathBuf> {
+        self.roots
+            .iter()
+            .flat_map(|root| [root.given.clone(), root.canonical.clone()])
+            .collect()
+    }
+
+    /// Whether this request may name the program a finished torrent runs on this machine.
+    ///
+    /// Two things have to hold. This run has a launch secret at all: the desktop app started this engine,
+    /// and the app is then the one thing that may name a program
+    /// ([`program_editable`](Self::program_editable)). And *this request* carries that secret, as a bearer
+    /// header and nothing else ([`FbttAuth::carries_launch_secret`]). A password or key session, a browser's
+    /// cookie session and the secret arriving in a URL all answer false, so a client merely visiting this
+    /// machine never reaches the file's program.
+    pub(crate) fn program_is_editable(&self, headers: &HeaderMap) -> bool {
+        self.program_editable && self.carries_launch_secret(headers)
+    }
+
+    /// Whether these request headers carry the launch secret, as a bearer header alone. Delegated to
+    /// [`FbttAuth`] so the secret lives in one place: this asks about a request, and only the
+    /// authenticator holds the secret to compare against.
+    pub(crate) fn carries_launch_secret(&self, headers: &HeaderMap) -> bool {
+        self.auth.carries_launch_secret(headers)
     }
 
     /// The pool the media routes take a place from before they start demuxing: `media`'s `media_permit` is
@@ -328,6 +548,32 @@ impl Shared {
     pub(crate) fn release_parked_verifies(&self) {
         self.verify_tally.release_parked();
     }
+
+    /// Arms [`ConfigSaves::park_inside_save`] and returns the count it moves: how many saves have reached
+    /// the hold since it was armed, published in order and only ever rising. Under `test-support` only, and
+    /// arming it twice changes nothing about the saves - both watchers see the same count. See
+    /// [`Server::park_config_saves`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn park_config_saves(&self) -> watch::Receiver<u64> {
+        self.config_saves.park()
+    }
+
+    /// Lets every parked save finish, and stops holding the ones that come after
+    /// ([`Self::park_config_saves`]). Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn release_parked_config_saves(&self) {
+        self.config_saves.release_parked();
+    }
+
+    /// A count of how many config changes have ended since this was read, rising once for every change whose
+    /// request has been answered or dropped. Under `test-support` only: a test hangs up on a change, waits
+    /// here for the request to be gone, and only then lets the parked save finish, so what it goes on to
+    /// measure is the change finishing on its own rather than a race with the disconnect arriving. See
+    /// [`ConfigSaves`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn config_change_endings(&self) -> watch::Receiver<u64> {
+        self.config_saves.endings()
+    }
 }
 
 /// What the Argon2 checks report to while they run: the counts no run reads, and the hold no run arms.
@@ -353,7 +599,7 @@ pub(crate) struct VerifyTally {
     /// once checks are being held, the checks that arrive after the release run through, so there is
     /// nothing to re-arm and nothing to reset.
     #[cfg(feature = "test-support")]
-    hold: OnceLock<VerifyHold>,
+    hold: OnceLock<Hold>,
 }
 
 impl VerifyTally {
@@ -425,7 +671,7 @@ impl VerifyTally {
     /// `test-support` only.
     #[cfg(feature = "test-support")]
     fn park(&self) -> watch::Receiver<u64> {
-        let hold = self.hold.get_or_init(VerifyHold::new);
+        let hold = self.hold.get_or_init(Hold::new);
         hold.counts.subscribe()
     }
 
@@ -439,47 +685,48 @@ impl VerifyTally {
     }
 }
 
-/// A place inside the Argon2 check that only a test can put there: a check that reaches it says how many are
-/// sitting there and then waits until somebody opens it. The waiting is a condvar because it happens on the
-/// blocking pool, where nothing may await; the count is a `watch` because whoever reads it is an async task
-/// sharing this runtime's only worker with the server, so it can afford to be told rather than to sit and
-/// poll. Without `test-support` none of this exists: no test arms a hold, and `Shared` carries neither the
-/// field nor the wait.
+/// A place in some blocking-pool work that only a test can put there: work that reaches it says how many
+/// are sitting there and then waits until somebody opens it. The waiting is a condvar because it happens on
+/// the blocking pool, where nothing may await; the count is a `watch` because whoever reads it is an async
+/// task sharing this runtime's worker with the server, so it can afford to be told rather than to sit and
+/// poll. Two holds are built from it - the one the Argon2 checks stop at ([`VerifyTally`]) and the one the
+/// config saves stop at ([`ConfigSaves`]) - and without `test-support` none of this exists: no test arms a
+/// hold, and `Shared` carries neither the field nor the wait.
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
-struct VerifyHold {
-    /// How many checks have reached the hold since it was armed, and the count a watcher waits on. It is
+struct Hold {
+    /// How many jobs have reached the hold since it was armed, and the count a watcher waits on. It is
     /// arrivals ever, not a count of what is parked right now, and it is published in order and only ever
-    /// rises: a check bumps it and tells watchers in one step, so the number a watcher reads cannot go
-    /// backwards - two checks arriving on two blocking threads once bumped and published as two steps, and the
+    /// rises: a job bumps it and tells watchers in one step, so the number a watcher reads cannot go
+    /// backwards - two jobs arriving on two blocking threads once bumped and published as two steps, and the
     /// second to publish could be the first to arrive, which made a watcher read the count fall by one. Every
     /// arrival bumps it and sends the new number, so a watcher reads a count and waits for the next change
-    /// instead of polling - which is how a test counts what is holding the permits without guessing at how
-    /// long a hash takes on somebody else's machine.
+    /// instead of polling - which is how a test counts what is parked without guessing at how long the work
+    /// takes on somebody else's machine.
     counts: watch::Sender<u64>,
-    /// `false` while checks are being held; [`VerifyHold::release`] makes it `true` for good, so the checks
-    /// that arrive afterwards run through without stopping. A condvar rather than a channel because the
-    /// people waiting here are not on a runtime: they are on the blocking pool, where nothing may await.
+    /// `false` while jobs are being held; [`Hold::release`] makes it `true` for good, so the jobs that
+    /// arrive afterwards run through without stopping. A condvar rather than a channel because the people
+    /// waiting here are not on a runtime: they are on the blocking pool, where nothing may await.
     open: Mutex<bool>,
     waiting: Condvar,
 }
 
 #[cfg(feature = "test-support")]
-impl VerifyHold {
+impl Hold {
     /// A hold nobody has opened yet: everything that arrives waits here until a test says otherwise.
     fn new() -> Self {
         let (counts, _) = watch::channel(0);
-        VerifyHold {
+        Hold {
             counts,
             open: Mutex::new(false),
             waiting: Condvar::new(),
         }
     }
 
-    /// Says this check has reached the inside of the verify, then waits there for the test to stop looking.
+    /// Says this job has reached the hold, then waits there for the test to stop looking.
     fn arrive_and_wait(&self) {
         // The bump and the publish are one step, under the watch's own lock, so the watched number only ever
-        // rises: two checks arriving on two blocking threads take their turns at it rather than each taking a
+        // rises: two jobs arriving on two blocking threads take their turns at it rather than each taking a
         // number and then racing to publish it, which could publish the second arrival before the first and
         // send the count backwards. The number is what a watcher reads; whether anybody is still watching to
         // be told is not its job.
@@ -501,6 +748,92 @@ impl VerifyHold {
     }
 }
 
+/// What the config saves report to: the hold a test arms so a save stops inside the write, and nothing a run
+/// ever touches. Its own `Arc` because the save runs on the blocking pool and carries this with the job,
+/// while the test that arms it holds the other end (see [`Shared::config_saves`]).
+///
+/// The count of endings is not the hold: it rises for every config change whose request is over, finished or
+/// dropped, and a test reads it to know that the server has really let a request go before it opens the hold.
+/// Without that, a test that hangs up on a save and releases it at the same moment is racing the disconnect
+/// across the loopback, and what it measures next is a coin toss rather than the change finishing on its own.
+#[derive(Debug)]
+pub(crate) struct ConfigSaves {
+    /// The hold, and nobody arms it but a test. A `OnceLock` for the same reason the verify hold is one:
+    /// arming it is a one-way door, and once saves are being held the ones that arrive after the release run
+    /// through, so there is nothing to re-arm and nothing to reset.
+    #[cfg(feature = "test-support")]
+    hold: OnceLock<Hold>,
+    /// How many config changes have ended - finished or been dropped - since the server started. Read by
+    /// [`Shared::config_change_endings`] under `test-support`, and the `watch` is always here so that the
+    /// [`ChangeGuard`] that bumps it needs no `cfg` at the point it is made.
+    #[cfg(feature = "test-support")]
+    endings: watch::Sender<u64>,
+}
+
+impl ConfigSaves {
+    /// A report nothing has armed a hold on and nothing has finished, which is what every run has.
+    fn new() -> Self {
+        ConfigSaves {
+            #[cfg(feature = "test-support")]
+            hold: OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            endings: watch::channel(0).0,
+        }
+    }
+
+    /// Stops this save inside the write until a test lets it go, if a test armed a hold
+    /// ([`Shared::park_config_saves`], under `test-support`). Called from inside the blocking job, right
+    /// before the file is written, so what is parked there is the save a request is waiting on. In a run
+    /// nothing has armed a hold, so there is nowhere to stop and this does nothing - the only cost it ever
+    /// has.
+    fn park_inside_save(&self) {
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(hold) = self.hold.get() {
+                hold.arrive_and_wait();
+            }
+        }
+    }
+
+    /// Arms [`park_inside_save`](Self::park_inside_save) and returns the count it moves. Under `test-support`
+    /// only.
+    #[cfg(feature = "test-support")]
+    fn park(&self) -> watch::Receiver<u64> {
+        self.hold.get_or_init(Hold::new).counts.subscribe()
+    }
+
+    /// Lets every parked save finish, and stops holding the ones that come after
+    /// ([`park`](Self::park)). Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn release_parked(&self) {
+        if let Some(hold) = self.hold.get() {
+            hold.release();
+        }
+    }
+
+    /// The count of changes that have ended, with a change to wait for. Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn endings(&self) -> watch::Receiver<u64> {
+        self.endings.subscribe()
+    }
+}
+
+/// A handle kept by one [`Shared::write_config`] call until its future goes away, one way or the other, and
+/// counted in [`ConfigSaves`] as it drops. It is the only thing in `write_config`'s own future that outlives
+/// the spawn - the change itself has moved into the task - so its `Drop` is what says the request is over.
+/// Under `test-support` only, and in a run there is no future to watch.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct ChangeGuard(Arc<ConfigSaves>);
+
+#[cfg(feature = "test-support")]
+impl Drop for ChangeGuard {
+    fn drop(&mut self) {
+        // One step, so the count a watcher reads is a change and never a bump it can miss.
+        self.0.endings.send_modify(|count| *count += 1);
+    }
+}
+
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Counts and nothing else: no password hash and no device key belongs in a `Debug` printing
@@ -510,6 +843,7 @@ impl std::fmt::Debug for Shared {
             .field("auth", &self.auth)
             .field("users", &self.users.len())
             .field("devices", &devices.entries.len())
+            .field("program_editable", &self.program_editable)
             .field("roots", &self.roots.len())
             .finish()
     }
@@ -570,6 +904,42 @@ impl DeviceTable {
         }
     }
 }
+
+/// The answer for a save that could not be written down: `500 config_unwritable`, saying which file failed
+/// and what the operating system said, and pointing at the log for the rest.
+///
+/// The answer names the file by what it is - the server's config - and not by where it lives or what it is
+/// called: that directory is the operator's business, and an answer that printed it would tell a signed-in
+/// stranger how this machine is laid out. The rule is not new here; a *read* failure keeps the same silence
+/// for the same reason, and `tests/server.rs` holds a device add to it. The whole path is in the log line
+/// this answer points at, which is where whoever runs this server needs it.
+fn config_unwritable(reason: &str) -> RouteError {
+    RouteError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "config_unwritable",
+        format!(
+            "the server could not write its config file ({}); see the server log",
+            clean(reason),
+        ),
+    )
+}
+
+/// What to say about a save that failed: what the operating system said, with none of where.
+///
+/// [`ConfigError::Write`] prints the file's own path in its line (`cannot write <path>: ...`), which is
+/// exactly the part an answer must not carry, so only the error underneath it - the operating system's own
+/// words - is taken from it. That is also what makes the answer useful: it says a folder could not be
+/// written to rather than how this machine is laid out. Anything else is said as it is.
+fn save_reason(problem: &fbtt_core::ConfigError) -> String {
+    match problem {
+        fbtt_core::ConfigError::Write { source, .. } => source.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The code [`RouteError::internal`] gives, and the one [`RouteError::named`] will rename: a `500` that
+/// says only that something went wrong.
+const INTERNAL: &str = "internal";
 
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
@@ -681,7 +1051,21 @@ impl RouteError {
 
     /// `500 internal`: something this server could not do, said as briefly as it can be.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL, message)
+    }
+
+    /// The same error with a different code, for a route that gives a shared failure its own name: the
+    /// settings routes answer a config they cannot read as `500 config_unreadable`; a device add keeps the
+    /// `500 internal` [`Shared::write_config`] builds, and both come from the same write.
+    ///
+    /// Only an error that says nothing of its own is renamed. A save failure already carries
+    /// `config_unwritable`, which names what really went wrong, so a route asking for `config_unreadable`
+    /// there does not claim a file it could read is one it could not.
+    fn named(mut self, code: &'static str) -> Self {
+        if self.code == INTERNAL {
+            self.code = code;
+        }
+        self
     }
 
     /// An extractor's own refusal - a body over the limit, a query string that does not parse - put in
@@ -958,6 +1342,19 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/api/v1/media/{torrent}/{file}/subtitles/{sub}",
             get(media::subtitle_file),
+        )
+        // The server's own settings, read and written over the API: the running limits and the downloads
+        // section, saved to `config.yaml` so a change survives a restart. Every write goes through one lock
+        // ([`Shared::write_config`]) with the device routes, and every body is a handful of fields, so the two
+        // `PUT`s get a cap of their own rather than fbt-api's room for a `.torrent`.
+        .route("/api/v1/settings", get(settings::get))
+        .route(
+            "/api/v1/settings/speed",
+            put(settings::put_speed).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
+        )
+        .route(
+            "/api/v1/settings/downloads",
+            put(settings::put_downloads).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
         )
         .with_state(shared)
 }

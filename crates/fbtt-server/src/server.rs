@@ -419,6 +419,34 @@ impl Server {
         self.shared.release_parked_verifies();
     }
 
+    /// Stops every change to `config.yaml` this server starts inside the save, and returns a count of how
+    /// many have reached that stopping point since it was armed - a count a test waits on rather than polls,
+    /// and releases with [`release_parked_config_saves`](Self::release_parked_config_saves). The count is
+    /// arrivals ever and only ever rises, like the verify hold's. Only a test does this, and it is how that
+    /// test hangs up on a change partway through and proves the change finishes without the request: the save
+    /// is held where a request is waiting on it, the request is dropped, and what happens next is the thing
+    /// under test. A save stays parked until released even after its request has gone, which is the point.
+    #[cfg(feature = "test-support")]
+    pub fn park_config_saves(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.park_config_saves()
+    }
+
+    /// Lets every save stopped by [`park_config_saves`](Self::park_config_saves) finish, and stops stopping
+    /// the ones that come after. Only a test calls this; without `test-support` there is nothing to stop.
+    #[cfg(feature = "test-support")]
+    pub fn release_parked_config_saves(&self) {
+        self.shared.release_parked_config_saves();
+    }
+
+    /// A count of how many config changes have ended - answered or dropped - rising once for each. A test
+    /// hangs up on a change, waits here until the request is really gone, and only then opens the hold, so
+    /// what it measures next is the change finishing on its own rather than a race with the disconnect
+    /// arriving. Only a test reads this; without `test-support` no change is counted.
+    #[cfg(feature = "test-support")]
+    pub fn config_change_endings(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.config_change_endings()
+    }
+
     /// Stops serving, saves, and releases the library. Returns once every connection is closed, the last
     /// save has been written or failed to be, and the lock has gone with it - so another
     /// featherbittorrent may start on this library as soon as this returns.

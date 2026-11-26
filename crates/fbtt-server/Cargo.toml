@@ -109,3 +109,11 @@ required-features = ["test-support"]
 [[test]]
 name = "remote"
 required-features = ["test-support"]
+
+# The settings routes: what a change writes to `config.yaml`, and which credential may name a program for
+# the server to run. The last two tests hand a value to `downloads.on_complete` and the route checks it is
+# a program by its full path; the tests name this test binary's own path (`std::env::current_exe()`) for
+# that, which is a real file and needs no extra binary declared here.
+[[test]]
+name = "settings"
+required-features = ["test-support"]
