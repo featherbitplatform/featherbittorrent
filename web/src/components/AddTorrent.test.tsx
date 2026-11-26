@@ -50,6 +50,8 @@ function server(
     add?: () => Response
     rootsAnswer?: () => Response
     mkdirAnswer?: () => Response
+    /** The answer to `GET /api/v1/settings`; without one the server is an old one and answers 404. */
+    settings?: () => Response
   } = {},
 ): { client: Api; seen: Seen[] } {
   const roots = options.roots ?? ['/downloads', '/usb/media']
@@ -65,6 +67,7 @@ function server(
       body: init?.body ?? null,
     }
     seen.push(call)
+    if (url === '/api/v1/settings' && options.settings !== undefined) return options.settings()
     if (url === '/api/v1/fs/roots') {
       return options.rootsAnswer?.() ?? json(200, JSON.stringify(roots))
     }
@@ -856,5 +859,40 @@ describe('the keyboard', () => {
       reopened !== null && (reopened as HTMLDialogElement).open === true,
       'the add dialog did not open again when the button that opens it was pressed a second time',
     ).toBe(true)
+  })
+})
+
+describe('the defaults the dialog starts with', () => {
+  const settingsAnswer = (downloads: Record<string, unknown>) => () =>
+    json(200, JSON.stringify({ speed: {}, downloads }))
+
+  it('add_dialog_defaults_from_settings', async () => {
+    const { client, seen } = server({
+      roots: ['/downloads', '/usb/media'],
+      settings: settingsAnswer({ default_dir: '/usb/media', start_paused: true }),
+    })
+    const { container } = openDialog(client)
+    await flush()
+    const box = screen.getByRole('checkbox', { name: 'Start paused' }) as HTMLInputElement
+    expect(box.checked, 'start_paused from settings did not tick the box').toBe(true)
+    expect(chosenPath(container), 'the picked folder did not start at default_dir').toBe('/usb/media')
+    // The person can still change both.
+    fireEvent.click(box)
+    expect(box.checked).toBe(false)
+    pressFolder(container, '/downloads')
+    fireEvent.change(magnetField(), { target: { value: MAGNET } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await flush()
+    expect(addedJson(seen)).toMatchObject({ save_path: '/downloads', paused: false })
+  })
+
+  it('add_dialog_on_old_server_keeps_todays_defaults', async () => {
+    const { client } = server({ roots: ['/downloads', '/usb/media'] })
+    const { container } = openDialog(client)
+    await flush()
+    const box = screen.getByRole('checkbox', { name: 'Start paused' }) as HTMLInputElement
+    expect(box.checked).toBe(false)
+    expect(chosenPath(container)).toBe('/downloads')
+    expect(screen.getByRole('dialog')).toBeTruthy()
   })
 })

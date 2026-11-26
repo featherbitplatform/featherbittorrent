@@ -243,16 +243,42 @@ creates parent folders, and a name that already exists is refused. The server al
 The `Settings` button in the header opens the Settings page; `Back to torrents` stays at the top of it and
 returns to the list, and so does the browser's back button or a phone's back gesture.
 
-The page shows one section at a time. A list of sections is on the left, in groups: `Torrents` (Speed),
+The page shows one section at a time. A list of sections is on the left, in groups: `Torrents` (Downloads, Speed),
 `Access` (Devices, Keyboard shortcuts) and, in the desktop app only, `This app` (Window, Serve the web UI,
-Instances). Pick a section, or move through the list with the arrow keys (`Home` and `End` go to the first
-and last), and only that section is shown, with its heading focused. A section that is not built yet is not
-listed. The page opens on the last section you used. On a phone the list becomes a `Jump to` menu at the top.
+Instances). Pick a section with a click, `Enter` or `Space` and its heading is focused; the arrow keys (`Home` and
+`End` go to the first and last) move through the list and open each section as they go, but keep the focus
+on the list, so you can keep going. A section that is not built yet is not listed. The page opens on the
+last section you used, and on Downloads the first time. On a phone the list becomes a `Jump to` menu at the top.
 
 Each section has its own `Save`. If you leave a section that holds changes (by picking another section,
-pressing `Back to torrents` or closing the tab), the page asks `You have unsaved changes in <Section>.`:
+pressing `Back to torrents`, pressing the header's button that asks for the torrent list back, using the
+browser's back button or closing the tab), the page asks `You have unsaved changes in <Section>.`:
 `Save changes` saves them and goes on, `Discard changes` drops them, and `Escape` closes the question and
 keeps you where you were.
+
+### Downloads
+
+The section has the settings that say what happens to a torrent once it is added: `Default folder` (where
+finished files go), `Unfinished folder` (a folder a torrent works in until it is whole, switched on with `Use
+an unfinished folder`), `Start torrents paused`, `Watch folder` (a folder whose `.torrent` files are picked
+up as they land, switched on with `Use a watch folder`) and `Run a program on completion`. Each folder is
+chosen with the same folder picker as the Add dialog, on the folders the server allows, so there is no box to
+type a path into. `Save` writes the section to the server's `config.yaml`; when the server refuses it (the
+unfinished folder is the same as the default folder, a folder outside the allowed ones) the reason is shown
+under the form and everything you typed is kept. A watch folder or a program the server could not use shows
+the server's reason under its field.
+
+The program is the one setting a browser cannot change. On a server it is read only from `config.yaml`, so
+the page shows the configured path (or `None`) with `Set in the server's config file` and has no field for
+it. Only the desktop app's `This computer` view, which talks to its own engine with the secret it started
+it with, can name the program, and there it is a text field. A save sends the program only when you changed
+it. The program is started with the torrent's name and folder as two separate arguments and is not waited
+for.
+
+The Add dialog starts from the same section: `Start paused` is ticked when `Start torrents paused` is on,
+and the folder tree starts in the `Default folder`; you can still change both for one torrent. On a server
+older than the settings routes the dialog keeps its earlier start (unticked, and the first folder the server
+allows).
 
 ### Speed
 

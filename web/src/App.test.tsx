@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { LAST_SECTION_KEY } from './components/settings/sections'
 import App from './App'
 import { UNREACHABLE_COPY } from './live'
 import { SESSION_ENDED, session } from './session'
@@ -50,7 +51,14 @@ function alive(url: string): Promise<unknown> {
   return answer({})
 }
 
-afterEach(cleanup)
+beforeEach(() => {
+  // These tests are about the Speed section; Downloads opens first on a fresh page.
+  window.localStorage.setItem(LAST_SECTION_KEY, 'speed')
+})
+afterEach(() => {
+  cleanup()
+  window.localStorage.clear()
+})
 installDialogShim()
 
 describe('the page as a whole', () => {
@@ -241,6 +249,48 @@ describe('the Settings screen in the page', () => {
       'the browser back did not close Settings',
     ).toBeNull()
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
+    push.mockRestore()
+    world.behavior = null
+  })
+})
+
+describe('leaving Settings with unsaved changes', () => {
+  /** Settings open on Speed with the download limit edited and not saved. */
+  async function dirtySettings(): Promise<void> {
+    world.behavior = alive
+    render(<App />)
+    await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const field = (await screen.findByLabelText('Download limit KiB/s')) as HTMLInputElement
+    await waitFor(() => expect(field.value).toBe('0'))
+    fireEvent.change(field, { target: { value: '64' } })
+  }
+
+  it('header_show_torrents_with_unsaved_changes_asks', async () => {
+    await dirtySettings()
+    // The header's Add torrent asks for the Torrents screen back; the table is hidden under Settings here.
+    fireEvent.click(screen.getByRole('button', { name: 'Add torrent', hidden: true }))
+    expect(screen.getByText('You have unsaved changes in Speed.')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Speed', level: 2 }), 'Settings closed without asking').toBeTruthy()
+    // Discarding answers the question and then does what was asked: Settings closes.
+    fireEvent.click(screen.getByRole('button', { name: 'Discard changes' }))
+    expect(screen.queryByRole('heading', { name: 'Speed', level: 2 })).toBeNull()
+    world.behavior = null
+  })
+
+  it('browser_back_with_unsaved_changes_asks', async () => {
+    const push = vi.spyOn(window.history, 'pushState')
+    await dirtySettings()
+    expect(push).toHaveBeenCalledTimes(1)
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(screen.getByText('You have unsaved changes in Speed.')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Speed', level: 2 }), 'Settings closed without asking').toBeTruthy()
+    // The entry the browser just left is put back, so a later Back still lands on the same place.
+    expect(push, 'the history entry was not put back').toHaveBeenCalledTimes(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Discard changes' }))
+    expect(screen.queryByRole('heading', { name: 'Speed', level: 2 })).toBeNull()
     push.mockRestore()
     world.behavior = null
   })

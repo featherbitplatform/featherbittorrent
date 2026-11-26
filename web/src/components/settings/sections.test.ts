@@ -19,12 +19,12 @@ const ids = (desktop: boolean, built: ReadonlySet<SectionId> = BUILT_SECTIONS) =
 it('visible_sections_browser_has_no_this_app_group', () => {
   const sections = visibleSections({ desktop: false, built: BUILT_SECTIONS })
   expect(sections.some((s) => s.group === 'This app')).toBe(false)
-  expect(sections.map((s) => s.id)).toEqual(['speed', 'devices', 'shortcuts'])
+  expect(sections.map((s) => s.id)).toEqual(['downloads', 'speed', 'devices', 'shortcuts'])
 })
 
 it('visible_sections_desktop_order', () => {
-  expect(ids(true)).toEqual(['speed', 'devices', 'shortcuts', 'window', 'serving', 'instances'])
-  const all = new Set<SectionId>([...BUILT_SECTIONS, 'downloads', 'proxy'])
+  expect(ids(true)).toEqual(['downloads', 'speed', 'devices', 'shortcuts', 'window', 'serving', 'instances'])
+  const all = new Set<SectionId>([...BUILT_SECTIONS, 'proxy'])
   expect(ids(true, all)).toEqual([
     'downloads', 'speed', 'proxy', 'devices', 'shortcuts', 'window', 'serving', 'instances',
   ])
@@ -41,15 +41,14 @@ it('legacy_ids_resolve', () => {
 
 it('unbuilt_sections_are_not_listed', () => {
   expect(ids(true)).not.toContain('proxy')
-  expect(ids(true)).not.toContain('downloads')
   // Nor can a link open one.
   const v = visibleSections({ desktop: true, built: BUILT_SECTIONS })
-  expect(resolveSection('proxy', v)).toBe('speed')
+  expect(resolveSection('proxy', v)).toBe('downloads')
 })
 
 it('a_desktop_id_in_a_browser_falls_back', () => {
   const v = visibleSections({ desktop: false, built: BUILT_SECTIONS })
-  expect(resolveSection('settings-desktop-serving', v)).toBe('speed')
+  expect(resolveSection('settings-desktop-serving', v)).toBe('downloads')
 })
 
 it('last_section_is_used_when_nothing_is_asked', () => {
@@ -68,8 +67,8 @@ it('last_section_survives_storage_throwing', () => {
     },
   }
   vi.stubGlobal('localStorage', throwing)
-  const everything = new Set<SectionId>([...BUILT_SECTIONS, 'downloads'])
-  expect(resolveSection(null, visibleSections({ desktop: false, built: everything }))).toBe('downloads')
-  // With Downloads not built yet, the first listed section opens.
-  expect(resolveSection(null, visibleSections({ desktop: false, built: BUILT_SECTIONS }))).toBe('speed')
+  expect(resolveSection(null, visibleSections({ desktop: false, built: BUILT_SECTIONS }))).toBe('downloads')
+  // Without Downloads built, the first listed section opens.
+  const without = new Set<SectionId>([...BUILT_SECTIONS].filter((id) => id !== 'downloads'))
+  expect(resolveSection(null, visibleSections({ desktop: false, built: without }))).toBe('speed')
 })

@@ -32,6 +32,8 @@ function fakeClient() {
 
 beforeEach(() => {
   window.localStorage.clear()
+  // These tests are about the Speed section; Downloads opens first on a fresh page.
+  window.localStorage.setItem(LAST_SECTION_KEY, 'speed')
 })
 afterEach(() => {
   cleanup()
@@ -70,14 +72,23 @@ it('arrow_keys_move_and_focus_the_heading', async () => {
   expect(speed.tabIndex).toBe(0)
   expect(within(list()).getByRole('button', { name: 'Devices' }).tabIndex).toBe(-1)
   fireEvent.keyDown(speed, { key: 'ArrowDown' })
-  expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Devices', level: 2 }))
-  expect(within(list()).getByRole('button', { name: 'Devices' }).getAttribute('aria-current')).toBe('page')
+  const devices = within(list()).getByRole('button', { name: 'Devices' })
+  expect(devices.getAttribute('aria-current')).toBe('page')
+  expect(screen.getByRole('heading', { name: 'Devices', level: 2 })).toBeTruthy()
+  // Arrow keys keep the focus on the list, so the next arrow press goes on from there.
+  expect(document.activeElement, 'an arrow key pulled the focus out of the list').toBe(devices)
   fireEvent.keyDown(list(), { key: 'End' })
   expect(screen.getByRole('heading', { name: 'Keyboard shortcuts', level: 2 })).toBeTruthy()
+  expect(document.activeElement).toBe(within(list()).getByRole('button', { name: 'Keyboard shortcuts' }))
   fireEvent.keyDown(list(), { key: 'Home' })
-  expect(screen.getByRole('heading', { name: 'Speed', level: 2 })).toBeTruthy()
+  expect(screen.getByRole('heading', { name: 'Downloads', level: 2 })).toBeTruthy()
   fireEvent.keyDown(list(), { key: 'ArrowUp' })
-  expect(screen.getByRole('heading', { name: 'Speed', level: 2 }), 'moved past the first section').toBeTruthy()
+  expect(screen.getByRole('heading', { name: 'Downloads', level: 2 }), 'moved past the first section').toBeTruthy()
+  // Enter or Space on the focused button is a click, which moves the focus on to the section's heading.
+  const focused = document.activeElement as HTMLElement
+  expect(focused).toBe(within(list()).getByRole('button', { name: 'Downloads' }))
+  fireEvent.click(focused)
+  expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Downloads', level: 2 }))
 })
 
 it('jump_to_select_on_phone_width', async () => {
@@ -180,8 +191,9 @@ it('choosing_a_section_remembers_it_and_storage_failing_changes_nothing', async 
       throw new Error('blocked')
     },
   })
+  // With nothing remembered the page opens on Downloads.
   render(<Settings client={fakeClient().client} onBack={vi.fn()} />)
-  await screen.findByLabelText('Download limit KiB/s')
+  await screen.findByRole('heading', { name: 'Downloads', level: 2 })
   pick('Devices')
   expect(screen.getByText('devices body')).toBeTruthy()
 })

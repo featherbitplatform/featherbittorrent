@@ -75,8 +75,11 @@ export interface TorrentsProps {
   onSignOut(): void
   /** Opens the Settings screen, which replaces this one. */
   onSettings(): void
-  /** Settings covers this screen and something here needs the screen back: close Settings. The header's Add torrent lives in the desktop title bar where Settings cannot cover it, so its dialog must open on a visible screen, not inside a hidden subtree. */
-  onShowTorrents(): void
+  /**
+   * Settings covers this screen and something here needs the screen back: close Settings. The header's Add torrent lives in the desktop title bar where Settings cannot cover it, so its dialog must open on a visible screen, not inside a hidden subtree.
+   * Answers `false` when Settings is asking about unsaved changes first and has not closed: nothing is opened over it.
+   */
+  onShowTorrents(): boolean | void
   /** Whether another screen (Settings) covers this one: the live loop slows to its hidden-page cadence. */
   hidden?: boolean
   /** The client to read through. Defaults to the connection's so tests can hand in a fake. */
@@ -445,7 +448,7 @@ export default function Torrents({
           // it: pressing it while Settings is up has to ask for this screen back in the same
           // render, so the dialog mounts on a screen that is shown and not inside a hidden
           // subtree, where a modal would block every click unseen.
-          if (hidden) onShowTorrents()
+          if (hidden && onShowTorrents() === false) return
           setAddOpen(true)
         }}
       />

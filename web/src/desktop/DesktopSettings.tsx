@@ -16,6 +16,7 @@ import Banner from '../components/Banner'
 import Button from '../components/Button'
 import TextField from '../components/TextField'
 import { Shortcuts } from '../components/settings/Shortcuts'
+import { useSectionDirty } from '../components/settings/useSectionDirty'
 import type { ShortcutOverride } from '../keys'
 import {
   desktopInfo,
@@ -119,10 +120,10 @@ export function ServingSection({
     }
   }, [])
 
-  async function apply(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault()
+  /** Apply the form. True when the shell kept it (or there was nothing to change); false when it refused. */
+  async function run(): Promise<boolean> {
     // Nothing would change: off while off, or the same address and login with no new password.
-    if (state !== null && unchanged(state, { enabled, bind, user, password })) return
+    if (state !== null && unchanged(state, { enabled, bind, user, password })) return true
     setBusy(true)
     let refused: string | null = null
     onServingApplying?.()
@@ -142,7 +143,16 @@ export function ServingSection({
     // A refused start still restarted This computer (back on the window's own engine), so the page asks
     // either way; the caller reconnects only when the launch secret changed.
     await onServingChanged(refused)
+    return refused === null
   }
+
+  async function apply(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    await run()
+  }
+
+  // An edited form that was not applied is a change Settings asks about before leaving the section.
+  useSectionDirty(state !== null && !unchanged(state, { enabled, bind, user, password }), run)
 
   // The page's line from the last apply, or else why this launch could not start serving.
   const shownProblem = problem ?? state?.problem ?? null

@@ -582,3 +582,16 @@ it('save_downloads_never_sends_on_complete', async () => {
   expect(sent).toEqual({ default_dir: '/data', unfinished_dir: '/data/part', start_paused: true, watch_dir: null })
   expect('on_complete' in sent).toBe(false)
 })
+
+it('save_downloads_sends_on_complete_only_when_asked_for_explicitly', async () => {
+  const input = { default_dir: '/data', unfinished_dir: null, start_paused: false, watch_dir: null }
+  const set = clientFor(200, SETTINGS_ANSWER)
+  await set.client.saveDownloads(input, { onComplete: { program: '/usr/bin/x' } })
+  expect(JSON.parse(String(set.seen[0].body))).toEqual({ ...input, on_complete: { program: '/usr/bin/x' } })
+  const clear = clientFor(200, SETTINGS_ANSWER)
+  await clear.client.saveDownloads(input, { onComplete: { program: null } })
+  expect(JSON.parse(String(clear.seen[0].body)).on_complete).toEqual({ program: null })
+  const plain = clientFor(200, SETTINGS_ANSWER)
+  await plain.client.saveDownloads(input, {})
+  expect('on_complete' in JSON.parse(String(plain.seen[0].body))).toBe(false)
+})
