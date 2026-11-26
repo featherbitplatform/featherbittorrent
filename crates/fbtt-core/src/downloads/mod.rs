@@ -457,7 +457,15 @@ impl Worker {
                 // the downloading states fell between two wakes - checking, then downloading, then
                 // whole, all in one gap - and whose `TorrentFinished` was dropped along with it, was
                 // never seen downloading by any wake here and so is not enrolled to be grieved for.
-                self.lock().seen_unfinished.insert(id);
+                //
+                // The same sighting says a new finish is coming, so the claim the *previous* finish
+                // left is let go: a torrent that finished, was force-rechecked or lost its data, and
+                // is downloading again owes its program a second time. Only a torrent seen
+                // downloading drops it - one that is whole and merely sitting there keeps it, which is
+                // what stops a program set later from replaying finishes this run already passed.
+                let mut shared = self.lock();
+                shared.seen_unfinished.insert(id);
+                shared.finish_handled.remove(&id);
             }
             match wanted(status.progress, &status.save_path, &settings) {
                 // Whole files in the unfinished folder are owed their move back, and the move runs the
@@ -577,13 +585,26 @@ impl Worker {
             if queued.in_flight || queued.given_up {
                 return;
             }
-            let still_wanted = wanted(status.progress, &status.save_path, &settings)
+            let wants = wanted(status.progress, &status.save_path, &settings);
+            let still_wanted = wants
                 .as_deref()
                 .is_some_and(|target| target == queued.target.as_path());
             if !still_wanted {
                 // It is where it belongs, or the settings want somewhere else now: this entry is a leftover,
                 // and the look that queued what is wanted now has had its own say.
-                shared.moves.remove(id);
+                let owed = shared
+                    .moves
+                    .remove(id)
+                    .is_some_and(|gone| gone.program_after);
+                drop(shared);
+                // A leftover that owed a program is a move whose answer came back stale - the settings
+                // changed while it ran - and the files it carried are whole where they landed, which is
+                // where nothing wants them moved again. Nobody else will run the program for them: the
+                // torrent was never seen arriving, so no wake recovers it. `finish_handled` makes this
+                // a no-op for a finish already handled.
+                if owed && wants.is_none() && status.progress >= 1.0 {
+                    self.run_program(id, &status.name, &status.save_path);
+                }
                 return;
             }
             queued.in_flight = true;
@@ -595,7 +616,13 @@ impl Worker {
         let id = *id;
         let name = status.name.clone();
         let moves = self.moves_tx.clone();
+        #[cfg(feature = "test-support")]
+        let park = Arc::clone(&self.park);
         tokio::spawn(async move {
+            #[cfg(feature = "test-support")]
+            // A test's way to hold a claimed move where the engine has not started it, which is the
+            // state "mid-copy" has for everything that reads the torrent: its files are where they were.
+            test_support::hold_the_move(&park).await;
             let outcome = torrent
                 .move_storage(target.clone(), MoveMode::FailIfExists)
                 .await;
@@ -1087,6 +1114,27 @@ impl AutomationHandle {
     #[cfg(feature = "test-support")]
     pub fn park_the_watch_folder(&self) {
         test_support::ask_for_park(&self.park);
+    }
+
+    /// Whether a move is held right now, see [`hold_the_next_move`](Self::hold_the_next_move).
+    /// Test-support builds only.
+    #[cfg(feature = "test-support")]
+    pub fn moves_are_held(&self) -> bool {
+        test_support::move_is_held(&self.park)
+    }
+
+    /// Holds the next move this automation starts, after it is claimed and before the engine is asked,
+    /// until [`release_the_move`](Self::release_the_move): the torrent's files are where they were, which
+    /// is how a copy in progress looks to everything else. Test-support builds only.
+    #[cfg(feature = "test-support")]
+    pub fn hold_the_next_move(&self) {
+        test_support::ask_to_hold_a_move(&self.park);
+    }
+
+    /// Lets a held move go on to the engine. Test-support builds only.
+    #[cfg(feature = "test-support")]
+    pub fn release_the_move(&self) {
+        test_support::release_the_move(&self.park);
     }
 
     /// Whether this automation's pass is parked right now: while it is, the loop is in the middle of a

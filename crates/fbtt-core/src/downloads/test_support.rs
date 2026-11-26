@@ -79,6 +79,12 @@ pub(crate) struct ParkFlags {
     parked: AtomicBool,
     /// Whether a parked pass may carry on.
     released: AtomicBool,
+    /// Whether the next move this automation starts should be held before the engine is asked.
+    hold_asked: AtomicBool,
+    /// Whether a move is held now.
+    hold_parked: AtomicBool,
+    /// Whether a held move may go on.
+    hold_released: AtomicBool,
 }
 
 fn armed<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -113,6 +119,34 @@ pub(crate) async fn park_the_pass(flags: &ParkFlags) {
         tokio::time::sleep(PARK_POLL).await;
     }
     flags.parked.store(false, Ordering::SeqCst);
+}
+
+/// Asks this automation to hold the next move it starts, [`move_is_held`] saying when one is.
+pub(crate) fn ask_to_hold_a_move(flags: &ParkFlags) {
+    flags.hold_asked.store(true, Ordering::SeqCst);
+}
+
+/// Whether a move of this automation is held right now.
+pub(crate) fn move_is_held(flags: &ParkFlags) -> bool {
+    flags.hold_parked.load(Ordering::SeqCst)
+}
+
+/// Lets the held move go on to the engine.
+pub(crate) fn release_the_move(flags: &ParkFlags) {
+    flags.hold_released.store(true, Ordering::SeqCst);
+}
+
+/// The hold this automation asked for, once: a claimed move waits here, before `move_storage`, so that
+/// the torrent still reports the folder it is moving out of while the settings change under it.
+pub(crate) async fn hold_the_move(flags: &ParkFlags) {
+    if !flags.hold_asked.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    flags.hold_parked.store(true, Ordering::SeqCst);
+    while !flags.hold_released.swap(false, Ordering::SeqCst) {
+        tokio::time::sleep(PARK_POLL).await;
+    }
+    flags.hold_parked.store(false, Ordering::SeqCst);
 }
 
 /// Makes the next `TorrentFinished` for `torrent` arrive as the `Lagged` the session sends when a

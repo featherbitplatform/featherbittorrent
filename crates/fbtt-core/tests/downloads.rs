@@ -535,8 +535,14 @@ async fn program_gets_name_and_final_folder() {
     .await;
     drop(moved);
     let done = finish(&mut client, &engine, &seed.id, seed.addr).await;
-    assert_eq!(done.save_path, default, "moved back before anything ran");
     drop(done);
+    // The row says whole a moment before the move back lands (the download is not slowed here), so the
+    // folder is waited for rather than read at the instant the last piece arrives.
+    let back = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &seed.id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    drop(back);
 
     let log = default.join(FAKE_LOG);
     // A run owed to this torrent has had every chance to happen by now: the answer to the move back, and
@@ -2075,4 +2081,141 @@ async fn watch_folder_adds_the_real_file_beside_a_fifo_body() {
     );
 
     shutdown(client, task).await;
+}
+
+/// A torrent added whole into the unfinished folder is moving to the default folder with its program
+/// owed when the person names another default folder mid-copy. The first move lands in a folder nobody
+/// wants any more, its answer comes back stale, and the entry for the new folder finds the torrent
+/// whole where it landed with nothing left to move: the program it owed still runs, once, for the
+/// folder the files are in.
+///
+/// The move is held before the engine is asked, which is what a copy under way looks like to everything
+/// else: the torrent still says it is in the unfinished folder, so the settings change is seen against
+/// that and replaces the entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_move_still_runs_the_program_it_owed() {
+    let lib = Library::new("dl_stale_owed");
+    let unfinished = lib.dir.path().join("incomplete");
+    let other = lib.dir.path().join("other_default");
+    let default = lib.config.download_dir.clone();
+    let on_complete = DownloadsConfig {
+        unfinished_dir: Some(unfinished.clone()),
+        on_complete: Some(PathBuf::from(FAKE)),
+        ..DownloadsConfig::default()
+    };
+    let config = config_with(&lib, on_complete.clone());
+    let (bytes, id) = whole_in_unfinished(&lib, "payload.bin", &unfinished).await;
+    fs::create_dir_all(&other).expect("the other default folder");
+
+    let (mut client, task, _engine, handle) = lib.start_with_automation(config).await;
+    handle.hold_the_next_move();
+    add(&mut client, bytes, Some(unfinished.clone()), "payload.bin").await;
+    within(async {
+        loop {
+            if handle.moves_are_held() {
+                return;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+
+    // The default folder changes while the first move is claimed and not yet copying.
+    handle.update(other.clone(), on_complete);
+    wait_for_settle().await;
+    handle.release_the_move();
+
+    let landed = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &id).is_some_and(|row| row.save_path == default)
+    })
+    .await;
+    drop(landed);
+
+    let text = recorded(&default.join(FAKE_LOG)).await;
+    wait_for_settle().await;
+    let text_later = recorded(&default.join(FAKE_LOG)).await;
+    assert_eq!(text, text_later, "and it ran once, not again later");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1, "one run for one finish: {text}");
+    let recording: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("the stand-in writes one JSON line");
+    assert_eq!(
+        args_of(&recording),
+        ["payload.bin".to_string(), default.display().to_string()],
+        "with the name, and the folder the files landed in",
+    );
+    assert_eq!(handle.problems(), (None, None), "nothing went wrong");
+
+    shutdown(client, task).await;
+}
+
+/// A torrent that finished, lost its data to a forced recheck and downloads again, finishes a second
+/// time, and that finish owes its program as the first did: two runs in all.
+///
+/// The claim a finish leaves behind is what stops a program set later from replaying finishes; it is
+/// let go when the torrent is seen downloading again, because that is a finish still to come.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_that_finishes_again_runs_its_program_again() {
+    let seed = Seed::start("dl_finish_twice").await;
+    let lib = Library::new("dl_finish_twice_leech");
+    let default = lib.config.download_dir.clone();
+    let config = config_with(
+        &lib,
+        DownloadsConfig {
+            on_complete: Some(PathBuf::from(FAKE)),
+            ..DownloadsConfig::default()
+        },
+    );
+
+    let (mut client, task, engine, handle) = lib.start_with_automation(config).await;
+    slow_down(&mut client);
+    add(&mut client, seed.bytes.clone(), None, "payload.bin").await;
+    let done = finish(&mut client, &engine, &seed.id, seed.addr).await;
+    drop(done);
+
+    let log = default.join(FAKE_LOG);
+    let first = recorded_lines(&log, 1).await;
+    assert_eq!(first.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+
+    // The data goes bad and the torrent is checked again: pieces are missing, and it downloads them.
+    let file = default.join("payload.bin");
+    let size = fs::metadata(&file).expect("the downloaded file").len();
+    fs::write(
+        &file,
+        vec![0u8; usize::try_from(size).expect("a small file")],
+    )
+    .expect("overwrite the payload with zeros");
+    let torrent = engine
+        .torrent(&fbt::InfoHashes::from_v1(wire_of(&seed.id)))
+        .expect("the session holds the torrent");
+    torrent.force_recheck().await.expect("the recheck starts");
+    let incomplete = wait_for(&mut client, |snapshot| {
+        row_of(snapshot, &seed.id).is_some_and(|row| row.progress < 1.0)
+    })
+    .await;
+    drop(incomplete);
+
+    let again = finish(&mut client, &engine, &seed.id, seed.addr).await;
+    drop(again);
+    wait_for_settle().await;
+
+    let text = recorded_lines(&log, 2).await;
+    wait_for_settle().await;
+    let text = {
+        let later = recorded_lines(&log, 2).await;
+        assert_eq!(text, later, "no third run follows");
+        later
+    };
+    assert_eq!(
+        text.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "each finish ran the program once: {text}",
+    );
+    assert_eq!(handle.problems(), (None, None), "nothing went wrong");
+
+    shutdown(client, task).await;
+    seed.stop().await;
 }

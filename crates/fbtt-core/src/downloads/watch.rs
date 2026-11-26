@@ -47,32 +47,34 @@ const TORRENT_SUFFIX: &str = ".torrent";
 /// The same limit in the units the setting and the notice are stated in.
 const MAX_WATCHED_MIB: u64 = MAX_WATCHED_FILE / (1024 * 1024);
 /// `O_NONBLOCK` as the platform this builds for spells it, for the open of a watch folder candidate
-/// ([`read_candidate`]): this crate carries no libc to ask, so each family names its own value. A
-/// platform outside the listed ones gets `0` - the flag is then simply absent, and the identity check
-/// at the open keeps answering for swapped-in shapes the read cannot wait on.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const OPEN_NONBLOCK: i32 = 0o4_000;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-const OPEN_NONBLOCK: i32 = 0x4;
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))
-))]
-const OPEN_NONBLOCK: i32 = 0;
+/// ([`read_candidate`]): this crate carries no libc to ask, so each family names its own value, and it
+/// is a function of the operating system's and the architecture's names so that a test can ask every
+/// combination, not only the one it runs on. A platform outside the listed ones gets `0` - the flag is
+/// then simply absent, and the identity check at the open keeps answering for swapped-in shapes the
+/// read cannot wait on.
+///
+/// Sources, one per value:
+/// * Linux and Android, `0o4000`: the generic `include/uapi/asm-generic/fcntl.h`, which x86, arm,
+///   aarch64, riscv, powerpc, s390x and loongarch use.
+/// * Linux MIPS, `0x80`: `arch/mips/include/uapi/asm/fcntl.h`.
+/// * Linux SPARC, `0x4000`: `arch/sparc/include/uapi/asm/fcntl.h`.
+/// * macOS, iOS, FreeBSD, OpenBSD and NetBSD, `0x4`: each system's `sys/fcntl.h`.
+#[cfg(unix)]
+fn nonblock_for(os: &str, arch: &str) -> i32 {
+    match (os, arch) {
+        ("linux" | "android", "mips" | "mips32r6" | "mips64" | "mips64r6") => 0x80,
+        ("linux" | "android", "sparc" | "sparc64") => 0x4_000,
+        ("linux" | "android", _) => 0o4_000,
+        ("macos" | "ios" | "freebsd" | "openbsd" | "netbsd", _) => 0x4,
+        _ => 0,
+    }
+}
+
+/// [`nonblock_for`] for the platform this is running on.
+#[cfg(unix)]
+fn open_nonblock() -> i32 {
+    nonblock_for(std::env::consts::OS, std::env::consts::ARCH)
+}
 
 /// What one scan saw of one candidate - its bytes and its modification time - and, keyed by path in
 /// a `BTreeMap`, what a whole scan saw, in name order. [`settled`] compares two scans with it.
@@ -361,7 +363,7 @@ fn read_candidate(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     // that was the agreed regular file at the look and a FIFO by the time this open runs would stop a
     // blocking open from ever coming back - and a watch folder stuck in one file's read is a watch
     // folder that adds nobody. A regular file opens and reads exactly as it would without the flag.
-    open.custom_flags(OPEN_NONBLOCK);
+    open.custom_flags(open_nonblock());
     let mut file = open.open(path).map_err(|problem| problem.to_string())?;
 
     let opened = file.metadata().map_err(|problem| problem.to_string())?;
@@ -516,6 +518,8 @@ fn rename_to_free(dir: &Path, file: &str, suffix: &str) -> Result<PathBuf, std::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::nonblock_for;
     use super::{
         ADDED, INVALID, LAST_NUMBER, NOT_THE_SAME, Scan, Unmoved, UnmovedMap, candidate,
         first_free_name, link_unusable, name_taken, numbered, read_candidate, read_capped, settled,
@@ -1014,5 +1018,25 @@ mod tests {
             why.contains(NOT_THE_SAME),
             "the reason is that the name is no longer the file that was looked at: {why}",
         );
+    }
+
+    /// `O_NONBLOCK` is not one number across Linux: MIPS and SPARC have their own, and a wrong one
+    /// would set some other open flag instead.
+    #[cfg(unix)]
+    #[test]
+    fn nonblock_follows_the_architecture_on_linux() {
+        for arch in ["x86_64", "aarch64", "riscv64", "powerpc64", "s390x"] {
+            assert_eq!(nonblock_for("linux", arch), 0o4_000, "{arch}");
+        }
+        for arch in ["mips", "mips64"] {
+            assert_eq!(nonblock_for("linux", arch), 0x80, "{arch}");
+        }
+        for arch in ["sparc", "sparc64"] {
+            assert_eq!(nonblock_for("linux", arch), 0x4_000, "{arch}");
+        }
+        assert_eq!(nonblock_for("android", "aarch64"), 0o4_000);
+        assert_eq!(nonblock_for("macos", "aarch64"), 0x4);
+        assert_eq!(nonblock_for("freebsd", "x86_64"), 0x4);
+        assert_eq!(nonblock_for("solaris", "x86_64"), 0);
     }
 }
