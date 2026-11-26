@@ -9,8 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fbtt_core::{
-    AddSource, Command, Detail, DetailTab, DeviceCommand, FilePriority, LiveLimits, Notice,
-    RowState, Snapshot,
+    AddSource, Command, Detail, DetailTab, DeviceCommand, FilePriority, Notice, RowState, Snapshot,
 };
 use fbtt_tui::keys::KEYS;
 use fbtt_tui::{Action, AddForm, Modal, Model};
@@ -515,81 +514,6 @@ fn delete_keep_and_delete() {
     let mut model = model_of(&empty);
     model.handle_key(letter('d'), &empty);
     assert!(model.modal.is_none(), "d asked a question about nothing");
-}
-
-#[test]
-fn settings_rejects_text() {
-    let snap = library();
-    let mut model = model_of(&snap);
-    model.handle_key(letter('S'), &snap);
-
-    // The field is prefilled with `0`, so this makes it not a number without clearing anything.
-    type_text(&mut model, &snap, "abc");
-    let actions = model.handle_key(key(KeyCode::Enter), &snap);
-    assert!(actions.is_empty(), "a field of text was sent as a limit");
-    assert!(
-        matches!(model.modal, Some(Modal::Settings(_))),
-        "a refused field closed the dialog"
-    );
-
-    let screen = Screen::new(&model, &snap, 100, 30);
-    let (x, y) = screen.find("0abc").expect("the field was not drawn");
-    assert_eq!(
-        screen.fg(x, y),
-        Color::Rgb(0xed, 0x4a, 0x49),
-        "the refused field was not marked red"
-    );
-
-    // Tab moves the cursor to the next field, which is where typing goes after it.
-    model.handle_key(key(KeyCode::Tab), &snap);
-    type_text(&mut model, &snap, "x");
-    let Modal::Settings(form) = model.modal.as_ref().expect("the dialog closed") else {
-        panic!("a different dialog is open: {:?}", model.modal);
-    };
-    assert_eq!(form.fields[1].text, "0x", "Tab did not move the cursor");
-    assert_eq!(form.fields[0].text, "0abc");
-}
-
-#[test]
-fn settings_sends_limits() {
-    let snap = library(); // every limit unlimited: two `0`s and three empty fields
-    let want = ["2048", "1024", "3", "", "5"];
-    let prefilled = [1, 1, 0, 0, 0];
-
-    let mut model = model_of(&snap);
-    model.handle_key(letter('S'), &snap);
-    for (index, text) in want.iter().enumerate() {
-        if index > 0 {
-            model.handle_key(key(KeyCode::Tab), &snap);
-        }
-        repeat(&mut model, &snap, KeyCode::Backspace, prefilled[index]);
-        type_text(&mut model, &snap, text);
-    }
-
-    let actions = model.handle_key(key(KeyCode::Enter), &snap);
-    assert_eq!(
-        actions,
-        vec![Action::Command(Command::SetLimits(LiveLimits {
-            download_kib: 2048,
-            upload_kib: 1024,
-            active_downloads: Some(3),
-            // An empty queue field is no limit, which is what the dialog says it means.
-            active_seeds: None,
-            active_total: Some(5),
-        }))],
-        "the five fields were not sent as one change"
-    );
-    assert!(
-        model.modal.is_none(),
-        "the dialog stayed open after applying"
-    );
-
-    // Esc cancels without sending anything, whatever has been typed.
-    let mut model = model_of(&snap);
-    model.handle_key(letter('S'), &snap);
-    type_text(&mut model, &snap, "999");
-    assert!(model.handle_key(key(KeyCode::Esc), &snap).is_empty());
-    assert!(model.modal.is_none());
 }
 
 #[test]

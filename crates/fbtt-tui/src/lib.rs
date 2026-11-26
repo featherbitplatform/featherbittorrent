@@ -13,12 +13,14 @@ pub mod graphics;
 pub mod keys;
 pub mod modal;
 pub mod model;
+pub mod settings;
 pub mod theme;
 pub mod view;
 
 pub use modal::{
     AddForm, ConnectForm, ConnectRequest, ConnectTarget, DevicesForm, FolderPicker, Input, Masked,
-    Modal, SecretInput, SettingsForm,
+    Modal, SecretInput,
 };
 pub use model::{Action, Descending, Model, SortKey, View, visible_rows};
+pub use settings::{SettingsScreen, TuiSection};
 pub use view::draw;

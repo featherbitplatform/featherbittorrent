@@ -11,11 +11,12 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fbtt_core::{
     Command, Connection, Detail, DetailTab, DeviceCommand, FilePriority, FileRow, Notice, RowState,
-    Snapshot, TorrentRow,
+    SettingsCommand, Snapshot, TorrentRow,
 };
 
 use crate::modal::{self, Modal};
 use crate::model::{Action, Model, visible_rows};
+use crate::settings::{ScreenAnswer, SettingsScreen};
 
 /// Every key the model answers, and what pressing it does. The help screen lists all of
 /// them; [`FOOTER_KEYS`] chooses which of them a person needs without looking, so those
@@ -88,6 +89,18 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<A
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
         return quit_press(model, snap);
     }
+    // The settings screen owns the keyboard while it is open, Ctrl+S included, which is why it is
+    // asked before the modifier filter below.
+    if let Some(screen) = model.settings.as_mut() {
+        return match screen.on_key(key, snap) {
+            ScreenAnswer::Stay => Vec::new(),
+            ScreenAnswer::Close => {
+                model.settings = None;
+                Vec::new()
+            }
+            ScreenAnswer::Send(command) => vec![Action::Command(command)],
+        };
+    }
     // `Ctrl+O` is the one modified key a dialog has to be given: its whole job is to put a folder into
     // the add dialog's destination field, and the only place it can come from is the list the backend
     // names. Anywhere else it means nothing, so it is dropped rather than reaching the map below as an
@@ -146,7 +159,11 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<A
                 // These open a dialog, which then answers every key itself.
                 KeyCode::Char('/') => model.modal = Some(Modal::Filter),
                 KeyCode::Char('a') => model.modal = Some(Modal::add(snap)),
-                KeyCode::Char('S') => model.modal = Some(Modal::settings(snap)),
+                // The full-screen settings: it is asked for the settings it shows as it opens.
+                KeyCode::Char('S') => {
+                    model.settings = Some(SettingsScreen::open(snap));
+                    return vec![Action::Command(Command::Settings(SettingsCommand::Load))];
+                }
                 KeyCode::Char('?') => model.modal = Some(Modal::Help),
                 // The connect screen is prefilled with what this run connected to last, so that
                 // changing one thing about a server does not mean typing it again.

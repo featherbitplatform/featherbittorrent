@@ -19,6 +19,8 @@ fbt.workspace = true
 # ratatui's backend uses, so one crossterm serves both.
 crossterm.workspace = true
 ratatui.workspace = true
+# The scrolling field in the settings screen measures text in terminal cells.
+unicode-width.workspace = true
 # The add dialog expands a leading `~/` in a path someone typed, which is the home
 # directory this platform says it has.
 directories.workspace = true

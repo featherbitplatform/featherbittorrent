@@ -1458,15 +1458,13 @@ fn help_placement_is_not_dropped_by_its_own_box() {
 }
 
 /// A dialog over the header: the mark is not placed this frame, because the box it would be
-/// drawn under is the box drawn over it. At 10 rows by 10 columns the settings box is
+/// drawn under is the box drawn over it. At 10 rows by 10 columns the add box is
 /// centred at (0, 0) and covers the three header rows and the mark's columns.
 #[test]
 fn modal_over_header_drops_small_placement() {
     let snap = library();
     let mut model = model_of(&snap);
-    model.modal = Some(fbtt_tui::modal::Modal::Settings(
-        fbtt_tui::modal::SettingsForm::new(&snap.limits),
-    ));
+    model.modal = Some(fbtt_tui::modal::Modal::add(&snap));
     let logos = logos(Protocol::Kitty, CellPx { w: 8, h: 16 });
     let drawn = drawn_with(&model, &snap, &logos, 10, 10);
     assert!(
