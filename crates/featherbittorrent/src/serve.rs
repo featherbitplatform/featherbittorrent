@@ -162,7 +162,7 @@ async fn open(
     let settings = {
         // A release build has no switches to read, so the config's own settings are the answer.
         let _ = debug;
-        config.session_settings()
+        config.settings_before_proxy()
     };
     Server::start_with_settings(settings, config, paths, lock).await
 }
@@ -186,7 +186,7 @@ fn apply_web_ui_env(config: &mut Config, env: &dyn Fn(&str) -> Option<String>) {
 /// one address it chose, the way `fbtt-server`'s own tests do.
 #[cfg(debug_assertions)]
 fn offline_settings(config: &Config, offline: bool) -> fbt::Settings {
-    let mut settings = config.session_settings();
+    let mut settings = config.settings_before_proxy();
     if offline {
         settings.listen_addrs = vec![std::net::SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),

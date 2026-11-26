@@ -33,6 +33,11 @@
 //! header - is the one thing that may set it. A password or key session, a browser's cookie session, and the
 //! secret arriving in a URL all get `403 set_in_config_file`, which is the same line a read-only screen
 //! shows.
+//!
+//! The proxy is written the same way and then applied to the running engine inside the same save, so the
+//! engine ends on the last proxy written. Its password never leaves this process: the view says only
+//! whether one is stored, a change keeps, clears or replaces it without the form ever holding it, and no
+//! answer or log line here carries it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,8 +49,8 @@ use axum::http::{HeaderMap, StatusCode};
 use fbt::{RateLimit, Session};
 use fbtt_core::fs_list::inside_roots;
 use fbtt_core::{
-    Config, DownloadsChange, DownloadsView, LiveLimits, OnCompleteView, SettingsProblem,
-    SettingsView, validate_downloads,
+    Config, DownloadsChange, DownloadsView, LiveLimits, OnCompleteView, PasswordStorage,
+    ProxyChange, ProxyView, SettingsProblem, SettingsView, validate_downloads,
 };
 
 use super::{RouteError, Shared};
@@ -168,6 +173,68 @@ pub(super) async fn put_downloads(
     Ok(Json(view(&shared, &config, &headers)))
 }
 
+/// `PUT /api/v1/settings/proxy`: the proxy every connection goes through, saved to `config.yaml` and
+/// applied to the running engine without a restart, answering the view the save left behind.
+///
+/// The change is resolved against the password the file holds as it is read for the write (`keep` keeps
+/// it, `clear` removes it, `{"set": ..}` replaces it) and the setting that leaves is checked with the same
+/// rules the engine starts under; one it refuses is `400 invalid_setting` with the line to show, and
+/// neither the file nor the engine changes. `type: none` removes the `proxy:` key and puts back the
+/// switches this run started on. The engine is switched inside the same save, so two saves in quick
+/// succession leave it on the second; a switch that fails after the write (a session shutting down) is
+/// `500 proxy_not_applied` with the engine's reason, never a quiet direct connection.
+pub(super) async fn put_proxy(
+    State(shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+    given: Result<Json<ProxyChange>, JsonRejection>,
+) -> Result<Json<SettingsView>, RouteError> {
+    let Json(change) = given?;
+    let applying = Arc::clone(&shared);
+    let config = shared
+        .write_config_then(
+            move |config| {
+                let resolved = change.resolve(config.proxy.as_ref());
+                if let Some(setting) = &resolved
+                    && let Err(problem) = setting.validate()
+                {
+                    return Err(RouteError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_setting",
+                        problem.message(),
+                    ));
+                }
+                config.proxy = resolved;
+                Ok(())
+            },
+            move |config| {
+                // The setting the file now holds, applied over the settings this run started on: the
+                // config handed here is the one just written, under the lock, so it is always the latest.
+                let proxy = config.proxy.clone();
+                async move {
+                    fbtt_core::proxy::apply_now(
+                        applying.session(),
+                        proxy.as_ref(),
+                        applying.base_settings(),
+                    )
+                    .await
+                    .map_err(|problem| {
+                        tracing::warn!(problem = %problem, "the saved proxy could not be applied");
+                        RouteError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "proxy_not_applied",
+                            format!(
+                                "The proxy is saved, but the engine could not switch to it: {problem}"
+                            ),
+                        )
+                    })
+                }
+            },
+        )
+        .await
+        .map_err(|error| error.named(CONFIG_UNREADABLE))?;
+    Ok(Json(view(&shared, &config, &headers)))
+}
+
 /// Whether every folder a submitted section names is somewhere this server may really write: below a root as
 /// spelled, and below a root again once the deepest part of the path that exists is resolved
 /// ([`inside_roots`]). A folder outside every root is `403 outside_roots`.
@@ -218,6 +285,8 @@ fn view(shared: &Shared, config: &Config, headers: &HeaderMap) -> SettingsView {
             watch_problem,
             on_complete_problem,
         },
+        // A server keeps the proxy password in `config.yaml`; the view says only whether there is one.
+        proxy: ProxyView::of(config.proxy.as_ref(), PasswordStorage::ConfigFile),
     }
 }
 

@@ -30,7 +30,7 @@ pub mod engine;
 
 // The two questions a screen asks of a session, where a caller looks for the proxy's own words
 // rather than the adapter's path: `fbtt_core::proxy::health(&session)`.
-pub use engine::{health, health_from_event};
+pub use engine::{apply_now, health, health_from_event};
 
 /// The longest proxy host this product accepts, in characters: the DNS name limit.
 const MAX_HOST_CHARS: usize = 253;

@@ -174,7 +174,7 @@ fn setup(app: &mut tauri::App, serve: bool) -> Result<(), Box<dyn std::error::Er
     let serving = app.state::<serving::Serving>().inner().clone();
     startup::spawn(handle, async move {
         serving
-            .start_this_computer(serve, fbtt_core::Config::session_settings)
+            .start_this_computer(serve, fbtt_core::Config::settings_before_proxy)
             .await
     });
     // 1. The window's chrome, before the window is shown. The config's windows exist by now (Tauri makes

@@ -93,7 +93,7 @@ pub(crate) struct Shared {
     /// back, and two requests doing that at once would lose one another's change - whichever read first
     /// would write its own copy of a file the other had already changed. Every product route that writes
     /// the file goes through [`Shared::write_config`] and therefore through this one lock: the devices,
-    /// the speed and the downloads. Held across the disk work, which is why it is an async lock -
+    /// the speed, the downloads and the proxy. Held across the disk work, which is why it is an async lock -
     /// nothing blocking runs inside it.
     changing_config: tokio::sync::Mutex<()>,
     /// What this run started on, its folders already rooted in the library. The config to write back
@@ -123,6 +123,10 @@ pub(crate) struct Shared {
     /// hands out and the stream route that serves it look at one library. Not in the `Debug` printing below:
     /// what a session prints is every torrent in it, which is not what a `Debug` line here is for.
     session: fbt::Session,
+    /// The engine settings this run started on before its proxy was applied: what a proxy saved over the
+    /// API is derived over ([`fbtt_core::network_for`]), so removing one brings back the switches it had
+    /// turned off rather than leaving them off until a restart. Never changed after the start.
+    base_settings: fbt::Settings,
     /// The unfinished folder, the watch folder and the completion program this server runs beside the
     /// engine it serves. The settings routes read its two complaints - what went wrong with the watch
     /// folder last time it was read, and with the program last time it was run - so a browser sees them
@@ -179,15 +183,20 @@ impl Shared {
     /// `roots` are those folders as canonicalised directories - the same list
     /// [`fbt_api::ApiConfig::allowed_roots`] is handed - and `dummy_password_hash` is the hash computed
     /// once at startup for the accounts this config has, or `None` when it has none worth hiding behind.
-    /// `session` is the engine's own session, cloned: what the torrent routes answer about. `launch` is the
+    /// `session` is the engine's own session, cloned: what the torrent routes answer about, and
+    /// `base_settings` the settings it started on before the proxy. `launch` is the
     /// desktop app's launch secret and whether it is the only way in, for an engine the app started
     /// ([`crate::DesktopAccess`]), and `None` for any other server.
+    // Each argument is one thing the server built at startup and hands over once; a struct to carry them
+    // would only rename this list for its one caller.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: Config,
         paths: Paths,
         roots: Vec<fs::Root>,
         dummy_password_hash: Option<String>,
         session: fbt::Session,
+        base_settings: fbt::Settings,
         launch: Option<(String, bool)>,
         automation: fbtt_core::downloads::AutomationHandle,
     ) -> Self {
@@ -214,6 +223,7 @@ impl Shared {
             paths,
             roots: roots.into(),
             session,
+            base_settings,
             automation,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
@@ -236,6 +246,12 @@ impl Shared {
     /// torrents exist.
     pub(crate) fn session(&self) -> &fbt::Session {
         &self.session
+    }
+
+    /// The engine settings this run started on before its proxy was applied: what the proxy route
+    /// derives a saved proxy's network settings over.
+    pub(crate) fn base_settings(&self) -> &fbt::Settings {
+        &self.base_settings
     }
 
     /// The unfinished folder, the watch folder and the completion program this run acts on, for the two
@@ -292,6 +308,31 @@ impl Shared {
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
         apply: impl FnOnce(&Config) + Send + 'static,
     ) -> Result<Config, RouteError> {
+        self.write_config_then(change, move |config| {
+            apply(config);
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    /// [`write_config`](Self::write_config) with an `apply` that is a future and may fail: the proxy's,
+    /// which waits on the engine to close the connections made under the old proxy.
+    ///
+    /// Everything `write_config` promises holds here: the apply runs inside the same task and under the
+    /// same guard, after the save has landed, so two changes take effect in the order they were written -
+    /// two proxy saves in quick succession leave the engine on the second. The future may wait on the
+    /// session, never on anything that takes the config lock. When it fails, the file and the config this
+    /// run reports from already hold the change, and the error is what the request answers: the change is
+    /// written but did not take hold, and the person is told so rather than left on the old setting
+    /// without knowing.
+    pub(crate) async fn write_config_then<F>(
+        self: &Arc<Self>,
+        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
+        apply: impl FnOnce(&Config) -> F + Send + 'static,
+    ) -> Result<Config, RouteError>
+    where
+        F: std::future::Future<Output = Result<(), RouteError>> + Send,
+    {
         // What the task needs: the state, and one more handle on the same `Arc` the request holds.
         let shared = Arc::clone(self);
         // Test-support only, and it lives in *this* future rather than in the task's: what a test waits on
@@ -311,11 +352,14 @@ impl Shared {
     /// `write_config` spawns, so it runs to the end whether or not the request that asked for it is still
     /// there, and the guard is what keeps two changes from taking effect in the reverse of the order they
     /// were written.
-    async fn change_config(
+    async fn change_config<F>(
         &self,
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
-        apply: impl FnOnce(&Config) + Send,
-    ) -> Result<Config, RouteError> {
+        apply: impl FnOnce(&Config) -> F + Send,
+    ) -> Result<Config, RouteError>
+    where
+        F: std::future::Future<Output = Result<(), RouteError>> + Send,
+    {
         let _guard = self.changing_config.lock().await;
         // Read on the blocking pool, like every other disk call here. Each call takes a copy of the path
         // of its own and `file` stays here, because the log line about a failure wants the file this
@@ -387,7 +431,7 @@ impl Shared {
         // written and never in the reverse.
         let resolved = config.resolve(&self.paths);
         *locked(&self.current) = resolved.clone();
-        apply(&resolved);
+        apply(&resolved).await?;
         Ok(resolved)
     }
 
@@ -1355,6 +1399,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/api/v1/settings/downloads",
             put(settings::put_downloads).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
+        )
+        .route(
+            "/api/v1/settings/proxy",
+            put(settings::put_proxy).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
         )
         .with_state(shared)
 }

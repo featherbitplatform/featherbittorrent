@@ -272,6 +272,11 @@ impl Backend {
                 change.on_complete = None;
                 self.api.put_json("/api/v1/settings/downloads", &change)
             }
+            // The password travels only when the person typed a new one (`{"set": ..}`); keeping or
+            // clearing it says so instead, and the server's answer says only whether one is saved.
+            SettingsCommand::Save(SettingsChange::Proxy(change)) => {
+                self.api.put_json("/api/v1/settings/proxy", &change)
+            }
         };
         match self.api.json::<SettingsView>(request).await {
             Ok(mut view) => {

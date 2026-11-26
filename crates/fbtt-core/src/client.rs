@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::config::Limits;
-use crate::settings::{DownloadsChange, SettingsView};
+use crate::settings::{DownloadsChange, ProxyChange, SettingsView};
 
 /// Commands the backend queues before [`Client::send`] starts refusing them. It
 /// handles one at a time and each is short, so 64 is more than a person can type.
@@ -380,6 +380,9 @@ pub enum SettingsChange {
     Speed(LiveLimits),
     /// The folders, the switch and (on a library run in this process only) the program to run.
     Downloads(DownloadsChange),
+    /// The proxy every connection goes through, applied to the running engine at once. Its `Debug`
+    /// never prints a password ([`PasswordChange`](crate::PasswordChange)).
+    Proxy(ProxyChange),
 }
 
 /// What a snapshot knows about the settings.

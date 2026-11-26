@@ -738,6 +738,22 @@ impl Config {
     /// and outgoing uTP under an HTTP proxy) are turned off here, so the settings a session starts
     /// on already say what it may do. See [`crate::proxy::apply_to_settings`].
     pub fn session_settings(&self) -> fbt::Settings {
+        let mut settings = self.settings_before_proxy();
+        // The proxy decides what may still run; with no proxy this changes nothing.
+        apply_to_settings(&mut settings, self.proxy.as_ref());
+        settings
+    }
+
+    /// [`session_settings`](Self::session_settings) before the `proxy:` section is applied: the
+    /// switches as this run would have them with no proxy at all.
+    ///
+    /// This is what a run hands the engine it starts. The backend and the server apply the proxy
+    /// themselves when they start the engine, and keep these as the base a proxy changed at runtime is
+    /// derived over ([`crate::proxy::network_for`]): removing a proxy then brings back exactly the
+    /// switches this run had before, rather than leaving them off until a restart. Settings that
+    /// already have the proxy applied still start a run on the proxy, but a proxy removed later leaves
+    /// the switches it turned off where they are.
+    pub fn settings_before_proxy(&self) -> fbt::Settings {
         let mut settings = fbt::Settings::default();
         settings.listen_addrs = vec![
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.listen_port),
@@ -753,8 +769,6 @@ impl Config {
         queue.active_limit = self.limits.active_total;
         settings.queue = queue;
         settings.cache_size = self.cache_size_mib.saturating_mul(MIB);
-        // The proxy decides what may still run; with no proxy this changes nothing.
-        apply_to_settings(&mut settings, self.proxy.as_ref());
         settings
     }
 }
