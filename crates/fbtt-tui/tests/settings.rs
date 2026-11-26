@@ -597,3 +597,123 @@ fn a_long_value_keeps_the_caret_in_view() {
         "the end of a long value is not in view:\n{text}"
     );
 }
+
+/// Edits Speed, sends it, edits again, and discards the change by moving to Downloads: the first
+/// send is then given up on and the screen is on Downloads.
+fn discard_with_a_save_out(model: &mut Model, snap: &Snapshot) {
+    replace_field(model, snap, "64");
+    assert_eq!(model.handle_key(ctrl_s(), snap).len(), 1);
+    replace_field(model, snap, "65");
+    press(model, snap, KeyCode::Tab);
+    press(model, snap, KeyCode::Up);
+    model.handle_key(letter('d'), snap);
+}
+
+#[test]
+fn discard_during_a_save_then_save_again_sends() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    discard_with_a_save_out(&mut model, &snap);
+    assert!(
+        Screen::new(&model, &snap, 120, 30)
+            .text()
+            .contains("Default folder")
+    );
+    press(&mut model, &snap, KeyCode::Tab);
+    let actions = model.handle_key(ctrl_s(), &snap);
+    assert_eq!(actions.len(), 1, "Ctrl+S stayed dead after a discard");
+}
+
+#[test]
+fn a_late_answer_to_a_discarded_save_is_ignored() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    discard_with_a_save_out(&mut model, &snap);
+    // Back to Speed and a second save.
+    press(&mut model, &snap, KeyCode::Down);
+    press(&mut model, &snap, KeyCode::Tab);
+    replace_field(&mut model, &snap, "66");
+    assert_eq!(model.handle_key(ctrl_s(), &snap).len(), 1);
+    // The first save's answer arrives now: it is not the second's.
+    model.push_notice(Notice::Info("Saved.".to_string()), Instant::now());
+    assert!(
+        is_dirty(&mut model, &snap),
+        "a late answer completed a newer save"
+    );
+    // The second's own answer does.
+    model.push_notice(Notice::Info("Saved.".to_string()), Instant::now());
+    assert!(!is_dirty(&mut model, &snap));
+}
+
+#[test]
+fn a_save_with_no_answer_times_out_and_can_be_retried() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    let start = Instant::now();
+    model.tick(start);
+    model.tick(start + std::time::Duration::from_secs(9));
+    assert!(
+        model.handle_key(ctrl_s(), &snap).is_empty(),
+        "timed out too early"
+    );
+    model.tick(start + std::time::Duration::from_secs(11));
+    let text = Screen::new(&model, &snap, 120, 30).text();
+    assert!(text.contains("No answer from the server."), "{text}");
+    assert!(
+        is_dirty(&mut model, &snap),
+        "a timeout marked the form saved"
+    );
+    assert_eq!(
+        model.handle_key(ctrl_s(), &snap).len(),
+        1,
+        "Save stayed dead after the timeout"
+    );
+}
+
+#[test]
+fn s_while_a_save_is_out_waits_and_then_leaves() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    assert_eq!(model.handle_key(ctrl_s(), &snap).len(), 1);
+    // Back out while it is out: the form still differs from what was saved.
+    press(&mut model, &snap, KeyCode::Esc);
+    assert!(
+        model.handle_key(letter('s'), &snap).is_empty(),
+        "a second save went out"
+    );
+    assert!(model.settings.is_some());
+    model.push_notice(Notice::Info("Saved.".to_string()), Instant::now());
+    assert!(model.settings.is_none(), "the leave was forgotten");
+
+    // A refusal keeps the screen and shows the line.
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    press(&mut model, &snap, KeyCode::Esc);
+    model.handle_key(letter('s'), &snap);
+    model.push_notice(Notice::Error("refused".to_string()), Instant::now());
+    assert!(model.settings.is_some());
+    assert!(
+        Screen::new(&model, &snap, 120, 30)
+            .text()
+            .contains("refused")
+    );
+}
+
+#[test]
+fn a_wide_value_keeps_the_caret_in_view() {
+    let snap = loaded(false);
+    let mut model = open(&snap);
+    press(&mut model, &snap, KeyCode::Tab);
+    press(&mut model, &snap, KeyCode::Enter);
+    type_text(&mut model, &snap, &"\u{6f22}".repeat(60));
+    type_text(&mut model, &snap, "END");
+    let text = Screen::new(&model, &snap, 80, 20).text();
+    assert!(
+        text.contains("END"),
+        "the end of a wide value is not in view:\n{text}"
+    );
+}

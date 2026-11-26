@@ -259,6 +259,9 @@ impl Model {
     /// each frame's clock reading so a line about something goes away without a key press; a
     /// `now` earlier than the notice arrived counts as no time passed.
     pub fn tick(&mut self, now: Instant) {
+        if let Some(screen) = self.settings.as_mut() {
+            screen.tick(now);
+        }
         let keep = self
             .notice
             .as_ref()

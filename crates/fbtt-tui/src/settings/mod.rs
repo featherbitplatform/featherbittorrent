@@ -11,6 +11,7 @@
 //! them raw; the drawing code in `view/settings.rs` passes every one through `fbt::display_safe`.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fbtt_core::{
@@ -95,7 +96,15 @@ struct InFlight {
     sent: SentValues,
     /// What to do once the save is answered well.
     pending: Option<Pending>,
+    /// The first clock reading after the send, which the timeout counts from. The screen has no
+    /// clock of its own: the model's tick is its time.
+    started: Option<Instant>,
 }
+
+/// How long a save may go unanswered before the screen gives up waiting for it.
+const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// What the screen says when that happens.
+const NO_ANSWER: &str = "No answer from the server.";
 
 /// The one notice a good save is answered with.
 const SAVED: &str = "Saved.";
@@ -334,6 +343,10 @@ pub struct SettingsScreen {
     confirm: Option<Pending>,
     /// A save has gone out and its answer has not come back.
     in_flight: Option<InFlight>,
+    /// How many sends were given up on (discarded or timed out) that may still be answered. Those
+    /// answers arrive in the order the sends went out, so the first this many are theirs and are
+    /// ignored rather than taken for the answer to a newer save.
+    stale_answers: usize,
     /// A save answered well on the way out: the model closes the screen.
     close_requested: bool,
     /// What a refused Load said, drawn in place of the loading line.
@@ -357,6 +370,7 @@ impl SettingsScreen {
             editing: false,
             confirm: None,
             in_flight: None,
+            stale_answers: 0,
             close_requested: false,
             load_error: None,
             error: None,
@@ -513,7 +527,19 @@ impl SettingsScreen {
         }
     }
 
+    /// Gives up on the save that is out, if any: its answer, when it comes, is not about what the form
+    /// holds now.
+    fn abandon_save(&mut self) {
+        if let Some(flight) = self.in_flight.take() {
+            // A send through `SetLimits` has no answer to wait for or to skip.
+            if !matches!(flight.sent, SentValues::Speed(_, Some(_))) {
+                self.stale_answers += 1;
+            }
+        }
+    }
+
     fn discard(&mut self) {
+        self.abandon_save();
         self.error = None;
         self.editing = false;
         match self.section {
@@ -678,7 +704,11 @@ impl SettingsScreen {
     /// Saves the open section. `then` is what to do once the save is answered well. While a save is
     /// out nothing is sent again.
     fn save(&mut self, then: Option<Pending>) -> ScreenAnswer {
-        if self.in_flight.is_some() {
+        if let Some(flight) = self.in_flight.as_mut() {
+            // The question's answer is for after this save: it goes on waiting for it.
+            if then.is_some() {
+                flight.pending = then;
+            }
             return ScreenAnswer::Stay;
         }
         self.editing = false;
@@ -718,6 +748,7 @@ impl SettingsScreen {
             section: self.section,
             sent,
             pending: then,
+            started: None,
         });
         ScreenAnswer::Send(command)
     }
@@ -748,6 +779,19 @@ impl SettingsScreen {
         false
     }
 
+    /// Counts the time a save has been waiting. After [`SAVE_TIMEOUT`] without an answer the screen
+    /// says so and frees the Save row; the form stays as typed, still unsaved.
+    pub(crate) fn tick(&mut self, now: Instant) {
+        let Some(flight) = self.in_flight.as_mut() else {
+            return;
+        };
+        let started = *flight.started.get_or_insert(now);
+        if now.saturating_duration_since(started) >= SAVE_TIMEOUT {
+            self.abandon_save();
+            self.error = Some(NO_ANSWER.to_string());
+        }
+    }
+
     /// Whether a good save asked for the screen to close, and forgets it.
     pub(crate) fn take_close(&mut self) -> bool {
         std::mem::take(&mut self.close_requested)
@@ -759,6 +803,13 @@ impl SettingsScreen {
     /// a line about another torrent is not about this form. A refused Load is shown where the loading
     /// line was.
     pub(crate) fn on_notice(&mut self, notice: &Notice) -> bool {
+        // An answer to a send that was given up on is not about the one that is out now.
+        let answer = matches!(notice, Notice::Error(_) | Notice::SignInRefused(_))
+            || matches!(notice, Notice::Info(text) if text == SAVED);
+        if self.stale_answers > 0 && answer {
+            self.stale_answers -= 1;
+            return false;
+        }
         if self.in_flight.is_none() {
             if let Notice::Error(text) = notice
                 && !self.speed_loaded

@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthChar;
 
 use crate::format;
 use crate::modal::{Input, keys_hint};
@@ -199,12 +200,29 @@ fn field(
         if at >= input.text.chars().count() {
             caret_at = visible.len();
         }
+        // Measured in terminal cells: a wide character takes two, so counting characters would
+        // scroll too late and push the caret off the row.
+        let width_of = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
         let room = room.max(2);
-        let start = (caret_at + 1).saturating_sub(room);
-        let shown: Vec<char> = visible[start..].iter().take(room).copied().collect();
+        let caret_width = visible.get(caret_at).map_or(1, |c| width_of(*c).max(1));
+        let mut start = 0;
+        let mut before_cells: usize = visible[..caret_at].iter().map(|c| width_of(*c)).sum();
+        while start < caret_at && before_cells + caret_width > room {
+            before_cells -= width_of(visible[start]);
+            start += 1;
+        }
+        let mut used = 0;
+        let mut shown: Vec<char> = Vec::new();
+        for c in &visible[start..] {
+            used += width_of(*c);
+            if used > room {
+                break;
+            }
+            shown.push(*c);
+        }
         let local = caret_at - start;
         spans.push(Span::styled(
-            shown[..local].iter().collect::<String>(),
+            shown[..local.min(shown.len())].iter().collect::<String>(),
             style,
         ));
         match shown.get(local) {
