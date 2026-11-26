@@ -795,7 +795,11 @@ async fn batch_program_is_refused_at_run_time() {
     let default = lib.config.download_dir.clone();
     // An absolute path to a file that really is there: the extension is the whole problem, so nothing
     // else may be wrong with it.
-    let program = write_file(&lib.dir.path().join("hooks"), "notify.bat", "@echo off\r\n");
+    let program = write_file(
+        &lib.dir.path().join("hooks"),
+        "notify.bat",
+        b"@echo off\r\n",
+    );
     let config = config_with(
         &lib,
         DownloadsConfig {

@@ -31,6 +31,8 @@ use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 
 use super::MAX_WATCHED_FILE;
 
@@ -520,11 +522,13 @@ fn rename_to_free(dir: &Path, file: &str, suffix: &str) -> Result<PathBuf, std::
 mod tests {
     #[cfg(unix)]
     use super::nonblock_for;
+    // Used only by the Unix tests (links and pipes), so imported only there.
     use super::{
-        ADDED, INVALID, LAST_NUMBER, NOT_THE_SAME, Scan, Unmoved, UnmovedMap, candidate,
-        first_free_name, link_unusable, name_taken, numbered, read_candidate, read_capped, settled,
-        sweep,
+        ADDED, INVALID, LAST_NUMBER, Scan, Unmoved, UnmovedMap, candidate, first_free_name,
+        link_unusable, numbered, read_candidate, read_capped, settled, sweep,
     };
+    #[cfg(unix)]
+    use super::{NOT_THE_SAME, name_taken};
     use crate::scratch::ScratchDir;
     use std::fs;
     use std::io::{Cursor, Error, ErrorKind};

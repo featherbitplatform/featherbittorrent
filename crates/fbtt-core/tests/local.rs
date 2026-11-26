@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use fbtt_core::{
     AddSource, Client, ClientParts, Command, Config, ConfigLoad, Connection, Detail, DetailTab,
-    DeviceCommand, DirListing, FilePriority, FileRow, LibraryLock, LiveLimits, LocalBackend,
-    Notice, RowState, Snapshot, TorrentId,
+    DeviceCommand, DirListing, FilePriority, FileRow, LiveLimits, Notice, RowState, Snapshot,
+    TorrentId,
 };
 
 mod support;
@@ -398,6 +398,7 @@ async fn failed_restore_keeps_backup() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_backup_blocks_state_writes() {
+    use fbtt_core::{LibraryLock, LocalBackend};
     use std::os::unix::fs::PermissionsExt;
 
     let lib = Library::new("local_backup_blocked");
