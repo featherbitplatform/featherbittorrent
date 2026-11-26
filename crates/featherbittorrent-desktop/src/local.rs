@@ -113,7 +113,7 @@ pub(crate) async fn start_with(
             ));
         }
     };
-    let mut config = library_config(&library, proxy_password.available())?;
+    let mut config = library_config(&library)?;
     move_password_to_keychain(&mut config, &library, proxy_password.as_ref());
     let config = with_allowed_roots(config, &library);
     // The engine logs in with the keychain's password; `config` keeps saying what the file holds, which
@@ -146,15 +146,11 @@ pub(crate) async fn start_with(
 /// when there is none yet, and the defaults (with the file left where it is) when it cannot be read. A
 /// problem worth knowing about that does not stop the start goes to stderr.
 ///
-/// `keychained`: the system has a keychain, where the proxy password is kept, so the file's proxy login
-/// is read without one ([`Config::load_keychained`]).
-fn library_config(paths: &Paths, keychained: bool) -> Result<Config, String> {
-    let loaded = if keychained {
-        Config::load_keychained(paths)
-    } else {
-        Config::load(paths)
-    };
-    match loaded {
+/// The file is read as the desktop app keeps it ([`Config::load_keychained`]): the proxy password belongs in
+/// the keychain, so a proxy login without one is the password kept there, even on a run whose keychain is
+/// out of reach (the engine then starts on the proxy with no login rather than not at all).
+fn library_config(paths: &Paths) -> Result<Config, String> {
+    match Config::load_keychained(paths) {
         Ok(ConfigLoad::Loaded(config)) => Ok(config.resolve(paths)),
         Ok(ConfigLoad::Missing) => {
             let config = Config::default_for(paths).resolve(paths);
@@ -523,6 +519,52 @@ pub(crate) mod tests {
         this.stop().await;
     }
 
+    /// A keychain out of reach for this run (a Secret Service that missed its deadline), after the
+    /// password left the file: This computer still starts, on the proxy with no login, and says no
+    /// password is saved. Never direct, and never a start refused over a login it cannot fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_without_keychain_and_password_stays_on_the_proxy() {
+        let dir = ScratchDir::new("desktop-local-keychain-out-of-reach");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let file = paths.library().config_file();
+        let mut config = Config::load_for_edit(&file).expect("reads").expect("there");
+        if let Some(proxy) = config.proxy.as_mut() {
+            proxy.password = None;
+        }
+        config
+            .save(&file)
+            .expect("the file as the keychain left it");
+        let store: Arc<dyn ProxyPasswordStore> =
+            Arc::new(ProxyKeychain::new(Arc::new(MemoryKeychain::unavailable())));
+
+        let this = start_keychained(&paths, store)
+            .await
+            .expect("This computer starts");
+        let running = this.network_settings();
+        assert_eq!(running.proxy.kind, fbt::ProxyKind::Socks5);
+        assert_eq!(running.proxy.username, None, "no login");
+        assert!(!running.enable_incoming_tcp, "nothing bypasses the proxy");
+
+        let (base, secret) = this.endpoint();
+        let view: serde_json::Value = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .get(format!("{base}/api/v1/settings"))
+                .bearer_auth(&secret)
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed")
+        .json()
+        .await
+        .expect("a JSON view");
+        assert_eq!(view["proxy"]["password_saved"], false, "{view}");
+        assert_eq!(view["proxy"]["password_storage"], "unavailable", "{view}");
+        this.stop().await;
+    }
+
     /// Removing the proxy at runtime over This computer's own route brings back the switches it turned
     /// off: the engine is handed its settings before the proxy, as the app's own start hands them.
     #[tokio::test(flavor = "multi_thread")]
@@ -640,7 +682,7 @@ pub(crate) mod tests {
         let library = paths.library();
         assert!(!library.config_file().exists(), "a fresh library");
 
-        let config = super::library_config(&library, false).expect("the defaults");
+        let config = super::library_config(&library).expect("the defaults");
         let written = Config::load_for_edit(&library.config_file())
             .expect("the config reads")
             .expect("the first run wrote one");
@@ -673,7 +715,7 @@ pub(crate) mod tests {
         .expect("write a config that names a proxy");
 
         assert_eq!(
-            super::library_config(&library, false).err().as_deref(),
+            super::library_config(&library).err().as_deref(),
             Some("Unknown proxy type \"socks4\"; use none, http or socks5.")
         );
         assert!(file.exists(), "the file is left in place");

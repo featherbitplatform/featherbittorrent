@@ -155,14 +155,10 @@ impl Serving {
         Ok(running)
     }
 
-    /// Reads the library's config for an edit, its proxy login without a password when the keychain holds
-    /// that ([`Config::load_for_edit_keychained`]).
+    /// Reads the library's config for an edit as the desktop app keeps it: its proxy login without a
+    /// password, which belongs in the keychain ([`Config::load_for_edit_keychained`]).
     fn load_for_edit(&self, file: &std::path::Path) -> Result<Option<Config>, String> {
-        if self.proxy_password.available() {
-            Config::load_for_edit_keychained(file)
-        } else {
-            Config::load_for_edit(file)
-        }
+        Config::load_for_edit_keychained(file)
     }
 
     /// The keychain This computer's proxy password is kept in, as the engine is handed it.

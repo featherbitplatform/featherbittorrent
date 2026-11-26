@@ -52,9 +52,9 @@ use crate::auth::{FbttAuth, keys, locked};
 /// device name from a config file, the words of a parse error about something a client sent. The
 /// workspace rule is that remote text is display-safe, and these routes are where remote text first
 /// reaches something a person will read.
-/// Reads `config.yaml` for an edit: [`Config::load_for_edit_keychained`] on the desktop app's engine with a
-/// keychain, where the file holds a proxy login without its password, and [`Config::load_for_edit`]
-/// everywhere else.
+/// Reads `config.yaml` for an edit: [`Config::load_for_edit_keychained`] on the desktop app's engine, where
+/// the file holds a proxy login without its password (even on a run whose keychain is out of reach), and
+/// [`Config::load_for_edit`] everywhere else.
 fn load_for_edit(path: &std::path::Path, keychained: bool) -> Result<Option<Config>, String> {
     if keychained {
         Config::load_for_edit_keychained(path)
@@ -279,6 +279,22 @@ impl Shared {
             .filter(|store| store.available())
     }
 
+    /// Runs `call` on the keychain on the blocking pool, as every other call that may wait on the system
+    /// is run: a Secret Service on a slow session bus must not hold a worker thread. A task that did not
+    /// finish is a failure with a line to show, never unwrapped.
+    pub(crate) async fn keychain_call<T: Send + 'static>(
+        store: &Arc<dyn crate::ProxyPasswordStore>,
+        call: impl FnOnce(&dyn crate::ProxyPasswordStore) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || call(store.as_ref()))
+            .await
+            .map_err(|problem| {
+                tracing::warn!(problem = %problem, "the keychain task did not finish");
+                "the keychain could not be asked".to_string()
+            })
+    }
+
     /// Where this run keeps the proxy password: the keychain, `config.yaml` because the desktop app's
     /// system has no keychain, or `config.yaml` because this is a server.
     pub(crate) fn proxy_password_storage(&self) -> fbtt_core::PasswordStorage {
@@ -343,10 +359,13 @@ impl Shared {
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
         apply: impl FnOnce(&Config) + Send + 'static,
     ) -> Result<Config, RouteError> {
-        self.write_config_then(change, move |config| {
-            apply(config);
-            std::future::ready(Ok(()))
-        })
+        self.write_config_then(
+            move |mut config| std::future::ready(change(&mut config).map(|()| config)),
+            move |config| {
+                apply(config);
+                std::future::ready(Ok(()))
+            },
+        )
         .await
     }
 
@@ -360,12 +379,16 @@ impl Shared {
     /// run reports from already hold the change, and the error is what the request answers; an apply that
     /// has to undo its change does so itself, still under the guard, with
     /// [`rewrite_from_apply`](Self::rewrite_from_apply), before it fails.
-    pub(crate) async fn write_config_then<F>(
+    ///
+    /// `change` is a future too, handed the config as read and answering the config to save: the proxy's
+    /// asks the keychain (on the blocking pool) before the save, still under the guard.
+    pub(crate) async fn write_config_then<C, F>(
         self: &Arc<Self>,
-        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
+        change: impl FnOnce(Config) -> C + Send + 'static,
         apply: impl FnOnce(&Config) -> F + Send + 'static,
     ) -> Result<Config, RouteError>
     where
+        C: std::future::Future<Output = Result<Config, RouteError>> + Send,
         F: std::future::Future<Output = Result<(), RouteError>> + Send,
     {
         // What the task needs: the state, and one more handle on the same `Arc` the request holds.
@@ -387,12 +410,13 @@ impl Shared {
     /// `write_config` spawns, so it runs to the end whether or not the request that asked for it is still
     /// there, and the guard is what keeps two changes from taking effect in the reverse of the order they
     /// were written.
-    async fn change_config<F>(
+    async fn change_config<C, F>(
         &self,
-        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
+        change: impl FnOnce(Config) -> C + Send,
         apply: impl FnOnce(&Config) -> F + Send,
     ) -> Result<Config, RouteError>
     where
+        C: std::future::Future<Output = Result<Config, RouteError>> + Send,
         F: std::future::Future<Output = Result<(), RouteError>> + Send,
     {
         let _guard = self.changing_config.lock().await;
@@ -401,7 +425,7 @@ impl Shared {
         // request actually used.
         let file = self.paths.config_file();
         let reading = file.clone();
-        let keychained = self.proxy_keychain().is_some();
+        let keychained = self.proxy_password.is_some();
         let read = tokio::task::spawn_blocking(move || load_for_edit(&reading, keychained))
             .await
             .map_err(|problem| {
@@ -412,7 +436,7 @@ impl Shared {
                 );
                 RouteError::internal("the server could not read its config; see the server log")
             })?;
-        let mut config = match read {
+        let config = match read {
             Ok(Some(config)) => config,
             // Nothing there yet: this run's own config is the only one to change.
             Ok(None) => self.base_config.clone(),
@@ -427,7 +451,7 @@ impl Shared {
                 ));
             }
         };
-        change(&mut config)?;
+        let config = change(config).await?;
         // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`). A
         // folder this server has no write permission on, a disk with no room left, a path somebody made
         // read-only: this is an operator's problem, not a client's mistake, so it is answered
@@ -482,7 +506,7 @@ impl Shared {
     ) -> Result<(), String> {
         let file = self.paths.config_file();
         let base = self.base_config.clone();
-        let keychained = self.proxy_keychain().is_some();
+        let keychained = self.proxy_password.is_some();
         let written = tokio::task::spawn_blocking(move || {
             let mut config = match load_for_edit(&file, keychained) {
                 Ok(Some(config)) => config,

@@ -331,6 +331,16 @@ proxy at its next start. If the keychain loses the password (an entry removed by
 starts on the proxy, with no login: the proxy refuses it, and typing the password again in the Proxy section
 fixes it. It never connects directly.
 
+The same happens when the keychain is out of reach for one run after the password has moved into it, for
+example a Linux session whose Secret Service does not answer in time when the app starts. This computer starts
+on the proxy with no login, the Proxy section shows no saved password, and the proxy refuses the login until
+the keychain is back (the next start finds the password again) or you type the password, which then goes into
+`config.yaml` for as long as the keychain is out of reach.
+
+When you change the proxy's host or port, the old password leaves the keychain before `config.yaml` names the
+new address, and the new password goes in after. An app that stops between the two writes can leave no
+password, which shows as a refused login, but never sends the old address's password to the new one.
+
 ## The window
 
 The app draws its own top bar: the instance switcher, the web UI's own header actions, and on Windows and

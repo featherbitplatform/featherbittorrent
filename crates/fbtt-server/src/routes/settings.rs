@@ -54,6 +54,7 @@ use fbtt_core::{
 };
 
 use super::{RouteError, Shared, clean};
+use crate::ProxyPasswordStore;
 use crate::auth::locked;
 
 /// How large a settings body may be, in bytes. The two bodies are a handful of numbers and three paths, so
@@ -73,9 +74,9 @@ const KIB: u64 = 1024;
 pub(super) async fn get(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
-) -> Json<SettingsView> {
+) -> Result<Json<SettingsView>, RouteError> {
     let config = shared.current_config();
-    Json(view(&shared, &config, &headers))
+    Ok(Json(view(&shared, &config, &headers).await?))
 }
 
 /// `PUT /api/v1/settings/speed`: the running rates and queue counts, saved to `config.yaml` so the next run
@@ -106,7 +107,7 @@ pub(super) async fn put_speed(
         )
         .await
         .map_err(|error| error.named(CONFIG_UNREADABLE))?;
-    Ok(Json(view(&shared, &config, &headers)))
+    Ok(Json(view(&shared, &config, &headers).await?))
 }
 
 /// `PUT /api/v1/settings/downloads`: the folders, the switch and, for the one client allowed to name it, the
@@ -171,7 +172,7 @@ pub(super) async fn put_downloads(
         )
         .await
         .map_err(|error| error.named(CONFIG_UNREADABLE))?;
-    Ok(Json(view(&shared, &config, &headers)))
+    Ok(Json(view(&shared, &config, &headers).await?))
 }
 
 /// `PUT /api/v1/settings/proxy`: the proxy every connection goes through, saved to `config.yaml` and
@@ -195,15 +196,16 @@ pub(super) async fn put_proxy(
 ) -> Result<Json<SettingsView>, RouteError> {
     let Json(change) = given?;
     // What the change step hands the apply step, both inside the same serialized save: the proxy the file
-    // held and the password the keychain held before this change, so a failure can put both back, and
-    // the setting the engine is to switch to, password included (the file may not hold it).
+    // held and the password the keychain held before this change, so a failure can put both back, what
+    // the keychain holds now, and the setting the engine is to switch to, password included (the file may
+    // not hold it).
     let previous: Arc<Mutex<Previous>> = Arc::default();
     let before = Arc::clone(&previous);
     let keychain = shared.proxy_keychain().cloned();
     let applying = Arc::clone(&shared);
     let config = shared
         .write_config_then(
-            move |config| {
+            move |mut config| async move {
                 let invalid = |problem: ProxyProblem| {
                     RouteError::new(
                         StatusCode::BAD_REQUEST,
@@ -213,7 +215,12 @@ pub(super) async fn put_proxy(
                 };
                 // With a keychain, the stored password is the keychain's (or one the file still holds,
                 // which the app's start could not move): `keep` keeps that one, under B3's same rules.
-                let held = keychain.as_ref().and_then(|store| store.get());
+                let held = match &keychain {
+                    Some(store) => Shared::keychain_call(store, |store| store.get())
+                        .await
+                        .map_err(|problem| keychain_error(&problem))?,
+                    None => None,
+                };
                 let mut stored = config.proxy.clone();
                 if let Some(setting) = stored.as_mut()
                     && setting.password.as_deref().is_none_or(str::is_empty)
@@ -223,6 +230,27 @@ pub(super) async fn put_proxy(
                 let resolved = change.resolve(stored.as_ref()).map_err(invalid)?;
                 if let Some(setting) = &resolved {
                     setting.validate().map_err(invalid)?;
+                }
+                // A password the keychain holds belongs to the address it was given for. When the address
+                // changes, it leaves the keychain before the file names the new address, so a crash
+                // between the two writes can leave no password but never the old one beside a new host.
+                let moving = held.is_some()
+                    && match (stored.as_ref(), resolved.as_ref()) {
+                        (Some(old), Some(new)) => !old.same_address(new),
+                        _ => true,
+                    };
+                let mut now = held.clone();
+                if moving && let Some(store) = &keychain {
+                    let cleared = Shared::keychain_call(store, |store| store.clear())
+                        .await
+                        .and_then(|cleared| cleared);
+                    if let Err(problem) = cleared {
+                        let problem = clean(&problem);
+                        tracing::warn!(problem = %problem, "the old proxy password could not be removed");
+                        // Nothing is written yet: the file, the keychain and the engine are as they were.
+                        return Err(not_saved(password_not_saved(&problem)));
+                    }
+                    now = None;
                 }
                 let mut file = resolved.clone();
                 if keychain.is_some()
@@ -234,46 +262,54 @@ pub(super) async fn put_proxy(
                 *locked(&before) = Previous {
                     file: config.proxy.clone(),
                     keychain: held,
+                    now,
                     engine: resolved,
                 };
                 config.proxy = file;
-                Ok(())
+                Ok(config)
             },
             move |_config| async move {
-                let (engine, keychain_before) = {
+                let (engine, keychain_before, keychain_now) = {
                     let previous = locked(&previous);
-                    (previous.engine.clone(), previous.keychain.clone())
+                    (
+                        previous.engine.clone(),
+                        previous.keychain.clone(),
+                        previous.now.clone(),
+                    )
                 };
                 let wanted = engine.as_ref().and_then(|setting| setting.password.clone());
                 let keychain = applying.proxy_keychain().cloned();
                 // The keychain is written after the file and before the engine: a keychain that will not
                 // take the password leaves the engine on the setting it has, and the file goes back.
-                let mut keychain_changed = false;
                 if let Some(store) = &keychain
-                    && wanted != keychain_before
+                    && wanted != keychain_now
                 {
-                    let written = match &wanted {
+                    let writing = wanted.clone();
+                    let written = Shared::keychain_call(store, move |store| match &writing {
                         Some(password) => store.set(password),
                         None => store.clear(),
-                    };
+                    })
+                    .await
+                    .and_then(|written| written);
                     if let Err(problem) = written {
                         let problem = clean(&problem);
                         tracing::warn!(problem = %problem, "the proxy password could not be saved");
+                        let keychain_back = restore_keychain(
+                            store,
+                            keychain_now.as_ref() != keychain_before.as_ref(),
+                            keychain_before,
+                        )
+                        .await;
                         let file = locked(&previous).file.take();
-                        let message = match applying
+                        let file_back = applying
                             .rewrite_from_apply(move |config| config.proxy = file)
-                            .await
-                        {
-                            Ok(()) => password_not_saved(&problem),
-                            Err(rollback) => fbtt_core::proxy::not_rolled_back(&problem, &rollback),
-                        };
-                        return Err(RouteError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "proxy_password_not_saved",
-                            message,
-                        ));
+                            .await;
+                        return Err(not_saved(keychain_refused(
+                            &problem,
+                            file_back.err(),
+                            keychain_back.err(),
+                        )));
                     }
-                    keychain_changed = true;
                 }
                 // The setting just resolved, applied over the settings this run started on: the
                 // change step ran under the same lock, so it is always the latest.
@@ -291,33 +327,17 @@ pub(super) async fn put_proxy(
                 // back to it too, still under the same lock, so nothing claims a proxy the engine is not
                 // using and the engine is never on a password the keychain does not hold.
                 tracing::warn!(problem = %problem, "the saved proxy could not be applied");
-                let mut rollback = Vec::new();
-                if keychain_changed && let Some(store) = &keychain {
-                    let restored = match &keychain_before {
-                        Some(password) => store.set(password),
-                        None => store.clear(),
-                    };
-                    if let Err(failed) = restored {
-                        rollback.push(clean(&failed));
+                let keychain_back = match &keychain {
+                    Some(store) => {
+                        restore_keychain(store, wanted != keychain_before, keychain_before).await
                     }
-                }
-                let file = locked(&previous).file.take();
-                if let Err(failed) = applying
-                    .rewrite_from_apply(move |config| config.proxy = file)
-                    .await
-                {
-                    rollback.push(failed);
-                }
-                let message = if rollback.is_empty() {
-                    fbtt_core::proxy::not_applied(&problem)
-                } else {
-                    let rollback = rollback.join("; ");
-                    tracing::warn!(
-                        problem = %rollback,
-                        "the previous proxy could not be written back",
-                    );
-                    fbtt_core::proxy::not_rolled_back(&problem, &rollback)
+                    None => Ok(()),
                 };
+                let file = locked(&previous).file.take();
+                let file_back = applying
+                    .rewrite_from_apply(move |config| config.proxy = file)
+                    .await;
+                let message = engine_refused(&problem, file_back.err(), keychain_back.err());
                 Err(RouteError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "proxy_not_applied",
@@ -327,7 +347,7 @@ pub(super) async fn put_proxy(
         )
         .await
         .map_err(|error| error.named(CONFIG_UNREADABLE))?;
-    Ok(Json(view(&shared, &config, &headers)))
+    Ok(Json(view(&shared, &config, &headers).await?))
 }
 
 /// What a proxy save's change step hands its apply step. Its `Debug` is never asked for: it holds
@@ -339,16 +359,94 @@ struct Previous {
     /// The password the keychain held before the change, to put back on a failure. Always `None` with no
     /// keychain.
     keychain: Option<String>,
+    /// The password the keychain holds once the change step is done: the old one, or none when the
+    /// address changed and the old one was taken out before the save.
+    now: Option<String>,
     /// The setting the engine is to switch to, with its password.
     engine: Option<ProxySetting>,
 }
 
+/// Puts `password` back in the keychain (or clears it, for none) when `changed` says the keychain no
+/// longer holds it. The error is the display-safe line saying the keychain would not.
+async fn restore_keychain(
+    store: &Arc<dyn ProxyPasswordStore>,
+    changed: bool,
+    password: Option<String>,
+) -> Result<(), String> {
+    if !changed {
+        return Ok(());
+    }
+    Shared::keychain_call(store, move |store| match &password {
+        Some(password) => store.set(password),
+        None => store.clear(),
+    })
+    .await
+    .and_then(|restored| restored)
+    .map_err(|problem| {
+        let problem = clean(&problem);
+        tracing::warn!(problem = %problem, "the previous proxy password could not be put back");
+        problem
+    })
+}
+
+/// A proxy save the keychain refused: `500 proxy_password_not_saved` with `message`.
+fn not_saved(message: String) -> RouteError {
+    RouteError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "proxy_password_not_saved",
+        message,
+    )
+}
+
 /// What a proxy save answers when the keychain would not take the new password (or let the old one
-/// go): nothing changed, and `problem` is the keychain's display-safe reason.
+/// go) and nothing changed: `problem` is the keychain's display-safe reason.
 fn password_not_saved(problem: &str) -> String {
     format!(
         "The keychain did not save the proxy password, so the previous setting is kept: {problem}"
     )
+}
+
+/// The answer to a keychain that refused the new password after the file was written: what failed, and
+/// what could not be put back. The engine was never asked. Every reason is display-safe.
+fn keychain_refused(problem: &str, file: Option<String>, keychain: Option<String>) -> String {
+    match (file, keychain) {
+        (None, None) => password_not_saved(problem),
+        (Some(file), None) => format!(
+            "The keychain did not save the proxy password, and config.yaml could not be put back and \
+             names the new proxy: {file}. The engine is still on the previous setting. The keychain's \
+             reason: {problem}"
+        ),
+        (None, Some(keychain)) => format!(
+            "The keychain did not save the proxy password, and it could not get the previous password \
+             back: {keychain}. config.yaml names the previous proxy again and the engine is still on it. \
+             The keychain's reason: {problem}"
+        ),
+        (Some(file), Some(keychain)) => format!(
+            "The keychain did not save the proxy password, config.yaml could not be put back and names \
+             the new proxy ({file}), and the keychain could not get the previous password back \
+             ({keychain}). The engine is still on the previous setting. The keychain's reason: {problem}"
+        ),
+    }
+}
+
+/// The answer to an engine that refused to switch: what was put back, and what could not be. Every reason
+/// is display-safe.
+fn engine_refused(problem: &str, file: Option<String>, keychain: Option<String>) -> String {
+    match (file, keychain) {
+        (None, None) => fbtt_core::proxy::not_applied(problem),
+        (Some(file), None) => fbtt_core::proxy::not_rolled_back(problem, &file),
+        (None, Some(keychain)) => format!(
+            "The engine could not switch to this proxy and is still on the previous setting, and \
+             config.yaml names it again, but the keychain could not get the previous password back: \
+             {keychain}. The engine's reason: {problem}"
+        ),
+        (Some(file), Some(keychain)) => fbtt_core::proxy::not_rolled_back(
+            problem,
+            &format!(
+                "{file}; the keychain could not get the previous password back either: {keychain}"
+            ),
+        ),
+    }
 }
 
 /// Whether every folder a submitted section names is somewhere this server may really write: below a root as
@@ -384,10 +482,15 @@ async fn folders_are_inside(
 const CONFIG_UNREADABLE: &str = "config_unreadable";
 
 /// The view one request reads: the live limits and the downloads section, with `editable` answering about
-/// this request's own credential.
-fn view(shared: &Shared, config: &Config, headers: &HeaderMap) -> SettingsView {
+/// this request's own credential. A keychain that could not be asked whether it holds the proxy password
+/// is a `500`.
+async fn view(
+    shared: &Shared,
+    config: &Config,
+    headers: &HeaderMap,
+) -> Result<SettingsView, RouteError> {
     let (watch_problem, on_complete_problem) = shared.automation().problems();
-    SettingsView {
+    Ok(SettingsView {
         speed: live_limits(shared.session()),
         downloads: DownloadsView {
             default_dir: config.download_dir.clone(),
@@ -401,21 +504,34 @@ fn view(shared: &Shared, config: &Config, headers: &HeaderMap) -> SettingsView {
             watch_problem,
             on_complete_problem,
         },
-        proxy: proxy_view(shared, config),
-    }
+        proxy: proxy_view(shared, config).await?,
+    })
 }
 
 /// The proxy section of the view: whether a password is stored, never the password, and where it is kept.
 /// A server keeps it in `config.yaml`; the desktop app's engine in the keychain when the system has one.
-fn proxy_view(shared: &Shared, config: &Config) -> ProxyView {
+async fn proxy_view(shared: &Shared, config: &Config) -> Result<ProxyView, RouteError> {
     let mut view = ProxyView::of(config.proxy.as_ref(), shared.proxy_password_storage());
     if view.kind != ProxyType::None
         && !view.password_saved
         && let Some(store) = shared.proxy_keychain()
     {
-        view.password_saved = store.get().is_some_and(|password| !password.is_empty());
+        view.password_saved = Shared::keychain_call(store, |store| {
+            store.get().is_some_and(|password| !password.is_empty())
+        })
+        .await
+        .map_err(|problem| keychain_error(&problem))?;
     }
-    view
+    Ok(view)
+}
+
+/// A keychain the blocking pool could not ask: `500` with the line to show.
+fn keychain_error(problem: &str) -> RouteError {
+    RouteError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "keychain_unavailable",
+        clean(problem),
+    )
 }
 
 /// The limits the session is running under, in KiB/s. The engine counts bytes per second, so a limit that is

@@ -481,6 +481,12 @@ struct MemoryStore {
     password: Mutex<Option<String>>,
     unavailable: bool,
     refuse_writes: AtomicBool,
+    /// The config file each write is recorded against, once a test names it.
+    watch: Mutex<Option<std::path::PathBuf>>,
+    /// Every `set` and `clear`, with the config file's text at the moment it ran.
+    calls: Mutex<Vec<(&'static str, String)>>,
+    /// When set, how many more writes are taken before every write is refused.
+    writes_left: Mutex<Option<usize>>,
 }
 
 impl MemoryStore {
@@ -501,6 +507,34 @@ impl MemoryStore {
     fn held(&self) -> Option<String> {
         self.password.lock().expect("the store's lock").clone()
     }
+
+    /// Whether this write is refused: refused writes were asked for, or the writes left ran out.
+    fn refuses(&self) -> bool {
+        if self.refuse_writes.load(Ordering::SeqCst) {
+            return true;
+        }
+        let mut left = self.writes_left.lock().expect("the store's lock");
+        match left.as_mut() {
+            Some(0) => true,
+            Some(count) => {
+                *count -= 1;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records `call` with the watched file's text as it is now.
+    fn record(&self, call: &'static str) {
+        let watched = self.watch.lock().expect("the store's lock").clone();
+        if let Some(path) = watched {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            self.calls
+                .lock()
+                .expect("the store's lock")
+                .push((call, text));
+        }
+    }
 }
 
 impl ProxyPasswordStore for MemoryStore {
@@ -512,19 +546,21 @@ impl ProxyPasswordStore for MemoryStore {
     }
 
     fn set(&self, password: &str) -> Result<(), String> {
-        if self.unavailable || self.refuse_writes.load(Ordering::SeqCst) {
+        if self.unavailable || self.refuses() {
             return Err("The keychain did not save the password: refused by the test".to_string());
         }
+        self.record("set");
         *self.password.lock().expect("the store's lock") = Some(password.to_string());
         Ok(())
     }
 
     fn clear(&self) -> Result<(), String> {
-        if self.refuse_writes.load(Ordering::SeqCst) {
+        if self.refuses() {
             return Err(
                 "The keychain did not remove the password: refused by the test".to_string(),
             );
         }
+        self.record("clear");
         *self.password.lock().expect("the store's lock") = None;
         Ok(())
     }
@@ -763,6 +799,43 @@ async fn desktop_keep_uses_the_keychain_password_for_the_same_address_only() {
     served.stop().await;
 }
 
+/// A new address takes the old password out of the keychain before `config.yaml` names the new address,
+/// and the new password goes in after: a crash between the writes can leave no password, never the old
+/// one beside a new host.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_new_address_clears_the_old_password_before_the_file_names_it() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let old_port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-order",
+        proxy_at(ProxyType::Socks5, old_port, None),
+        Some(store.clone()),
+    )
+    .await;
+    *store.watch.lock().expect("the store's lock") = Some(paths.config_file());
+    let new_port = closed_port();
+
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": new_port, "username": "bob",
+               "password": {"set": "the-new-password"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let calls = store.calls.lock().expect("the store's lock").clone();
+    let order: Vec<(&str, bool)> = calls
+        .iter()
+        .map(|(call, file)| (*call, file.contains(&format!("port: {new_port}"))))
+        .collect();
+    assert_eq!(
+        order,
+        vec![("clear", false), ("set", true)],
+        "cleared while the file named the old address, set once it named the new one"
+    );
+    assert_eq!(store.held().as_deref(), Some("the-new-password"));
+    served.stop().await;
+}
+
 /// A keychain that will not take the password is `500` with its reason, and nothing changes: not the
 /// file, not the keychain, not the engine.
 #[tokio::test(flavor = "multi_thread")]
@@ -842,6 +915,51 @@ async fn desktop_failed_apply_puts_the_keychain_password_back() {
     let running = served.server.network_settings();
     assert_eq!(running.proxy.kind, fbt::ProxyKind::Http);
     assert_eq!(running.proxy.password.as_deref(), Some(PROXY_PASSWORD));
+
+    drop(squatter);
+    served.stop().await;
+}
+
+/// A switch the engine refuses, where the file goes back but the keychain will not take the previous
+/// password again: the answer says exactly that, not that config.yaml could not be put back.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_failed_apply_says_when_only_the_keychain_could_not_go_back() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let proxy_port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-keychain-not-back",
+        proxy_at(ProxyType::Http, proxy_port, None),
+        Some(store.clone()),
+    )
+    .await;
+    let before = file_text(&paths);
+    let engine_port = served
+        .server
+        .engine_local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+    // The clear before the save is taken; putting the password back afterwards is refused.
+    *store.writes_left.lock().expect("the store's lock") = Some(1);
+
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(text.contains("proxy_not_applied"), "{text}");
+    assert!(
+        text.contains(
+            "config.yaml names it again, but the keychain could not get the previous password back"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("could not be put back"), "{text}");
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    assert_eq!(file_text(&paths), before, "the file went back");
 
     drop(squatter);
     served.stop().await;
