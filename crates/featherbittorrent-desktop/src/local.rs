@@ -342,7 +342,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             super::library_config(&library).err().as_deref(),
-            Some("Unknown proxy type socks4; use none, http or socks5.")
+            Some("Unknown proxy type \"socks4\"; use none, http or socks5.")
         );
         assert!(file.exists(), "the file is left in place");
         assert!(

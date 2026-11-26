@@ -212,6 +212,25 @@ async fn engine_starts_when_the_proxy_is_down() {
         Some(format!("Can't reach the proxy: {reason}").as_str()),
         "the one line a screen shows"
     );
+    // The engine's own reason starts with its own "cannot reach the proxy: ", which this product's
+    // headline also says; the line must carry the phrase once, not twice.
+    assert_eq!(
+        reason
+            .to_ascii_lowercase()
+            .matches("reach the proxy")
+            .count(),
+        0,
+        "the engine's own wording is stripped from the reason: {reason:?}"
+    );
+    let headline = health.headline().expect("a line for an unreachable proxy");
+    assert_eq!(
+        headline
+            .to_ascii_lowercase()
+            .matches("reach the proxy")
+            .count(),
+        1,
+        "the one line says it once: {headline}"
+    );
 
     shutdown(client, task).await;
 }
@@ -357,7 +376,7 @@ async fn a_limits_save_never_drops_a_proxy_it_cannot_read() {
         loop {
             match client.notice().await {
                 Some(Notice::Info(text) | Notice::Error(text)) => {
-                    if text.contains("Unknown proxy type socks4") {
+                    if text.contains("Unknown proxy type \"socks4\"") {
                         return text;
                     }
                 }

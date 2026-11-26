@@ -60,6 +60,24 @@ pub fn health_from_event(event: &Event) -> Option<ProxyHealth> {
     }
 }
 
+/// The engine's own wording for a proxy it could not reach. The reason fbt hands over already starts
+/// with it (`ProxyError::Unreachable`), and this product's one line adds its own
+/// "Can't reach the proxy: ", so the prefix is dropped here to keep the line from saying it twice.
+const ENGINE_UNREACHABLE_PREFIX: &str = "cannot reach the proxy: ";
+
+/// `reason` without the engine's own unreachable wording at its front, when it is there: the rest,
+/// unchanged, otherwise. The comparison is ASCII case-insensitive, and the slice is taken only at a
+/// character boundary, so a reason that is nothing like this is returned as it is.
+fn without_engine_prefix(reason: &str) -> &str {
+    if reason.is_char_boundary(ENGINE_UNREACHABLE_PREFIX.len())
+        && reason[..ENGINE_UNREACHABLE_PREFIX.len()].eq_ignore_ascii_case(ENGINE_UNREACHABLE_PREFIX)
+    {
+        &reason[ENGINE_UNREACHABLE_PREFIX.len()..]
+    } else {
+        reason
+    }
+}
+
 /// The engine's proxy state as this product's health.
 fn from_state(state: ProxyState) -> ProxyHealth {
     match state {
@@ -68,9 +86,11 @@ fn from_state(state: ProxyState) -> ProxyHealth {
         ProxyState::UdpNotRelayed => ProxyHealth::UdpNotRelayed,
         ProxyState::LoginRefused => ProxyHealth::LoginRefused,
         ProxyState::Unreachable { reason } => ProxyHealth::Unreachable {
-            // The engine already made this display-safe and bounded; running it through the same
+            // The engine's own "cannot reach the proxy: " is dropped, because this product's
+            // headline adds its own "Can't reach the proxy: " and the line must not say it twice.
+            // The engine already made the rest display-safe and bounded; running it through the same
             // rule again costs nothing and keeps this type's promise true whatever the reason was.
-            reason: fbt::display_safe(&reason, fbt::MAX_DISPLAY_CHARS),
+            reason: fbt::display_safe(without_engine_prefix(&reason), fbt::MAX_DISPLAY_CHARS),
         },
         // `ProxyState` is `#[non_exhaustive]`: a state a later fbt-lib adds is not one this product
         // knows, and saying so is better than a green state that may be lying.
@@ -112,7 +132,9 @@ mod tests {
     }
 
     /// The reason is display-safe on the way through: control and bidi characters are dropped and
-    /// the text is bounded, so a proxy's own error text cannot reach a screen as it is.
+    /// the text is bounded, so a proxy's own error text cannot reach a screen as it is. The engine's
+    /// own "cannot reach the proxy: " wording is dropped too, so the one line this product draws does
+    /// not say it twice.
     #[test]
     fn an_unreachable_reason_is_made_display_safe() {
         let ProxyHealth::Unreachable { reason } = from_state(ProxyState::Unreachable {
@@ -122,6 +144,28 @@ mod tests {
         };
         assert!(!reason.contains('\u{202e}'), "{reason:?}");
         assert!(!reason.contains('\u{7}'), "{reason:?}");
+
+        // The engine's own wording, as fbt hands it over, is dropped before the line is drawn.
+        let health = from_state(ProxyState::Unreachable {
+            reason: "cannot reach the proxy: Connection refused (os error 61)".to_string(),
+        });
+        assert_eq!(
+            health,
+            ProxyHealth::Unreachable {
+                reason: "Connection refused (os error 61)".to_string()
+            },
+            "the engine's own wording is dropped, not repeated"
+        );
+        let headline = health.headline().expect("a line for an unreachable proxy");
+        assert_eq!(
+            headline, "Can't reach the proxy: Connection refused (os error 61)",
+            "the one line says it once"
+        );
+        assert_eq!(
+            headline.matches("reach the proxy").count(),
+            1,
+            "the phrase is not repeated: {headline}"
+        );
     }
 
     /// Only the proxy state's own event carries health; every other event says nothing about it.

@@ -111,6 +111,13 @@ pub enum ProxyProblem {
     TooLong,
     /// The type is a word this product does not know, kept as written.
     UnknownType(String),
+    /// A SOCKS5 proxy named only one half of a login: SOCKS5 has both or neither.
+    IncompleteLogin,
+    /// An HTTP user name carries a `:`: HTTP Basic splits on it, so it cannot.
+    UsernameColon,
+    /// The engine refuses the proxy this product built, with fbt's own words. The last word, for a
+    /// case this product's own checks do not cover.
+    Engine(String),
 }
 
 impl ProxyProblem {
@@ -123,7 +130,24 @@ impl ProxyProblem {
                 "The user name and password can be at most 255 bytes each.".to_string()
             }
             ProxyProblem::UnknownType(name) => {
-                format!("Unknown proxy type {name}; use none, http or socks5.")
+                // The word is quoted so an empty one is visible as `""` rather than a gap, and it is
+                // made display-safe first: it came from a file.
+                format!(
+                    "Unknown proxy type \"{}\"; use none, http or socks5.",
+                    fbt::display_safe(name, fbt::MAX_DISPLAY_CHARS)
+                )
+            }
+            ProxyProblem::IncompleteLogin => {
+                "A SOCKS5 login needs both a user name and a password.".to_string()
+            }
+            ProxyProblem::UsernameColon => "The user name cannot contain a colon.".to_string(),
+            ProxyProblem::Engine(problem) => {
+                // The engine's own sentence, made display-safe in case its wording ever carries a
+                // character a screen should not draw.
+                format!(
+                    "The proxy setting is not valid: {}",
+                    fbt::display_safe(problem, fbt::MAX_DISPLAY_CHARS)
+                )
             }
         }
     }
@@ -159,25 +183,39 @@ pub struct ProxySetting {
 }
 
 impl ProxySetting {
-    /// Whether this section names a proxy at all: `type: none` (or an absent section) does not.
+    /// Whether this section names a proxy at all: `type: none` (or an absent section) does not, and
+    /// neither does an empty type with no host, which is an empty section.
     pub fn is_set(&self) -> bool {
-        !matches!(self.kind, ProxyType::None)
+        match &self.kind {
+            ProxyType::None => false,
+            ProxyType::Other(name) => !(name.is_empty() && self.host.is_empty()),
+            ProxyType::Http | ProxyType::Socks5 => true,
+        }
     }
 
     /// Checks that a run can act on this section: the type is one this product knows, the host is a
     /// name or an address (1 to 253 characters, no whitespace, not spelled as a URL), the port is
-    /// not 0, and neither credential is longer than SOCKS5 can carry.
+    /// not 0, and the credentials can be sent (at most 255 bytes each; a SOCKS5 login is both halves
+    /// or neither; an HTTP user name carries no `:`). The engine's own check runs last, so a case
+    /// this product does not cover is still refused - with fbt's sentence rather than engine-worded
+    /// text at start.
     pub fn validate(&self) -> Result<(), ProxyProblem> {
         match &self.kind {
             // No proxy: nothing else in the section is used, so nothing else can be wrong with it.
             ProxyType::None => return Ok(()),
+            // An empty type naming no host is an empty section: no proxy, nothing to refuse.
+            ProxyType::Other(name) if name.is_empty() && self.host.is_empty() => return Ok(()),
             ProxyType::Other(name) => return Err(ProxyProblem::UnknownType(name.clone())),
             ProxyType::Http | ProxyType::Socks5 => {}
         }
-        if self.host.is_empty()
-            || self.host.chars().count() > MAX_HOST_CHARS
-            || self.host.contains("://")
-            || self.host.chars().any(char::is_whitespace)
+        // The host is checked and dialled without one surrounding pair of brackets, so an IPv6
+        // literal spelled for a URI (`[::1]`) is a host this product accepts; the stored setting
+        // keeps the brackets as typed.
+        let host = unbracketed(&self.host);
+        if host.is_empty()
+            || host.chars().count() > MAX_HOST_CHARS
+            || host.contains("://")
+            || host.chars().any(char::is_whitespace)
         {
             // A host that is empty, too long, a URL, or has a space in it is not a host to dial; the
             // one sentence says what to type instead.
@@ -186,6 +224,8 @@ impl ProxySetting {
         if self.port == 0 {
             return Err(ProxyProblem::BadPort);
         }
+        // The length check comes before the login's shape, so a lone over-long credential is the
+        // length that is wrong with it, not the half-login.
         if self
             .username
             .as_ref()
@@ -197,6 +237,22 @@ impl ProxySetting {
         {
             return Err(ProxyProblem::TooLong);
         }
+        let user = self.username.as_deref().filter(|user| !user.is_empty());
+        let pass = self.password.as_deref().filter(|pass| !pass.is_empty());
+        // A SOCKS5 login is both halves or neither: a user name without a password (or the other way
+        // around) is a login the engine would refuse at start.
+        if matches!(self.kind, ProxyType::Socks5) && user.is_some() != pass.is_some() {
+            return Err(ProxyProblem::IncompleteLogin);
+        }
+        // HTTP Basic splits the user name on `:`, so a user name that carries one cannot be sent.
+        if matches!(self.kind, ProxyType::Http) && user.is_some_and(|user| user.contains(':')) {
+            return Err(ProxyProblem::UsernameColon);
+        }
+        // The engine's own check, last: whatever this product's checks did not cover, fbt's does, so
+        // a config never passes loading and then fails at start with engine-worded text.
+        if let Err(problem) = self.to_engine().validate() {
+            return Err(ProxyProblem::Engine(problem));
+        }
         Ok(())
     }
 
@@ -205,13 +261,24 @@ impl ProxySetting {
     /// here is only ever reached after [`validate`](Self::validate) accepted it (a config that names
     /// an unknown type is refused at load), and an unknown type falls back to SOCKS5 so that nothing
     /// can fall through to a direct connection.
+    ///
+    /// The host loses one surrounding pair of brackets (an IPv6 literal spelled for a URI), and an
+    /// empty login becomes no login: empty credentials are not sent, the way the engine expects.
     pub fn to_engine(&self) -> fbt::ProxyConfig {
         let mut config = fbt::ProxyConfig::default();
         config.kind = self.engine_kind();
-        config.host = self.host.clone();
+        config.host = unbracketed(&self.host).to_string();
         config.port = self.port;
-        config.username = self.username.clone();
-        config.password = self.password.clone();
+        let user = self.username.as_deref().filter(|user| !user.is_empty());
+        let pass = self.password.as_deref().filter(|pass| !pass.is_empty());
+        if user.is_none() && pass.is_none() {
+            // Both empty (or absent) is no login at all; the engine must not be handed a blank one.
+            config.username = None;
+            config.password = None;
+        } else {
+            config.username = self.username.clone();
+            config.password = self.password.clone();
+        }
         config.proxy_peers = true;
         config.proxy_trackers = true;
         config.proxy_hostnames = true;
@@ -220,15 +287,25 @@ impl ProxySetting {
     }
 
     /// This setting's [`ProxyType`] as the engine's kind. `Other` never comes from a config a run
-    /// acts on (see [`ProxyType`]); it maps to SOCKS5 so the fallback is still a proxy rather than
-    /// nothing.
+    /// acts on (see [`ProxyType`]): an empty one is no proxy, and any other maps to SOCKS5 so the
+    /// fallback is still a proxy rather than nothing.
     fn engine_kind(&self) -> fbt::ProxyKind {
-        match self.kind {
+        match &self.kind {
             ProxyType::None => fbt::ProxyKind::None,
             ProxyType::Http => fbt::ProxyKind::Http,
+            ProxyType::Other(name) if name.is_empty() => fbt::ProxyKind::None,
             ProxyType::Socks5 | ProxyType::Other(_) => fbt::ProxyKind::Socks5,
         }
     }
+}
+
+/// A host as written without one surrounding pair of brackets: `[::1]` becomes `::1`, so an IPv6
+/// literal spelled the way a URI spells it is accepted and dialled bare. A string that is not a
+/// bracketed pair - including one with only one bracket - is returned as it is.
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 impl fmt::Debug for ProxySetting {
@@ -248,8 +325,9 @@ impl fmt::Debug for ProxySetting {
 
 /// The engine's network settings for `proxy`, derived from `base`.
 ///
-/// With no proxy, or a section whose `type` is `none`, this is `base` unchanged: a run without a
-/// proxy behaves exactly as it did before this setting existed. With a proxy set, the switches
+/// With no proxy, or a section whose `type` is `none`, this is `base`'s switches unchanged and the
+/// engine's default proxy (not whatever `base` carried): a run without a proxy behaves exactly as it
+/// did before this setting existed. With a proxy set, the switches
 /// section 3.3 of the design turns off go off - incoming TCP and uTP, UPnP, NAT-PMP and local peer
 /// discovery, which cannot go through a proxy - and with an HTTP proxy, which carries TCP only, the
 /// DHT and outgoing uTP as well. A SOCKS5 proxy keeps `base`'s DHT and uTP switches: the engine
@@ -258,6 +336,9 @@ impl fmt::Debug for ProxySetting {
 pub fn network_for(proxy: Option<&ProxySetting>, base: &fbt::Settings) -> fbt::NetworkSettings {
     let mut network = base.network();
     let Some(setting) = proxy.filter(|setting| setting.is_set()) else {
+        // No proxy: the engine's default, whatever `base` carried. A base that names a proxy of its
+        // own must not leak it into a run that has none.
+        network.proxy = fbt::ProxyConfig::default();
         return network;
     };
     network.proxy = setting.to_engine();
@@ -422,6 +503,22 @@ mod tests {
             .validate(),
             Err(ProxyProblem::UnknownType("socks4".to_string()))
         );
+        // An empty type with no host is an empty section: no proxy, nothing to refuse; with a host
+        // it is a type this product does not know, named as the empty word it is.
+        let empty_type = ProxySetting {
+            kind: ProxyType::Other(String::new()),
+            ..socks5("", 1080)
+        };
+        assert_eq!(empty_type.validate(), Ok(()));
+        assert!(!empty_type.is_set());
+        assert_eq!(
+            ProxySetting {
+                kind: ProxyType::Other(String::new()),
+                ..socks5("h", 1080)
+            }
+            .validate(),
+            Err(ProxyProblem::UnknownType(String::new()))
+        );
         // `type: none` accepts anything else in the section: none of it is used.
         assert_eq!(
             ProxySetting {
@@ -450,7 +547,133 @@ mod tests {
         );
         assert_eq!(
             message(ProxyProblem::UnknownType("socks4".to_string())),
-            "Unknown proxy type socks4; use none, http or socks5."
+            "Unknown proxy type \"socks4\"; use none, http or socks5."
+        );
+        assert_eq!(
+            message(ProxyProblem::UnknownType(String::new())),
+            "Unknown proxy type \"\"; use none, http or socks5."
+        );
+        assert_eq!(
+            message(ProxyProblem::IncompleteLogin),
+            "A SOCKS5 login needs both a user name and a password."
+        );
+        assert_eq!(
+            message(ProxyProblem::UsernameColon),
+            "The user name cannot contain a colon."
+        );
+        assert_eq!(
+            message(ProxyProblem::Engine(
+                "proxy host contains brackets".to_string()
+            )),
+            "The proxy setting is not valid: proxy host contains brackets"
+        );
+    }
+
+    /// This product's validation agrees with the engine's: the cases where they could drift - a
+    /// bracketed IPv6 literal, an empty login, a SOCKS5 half login and an HTTP user name with a
+    /// colon - are each pinned, and every shape this product accepts the engine accepts too.
+    #[test]
+    fn proxy_validation_matches_the_engine() {
+        // A bracketed IPv6 literal is a host this product accepts, and the engine gets it bare.
+        let bracketed = socks5("[2001:db8::1]", 1080);
+        assert_eq!(
+            bracketed.validate(),
+            Ok(()),
+            "a bracketed IPv6 host is accepted"
+        );
+        assert_eq!(
+            bracketed.to_engine().host,
+            "2001:db8::1",
+            "the brackets come off"
+        );
+        assert_eq!(bracketed.to_engine().validate(), Ok(()));
+        let loopback = socks5("[::1]", 1080);
+        assert_eq!(loopback.validate(), Ok(()));
+        assert_eq!(loopback.to_engine().host, "::1");
+        assert_eq!(loopback.to_engine().validate(), Ok(()));
+
+        // An empty login is no login: accepted, and the engine is handed no credentials.
+        let empty_login = ProxySetting {
+            username: Some(String::new()),
+            password: Some(String::new()),
+            ..socks5("proxy.example", 1080)
+        };
+        assert_eq!(empty_login.validate(), Ok(()), "an empty login is no login");
+        assert_eq!(empty_login.to_engine().username, None);
+        assert_eq!(empty_login.to_engine().password, None);
+
+        // A SOCKS5 login is both halves or neither, with this product's own sentence.
+        let half_login = ProxySetting {
+            username: Some("alice".to_string()),
+            password: None,
+            ..socks5("proxy.example", 1080)
+        };
+        assert_eq!(half_login.validate(), Err(ProxyProblem::IncompleteLogin));
+        assert_eq!(
+            half_login.validate().unwrap_err().message(),
+            "A SOCKS5 login needs both a user name and a password."
+        );
+
+        // An HTTP user name cannot carry a colon, with this product's own sentence.
+        let user_colon = ProxySetting {
+            kind: ProxyType::Http,
+            username: Some("a:b".to_string()),
+            password: Some("pw".to_string()),
+            ..socks5("proxy.example", 3128)
+        };
+        assert_eq!(user_colon.validate(), Err(ProxyProblem::UsernameColon));
+        assert_eq!(
+            user_colon.validate().unwrap_err().message(),
+            "The user name cannot contain a colon."
+        );
+
+        // Everything this product accepts, the engine accepts: no drift between the two checks.
+        let accepted = [
+            socks5("proxy.example", 1080),
+            socks5("[2001:db8::1]", 1080),
+            socks5("[::1]", 1080),
+            empty_login,
+            ProxySetting {
+                username: Some("alice".to_string()),
+                password: Some("hunter2".to_string()),
+                ..socks5("proxy.example", 1080)
+            },
+            ProxySetting {
+                kind: ProxyType::Http,
+                username: Some("alice".to_string()),
+                password: Some("hunter2".to_string()),
+                ..socks5("proxy.example", 3128)
+            },
+        ];
+        for setting in accepted {
+            assert_eq!(setting.validate(), Ok(()), "{setting:?}");
+            assert_eq!(
+                setting.to_engine().validate(),
+                Ok(()),
+                "the engine accepts what this product does: {setting:?}"
+            );
+        }
+    }
+
+    /// A base that already carries a proxy does not leak it into a run that has none: `network_for`
+    /// with no proxy is the engine's default proxy, whatever the base said.
+    #[test]
+    fn no_proxy_drops_a_base_proxy() {
+        let mut base = fbt::Settings::default();
+        let mut carried = base.network();
+        carried.proxy = socks5("proxy.example", 1080).to_engine();
+        assert_ne!(
+            carried.proxy,
+            fbt::ProxyConfig::default(),
+            "the base carries a proxy"
+        );
+        base.set_network(carried);
+
+        let derived = network_for(None, &base);
+        assert_eq!(
+            derived.proxy,
+            fbt::ProxyConfig::default(),
+            "no proxy means no proxy, whatever the base carried"
         );
     }
 

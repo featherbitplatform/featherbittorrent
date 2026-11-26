@@ -146,7 +146,7 @@ fn a_config_with_an_unusable_proxy_refuses_to_start() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(
         stderr.trim(),
-        "Unknown proxy type socks4; use none, http or socks5.",
+        "Unknown proxy type \"socks4\"; use none, http or socks5.",
         "the one line says what is wrong and nothing else"
     );
     assert!(
