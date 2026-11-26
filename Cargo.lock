@@ -1765,8 +1765,8 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbt"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -1777,8 +1777,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-api"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "axum",
  "bytes",
@@ -1800,16 +1800,16 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "fbt-core"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "rand 0.10.3",
  "sha1",
@@ -1820,8 +1820,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "fbt-bencode",
@@ -1836,8 +1836,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -1849,8 +1849,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-net"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -1864,8 +1864,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-session"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -1891,8 +1891,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -1913,8 +1913,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-utp"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -1926,8 +1926,8 @@ dependencies = [
 
 [[package]]
 name = "fbt-wire"
-version = "0.12.0"
-source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.12.0#c00d28f94bb7bf0b99b324c0f14f8796f2099dbd"
+version = "0.13.0"
+source = "git+https://github.com/featherbitplatform/fbt-lib?tag=v0.13.0#3fe2734eb568967be111b3163c5b2f8d2dd79b75"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",

@@ -55,10 +55,10 @@ ratatui = { version = "0.30", default-features = false, features = [
     "layout-cache",
 ] }
 directories = "6"
-fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.12.0", features = ["serde"] }
+fbt = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.13.0", features = ["serde"] }
 # The control API the server serves, on the same tag as the engine it drives: the two come from one
 # repository and one release, so they move together or not at all.
-fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.12.0" }
+fbt-api = { git = "https://github.com/featherbitplatform/fbt-lib", tag = "v0.13.0" }
 # The `Stream` trait only: `std::stream::Stream` is still unstable, and this is the
 # same futures tree crossterm's `EventStream` implements it from. Already in the tree
 # through crossterm's own event-stream feature, so this adds no versions to Cargo.lock.

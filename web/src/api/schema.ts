@@ -820,7 +820,7 @@ export interface components {
              * @description Why: `self_connection`, `info_hash_mismatch`,
              *     `handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,
              *     `io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,
-             *     `upload_only`, `blocked` or `unknown`.
+             *     `upload_only`, `blocked`, `network_changed` or `unknown`.
              */
             reason: string;
             /** @description The torrent's id. */
@@ -910,6 +910,13 @@ export interface components {
             message: string;
             /** @enum {string} */
             type: "proxy_error";
+        } | {
+            /** @description Why, for `unreachable`; `null` otherwise. */
+            reason?: string | null;
+            /** @description The state, as the schema's enum names it. */
+            state: components["schemas"]["ProxyStateDto"];
+            /** @enum {string} */
+            type: "proxy_state_changed";
         } | {
             /**
              * Format: int64
@@ -1090,6 +1097,13 @@ export interface components {
          * @enum {string}
          */
         PriorityDto: "skip" | "low" | "normal" | "high";
+        /**
+         * @description The proxy state an [`EventDto::ProxyStateChanged`] carries, as its own
+         *     schema so the OpenAPI document lists the five names as an enum rather than
+         *     describing them in prose.
+         * @enum {string}
+         */
+        ProxyStateDto: "not_set" | "reachable" | "udp_not_relayed" | "unreachable" | "login_refused" | "unknown";
         /** @description `PUT /api/v1/torrents/{id}/queue-position`. */
         QueuePositionRequest: {
             /** @description The new place in the queue, from 0; past the end is the bottom. */

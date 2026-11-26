@@ -641,7 +641,7 @@
                 ]
               },
               "reason": {
-                "description": "Why: `self_connection`, `info_hash_mismatch`,\n`handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,\n`io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,\n`upload_only`, `blocked` or `unknown`.",
+                "description": "Why: `self_connection`, `info_hash_mismatch`,\n`handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,\n`io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,\n`upload_only`, `blocked`, `network_changed` or `unknown`.",
                 "type": "string"
               },
               "torrent": {
@@ -940,6 +940,33 @@
             },
             "required": [
               "message",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proxy's health changed.",
+            "properties": {
+              "reason": {
+                "description": "Why, for `unreachable`; `null` otherwise.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "$ref": "#/components/schemas/ProxyStateDto",
+                "description": "The state, as the schema's enum names it."
+              },
+              "type": {
+                "enum": [
+                  "proxy_state_changed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
               "type"
             ],
             "type": "object"
@@ -1296,6 +1323,18 @@
           "low",
           "normal",
           "high"
+        ],
+        "type": "string"
+      },
+      "ProxyStateDto": {
+        "description": "The proxy state an [`EventDto::ProxyStateChanged`] carries, as its own\nschema so the OpenAPI document lists the five names as an enum rather than\ndescribing them in prose.",
+        "enum": [
+          "not_set",
+          "reachable",
+          "udp_not_relayed",
+          "unreachable",
+          "login_refused",
+          "unknown"
         ],
         "type": "string"
       },
@@ -1767,7 +1806,7 @@
       "name": "Apache-2.0"
     },
     "title": "fbt API",
-    "version": "0.12.0"
+    "version": "0.13.0"
   },
   "openapi": "3.1.0",
   "paths": {
