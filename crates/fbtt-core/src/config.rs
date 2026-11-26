@@ -896,7 +896,8 @@ where
 /// * a top-level YAML merge (`<<`) is kept there too, because the parser does not apply merges.
 ///   [`merge_brings_a_proxy`] applies it and refuses the file as [`ProxyProblem::MergeKey`] when the
 ///   merge would bring in a proxy the file did not itself set. An explicit key always wins over a
-///   merged one, so a file with its own `proxy:` section and an unrelated merge loads.
+///   merged one, so a file with its own `proxy:` section and a single-level unrelated merge loads;
+///   a nested merge is refused (see [`merge_brings_a_proxy`]).
 fn hidden_proxy_problem(config: &Config, bytes: &[u8]) -> Option<ProxyProblem> {
     if config.unknown_keys.keys().any(|key| is_proxy_key(key)) {
         return Some(ProxyProblem::KeyCase);
