@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Unfinished folder, watch folder, start paused and run a program on completion (`downloads:` in `config.yaml`). ([#45](https://github.com/featherbitplatform/featherbittorrent/pull/45))
 
 ### Changed
 
-- Leaving a Settings section with unsaved changes now asks on every way out (the header, the browser's back button), and the arrow keys keep the focus on the section list. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- Leaving a Settings section with unsaved changes now asks on every way out (the header, the browser's back button), and the arrow keys keep the focus on the section list. ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Settings shows one section at a time with a section list, in the web UI and the desktop app. ([#48](https://github.com/featherbitplatform/featherbittorrent/pull/48))
 - Saving settings keeps keys in `config.yaml` that this version does not know about. ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
 - Built on fbt-lib 0.13.0. ([#46](https://github.com/featherbitplatform/featherbittorrent/pull/46))
