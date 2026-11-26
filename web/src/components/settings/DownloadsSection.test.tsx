@@ -193,12 +193,30 @@ describe('the Downloads section', () => {
     expect(puts(calls)[0].body).toEqual({ default_dir: '/data', unfinished_dir: null, start_paused: false, watch_dir: null })
   })
 
+  it('ticking_unfinished_starts_empty_and_save_waits_for_a_folder', async () => {
+    const { client, calls } = server()
+    render(<DownloadsSection client={client} />)
+    await screen.findByText('/data')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Use an unfinished folder' }))
+    expect(screen.getByText('Choose a folder.')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true)
+    // The picker opened for it.
+    const part = await waitFor(() => {
+      const row = document.querySelector('[data-folder="/data/part"]')
+      if (row === null) throw new Error('not listed yet')
+      return row
+    })
+    fireEvent.click(part)
+    expect(screen.queryByText('Choose a folder.')).toBeNull()
+    expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(puts(calls)).toHaveLength(0)
+  })
+
   it('a_folder_is_chosen_with_the_picker_on_the_servers_roots', async () => {
     const { client, calls } = server()
     render(<DownloadsSection client={client} />)
     await screen.findByText('/data')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Use an unfinished folder' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Choose Unfinished folder' }))
     const part = await waitFor(() => {
       const row = document.querySelector('[data-folder="/data/part"]')
       if (row === null) throw new Error('not listed yet')

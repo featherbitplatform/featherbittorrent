@@ -71,11 +71,16 @@ interface FolderFieldProps {
 
 /** One folder: its path, and a button that opens the picker on the server's roots. */
 function FolderField({ client, label, value, onChange }: FolderFieldProps) {
-  const [open, setOpen] = useState(false)
+  // A folder just switched on has none yet: the picker opens for it.
+  const [open, setOpen] = useState(value === '')
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
-        <code className="min-w-0 break-all font-mono text-[12px] text-strong">{value}</code>
+        {value === '' ? (
+          <span className="text-[12px] text-muted">Choose a folder.</span>
+        ) : (
+          <code className="min-w-0 break-all font-mono text-[12px] text-strong">{value}</code>
+        )}
         <Button
           variant="secondary"
           size="sm"
@@ -144,6 +149,11 @@ export default function DownloadsSection({ client: given }: { client?: Api }) {
   /** Send the section. True when the server kept it; false (with its reason shown) when it did not. */
   async function save(): Promise<boolean> {
     if (values === null || base === null || savingRef.current) return false
+    // A folder switched on and not yet chosen: nothing to send.
+    if (values.unfinishedDir === '' || values.watchDir === '') {
+      setProblem('Choose a folder.')
+      return false
+    }
     savingRef.current = true
     setBusy(true)
     setSaved(false)
@@ -206,7 +216,7 @@ export default function DownloadsSection({ client: given }: { client?: Api }) {
             type="checkbox"
             className={CHECKBOX}
             checked={values.unfinishedDir !== null}
-            onChange={(event) => change({ unfinishedDir: event.target.checked ? values.defaultDir : null })}
+            onChange={(event) => change({ unfinishedDir: event.target.checked ? '' : null })}
           />
           Use an unfinished folder
         </label>
@@ -237,7 +247,7 @@ export default function DownloadsSection({ client: given }: { client?: Api }) {
             type="checkbox"
             className={CHECKBOX}
             checked={values.watchDir !== null}
-            onChange={(event) => change({ watchDir: event.target.checked ? values.defaultDir : null })}
+            onChange={(event) => change({ watchDir: event.target.checked ? '' : null })}
           />
           Use a watch folder
         </label>
@@ -276,7 +286,7 @@ export default function DownloadsSection({ client: given }: { client?: Api }) {
       )}
       {saved && <p className="text-[13px] text-muted">Saved.</p>}
       <div>
-        <Button type="submit" disabled={busy}>
+        <Button type="submit" disabled={busy || values.unfinishedDir === '' || values.watchDir === ''}>
           Save
         </Button>
       </div>

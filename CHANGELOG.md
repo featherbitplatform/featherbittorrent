@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). The Add dialog starts from them. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
 - Unfinished folder, watch folder, start paused and run a program on completion (`downloads:` in `config.yaml`). ([#45](https://github.com/featherbitplatform/featherbittorrent/pull/45))
 
 ### Changed

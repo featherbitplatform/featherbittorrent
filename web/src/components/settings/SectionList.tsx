@@ -62,6 +62,11 @@ export default function SectionList({ sections, current, onSelect }: SectionList
     if (to !== from) {
       followFocus.current = true
       onSelect(sections[to].id, 'arrow')
+      // The section changes in this same event or not at all (the unsaved-changes question holds it):
+      // a flag still set after that would pull the focus on some later, unrelated change.
+      setTimeout(() => {
+        followFocus.current = false
+      }, 0)
     }
   }
 

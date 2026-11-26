@@ -247,7 +247,9 @@ export default function FolderPicker({ client, value, onPathChange, start, keep 
         if (cancelled) return
         setRoots(list)
         if (keepRef.current) {
+          // Nothing chosen yet: open the first root so there is something to pick, without picking it.
           if (valueRef.current !== '') expand(valueRef.current)
+          else if (list.length > 0) expand(list[0] as string)
         } else if (list.length > 0) {
           // The dialog starts inside the server's default folder, not at the roof of the filesystem,
           // and it starts *inside* it: the folder is picked and opened in the same breath.

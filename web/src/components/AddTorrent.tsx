@@ -77,6 +77,9 @@ function isTorrentName(name: string): boolean {
   return name.toLowerCase().endsWith('.torrent')
 }
 
+/** How long the dialog waits for the settings before it shows the folder tree with today's defaults. */
+const SETTINGS_WAIT_MS = 3000
+
 /** What is wrong with this already-accepted file, in the person's language, or null when it is worth uploading. */
 function fileProblem(file: File | null): string | null {
   if (file === null) return null
@@ -171,6 +174,13 @@ export default function AddTorrent({
   useEffect(() => {
     if (client === null) return
     let cancelled = false
+    // A server that never answers must not hide the folder tree for good: after this long the tree
+    // starts with today's defaults, and a late answer then changes nothing the person could have used.
+    let gaveUp = false
+    const timer = setTimeout(() => {
+      gaveUp = true
+      setDefaults({ client, dir: undefined })
+    }, SETTINGS_WAIT_MS)
     const ask = async (): Promise<void> => {
       let dir: string | undefined
       let paused: boolean | undefined
@@ -181,13 +191,15 @@ export default function AddTorrent({
       } catch {
         // Today's defaults.
       }
+      clearTimeout(timer)
       if (cancelled) return
       if (paused !== undefined && !pausedTouched.current) setStartPaused(paused)
-      setDefaults({ client, dir })
+      if (!gaveUp) setDefaults({ client, dir })
     }
     void ask()
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
   }, [client])
 
