@@ -98,6 +98,13 @@ required-features = ["test-support"]
 name = "stream"
 required-features = ["test-support"]
 
+# The proxy setting on a live engine: a proxy that is down when a session starts, a session that
+# never connects directly while a proxy is set, and a proxy that refuses the login. All on loopback,
+# and all of it through `LocalBackend::start_for_test`, so it needs `test-support` too.
+[[test]]
+name = "proxy"
+required-features = ["test-support"]
+
 # Launching a player, against the fake one above. `CARGO_BIN_EXE_fbtt-fake-player` is only set for a
 # test target that binary is built for, which is what this feature does here.
 [[test]]

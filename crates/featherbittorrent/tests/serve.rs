@@ -583,6 +583,40 @@ fn serve_refuses_before_asking() {
     );
 }
 
+/// A `config.yaml` that names a proxy the app cannot use refuses the run: one line
+/// saying what is wrong, exit 1, the file left where it is and no `.bad` beside it,
+/// because starting on defaults would connect directly, which is the leak this
+/// setting exists to close.
+#[test]
+fn serve_refuses_a_config_whose_proxy_is_unusable() {
+    let scratch = Scratch::new("serve_bad_proxy");
+    fs::write(
+        scratch.config_file(),
+        "proxy:\n  type: socks5\n  host: \"\"\n  port: 1080\n",
+    )
+    .expect("write a config that names an unusable proxy");
+
+    let run = Run::start(&scratch, &["serve"], "", "bad_proxy");
+    let (code, stdout, stderr) = run.wait(1);
+    assert_eq!(code, 1, "an unusable proxy is refused: {stderr}");
+    assert!(
+        stderr.contains("Enter the proxy's host name or address."),
+        "the line names the problem: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Download folder"),
+        "the wizard never ran: {stdout}"
+    );
+    assert!(
+        scratch.config_file().exists(),
+        "the config file is left in place"
+    );
+    assert!(
+        !scratch.config_dir.join("config.yaml.bad").exists(),
+        "nothing was set aside"
+    );
+}
+
 /// A server run starts on the config file, answers over HTTP, and stops on its own
 /// terms: exit code 0, the library released for whatever starts next.
 #[test]

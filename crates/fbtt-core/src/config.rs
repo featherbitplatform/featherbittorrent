@@ -14,7 +14,10 @@
 //! overrule the file before that question is asked.
 //! A file that cannot be parsed does not stop the app. It runs on this library's defaults, and
 //! the file it could not read is kept aside as `config.yaml.bad` so the next save cannot
-//! overwrite what we never understood.
+//! overwrite what we never understood. A `proxy:` line is the one exception, and it is the point:
+//! a file that names a proxy and cannot be read is refused rather than set aside, because a run
+//! on defaults would connect directly while the person believes their traffic goes through a
+//! proxy. See [`Config::load`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,6 +31,7 @@ use serde_norway::Value;
 use thiserror::Error;
 
 use crate::paths::Paths;
+use crate::proxy::{ProxyProblem, ProxySetting, apply_to_settings};
 
 /// The port to listen on when the user does not pick one: BitTorrent's own.
 const DEFAULT_LISTEN_PORT: u16 = 6881;
@@ -76,6 +80,16 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A `proxy:` section this run may not act on, or a file that names a proxy and cannot be read
+    /// at all. The string is the one line to show and to log.
+    ///
+    /// This is the one config problem that stops a run instead of coming back as defaults, and it
+    /// is deliberate: a file that names a proxy and connects directly instead is an address leak,
+    /// which defaults cannot be the answer to. The TUI, `serve` and the desktop app all refuse to
+    /// start on it, and the file is left exactly where it is so it can be fixed. See
+    /// [`Config::load`].
+    #[error("{0}")]
+    Proxy(String),
 }
 
 /// What reading the config file produced.
@@ -85,7 +99,9 @@ pub enum ConfigLoad {
     Loaded(Config),
     /// There is no file yet: a library nobody has configured.
     Missing,
-    /// The file is there but cannot be read as YAML.
+    /// The file is there but cannot be read as YAML. Its bytes carry no `proxy:` line: a file that
+    /// names a proxy and cannot be read is refused by [`Config::load`] instead of coming back here
+    /// ([`ConfigError::Proxy`]), so nothing that answered this ever leaves a proxy behind.
     Bad {
         /// What to run on instead: this library's defaults, its download folder
         /// rooted in the data directory (see [`Config::resolve`]).
@@ -443,6 +459,20 @@ pub struct Config {
     /// `.torrent` files, and the program to run when one finishes. See [`DownloadsConfig`].
     #[serde(skip_serializing_if = "DownloadsConfig::is_default")]
     pub downloads: DownloadsConfig,
+    /// The proxy every connection goes through, when one is set. Absent, or `type: none`, means no
+    /// proxy and today's direct behaviour. See [`ProxySetting`].
+    ///
+    /// A config that names a proxy is never quietly ignored: a `proxy:` section this version cannot
+    /// act on is refused by [`Config::load`] rather than run without it (see [`ConfigError::Proxy`]).
+    /// A `proxy` key whose value is null is not "no proxy" either: the field's own deserializer
+    /// refuses it in the same parse that reads the key, so a tag or an escape on the key cannot
+    /// hide it.
+    #[serde(
+        default,
+        deserialize_with = "proxy_section",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub proxy: Option<ProxySetting>,
     /// The keys this version does not know, kept as they were read and written back on the next save.
     ///
     /// One `config.yaml` is written by more than one version of this product, and by a person who leaves
@@ -530,6 +560,8 @@ impl Config {
             // No downloads settings chosen either: files go straight into `download_dir`, new
             // torrents start at once, nothing is watched and nothing is run at the end.
             downloads: DownloadsConfig::default(),
+            // No proxy: every connection is made directly, exactly as before this setting existed.
+            proxy: None,
             unknown_keys: BTreeMap::new(),
         }
     }
@@ -547,6 +579,16 @@ impl Config {
     /// a directory in the way) is an error, because there is no way to tell
     /// "empty" from "unavailable". The library comes in rather than the file for
     /// exactly this reason: the defaults have to be rooted in it.
+    ///
+    /// A proxy is the one thing that stops this call instead of being worked
+    /// around. A file whose `proxy:` section this run may not act on, and a file
+    /// that cannot be read at all *and* names a proxy, both come back as
+    /// [`ConfigError::Proxy`] with the one line to show, and the file is left
+    /// exactly where it is: a run that went on with defaults - or with the
+    /// unreadable file renamed aside and defaults in its place - would connect
+    /// directly while the person believes their traffic is going through a proxy.
+    /// That is an address leak, and no default is the right answer to it. A file
+    /// with no `proxy:` line keeps the behaviour above, `.bad` rename included.
     pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
         let path = paths.config_file();
         match read_and_parse(&path)? {
@@ -560,7 +602,16 @@ impl Config {
                     problem,
                 })
             }
-            Reading::Unparsable(error) => {
+            // A `proxy:` section this run may not use: refusing is the whole point (see above). The
+            // message is the product's own sentence about what to fix.
+            Reading::ProxyProblem(problem) => Err(ConfigError::Proxy(problem.message())),
+            Reading::Unparsable { error, named_proxy } => {
+                if named_proxy {
+                    // The bytes name a proxy and cannot be read, so nothing here can be trusted to
+                    // have got the proxy right: refuse, and leave the file where its owner can fix
+                    // it. Renaming it aside and starting on defaults would connect directly.
+                    return Err(ConfigError::Proxy(unreadable_proxy_line(&path, &error)));
+                }
                 // The file moves out of the way before anything can take its place.
                 let aside = suffixed(&path, BAD_FILE_SUFFIX);
                 std::fs::rename(&path, &aside).map_err(|source| ConfigError::Write {
@@ -586,6 +637,10 @@ impl Config {
     /// would quietly drop everything else that was in them. `path` rather than [`Paths`] for the same
     /// reason - no library defaults are wanted here, and having them on hand is how a caller gets tempted
     /// to use them.
+    ///
+    /// A `proxy:` section this run may not act on is refused here too, with the same one sentence
+    /// [`load`](Self::load) refuses with: an editor must never rewrite a file whose proxy it did not
+    /// understand, because the write would drop the line and leave a config that connects directly.
     pub fn load_for_edit(path: &Path) -> Result<Option<Config>, String> {
         match read_and_parse(path) {
             Ok(Reading::Absent) => Ok(None),
@@ -595,7 +650,10 @@ impl Config {
             // to fix. The one line names the file and says the player's setting is what to fix, so the
             // person who got it knows where and what, and the edit is refused rather than rewritten.
             Ok(Reading::PlayerProblem(_, problem)) => Err(player_problem_line(path, &problem)),
-            Ok(Reading::Unparsable(error)) => Err(problem_line(path, &error)),
+            // A `proxy:` section this version cannot act on: the same refusal as a run's, so nothing
+            // that writes the file can drop the proxy and leave a direct connection behind.
+            Ok(Reading::ProxyProblem(problem)) => Err(problem.message()),
+            Ok(Reading::Unparsable { error, .. }) => Err(problem_line(path, &error)),
             // A file that cannot be opened at all: the same reason `load` calls it an error, put in one
             // line instead of carrying an enum a caller only formats anyway.
             Err(problem) => Err(problem.to_string()),
@@ -674,6 +732,11 @@ impl Config {
     /// through. Both address families listen on the one port, and everything
     /// the config does not name keeps the engine's own default: a new fbt-lib
     /// release changes it here only by choice.
+    ///
+    /// A `proxy:` section is applied last, and it is more than an address: the switches that cannot
+    /// go through a proxy (incoming connections, port forwarding, local peer discovery, and the DHT
+    /// and outgoing uTP under an HTTP proxy) are turned off here, so the settings a session starts
+    /// on already say what it may do. See [`crate::proxy::apply_to_settings`].
     pub fn session_settings(&self) -> fbt::Settings {
         let mut settings = fbt::Settings::default();
         settings.listen_addrs = vec![
@@ -690,6 +753,8 @@ impl Config {
         queue.active_limit = self.limits.active_total;
         settings.queue = queue;
         settings.cache_size = self.cache_size_mib.saturating_mul(MIB);
+        // The proxy decides what may still run; with no proxy this changes nothing.
+        apply_to_settings(&mut settings, self.proxy.as_ref());
         settings
     }
 }
@@ -705,8 +770,18 @@ enum Reading {
     /// Bytes that read as this config, but the player's setting is not something a run may act on,
     /// with the one line that says what is wrong.
     PlayerProblem(Box<Config>, String),
-    /// Bytes that are there and are not this config, with the parse failure that says so.
-    Unparsable(serde_norway::Error),
+    /// Bytes that read as this config, but the `proxy:` section in it is not something a run may act
+    /// on, with the refusal that says what to fix.
+    ProxyProblem(ProxyProblem),
+    /// Bytes that are there and are not this config, with the parse failure that says so and whether
+    /// the bytes name a proxy: a file whose `proxy:` line cannot be read must be refused rather than
+    /// set aside and run without it.
+    Unparsable {
+        /// What the parser said.
+        error: serde_norway::Error,
+        /// Whether the bytes carry a `proxy:` line, whatever the parse failure was.
+        named_proxy: bool,
+    },
 }
 
 /// Reads `path` and parses it: [`Reading::Absent`] for no file, [`Reading::Unparsable`] for bytes that
@@ -714,9 +789,11 @@ enum Reading {
 /// a directory in the way), where there is no way to tell "empty" from "unavailable". A file that reads
 /// as this config but overruns the player's bounds is a [`Reading::PlayerProblem`], not an
 /// [`Reading::Unparsable`]: the bytes were understood, so the file stays where it is and only the
-/// player's setting is the part the run does not act on. This is the one place a config file is read;
-/// [`Config::load`] and [`Config::load_for_edit`] differ in what they do with an unparsable file, not
-/// in how they find out about it.
+/// player's setting is the part the run does not act on. A file whose `proxy:` section this run may not
+/// use is a [`Reading::ProxyProblem`], checked before the player's setting: a global setting that would
+/// connect directly is more important than a per-torrent one that is merely unusable. This is the one
+/// place a config file is read; [`Config::load`] and [`Config::load_for_edit`] differ in what they do
+/// with an unreadable file, not in how they find out about it.
 fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -730,8 +807,35 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     };
     let config = match serde_norway::from_slice::<Config>(&bytes) {
         Ok(config) => config,
-        Err(error) => return Ok(Reading::Unparsable(error)),
+        // A `proxy` key that is present with a null value - `proxy:`, `proxy: ~`, or a section whose
+        // indentation was lost - would read as no proxy and leave the engine connecting directly.
+        // [`proxy_section`] stops the parse there, and the file is refused as a host to enter.
+        Err(error) if error.to_string().contains(NULL_PROXY_SECTION) => {
+            return Ok(Reading::ProxyProblem(ProxyProblem::NoHost));
+        }
+        Err(error) => {
+            return Ok(Reading::Unparsable {
+                error,
+                // Whether the bytes name a proxy is read off the bytes themselves: the parse failed,
+                // so there is no parsed section to ask, and a file that names a proxy must be refused
+                // rather than set aside (see [`Config::load`]).
+                named_proxy: names_a_proxy(&bytes),
+            });
+        }
     };
+    // A proxy key the config kept as an unknown key (another case) or that only a merge would bring
+    // in would also leave the engine connecting directly; both are read off the same parse, so a
+    // folder path that merely contains the word "proxy" is not a proxy setting.
+    if let Some(problem) = hidden_proxy_problem(&config, &bytes) {
+        return Ok(Reading::ProxyProblem(problem));
+    }
+    // A `proxy:` section this run may not use stops it here, before the player's setting is looked at:
+    // everything a bypass could leak is a larger fact than a player line a person mistyped.
+    if let Some(proxy) = &config.proxy
+        && let Err(problem) = proxy.validate()
+    {
+        return Ok(Reading::ProxyProblem(problem));
+    }
     // The player's program and arguments end up on a process's argument line, so a file that overruns
     // them is not acted on: the config comes back with the player's setting at its default, and the
     // line saying why is the one the run shows. The file itself is read, and it stays where it is.
@@ -741,6 +845,101 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
         return Ok(Reading::PlayerProblem(Box::new(kept), problem));
     }
     Ok(Reading::Parsed(Box::new(config)))
+}
+
+/// Whether these bytes carry a top-level-looking `proxy:` key, read from the raw text because a file
+/// that failed to parse has no parsed section to ask.
+///
+/// This is deliberately over-eager, and it is only ever asked about a file that could not be parsed:
+/// the whole point is to notice a proxy in bytes the parser could not turn into a config. A leading
+/// byte-order mark is dropped, comment lines are skipped, and any other line that mentions `proxy`
+/// anywhere (ASCII, case-insensitive) counts - an indented or quoted key, a flow-style `{"proxy": ...}`
+/// and a key spelled with unknown spacing all match. Refusing to set aside an unparsable file costs
+/// little; a leak, if one is missed, costs a lot. A file that *does* parse is asked
+/// [`proxy_section`] and [`hidden_proxy_problem`] instead, which read the parse itself, so a folder
+/// path that merely contains the word "proxy" does not stop a valid file from loading.
+fn names_a_proxy(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#') && trimmed.to_ascii_lowercase().contains("proxy")
+    })
+}
+
+/// The error [`proxy_section`] raises for a `proxy` key whose value is null, which
+/// [`read_and_parse`] recognises and turns into [`ProxyProblem::NoHost`]. It is never shown: the
+/// refusal's own sentence is.
+const NULL_PROXY_SECTION: &str =
+    "the proxy section is present but empty (fbtt: null proxy section)";
+
+/// Reads `Config.proxy` for a key that is present. Serde calls this only when the parse found the
+/// `proxy` key - with its tags dropped and its escapes resolved, exactly as the config reads every
+/// field - and an absent key takes the field's default, `None`. So a present key with a null value
+/// is told apart from an absent one in the same parse that builds the config, and refused with
+/// [`NULL_PROXY_SECTION`] rather than read as "no proxy".
+fn proxy_section<'de, D>(deserializer: D) -> Result<Option<ProxySetting>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<ProxySetting>::deserialize(deserializer)? {
+        Some(setting) => Ok(Some(setting)),
+        None => Err(serde::de::Error::custom(NULL_PROXY_SECTION)),
+    }
+}
+
+/// What hides a proxy this file names from the parsed config, read off the parse that built it:
+///
+/// * a top-level key that is `proxy` in another case or with spaces around it (`Proxy:`, `PROXY:`)
+///   is kept in [`Config::unknown_keys`], already resolved (tags dropped, escapes applied), and is
+///   refused as [`ProxyProblem::KeyCase`];
+/// * a top-level YAML merge (`<<`) is kept there too, because the parser does not apply merges.
+///   [`merge_brings_a_proxy`] applies it and refuses the file as [`ProxyProblem::MergeKey`] when the
+///   merge would bring in a proxy the file did not itself set. An explicit key always wins over a
+///   merged one, so a file with its own `proxy:` section and a single-level unrelated merge loads;
+///   a nested merge is refused (see [`merge_brings_a_proxy`]).
+fn hidden_proxy_problem(config: &Config, bytes: &[u8]) -> Option<ProxyProblem> {
+    if config.unknown_keys.keys().any(|key| is_proxy_key(key)) {
+        return Some(ProxyProblem::KeyCase);
+    }
+    if config.unknown_keys.contains_key("<<") && merge_brings_a_proxy(bytes, config.proxy.is_some())
+    {
+        return Some(ProxyProblem::MergeKey);
+    }
+    None
+}
+
+/// Whether a top-level key means `proxy`, whatever its case or surrounding spaces.
+fn is_proxy_key(key: &str) -> bool {
+    key.trim().eq_ignore_ascii_case("proxy")
+}
+
+/// Whether applying this file's top-level merges would bring in a proxy key that the file did not
+/// itself parse as its proxy. A file whose merges cannot be read or applied is taken to bring one
+/// (fail closed): refusing costs little, and a leak costs a lot. Keys are read with
+/// [`Value::as_str`], which drops tags, so a tagged key is the word it spells.
+///
+/// A top level that still has a `<<` after [`Value::apply_merge`] is also taken to bring one. A
+/// merge nested a level deeper (an anchor whose own mapping merges another) copies that inner `<<`
+/// into the top level, and `apply_merge` does not revisit the top level, so the proxy it carries
+/// would be left unmerged and the file would load with no proxy.
+fn merge_brings_a_proxy(bytes: &[u8], proxy_is_parsed: bool) -> bool {
+    let Ok(mut value) = serde_norway::from_slice::<Value>(bytes) else {
+        return true;
+    };
+    if value.apply_merge().is_err() {
+        return true;
+    }
+    if value
+        .as_mapping()
+        .is_some_and(|mapping| mapping.contains_key("<<"))
+    {
+        return true;
+    }
+    !proxy_is_parsed
+        && value
+            .as_mapping()
+            .is_some_and(|mapping| mapping.keys().filter_map(Value::as_str).any(is_proxy_key))
 }
 
 /// What is wrong with a config's player setting, or `None` when the program and its arguments
@@ -815,19 +1014,45 @@ pub(crate) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
 /// One line about a parse failure: the whole message with its newlines folded
 /// into spaces, led by the file's name so the line makes sense on its own.
 fn problem_line(path: &Path, error: &serde_norway::Error) -> String {
-    let name = path
-        .file_name()
+    format!("{}: {}", file_name_of(path), folded_error(error))
+}
+
+/// One line about a file that cannot be read *and* names a proxy: the file's name, what to do about
+/// it, and the parse failure that stopped it being read. Folding and the name come from the same two
+/// helpers [`problem_line`] uses, so the two lines a person can get about one file read alike.
+///
+/// This is the wording the plan fixes for exactly this case: the file is kept, and the line has to
+/// say why nothing will connect until it is fixed, rather than leaving a person to wonder why their
+/// downloads are idle behind a proxy they can no longer see in the file.
+fn unreadable_proxy_line(path: &Path, error: &serde_norway::Error) -> String {
+    format!(
+        "{} cannot be read and names a proxy, so nothing will connect until it is fixed: {}",
+        file_name_of(path),
+        folded_error(error)
+    )
+}
+
+/// The file's own name, for a line about it: a full path in a log line is more than a person needs
+/// when the line is already shown beside the file.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
         .unwrap_or(path.as_os_str())
-        .to_string_lossy();
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A parse failure as one line of text: the message's whitespace collapsed, or a plain "malformed
+/// YAML" for a failure that says nothing.
+fn folded_error(error: &serde_norway::Error) -> String {
     let message = error
         .to_string()
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ");
     if message.is_empty() {
-        format!("{name}: malformed YAML")
+        "malformed YAML".to_string()
     } else {
-        format!("{name}: {message}")
+        message
     }
 }
 
@@ -928,11 +1153,12 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigLoad, CookieSecure, DOWNLOADS_DIR_NAME,
-        DeviceEntry, DownloadsConfig, Limits, LogoSetting, PlayerConfig, ServerConfig, UserEntry,
-        suffixed, user_download_dir, web_ui_env_override,
+        AuthConfig, BAD_FILE_SUFFIX, Config, ConfigError, ConfigLoad, CookieSecure,
+        DOWNLOADS_DIR_NAME, DeviceEntry, DownloadsConfig, Limits, LogoSetting, PlayerConfig,
+        ServerConfig, UserEntry, suffixed, user_download_dir, web_ui_env_override,
     };
     use crate::paths::Paths;
+    use crate::proxy::{ProxySetting, ProxyType};
     use crate::scratch::ScratchDir;
     use serde_norway::Value;
     use std::fs;
@@ -2121,6 +2347,7 @@ mod tests {
             },
             logo: LogoSetting::Off,
             downloads: DownloadsConfig::default(),
+            proxy: None,
             unknown_keys: Default::default(),
         };
         assert_eq!(
@@ -2369,5 +2596,500 @@ mod tests {
         let unset = Config::default().resolve(&paths);
         assert_eq!(unset.downloads.unfinished_dir, None);
         assert_eq!(unset.downloads.watch_dir, None);
+    }
+
+    /// A SOCKS5 proxy at `host:port`, with no credentials.
+    fn socks5(host: &str, port: u16) -> ProxySetting {
+        ProxySetting {
+            kind: ProxyType::Socks5,
+            host: host.to_string(),
+            port,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// A config that names a proxy round-trips through the file exactly as it was set, and a config
+    /// that names none writes no `proxy:` key at all: the new setting is silent until somebody
+    /// chooses it, like the downloads section.
+    #[test]
+    fn proxy_round_trips_and_absent_writes_nothing() {
+        let dir = ScratchDir::new("config_proxy_round_trip");
+        let paths = library(&dir);
+        let path = paths.config_file();
+
+        Config::default().save(&path).expect("save the defaults");
+        let default_saved = fs::read_to_string(&path).expect("read the save back");
+        assert_eq!(
+            yaml_value(&default_saved, "proxy"),
+            None,
+            "a config with no proxy names no proxy section: {default_saved}"
+        );
+
+        let chosen = Config {
+            proxy: Some(ProxySetting {
+                kind: ProxyType::Socks5,
+                host: "proxy.example".to_string(),
+                port: 1080,
+                username: Some("alice".to_string()),
+                password: Some("hunter2".to_string()),
+            }),
+            ..Config::default()
+        };
+        chosen.save(&path).expect("save the proxy");
+        let written = fs::read_to_string(&path).expect("read the save back");
+        assert_eq!(
+            yaml_value(&written, "type"),
+            Some("socks5"),
+            "the type is written as its word: {written}"
+        );
+        assert_eq!(yaml_value(&written, "host"), Some("proxy.example"));
+        assert_eq!(yaml_value(&written, "port"), Some("1080"));
+        let again = Config::load_for_edit(&path)
+            .expect("the proxy reads back")
+            .expect("the save wrote a file");
+        assert_eq!(again, chosen, "the whole config round-trips");
+        assert_eq!(again.proxy, chosen.proxy);
+    }
+
+    /// With a proxy set, the settings a session starts on turn off everything that cannot go through
+    /// it: incoming connections, UPnP and NAT-PMP port forwarding, and local peer discovery. The
+    /// engine's own proxy config says the same thing with `proxy_only`, so either alone holds.
+    #[test]
+    fn socks5_turns_off_incoming_and_discovery() {
+        let config = Config {
+            proxy: Some(socks5("proxy.example", 1080)),
+            ..Config::default()
+        };
+        let settings = config.session_settings();
+        assert!(!settings.enable_incoming_tcp, "nothing may connect in");
+        assert!(!settings.enable_incoming_utp);
+        assert!(!settings.enable_lsd, "local peer discovery goes direct");
+        assert!(
+            !settings.enable_upnp,
+            "port forwarding would reveal the address"
+        );
+        assert!(!settings.enable_natpmp);
+        assert_eq!(settings.proxy.kind, fbt::ProxyKind::Socks5);
+        assert!(settings.proxy.proxy_peers && settings.proxy.proxy_trackers);
+        assert!(settings.proxy.proxy_hostnames, "names go to the proxy");
+        assert!(
+            settings.proxy.proxy_only,
+            "the engine treats every bypass as off too"
+        );
+    }
+
+    /// An HTTP proxy carries TCP only, so the DHT and outgoing uTP go off with the rest. A SOCKS5
+    /// proxy keeps both switches: the engine relays UDP when the proxy supports it and turns them
+    /// off itself when it does not.
+    #[test]
+    fn http_also_turns_off_dht_and_utp() {
+        let http = Config {
+            proxy: Some(ProxySetting {
+                kind: ProxyType::Http,
+                ..socks5("proxy.example", 3128)
+            }),
+            ..Config::default()
+        };
+        let settings = http.session_settings();
+        assert!(!settings.dht_enabled, "an HTTP proxy carries no UDP");
+        assert!(!settings.enable_outgoing_utp);
+        assert!(!settings.enable_incoming_tcp);
+        assert_eq!(settings.proxy.kind, fbt::ProxyKind::Http);
+
+        let socks = Config {
+            proxy: Some(socks5("proxy.example", 1080)),
+            ..Config::default()
+        };
+        let settings = socks.session_settings();
+        assert!(settings.dht_enabled, "a SOCKS5 proxy keeps the DHT switch");
+        assert!(settings.enable_outgoing_utp);
+    }
+
+    /// A config that names no proxy produces exactly the settings it did before this setting
+    /// existed: every network switch at the engine's own default, and no proxy. This is the "no
+    /// proxy is today" check, written field by field against the values an older version ran with.
+    #[test]
+    fn no_proxy_is_todays_settings() {
+        let engine = fbt::Settings::default();
+        let settings = Config::default().session_settings();
+        assert_eq!(settings.dht_enabled, engine.dht_enabled);
+        assert_eq!(settings.enable_lsd, engine.enable_lsd);
+        assert_eq!(settings.enable_upnp, engine.enable_upnp);
+        assert_eq!(settings.enable_natpmp, engine.enable_natpmp);
+        assert_eq!(settings.enable_incoming_tcp, engine.enable_incoming_tcp);
+        assert_eq!(settings.enable_incoming_utp, engine.enable_incoming_utp);
+        assert_eq!(settings.enable_outgoing_utp, engine.enable_outgoing_utp);
+        assert_eq!(settings.proxy, fbt::ProxyConfig::default());
+        assert_eq!(settings.network(), engine.network());
+        assert!(settings.dht_enabled, "the default is a DHT node");
+        assert_eq!(settings.proxy.kind, fbt::ProxyKind::None);
+
+        // `type: none` is the same as no section at all.
+        let none = Config {
+            proxy: Some(ProxySetting {
+                kind: ProxyType::None,
+                host: String::new(),
+                port: 0,
+                username: None,
+                password: None,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(none.session_settings().network(), settings.network());
+    }
+
+    /// A `proxy:` section this run may not act on stops the run: a run on defaults would connect
+    /// directly, which is the address leak this setting exists to prevent.
+    #[test]
+    fn invalid_proxy_refuses_to_start() {
+        let dir = ScratchDir::new("config_proxy_invalid");
+        let paths = library(&dir);
+        fs::write(
+            paths.config_file(),
+            "proxy:\n  type: socks5\n  host: \"\"\n  port: 1080\n",
+        )
+        .expect("write a config with an empty host");
+        match Config::load(&paths) {
+            Err(ConfigError::Proxy(problem)) => {
+                assert_eq!(problem, "Enter the proxy's host name or address.");
+                assert_eq!(problem.lines().count(), 1, "one line: {problem}");
+            }
+            other => panic!("an unusable proxy refuses the run, got {other:?}"),
+        }
+        // The file is left where it is: a person has to see the line to fix it.
+        assert!(paths.config_file().exists());
+        assert!(!dir.path().join("config.yaml.bad").exists());
+
+        // A port of 0 is refused the same way, and so is a credential SOCKS5 cannot carry.
+        fs::write(
+            paths.config_file(),
+            "proxy:\n  type: http\n  host: proxy.example\n  port: 0\n",
+        )
+        .expect("write a config with port 0");
+        assert!(matches!(
+            Config::load(&paths),
+            Err(ConfigError::Proxy(problem)) if problem == "The port must be a number from 1 to 65535."
+        ));
+        fs::write(
+            paths.config_file(),
+            format!(
+                "proxy:\n  type: socks5\n  host: proxy.example\n  port: 1080\n  password: \"{}\"\n",
+                "p".repeat(256)
+            ),
+        )
+        .expect("write a config with a long password");
+        assert!(matches!(
+            Config::load(&paths),
+            Err(ConfigError::Proxy(problem)) if problem == "The user name and password can be at most 255 bytes each."
+        ));
+
+        // An editor gets the same refusal rather than rewriting the line away.
+        assert_eq!(
+            Config::load_for_edit(&paths.config_file()),
+            Err("The user name and password can be at most 255 bytes each.".to_string())
+        );
+    }
+
+    /// A type this product does not know is a refusal that names it, not a YAML error: the section
+    /// reaches validation, which is what turns `socks4` into a sentence a person can act on.
+    #[test]
+    fn unknown_proxy_type_refuses_to_start() {
+        let dir = ScratchDir::new("config_proxy_unknown");
+        let paths = library(&dir);
+        fs::write(
+            paths.config_file(),
+            "proxy:\n  type: socks4\n  host: proxy.example\n  port: 1080\n",
+        )
+        .expect("write a config with an unknown type");
+        match Config::load(&paths) {
+            Err(ConfigError::Proxy(problem)) => assert_eq!(
+                problem,
+                "Unknown proxy type \"socks4\"; use none, http or socks5."
+            ),
+            other => panic!("an unknown type refuses the run, got {other:?}"),
+        }
+        assert!(paths.config_file().exists(), "the file is left alone");
+        assert_eq!(
+            Config::load_for_edit(&paths.config_file()),
+            Err("Unknown proxy type \"socks4\"; use none, http or socks5.".to_string())
+        );
+    }
+
+    /// A `proxy:` key that reads as null is not "no proxy": an empty section, a `~`, and a section
+    /// that lost its indentation all leave the engine connecting directly, which is the leak this
+    /// setting exists to close, so each is refused as a host this run cannot use.
+    #[test]
+    fn null_proxy_key_refuses_to_start() {
+        let dir = ScratchDir::new("config_proxy_null");
+        let paths = library(&dir);
+        let no_host = "Enter the proxy's host name or address.";
+        let key_case = "Write the proxy setting as proxy: in lower case.";
+        let merge = "Write the proxy: section out in full; a YAML merge (<<) cannot carry it.";
+        let cases = [
+            ("proxy:\n", no_host),
+            ("proxy: ~\n", no_host),
+            // The indentation lost: `proxy` reads as null and the rest lands at the top level.
+            (
+                "proxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+                no_host,
+            ),
+            // A duplicate unknown key: the config keeps the last one, but a mapping parse refuses
+            // the file, so the precise question cannot be asked and the over-eager scan answers.
+            ("foo: 1\nfoo: 2\nproxy:\n", no_host),
+            (
+                "foo: 1\nfoo: 2\nproxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+                no_host,
+            ),
+            // A key in another case is an unknown key to the config, not its proxy.
+            (
+                "Proxy:\n  type: socks5\n  host: 10.0.0.1\n  port: 1080\n",
+                key_case,
+            ),
+            (
+                "PROXY:\n  type: socks5\n  host: 10.0.0.1\n  port: 1080\n",
+                key_case,
+            ),
+            // A merge is not applied by the parser, so a proxy carried by one would be dropped.
+            (
+                "base: &b\n  proxy:\n    type: socks5\n    host: 10.0.0.1\n    port: 1080\n<<: *b\n",
+                merge,
+            ),
+            // A custom tag on the key: the config reads it as its `proxy` field all the same.
+            ("!x proxy:\n", no_host),
+            (
+                "!x proxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+                no_host,
+            ),
+            // An escaped key is `proxy` once the escape is resolved, which a byte scan cannot see.
+            ("foo: 1\nfoo: 2\n\"pro\\x78y\":\n", no_host),
+            (
+                "base: &b\n  \"pro\\x78y\":\n    type: socks5\n    host: 10.0.0.1\n    port: 1080\n<<: *b\n",
+                merge,
+            ),
+            // A merge nested a level deeper leaves a `<<` at the top level once merges are applied.
+            (
+                "c: &c\n  proxy: {type: socks5, host: 10.0.0.1, port: 1080}\nb: &b\n  <<: *c\n<<: *b\n",
+                merge,
+            ),
+            (
+                "c: &c\n  proxy: {type: socks5, host: 10.0.0.1, port: 1080}\nb: &b\n  <<: *c\n<<: [*b]\n",
+                merge,
+            ),
+        ];
+        for (text, expected) in cases {
+            fs::write(paths.config_file(), text).expect("write a config whose proxy is null");
+            match Config::load(&paths) {
+                Err(ConfigError::Proxy(problem)) => {
+                    assert_eq!(
+                        problem, expected,
+                        "a hidden proxy is refused with its own line: {text:?}"
+                    );
+                }
+                other => panic!("a null proxy key refuses the run ({text:?}), got {other:?}"),
+            }
+            assert!(
+                paths.config_file().exists(),
+                "the file is left where it can be fixed: {text:?}"
+            );
+            assert!(
+                !dir.path().join("config.yaml.bad").exists(),
+                "nothing was set aside: {text:?}"
+            );
+        }
+    }
+
+    /// A folder whose path contains the word "proxy" is not a proxy key: a valid file naming one
+    /// loads like any other. This is what the over-eager scan must not be asked of a file that
+    /// parses.
+    #[test]
+    fn a_folder_named_proxy_still_loads() {
+        let dir = ScratchDir::new("config_folder_named_proxy");
+        let paths = library(&dir);
+        let folder = dir.path().join("proxy-files");
+        fs::write(
+            paths.config_file(),
+            format!("download_dir: {}\n", folder.display()),
+        )
+        .expect("write a valid config whose folder names proxy");
+
+        let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("a valid file loads") else {
+            panic!("a folder named proxy is not a proxy setting");
+        };
+        assert_eq!(loaded.download_dir, folder, "the folder is read as written");
+        assert!(loaded.proxy.is_none(), "and no proxy was invented");
+
+        // A merge that has nothing to do with a proxy is not refused, as long as the word appears
+        // nowhere in the file.
+        fs::write(paths.config_file(), "shared: &s\n  note: kept\n<<: *s\n")
+            .expect("write a valid config with an unrelated merge");
+        let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("a file with a merge loads")
+        else {
+            panic!("a merge that carries no proxy is not a proxy setting");
+        };
+        assert!(loaded.proxy.is_none(), "and no proxy was invented");
+
+        // A real `proxy:` section beside an unrelated merge loads, and its proxy is the one used: an
+        // explicit key always wins over a merged one, so the merge cannot displace it.
+        fs::write(
+            paths.config_file(),
+            "proxy:\n  type: socks5\n  host: 10.0.0.1\n  port: 1080\nshared: &s\n  note: kept\n<<: *s\n",
+        )
+        .expect("write a valid config with a proxy and an unrelated merge");
+        let ConfigLoad::Loaded(loaded) =
+            Config::load(&paths).expect("a proxy beside an unrelated merge loads")
+        else {
+            panic!("a proxy beside an unrelated merge loads as written");
+        };
+        let proxy = loaded.proxy.expect("the proxy section is read");
+        assert_eq!(proxy.host, "10.0.0.1", "the explicit proxy is the one used");
+        assert_eq!(proxy.port, 1080);
+    }
+
+    /// A file that cannot be read and names a proxy in any spelling is refused rather than set
+    /// aside: the scan for an unparsable file is deliberately over-eager, because refusing costs
+    /// little and a leak costs a lot.
+    #[test]
+    fn unparsable_file_naming_a_proxy_in_any_spelling_refuses() {
+        let dir = ScratchDir::new("config_proxy_any_spelling");
+        let paths = library(&dir);
+        let cases = [
+            // An indented key.
+            "  proxy: 1\nlisten_port: [nope\n",
+            // A double-quoted key.
+            "\"proxy\": 1\nlisten_port: [nope\n",
+            // A single-quoted key.
+            "'proxy': 1\nlisten_port: [nope\n",
+            // A byte-order mark before the key.
+            "\u{FEFF}proxy: 1\nlisten_port: [nope\n",
+            // JSON flow style, unparsable elsewhere.
+            "{\"proxy\": {\"type\": \"socks5\"}, \"oops\": [nope\n",
+        ];
+        for text in cases {
+            fs::write(paths.config_file(), text)
+                .expect("write an unparsable config naming a proxy");
+            match Config::load(&paths) {
+                Err(ConfigError::Proxy(problem)) => {
+                    assert!(
+                        problem.contains("names a proxy"),
+                        "the line says why nothing will connect ({text:?}): {problem}"
+                    );
+                    assert!(
+                        problem.contains("config.yaml"),
+                        "the line names the file ({text:?}): {problem}"
+                    );
+                }
+                other => {
+                    panic!("an unparsable file naming a proxy refuses ({text:?}), got {other:?}")
+                }
+            }
+            assert!(
+                paths.config_file().exists(),
+                "the file is left where it can be fixed: {text:?}"
+            );
+            assert!(
+                !dir.path().join("config.yaml.bad").exists(),
+                "nothing was set aside: {text:?}"
+            );
+        }
+    }
+
+    /// A file that cannot be read *and* names a proxy is refused, and is not renamed: setting it
+    /// aside and starting on defaults would connect directly, which is exactly the leak. The
+    /// sentence says so and carries the parse failure.
+    #[test]
+    fn unparsable_file_with_a_proxy_key_refuses_to_start() {
+        let dir = ScratchDir::new("config_proxy_unparsable");
+        let paths = library(&dir);
+        // The tab is the YAML error, so the bytes do not parse; the `proxy:` line is what turns a
+        // file that would be set aside into one that stops the run.
+        fs::write(
+            paths.config_file(),
+            "proxy:\n  type: socks5\n  host: proxy.example\n\tport: 1080\n",
+        )
+        .expect("write an unparsable config that names a proxy");
+
+        match Config::load(&paths) {
+            Err(ConfigError::Proxy(problem)) => {
+                assert!(
+                    problem.contains("names a proxy"),
+                    "the line says why nothing will connect: {problem}"
+                );
+                assert!(
+                    problem.contains("config.yaml"),
+                    "the line names the file: {problem}"
+                );
+                assert_eq!(problem.lines().count(), 1, "one line: {problem}");
+            }
+            other => panic!("an unreadable file with a proxy refuses the run, got {other:?}"),
+        }
+        assert!(
+            paths.config_file().exists(),
+            "the file stays where its owner can fix it"
+        );
+        assert!(
+            !dir.path().join("config.yaml.bad").exists(),
+            "nothing was renamed aside"
+        );
+        // An editor refuses too, and moves nothing.
+        assert!(Config::load_for_edit(&paths.config_file()).is_err());
+        assert!(paths.config_file().exists());
+        assert!(!dir.path().join("config.yaml.bad").exists());
+    }
+
+    /// A file that cannot be read and names no proxy keeps the behaviour it always had: its bytes
+    /// move aside under `.bad` and the run starts on this library's defaults.
+    #[test]
+    fn unparsable_file_without_proxy_is_still_set_aside() {
+        let dir = ScratchDir::new("config_proxy_no_proxy_unparsable");
+        let paths = library(&dir);
+        fs::write(paths.config_file(), "listen_port: [nope\n").expect("write a malformed config");
+
+        let ConfigLoad::Bad { config, problem } =
+            Config::load(&paths).expect("a malformed file is still read")
+        else {
+            panic!("a malformed config comes back as the defaults");
+        };
+        assert!(!problem.is_empty());
+        assert_eq!(config, Config::default_for(&paths).resolve(&paths));
+        assert!(!paths.config_file().exists(), "the bad file moved away");
+        assert!(dir.path().join("config.yaml.bad").exists());
+    }
+
+    /// A proxy mentioned only in a comment is not a `proxy:` key: a file that cannot be read over
+    /// some other line is still set aside, and a person who commented their proxy line out gets
+    /// today's behaviour rather than a refusal.
+    #[test]
+    fn a_proxy_in_a_comment_is_not_a_proxy_key() {
+        let dir = ScratchDir::new("config_proxy_in_a_comment");
+        let paths = library(&dir);
+        fs::write(
+            paths.config_file(),
+            "# proxy: http://proxy.example:3128\nlisten_port: [nope\n",
+        )
+        .expect("write a malformed config whose only proxy is commented out");
+        assert!(
+            matches!(Config::load(&paths), Ok(ConfigLoad::Bad { .. })),
+            "a commented-out proxy line is not the proxy setting"
+        );
+        assert!(dir.path().join("config.yaml.bad").exists());
+    }
+
+    /// An absent proxy key in a section that parses keeps the proxy absent, and a proxy problem in
+    /// a config that also overruns the player's bounds is reported as the proxy: the global setting
+    /// that would connect directly is the one to fix first.
+    #[test]
+    fn a_proxy_problem_wins_over_a_player_problem() {
+        let dir = ScratchDir::new("config_proxy_and_player");
+        let paths = library(&dir);
+        fs::write(
+            paths.config_file(),
+            "player:\n  program: \"\"\nproxy:\n  type: socks4\n  host: proxy.example\n  port: 1080\n",
+        )
+        .expect("write a config with both problems");
+        assert!(
+            matches!(Config::load(&paths), Err(ConfigError::Proxy(_))),
+            "the proxy is the problem to fix first"
+        );
     }
 }
