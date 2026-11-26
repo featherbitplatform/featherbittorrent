@@ -64,6 +64,49 @@ export interface DeviceRow {
   fingerprint: string
 }
 
+/**
+ * The speed and queue settings, as `GET /api/v1/settings` answers them under `speed` (this product's own
+ * route, not in the OpenAPI document). A rate is in KiB/s, a count is a number, and `null` is unlimited.
+ */
+export interface SpeedSettings {
+  download_kib: number | null
+  upload_kib: number | null
+  active_downloads: number | null
+  active_seeds: number | null
+  active_total: number | null
+}
+
+/** What a server says about running a program on completion: the program, and whether this page may set it. */
+export interface OnCompleteState {
+  program: string | null
+  editable: boolean
+}
+
+/** The downloads settings, as `GET /api/v1/settings` answers them under `downloads`. */
+export interface DownloadsSettings {
+  default_dir: string
+  unfinished_dir: string | null
+  start_paused: boolean
+  watch_dir: string | null
+  on_complete: OnCompleteState
+  watch_problem: string | null
+  on_complete_problem: string | null
+}
+
+/** What `PUT /api/v1/settings/downloads` takes from this page. Never the program on completion: a server reads it only from its config file. */
+export interface DownloadsInput {
+  default_dir: string
+  unfinished_dir: string | null
+  start_paused: boolean
+  watch_dir: string | null
+}
+
+/** The whole settings object, as every settings route answers it. */
+export interface ProductSettings {
+  speed: SpeedSettings
+  downloads: DownloadsSettings
+}
+
 /** The kind of track a file carries, as the media probe says it. */
 export type MediaTrackKind = 'video' | 'audio' | 'subtitle'
 
@@ -197,6 +240,9 @@ export interface Api {
   setSessionLimits(downloadBps: number | null, uploadBps: number | null): Promise<void>
   queueSettings(): Promise<components['schemas']['QueueSettingsDto']>
   setQueueSettings(settings: components['schemas']['QueueSettingsDto']): Promise<void>
+  settings(): Promise<ProductSettings>
+  saveSpeed(speed: SpeedSettings): Promise<ProductSettings>
+  saveDownloads(downloads: DownloadsInput): Promise<ProductSettings>
   devices(): Promise<DeviceRow[]>
   addDevice(name: string, publicKey: string): Promise<DeviceRow>
   removeDevice(name: string): Promise<void>
@@ -206,6 +252,7 @@ export interface Api {
 const TORRENTS = '/api/v1/torrents'
 const MEDIA = '/api/v1/media'
 const STREAM_TOKENS = '/api/v1/stream-tokens'
+const SETTINGS = '/api/v1/settings'
 const DEVICES = '/api/v1/auth/devices'
 
 /**
@@ -389,6 +436,34 @@ export function createClient(
       sendJson('/api/v1/session/limits', 'PUT', { download: downloadBps, upload: uploadBps } satisfies components['schemas']['LimitsRequest']),
     queueSettings: () => json('/api/v1/session/queue', 'GET'),
     setQueueSettings: (settings) => sendJson('/api/v1/session/queue', 'PUT', settings),
+    settings: () => json(SETTINGS, 'GET'),
+    saveSpeed: (speed) =>
+      json(
+        `${SETTINGS}/speed`,
+        'PUT',
+        JSON.stringify({
+          download_kib: speed.download_kib,
+          upload_kib: speed.upload_kib,
+          active_downloads: speed.active_downloads,
+          active_seeds: speed.active_seeds,
+          active_total: speed.active_total,
+        }),
+        'application/json',
+      ),
+    // Picked field by field: the program on completion is never sent from this page, even when the
+    // caller's object carries one.
+    saveDownloads: (downloads) =>
+      json(
+        `${SETTINGS}/downloads`,
+        'PUT',
+        JSON.stringify({
+          default_dir: downloads.default_dir,
+          unfinished_dir: downloads.unfinished_dir,
+          start_paused: downloads.start_paused,
+          watch_dir: downloads.watch_dir,
+        }),
+        'application/json',
+      ),
     devices: () => json(DEVICES, 'GET'),
     addDevice: (name, publicKey) =>
       json(DEVICES, 'POST', JSON.stringify({ name, public_key: publicKey }), 'application/json'),

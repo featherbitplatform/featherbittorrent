@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The Desktop section of Settings: drawn only inside the app, the tray answer only with a tray, the
+ * The `This app` sections of Settings: drawn only inside the app, the tray answer only with a tray, the
  * system title bar switch only on Linux (design spec 2.4: Windows always draws its own bar), shortcut
  * changes saved through the shell and applied at once, and Serve the web UI applied with its login.
  *
@@ -29,11 +29,18 @@ const shell = vi.hoisted(() => ({
   forgetPassword: vi.fn(),
 }))
 vi.mock('./bridge', () => ({ ...shell, LOCAL_ID: 'local' }))
-vi.mock('../components/settings/ServerSettings', () => ({ default: () => <div>server settings</div> }))
+vi.mock('../components/settings/SpeedSection', () => ({ default: () => <div>speed settings</div> }))
 vi.mock('../components/settings/Devices', () => ({ default: () => <div>devices</div> }))
 
 import { Settings } from '../screens/Settings'
-import { DesktopSettings, PLAIN_HTTP_WARNING } from './DesktopSettings'
+import {
+  DesktopShortcuts,
+  InstancesSection,
+  PLAIN_HTTP_WARNING,
+  ServingSection,
+  WindowSection,
+} from './DesktopSettings'
+import type { ServingSectionProps } from './DesktopSettings'
 
 const LIST = {
   default: 'local',
@@ -63,49 +70,61 @@ afterEach(() => {
   for (const fn of Object.values(shell)) fn.mockReset()
 })
 
-function renderSection(props: Partial<Parameters<typeof DesktopSettings>[0]> = {}) {
+function renderSection(props: Partial<ServingSectionProps> = {}) {
   const onServingChanged = vi.fn().mockResolvedValue(undefined)
   render(
-    <DesktopSettings
-      list={LIST}
-      current="local"
-      onInstancesChanged={vi.fn().mockResolvedValue(undefined)}
-      onServingChanged={onServingChanged}
-      {...props}
-    />,
+    <>
+      <WindowSection />
+      <DesktopShortcuts />
+      <ServingSection onServingChanged={onServingChanged} {...props} />
+    </>,
   )
   return { onServingChanged }
 }
 
-it('desktop_section_only_in_desktop', async () => {
+/** The slot the desktop page provides, for the Settings page to draw. */
+function slot(request: { section: string; seq: number } | null = null) {
+  return {
+    sections: [
+      { id: 'window' as const, render: () => <WindowSection /> },
+      {
+        id: 'serving' as const,
+        render: () => <ServingSection onServingChanged={vi.fn().mockResolvedValue(undefined)} />,
+      },
+      {
+        id: 'instances' as const,
+        render: () => (
+          <InstancesSection list={LIST} current="local" onInstancesChanged={vi.fn().mockResolvedValue(undefined)} />
+        ),
+      },
+    ],
+    shortcuts: <DesktopShortcuts />,
+    request,
+    onOpened: vi.fn(),
+  }
+}
+
+it('this_app_sections_only_in_desktop', async () => {
   const client = {} as Api
   const { unmount } = render(<Settings client={client} onBack={vi.fn()} />)
-  expect(screen.queryByRole('heading', { name: 'Desktop' })).toBeNull()
-  expect(screen.getByRole('heading', { name: 'Keyboard shortcuts' }), 'the browser keeps its read-only list').toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Window' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Serve the web UI' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Instances' })).toBeNull()
   unmount()
 
   render(
-    <DesktopSettingsContext.Provider
-      value={{
-        sections: (
-          <DesktopSettings
-            list={LIST}
-            current="local"
-            onInstancesChanged={vi.fn().mockResolvedValue(undefined)}
-            onServingChanged={vi.fn().mockResolvedValue(undefined)}
-          />
-        ),
-        request: null,
-        onOpened: vi.fn(),
-      }}
-    >
-      <Settings client={client} onBack={vi.fn()} />
+    <DesktopSettingsContext.Provider value={slot()}>
+      <Settings client={client} onBack={vi.fn()} section="settings-desktop" />
     </DesktopSettingsContext.Provider>,
   )
-  expect(screen.getByRole('heading', { name: 'Desktop' })).toBeTruthy()
-  expect(screen.getAllByRole('heading', { name: 'Keyboard shortcuts' })).toHaveLength(1)
+  expect(screen.getByRole('heading', { name: 'Window' })).toBeTruthy()
+  await screen.findByText('Close completely')
+  // Keyboard shortcuts are an Access section and the editable list replaces the read-only one.
+  fireEvent.click(screen.getByRole('button', { name: 'Keyboard shortcuts' }))
   expect(screen.getAllByRole('button', { name: 'Change' }).length, 'the desktop list is editable').toBeGreaterThan(0)
-  expect(screen.getByRole('heading', { name: 'Instances' })).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Instances' }))
+  expect(screen.getByRole('heading', { name: 'Instances', level: 2 })).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Serve the web UI' }))
   await waitFor(() => expect(shell.servingStatus).toHaveBeenCalled())
 })
 

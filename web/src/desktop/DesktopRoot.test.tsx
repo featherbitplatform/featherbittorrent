@@ -8,7 +8,7 @@
  * @module desktop/DesktopRoot.test
  */
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { Fragment, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TitleBarSlotsContext } from '../components/titleBarSlots'
@@ -63,7 +63,10 @@ vi.mock('./bridge', () => ({
 vi.mock('./DesktopSettings', () => ({
   INSTANCES_SECTION: 'settings-desktop-instances',
   SERVING_SECTION: 'settings-desktop-serving',
-  DesktopSettings: function FakeDesktopSettings({
+  WindowSection: () => null,
+  InstancesSection: () => null,
+  DesktopShortcuts: () => null,
+  ServingSection: function FakeServingSection({
     onServingApplying,
     onServingChanged,
   }: {
@@ -115,7 +118,7 @@ vi.mock('../App', () => ({
     return (
       <div>
         {request !== null && <div>settings at {request.section}</div>}
-        {desktop?.sections}
+        {desktop?.sections.map((section) => <Fragment key={section.id}>{section.render()}</Fragment>)}
         <div>
           workspace {endpoint.kind === 'bearer' ? `${endpoint.base} ${endpoint.token ?? 'signed out'}` : ''}
         </div>
@@ -508,7 +511,7 @@ it('an_opened_link_survives_a_switch', async () => {
   expect((screen.getByLabelText('Magnet link') as HTMLInputElement).value).toBe(magnet)
 })
 
-it('manage_instances_opens_settings_at_the_instances_section', async () => {
+it('manage_instances_opens_the_instances_section', async () => {
   shell.connect.mockResolvedValueOnce(bearer('first'))
   renderRoot()
   await screen.findByText(`workspace ${BASE} first`)
@@ -516,6 +519,14 @@ it('manage_instances_opens_settings_at_the_instances_section', async () => {
   fireEvent.click(screen.getByRole('menuitem', { name: 'Manage instances' }))
   await screen.findByText('settings at settings-desktop-instances')
   expect(screen.queryByRole('heading', { name: 'Instances', level: 1 }), 'the standalone manager opened').toBeNull()
+})
+
+it('serving_link_opens_serving', async () => {
+  shell.connect.mockResolvedValueOnce(bearer('first')).mockResolvedValueOnce(bearer('restarted'))
+  renderRoot()
+  await screen.findByText(`workspace ${BASE} first`)
+  fireEvent.click(screen.getByRole('button', { name: 'serving applied' }))
+  await screen.findByText('settings at settings-desktop-serving')
 })
 
 it('a_serving_change_reconnects_this_computer_at_once', async () => {
