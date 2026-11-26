@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Unfinished folder, watch folder, start paused and run a program on completion (`downloads:` in `config.yaml`). ([#45](https://github.com/featherbitplatform/featherbittorrent/pull/45))
-- A proxy (`proxy:` in `config.yaml`): an HTTP or SOCKS5 proxy, by host and port, with an optional user name and password. With a proxy set, every connection goes through it, and what a proxy cannot carry is off (incoming connections, port forwarding, local peer discovery, and with an HTTP proxy the DHT, uTP and UDP trackers). A config that names a proxy and cannot be read refuses to start instead of running on defaults and connecting directly. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- A proxy (`proxy:` in `config.yaml`): an HTTP or SOCKS5 proxy, by host and port, with an optional user name and password. With a proxy set, every connection goes through it, and what a proxy cannot carry is off (incoming connections, port forwarding, local peer discovery, and with an HTTP proxy the DHT, uTP and UDP trackers). A config that names a proxy and cannot be read refuses to start instead of running on defaults and connecting directly. ([#51](https://github.com/featherbitplatform/featherbittorrent/pull/51))
 
 ### Changed
 
