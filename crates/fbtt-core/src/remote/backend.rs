@@ -199,7 +199,9 @@ impl Backend {
                 }
                 // A server that will not answer its queue route still has rates to show: the counts stay
                 // unknown rather than being invented as unlimited.
-                Err(ApiError::Answer(_)) => self.limits = map::rate_limits(&session),
+                Err(ApiError::Answer(_) | ApiError::NotFound(_)) => {
+                    self.limits = map::rate_limits(&session)
+                }
                 Err(problem) => return Err(problem),
             }
             self.want_limits = false;
@@ -284,6 +286,7 @@ impl Backend {
             default_dir: self.default_dir.clone(),
             dirs: self.dirs.clone(),
             devices: self.devices.clone(),
+            settings: self.settings.clone(),
         });
         if next == self.published {
             return;
@@ -307,7 +310,7 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::LiveLimits;
+    use crate::client::{LiveLimits, SettingsState};
     use crate::remote::Secret;
     use crate::remote::blank;
     use crate::remote::http::Api;
@@ -356,6 +359,7 @@ mod tests {
             watching: None,
             dirs: None,
             devices: None,
+            settings: SettingsState::NotLoaded,
             relay: None,
             torrents: Vec::new(),
             totals: Totals {

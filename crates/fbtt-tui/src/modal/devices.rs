@@ -297,6 +297,7 @@ mod tests {
             default_dir: PathBuf::from("/downloads"),
             dirs: None,
             devices,
+            settings: fbtt_core::SettingsState::NotLoaded,
         }
     }
 

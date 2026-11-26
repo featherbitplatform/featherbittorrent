@@ -7,11 +7,14 @@
 use std::path::PathBuf;
 
 use crate::client::{
-    AddSource, Command, DeviceCommand, DirListing, FilePriority, LiveLimits, Notice, TorrentId,
+    AddSource, Command, DeviceCommand, DirListing, FilePriority, LiveLimits, Notice,
+    SettingsChange, SettingsCommand, SettingsState, TorrentId,
 };
 use crate::engine::map::{clean, rate_bytes};
+use crate::remote::bodies::ApiError;
 use crate::remote::routes::{encode, torrent_route};
 use crate::remote::{Backend, map};
+use crate::settings::SettingsView;
 
 impl Backend {
     /// One command, answered. `Shutdown` never reaches here: the loop stops on it before doing any work.
@@ -42,6 +45,7 @@ impl Backend {
             }
             Command::ListDirs(path) => self.dirs = Some(self.list_dirs(path).await),
             Command::Devices(command) => self.devices(command).await,
+            Command::Settings(command) => self.settings(command).await,
             // Playing a file: a stream address from the server's token route, checked
             // before it reaches a player, through the relay for a gateway target.
             Command::Stream { id, file } => self.stream(&id, file).await,
@@ -241,4 +245,50 @@ impl Backend {
             }
         }
     }
+
+    /// One [`Command::Settings`]: `GET /api/v1/settings` to load, and the matching `PUT` to save. The
+    /// server's answer to either is the whole view, which is what the next snapshot carries. A server
+    /// older than these routes answers `404`, which is [`SettingsState::Unsupported`] and nothing worse:
+    /// its limits still save through [`Command::SetLimits`].
+    pub(crate) async fn settings(&mut self, command: SettingsCommand) {
+        let saving = !matches!(command, SettingsCommand::Load);
+        let request = match command {
+            SettingsCommand::Load => self.api.get("/api/v1/settings"),
+            SettingsCommand::Save(SettingsChange::Speed(limits)) => {
+                self.api.put_json("/api/v1/settings/speed", &limits)
+            }
+            SettingsCommand::Save(SettingsChange::Downloads(mut change)) => {
+                // The program is the server's own config file's to hold: a remote client never names it,
+                // whatever the screen handed in, and an absent key keeps what the file has.
+                change.on_complete = None;
+                self.api.put_json("/api/v1/settings/downloads", &change)
+            }
+        };
+        match self.api.json::<SettingsView>(request).await {
+            Ok(mut view) => {
+                // Both lines are the server's text about its own disk.
+                view.downloads.watch_problem =
+                    view.downloads.watch_problem.map(|line| clean(&line));
+                view.downloads.on_complete_problem =
+                    view.downloads.on_complete_problem.map(|line| clean(&line));
+                if saving {
+                    // What the server says it is running under is the truth until the next read.
+                    self.limits = view.speed;
+                    self.notify(Notice::Info("Saved.".to_owned()));
+                }
+                self.settings = SettingsState::Loaded(view);
+            }
+            Err(ApiError::NotFound(_)) => {
+                self.settings = SettingsState::Unsupported;
+                if saving {
+                    self.notify(Notice::Error(TOO_OLD.to_owned()));
+                }
+            }
+            Err(problem) => self.notify(problem.notice()),
+        }
+    }
 }
+
+/// What a save answers when the server has no settings routes: said in the plan's own words.
+const TOO_OLD: &str =
+    "This server is too old to change its settings here. Update it to change them.";

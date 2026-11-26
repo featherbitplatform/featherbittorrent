@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::config::Limits;
+use crate::settings::{DownloadsChange, SettingsView};
 
 /// Commands the backend queues before [`Client::send`] starts refusing them. It
 /// handles one at a time and each is short, so 64 is more than a person can type.
@@ -357,6 +358,45 @@ pub struct Snapshot {
     /// The devices a server lets sign in, from the last [`Command::Devices`]; `None` until one is asked
     /// for, which is also what a library with no server to manage them keeps showing.
     pub devices: Option<Vec<DeviceRow>>,
+    /// What the Settings screen shows, from the last [`SettingsCommand::Load`] or save; see
+    /// [`SettingsState`].
+    pub settings: SettingsState,
+}
+
+/// What the screen asks of a backend's settings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsCommand {
+    /// Read the settings: the answer is [`Snapshot::settings`].
+    Load,
+    /// Change one section and save it. The answer is the new [`Snapshot::settings`] and a
+    /// [`Notice::Info`] saying `Saved.`, or a [`Notice::Error`] with the reason and nothing changed.
+    Save(SettingsChange),
+}
+
+/// One section of the settings, whole, as a form submits it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsChange {
+    /// The running rates and queue counts.
+    Speed(LiveLimits),
+    /// The folders, the switch and (on a library run in this process only) the program to run.
+    Downloads(DownloadsChange),
+}
+
+/// What a snapshot knows about the settings.
+///
+/// `Loaded` holds the view itself rather than a box, which is the shape the screens are written against:
+/// one of these lives in each snapshot, so the size of the unused variants costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SettingsState {
+    /// Nothing has asked yet.
+    #[default]
+    NotLoaded,
+    /// The settings as the backend last read them.
+    Loaded(SettingsView),
+    /// The server is too old to have settings routes: its limits still save through
+    /// [`Command::SetLimits`], and everything else is set in its config file.
+    Unsupported,
 }
 
 /// What a torrent is being added from.
@@ -417,6 +457,8 @@ pub enum Command {
         /// The file to play, or the backend's choice when `None`.
         file: Option<usize>,
     },
+    /// Read or change the settings; see [`SettingsCommand`].
+    Settings(SettingsCommand),
     /// Save everything and stop. Dropping every [`Client`] is the same as this.
     Shutdown,
 }

@@ -37,6 +37,10 @@ pub(crate) enum ApiError {
     /// outside the server's roots, a body the server could not parse. The link is fine; one line tells
     /// the person what the server said.
     Answer(String),
+    /// A `404`: the server has no such route or no such thing. It is an ordinary answer like
+    /// [`Answer`](Self::Answer), and is its own variant so that a caller can tell "this server is older
+    /// than the route I asked for" from every other refusal. What it carries is the line to show.
+    NotFound(String),
     /// The relay's head wait ran out: the upstream opened the connection and then never sent a
     /// response head within [`super::http::RELAY_HEAD_TIMEOUT`]. It is its own variant rather than
     /// [`Transport`](Self::Transport) or [`Answer`](Self::Answer) because the relay answers it with
@@ -53,7 +57,7 @@ impl ApiError {
         match self {
             ApiError::Transport(problem) => format!("the server could not be reached: {problem}"),
             ApiError::Refused(reason) => format!("{SIGN_IN_REFUSED}: {reason}"),
-            ApiError::Answer(message) => message.clone(),
+            ApiError::Answer(message) | ApiError::NotFound(message) => message.clone(),
             ApiError::HeadTimeout => "the server did not answer the stream request".to_string(),
         }
     }

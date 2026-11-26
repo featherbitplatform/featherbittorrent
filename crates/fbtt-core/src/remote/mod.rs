@@ -46,7 +46,7 @@ use zeroize::Zeroizing;
 
 use crate::client::{
     COMMAND_QUEUE, Client, Command, Connection, Detail, DetailTab, DeviceRow, DirListing,
-    LinkState, LiveLimits, Notice, Snapshot, TorrentId, TorrentRow, Totals,
+    LinkState, LiveLimits, Notice, SettingsState, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::engine::map::clean;
 use crate::ui_state::{LoginMethod, RemoteTarget};
@@ -201,6 +201,7 @@ impl RemoteBackend {
                     watching: None,
                     dirs: None,
                     devices: None,
+                    settings: SettingsState::NotLoaded,
                     // The relay starts on the first `Stream` a gateway target is asked
                     // for, and is kept for the run. A plain field: commands are answered
                     // one at a time by the loop, so a second `Stream` cannot race the
@@ -257,6 +258,7 @@ fn blank(name: String, secure: bool, auth: String, state: LinkState) -> Snapshot
         default_dir: PathBuf::new(),
         dirs: None,
         devices: None,
+        settings: SettingsState::NotLoaded,
     }
 }
 
@@ -325,6 +327,8 @@ struct Backend {
     dirs: Option<DirListing>,
     /// The devices this server lets sign in, from the last `Devices` command; `None` until one is asked for.
     devices: Option<Vec<DeviceRow>>,
+    /// What the settings routes last answered (see [`SettingsState`]), kept so every later snapshot carries it.
+    settings: SettingsState,
     /// The loopback relay a gateway target streams through: started on the first
     /// `Stream` that needs it and kept for the run, the same arrangement as the local
     /// endpoint (see [`crate::stream::local::LocalEndpoint`]). A plain field rather than

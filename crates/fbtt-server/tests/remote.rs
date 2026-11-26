@@ -21,14 +21,15 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::MethodRouter, routing::get, routing::post};
+use axum::{Json, Router, routing::MethodRouter, routing::get, routing::post, routing::put};
 use base64::Engine as _;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{
     AddSource, AuthConfig, Client, Command, Config, Connection, DeviceCommand, DeviceEntry,
     DirListing, LibraryLock, LinkState, LoginMethod, Notice, Paths, RemoteBackend, RemoteTarget,
-    RowState, Secret, ServerConfig, TorrentId, UserEntry,
+    RowState, Secret, ServerConfig, SettingsChange, SettingsCommand, SettingsState, TorrentId,
+    UserEntry,
 };
 use fbtt_server::Server;
 use fbtt_server::auth::password;
@@ -4499,5 +4500,245 @@ async fn hostile_server_stream_answer() {
     // The link is up: a rude answer is an answer, and the client is still answering
     // its screen.
     wait_for_state(&mut client, true).await;
+    shutdown(&mut client).await;
+}
+
+// ------------------------------------------------------------------------------------------- settings
+
+/// `Load` then `Save(Speed)` against a real server: the answer becomes `Loaded` with the new numbers, and
+/// the server's own `config.yaml` has them.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_settings_round_trip() {
+    let lib = Library::new("remote_settings", vec![alice()], vec![]);
+    let (server, addr) = lib.serve().await;
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let first = wait_for(&mut client, |snapshot| match &snapshot.settings {
+        SettingsState::Loaded(view) => Some(view.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first.downloads.default_dir, lib.config.download_dir);
+
+    let mut limits = first.speed;
+    limits.download_kib = 321;
+    limits.upload_kib = 123;
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Speed(limits)
+    ))));
+    let saved = wait_for(&mut client, |snapshot| match &snapshot.settings {
+        SettingsState::Loaded(view) if view.speed.download_kib == 321 => Some(view.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(saved.speed.upload_kib, 123);
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line == "Saved.")
+    })
+    .await;
+    assert!(lines.iter().any(|line| line == "Saved."), "{lines:?}");
+
+    match Config::load(&lib.paths).expect("read the server's config back") {
+        fbtt_core::ConfigLoad::Loaded(config) => {
+            assert_eq!(config.limits.download_kib, 321);
+            assert_eq!(config.limits.upload_kib, 123);
+        }
+        other => panic!("the server wrote its limits, got {other:?}"),
+    }
+
+    shutdown(&mut client).await;
+    within(server.shutdown()).await.expect("the last save ran");
+}
+
+/// The settings a stub server answers: a view whose program is shown and not editable, as a real server
+/// answers every request that does not carry the launch secret.
+fn stub_view(program: &Path) -> Value {
+    json!({
+        "speed": {
+            "download_kib": 0,
+            "upload_kib": 0,
+            "active_downloads": 3,
+            "active_seeds": null,
+            "active_total": null
+        },
+        "downloads": {
+            "default_dir": std::env::temp_dir(),
+            "unfinished_dir": null,
+            "start_paused": false,
+            "watch_dir": null,
+            "on_complete": { "program": program, "editable": false },
+            "watch_problem": null,
+            "on_complete_problem": null
+        }
+    })
+}
+
+/// A server's program is its config file's to hold: the view says it is not editable, and a downloads save
+/// from the remote backend never sends the `on_complete` key, whatever the screen handed in.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_program_is_not_editable() {
+    let program = std::env::current_exe().expect("this test's own binary");
+    let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let view = stub_view(&program);
+    let get_view = view.clone();
+    let put_view = view.clone();
+    let seen = Arc::clone(&bodies);
+    let fake = Fake::plain();
+    let addr = serve(
+        api_routes(get(events))
+            .route(
+                "/api/v1/settings",
+                get(move || {
+                    let body = get_view.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/api/v1/settings/downloads",
+                put(move |Json(body): Json<Value>| {
+                    let seen = Arc::clone(&seen);
+                    let answer = put_view.clone();
+                    async move {
+                        seen.lock().expect("the test state").push(body);
+                        Json(answer)
+                    }
+                }),
+            )
+            .with_state(fake),
+    )
+    .await;
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let loaded = wait_for(&mut client, |snapshot| match &snapshot.settings {
+        SettingsState::Loaded(view) => Some(view.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!loaded.downloads.on_complete.editable);
+    assert_eq!(loaded.downloads.on_complete.program, Some(program.clone()));
+
+    // The screen hands in a program anyway.
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(fbtt_core::DownloadsChange {
+            default_dir: std::env::temp_dir(),
+            unfinished_dir: None,
+            start_paused: true,
+            watch_dir: None,
+            on_complete: Some(fbtt_core::OnCompleteSet {
+                program: Some(program),
+            }),
+        })
+    ))));
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line == "Saved.")
+    })
+    .await;
+    assert!(lines.iter().any(|line| line == "Saved."), "{lines:?}");
+
+    let bodies = bodies.lock().expect("the test state").clone();
+    assert_eq!(bodies.len(), 1, "one save, one request: {bodies:?}");
+    assert_eq!(bodies[0]["start_paused"], json!(true), "the section went");
+    assert!(
+        bodies[0].get("on_complete").is_none(),
+        "a remote client never names the program: {:?}",
+        bodies[0]
+    );
+
+    shutdown(&mut client).await;
+}
+
+/// A server older than the settings routes answers `404`: the settings are `Unsupported`, nothing spins,
+/// and the limits still save through the engine routes as they always did.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_server_settings_are_unsupported_and_limits_still_save() {
+    let limits_bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = Arc::clone(&limits_bodies);
+    let fake = Fake::plain();
+    let addr = serve(
+        api_routes(get(events))
+            .route(
+                "/api/v1/session/limits",
+                put(move |Json(body): Json<Value>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock().expect("the test state").push(body);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/session/queue",
+                put(|Json(_): Json<Value>| async { StatusCode::NO_CONTENT }),
+            )
+            .with_state(fake),
+    )
+    .await;
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::None, None, None),
+        Secret::None,
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    wait_for(&mut client, |snapshot| {
+        (snapshot.settings == SettingsState::Unsupported).then_some(())
+    })
+    .await;
+    // Still connected: a missing route is not a lost link.
+    wait_for_state(&mut client, true).await;
+
+    // A save says the server is too old.
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Speed(fbtt_core::LiveLimits {
+            download_kib: 50,
+            upload_kib: 0,
+            active_downloads: None,
+            active_seeds: None,
+            active_total: None,
+        })
+    ))));
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line.contains("too old"))
+    })
+    .await;
+    assert!(
+        lines.iter().any(|line| line
+            == "This server is too old to change its settings here. Update it to change them."),
+        "{lines:?}"
+    );
+
+    // And the old path works.
+    assert!(client.send(Command::SetLimits(fbtt_core::LiveLimits {
+        download_kib: 50,
+        upload_kib: 0,
+        active_downloads: None,
+        active_seeds: None,
+        active_total: None,
+    })));
+    within(async {
+        loop {
+            if !limits_bodies.lock().expect("the test state").is_empty() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+    let bodies = limits_bodies.lock().expect("the test state").clone();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+
     shutdown(&mut client).await;
 }
