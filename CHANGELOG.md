@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Saving settings keeps keys in `config.yaml` that this version does not know about. ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
+- Built on fbt-lib 0.13.0. ([#46](https://github.com/featherbitplatform/featherbittorrent/pull/46))
 
 ## [0.4.1] - 2026-11-24
 
