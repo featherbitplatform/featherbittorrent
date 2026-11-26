@@ -407,20 +407,193 @@ fn paths_are_drawn_through_display_safe() {
     if let SettingsState::Loaded(view) = &mut snap.settings {
         view.downloads.default_dir =
             PathBuf::from(format!("{}\u{1b}[31mEVIL   TAIL", dir("d").display()));
-        view.downloads.watch_problem = Some("bad\u{7}bell".to_string());
-        view.downloads.on_complete.program = Some(PathBuf::from("run\u{202e}this"));
+        view.downloads.watch_problem = Some("watch   problem".to_string());
+        view.downloads.on_complete_problem = Some("program   problem".to_string());
+        view.downloads.on_complete.program = Some(PathBuf::from("run\u{1b}   this"));
     }
     let model = open(&snap);
-    let screen = Screen::new(&model, &snap, 140, 30);
-    let text = screen.text();
+    let text = Screen::new(&model, &snap, 140, 30).text();
     // Display-safe text has its control characters gone and its runs of spaces collapsed, which is
-    // what tells a path drawn through `display_safe` from one drawn raw.
+    // what tells a path drawn through `display_safe` from one drawn raw. Each of the four lines
+    // carries its own marker, so dropping the call from any one of them fails here.
+    for marker in ["EVIL TAIL", "watch problem", "program problem", "run this"] {
+        assert!(
+            text.contains(marker),
+            "{marker:?} was not drawn safely:\n{text}"
+        );
+    }
     assert!(
-        text.contains("EVIL TAIL"),
-        "the path was not drawn safely:\n{text}"
+        !text.contains('\u{1b}'),
+        "a control character reached the screen"
+    );
+}
+
+fn unsupported() -> Snapshot {
+    let mut snap = library();
+    snap.settings = SettingsState::Unsupported;
+    snap.limits.download_kib = 100;
+    snap
+}
+
+/// Esc asks when the open section has unsaved changes and leaves at once when it has none.
+fn is_dirty(model: &mut Model, snap: &Snapshot) -> bool {
+    press(model, snap, KeyCode::Esc);
+    let stayed = model.settings.is_some();
+    if stayed {
+        // Put the question away again.
+        press(model, snap, KeyCode::Esc);
+    }
+    stayed
+}
+
+#[test]
+fn unsupported_set_limits_failure_is_shown_and_form_stays_dirty() {
+    let snap = unsupported();
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    model.push_notice(
+        Notice::Error("the engine refused".to_string()),
+        Instant::now(),
+    );
+    let text = Screen::new(&model, &snap, 120, 30).text();
+    assert!(text.contains("the engine refused"), "{text}");
+    assert!(
+        is_dirty(&mut model, &snap),
+        "a refused save marked the form saved"
+    );
+    // The snapshot's old limits do not revert what was typed.
+    model.sync_selection(&snap);
+    assert!(Screen::new(&model, &snap, 120, 30).text().contains("64"));
+
+    // A save with no answer but the limits showing up in the next snapshot is a good one.
+    model.handle_key(ctrl_s(), &snap);
+    assert!(
+        is_dirty(&mut model, &snap),
+        "saved before the limits arrived"
+    );
+    let mut newer = snap.clone();
+    newer.limits.download_kib = 64;
+    model.sync_selection(&newer);
+    assert!(!is_dirty(&mut model, &newer));
+}
+
+#[test]
+fn typing_during_a_save_keeps_the_form_dirty() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    replace_field(&mut model, &snap, "65");
+    model.push_notice(Notice::Info("Saved.".to_string()), Instant::now());
+    assert!(
+        is_dirty(&mut model, &snap),
+        "an edit made during the save was marked saved"
+    );
+}
+
+#[test]
+fn an_unrelated_notice_does_not_answer_the_save() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    model.push_notice(Notice::Info("Torrent added".to_string()), Instant::now());
+    assert!(
+        is_dirty(&mut model, &snap),
+        "another line answered the save"
+    );
+    model.push_notice(Notice::Info("Saved.".to_string()), Instant::now());
+    assert!(!is_dirty(&mut model, &snap));
+}
+
+#[test]
+fn ctrl_s_while_saving_sends_once() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    assert_eq!(model.handle_key(ctrl_s(), &snap).len(), 1);
+    assert!(
+        model.handle_key(ctrl_s(), &snap).is_empty(),
+        "a second save went out"
     );
     assert!(
-        !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\u{202e}'),
-        "a control or format character reached the screen"
+        Screen::new(&model, &snap, 120, 30)
+            .text()
+            .contains("saving")
+    );
+    // A refusal frees the Save row again.
+    model.push_notice(Notice::Error("no".to_string()), Instant::now());
+    assert_eq!(model.handle_key(ctrl_s(), &snap).len(), 1);
+}
+
+#[test]
+fn refused_load_is_shown() {
+    let snap = library();
+    let mut model = open(&snap);
+    assert!(
+        Screen::new(&model, &snap, 120, 30)
+            .text()
+            .contains("Loading settings.")
+    );
+    model.push_notice(
+        Notice::Error("cannot read the settings".to_string()),
+        Instant::now(),
+    );
+    let text = Screen::new(&model, &snap, 120, 30).text();
+    assert!(text.contains("cannot read the settings"), "{text}");
+    assert!(!text.contains("Loading settings."));
+    press(&mut model, &snap, KeyCode::Esc);
+    assert!(model.settings.is_none(), "Esc did not leave");
+}
+
+#[test]
+fn speed_fields_all_convert() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    for text in ["2048", "1024", "3", "", "5"] {
+        replace_field(&mut model, &snap, text);
+        press(&mut model, &snap, KeyCode::Down);
+    }
+    let actions = model.handle_key(ctrl_s(), &snap);
+    assert_eq!(
+        actions,
+        vec![Action::Command(Command::Settings(SettingsCommand::Save(
+            SettingsChange::Speed(LiveLimits {
+                download_kib: 2048,
+                upload_kib: 1024,
+                active_downloads: Some(3),
+                active_seeds: None,
+                active_total: Some(5),
+            })
+        )))]
+    );
+
+    // A field that is not a number is marked red and nothing goes out.
+    let mut model = open_speed(&snap);
+    press(&mut model, &snap, KeyCode::Enter);
+    type_text(&mut model, &snap, "abc");
+    press(&mut model, &snap, KeyCode::Enter);
+    assert!(model.handle_key(ctrl_s(), &snap).is_empty());
+    let screen = Screen::new(&model, &snap, 120, 30);
+    let (x, y) = screen.find("0abc").expect("the field was not drawn");
+    assert_eq!(
+        screen.fg(x, y),
+        ratatui::style::Color::Rgb(0xed, 0x4a, 0x49)
+    );
+}
+
+#[test]
+fn a_long_value_keeps_the_caret_in_view() {
+    let snap = loaded(false);
+    let mut model = open(&snap);
+    press(&mut model, &snap, KeyCode::Tab);
+    press(&mut model, &snap, KeyCode::Enter);
+    type_text(&mut model, &snap, &"z".repeat(200));
+    type_text(&mut model, &snap, "END");
+    let text = Screen::new(&model, &snap, 80, 20).text();
+    assert!(
+        text.contains("zzEND"),
+        "the end of a long value is not in view:\n{text}"
     );
 }

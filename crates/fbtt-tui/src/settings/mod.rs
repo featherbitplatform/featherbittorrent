@@ -57,9 +57,6 @@ pub(crate) enum ScreenAnswer {
     Close,
     /// Something for the backend; the screen stays up for the answer.
     Send(Command),
-    /// Something for the backend, then back to the torrents: a save answered `s` to the leave question
-    /// on a path the backend does not acknowledge.
-    SendThenClose(Command),
 }
 
 /// Which half of the screen takes the keys.
@@ -79,6 +76,29 @@ enum Pending {
     /// Open another section.
     Section(TuiSection),
 }
+
+/// The values a save carried, kept until its answer comes back. What the section holds as saved
+/// afterwards is exactly this, whatever was typed since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SentValues {
+    /// The five speed texts, and the limits themselves when they went out through `SetLimits`, which
+    /// the backend does not acknowledge: the next snapshot that carries them is the answer.
+    Speed([String; 5], Option<LiveLimits>),
+    /// The downloads texts and the switch.
+    Downloads([String; 4], bool),
+}
+
+/// A save that went out and has not been answered yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlight {
+    section: TuiSection,
+    sent: SentValues,
+    /// What to do once the save is answered well.
+    pending: Option<Pending>,
+}
+
+/// The one notice a good save is answered with.
+const SAVED: &str = "Saved.";
 
 /// One row of the downloads section a cursor can stand on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +151,6 @@ impl SpeedForm {
 
     fn dirty(&self) -> bool {
         self.values() != self.base
-    }
-
-    fn saved(&mut self) {
-        self.base = self.values();
     }
 
     fn discard(&mut self) {
@@ -266,10 +282,6 @@ impl DownloadsForm {
         self.values() != self.base
     }
 
-    fn saved(&mut self) {
-        self.base = self.values();
-    }
-
     fn discard(&mut self) {
         let row = self.row;
         let ([default, unfinished, watch, program], paused) = self.base.clone();
@@ -321,9 +333,11 @@ pub struct SettingsScreen {
     /// The question asked when leaving with unsaved changes, and what it was about.
     confirm: Option<Pending>,
     /// A save has gone out and its answer has not come back.
-    saving: bool,
-    /// What to do once that save is answered well.
-    pending: Option<Pending>,
+    in_flight: Option<InFlight>,
+    /// A save answered well on the way out: the model closes the screen.
+    close_requested: bool,
+    /// What a refused Load said, drawn in place of the loading line.
+    pub(crate) load_error: Option<String>,
     /// The line the last refused save came back with.
     pub(crate) error: Option<String>,
 }
@@ -342,8 +356,9 @@ impl SettingsScreen {
             unsupported: false,
             editing: false,
             confirm: None,
-            saving: false,
-            pending: None,
+            in_flight: None,
+            close_requested: false,
+            load_error: None,
             error: None,
         };
         screen.refresh(state);
@@ -363,8 +378,23 @@ impl SettingsScreen {
     pub(crate) fn sync(&mut self, snap: &Snapshot) {
         self.refresh(&snap.settings);
         if self.unsupported {
+            // `SetLimits` has no acknowledgement: the snapshot that carries the numbers sent is it.
+            if let Some(InFlight {
+                sent: SentValues::Speed(_, Some(limits)),
+                ..
+            }) = &self.in_flight
+                && *limits == snap.limits
+                && self.complete_save()
+            {
+                self.close_requested = true;
+            }
             self.fill_speed(&snap.limits);
         }
+    }
+
+    /// Whether a save is out and waiting for its answer.
+    pub(crate) fn saving(&self) -> bool {
+        self.in_flight.is_some()
     }
 
     /// Refills the sections that are not dirty from `state`. A form with unsaved changes keeps what
@@ -396,6 +426,7 @@ impl SettingsScreen {
             };
         }
         self.downloads_loaded = true;
+        self.load_error = None;
     }
 
     fn fill_speed(&mut self, limits: &LiveLimits) {
@@ -407,6 +438,7 @@ impl SettingsScreen {
             };
         }
         self.speed_loaded = true;
+        self.load_error = None;
     }
 
     /// Whether the open section has changes that were not saved.
@@ -436,6 +468,9 @@ impl SettingsScreen {
             return ScreenAnswer::Stay;
         }
         self.sync(snap);
+        if self.take_close() {
+            return ScreenAnswer::Close;
+        }
         if self.confirm.is_some() {
             return self.confirm_key(key);
         }
@@ -640,72 +675,107 @@ impl SettingsScreen {
         ScreenAnswer::Stay
     }
 
-    /// Saves the open section. `then` is what to do once the save is answered well.
+    /// Saves the open section. `then` is what to do once the save is answered well. While a save is
+    /// out nothing is sent again.
     fn save(&mut self, then: Option<Pending>) -> ScreenAnswer {
+        if self.in_flight.is_some() {
+            return ScreenAnswer::Stay;
+        }
         self.editing = false;
         self.error = None;
-        let command = match self.section {
+        let (command, sent) = match self.section {
             TuiSection::Downloads => {
                 if self.unsupported || !self.downloads_loaded {
                     return ScreenAnswer::Stay;
                 }
-                Command::Settings(SettingsCommand::Save(SettingsChange::Downloads(
-                    self.downloads.change(),
-                )))
+                let (texts, paused) = self.downloads.values();
+                (
+                    Command::Settings(SettingsCommand::Save(SettingsChange::Downloads(
+                        self.downloads.change(),
+                    ))),
+                    SentValues::Downloads(texts, paused),
+                )
             }
             TuiSection::Speed => {
                 let Some(limits) = self.speed.limits() else {
                     return ScreenAnswer::Stay;
                 };
                 if self.unsupported {
-                    // A server with no settings routes takes its limits the way it always did, and
-                    // answers nothing the screen could wait for, so this save counts as made.
-                    self.speed.saved();
-                    return match then {
-                        Some(Pending::Leave) => {
-                            ScreenAnswer::SendThenClose(Command::SetLimits(limits))
-                        }
-                        Some(pending) => {
-                            self.proceed(pending);
-                            ScreenAnswer::Send(Command::SetLimits(limits))
-                        }
-                        None => ScreenAnswer::Send(Command::SetLimits(limits)),
-                    };
+                    // A server with no settings routes takes its limits the way it always did.
+                    (
+                        Command::SetLimits(limits),
+                        SentValues::Speed(self.speed.values(), Some(limits)),
+                    )
+                } else {
+                    (
+                        Command::Settings(SettingsCommand::Save(SettingsChange::Speed(limits))),
+                        SentValues::Speed(self.speed.values(), None),
+                    )
                 }
-                Command::Settings(SettingsCommand::Save(SettingsChange::Speed(limits)))
             }
         };
-        self.saving = true;
-        self.pending = then;
+        self.in_flight = Some(InFlight {
+            section: self.section,
+            sent,
+            pending: then,
+        });
         ScreenAnswer::Send(command)
     }
 
-    /// What the backend said about the save that went out. True when the screen should close.
+    /// A save was answered well: what it carried is what the section has saved now, and the form stays
+    /// dirty if it was edited since. Returns whether the screen should close.
+    fn complete_save(&mut self) -> bool {
+        let Some(flight) = self.in_flight.take() else {
+            return false;
+        };
+        match flight.sent {
+            SentValues::Speed(values, _) => self.speed.base = values,
+            SentValues::Downloads(texts, paused) => self.downloads.base = (texts, paused),
+        }
+        // Edited since: the section still has unsaved changes, so the question that was waiting on
+        // this save is asked again rather than answered.
+        let clean = match flight.section {
+            TuiSection::Downloads => !self.downloads.dirty(),
+            TuiSection::Speed => !self.speed.dirty(),
+        };
+        match flight.pending {
+            Some(Pending::Leave) if clean => return true,
+            Some(Pending::Section(section)) if clean => {
+                self.proceed(Pending::Section(section));
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Whether a good save asked for the screen to close, and forgets it.
+    pub(crate) fn take_close(&mut self) -> bool {
+        std::mem::take(&mut self.close_requested)
+    }
+
+    /// What the backend said. True when the screen should close.
+    ///
+    /// While a save is out, the first `Saved.` or the first error is its answer and nothing else is:
+    /// a line about another torrent is not about this form. A refused Load is shown where the loading
+    /// line was.
     pub(crate) fn on_notice(&mut self, notice: &Notice) -> bool {
-        if !self.saving {
+        if self.in_flight.is_none() {
+            if let Notice::Error(text) = notice
+                && !self.speed_loaded
+                && !self.downloads_loaded
+                && !self.unsupported
+            {
+                self.load_error = Some(text.clone());
+            }
             return false;
         }
         match notice {
-            Notice::Info(_) => {
-                self.saving = false;
-                match self.section {
-                    TuiSection::Downloads => self.downloads.saved(),
-                    TuiSection::Speed => self.speed.saved(),
-                }
-                match self.pending.take() {
-                    Some(Pending::Leave) => return true,
-                    Some(pending) => {
-                        self.proceed(pending);
-                    }
-                    None => {}
-                }
-            }
+            Notice::Info(text) if text == SAVED => return self.complete_save(),
             Notice::Error(text) | Notice::SignInRefused(text) => {
-                self.saving = false;
-                self.pending = None;
+                self.in_flight = None;
                 self.error = Some(text.clone());
             }
-            Notice::Play(_) => {}
+            Notice::Info(_) | Notice::Play(_) => {}
         }
         false
     }

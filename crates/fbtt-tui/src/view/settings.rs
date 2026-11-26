@@ -59,7 +59,10 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, model: &Model, screen: &Settin
         area.width - LIST_WIDTH - 3,
         body_height,
     );
-    frame.render_widget(Paragraph::new(section_lines(screen)), content);
+    frame.render_widget(
+        Paragraph::new(section_lines(screen, usize::from(content.width))),
+        content,
+    );
 
     // The line above the keys: what the last save was refused with, or what it said.
     let status = Rect::new(area.x + 1, area.y + area.height - 2, area.width - 1, 1);
@@ -162,7 +165,14 @@ fn label(text: &str, on_row: bool) -> Vec<Span<'static>> {
 
 /// A text field's line. The text is drawn through `display_safe`, and the caret is drawn only while
 /// the field is being edited.
-fn field(text: &str, input: &Input, on_row: bool, editing: bool, invalid: bool) -> Line<'static> {
+fn field(
+    text: &str,
+    input: &Input,
+    on_row: bool,
+    editing: bool,
+    invalid: bool,
+    room: usize,
+) -> Line<'static> {
     let colour = if invalid {
         theme::RED_500
     } else {
@@ -171,17 +181,39 @@ fn field(text: &str, input: &Input, on_row: bool, editing: bool, invalid: bool) 
     let style = Style::new().fg(colour);
     let mut spans = label(text, on_row);
     if on_row && editing {
+        // The text being edited is drawn as it is, control characters aside: collapsing spaces here
+        // would put the caret somewhere else than where the next character lands. A value longer
+        // than the row scrolls so the caret stays in view.
         let caret = Style::new().fg(theme::INK_950).bg(theme::INK_50);
-        let (before, at_cursor) = input.split_at_cursor();
-        spans.push(Span::styled(format::safe(&before), style));
-        let mut rest = format::safe(&at_cursor)
-            .chars()
-            .collect::<Vec<_>>()
-            .into_iter();
-        match rest.next() {
+        let at = input.cursor.min(input.text.chars().count());
+        let mut visible: Vec<char> = Vec::new();
+        let mut caret_at = 0;
+        for (index, c) in input.text.chars().enumerate() {
+            if index == at {
+                caret_at = visible.len();
+            }
+            if !c.is_control() {
+                visible.push(c);
+            }
+        }
+        if at >= input.text.chars().count() {
+            caret_at = visible.len();
+        }
+        let room = room.max(2);
+        let start = (caret_at + 1).saturating_sub(room);
+        let shown: Vec<char> = visible[start..].iter().take(room).copied().collect();
+        let local = caret_at - start;
+        spans.push(Span::styled(
+            shown[..local].iter().collect::<String>(),
+            style,
+        ));
+        match shown.get(local) {
             Some(c) => {
                 spans.push(Span::styled(c.to_string(), caret));
-                spans.push(Span::styled(rest.collect::<String>(), style));
+                spans.push(Span::styled(
+                    shown[local + 1..].iter().collect::<String>(),
+                    style,
+                ));
             }
             None => spans.push(Span::styled(" ", caret)),
         }
@@ -224,7 +256,9 @@ fn problem(text: &str) -> Line<'static> {
     ])
 }
 
-fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
+fn section_lines(screen: &SettingsScreen, width: usize) -> Vec<Line<'static>> {
+    // Cells a field's value may take: what is left of the row after the marker, the label and the gap.
+    let room = width.saturating_sub(2 + LABEL_WIDTH + 2);
     let mut lines = vec![heading(screen.section.title()), Line::default()];
     if !screen.section_ready() {
         let text = if screen.unsupported && screen.section == TuiSection::Downloads {
@@ -232,7 +266,12 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
         } else {
             "Loading settings."
         };
-        lines.push(if screen.unsupported {
+        lines.push(if let Some(error) = &screen.load_error {
+            Line::from(Span::styled(
+                format::safe(error),
+                Style::new().fg(theme::RED_500),
+            ))
+        } else if screen.unsupported {
             Line::from(Span::styled(text, Style::new().fg(theme::AMBER_500)))
         } else {
             muted(text)
@@ -253,6 +292,7 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                 on(DownloadsRow::Default),
                 editing,
                 false,
+                room,
             ));
             lines.push(field(
                 "Unfinished folder",
@@ -260,6 +300,7 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                 on(DownloadsRow::Unfinished),
                 editing,
                 false,
+                room,
             ));
             lines.push(switch(
                 "Start torrents paused",
@@ -272,6 +313,7 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                 on(DownloadsRow::Watch),
                 editing,
                 false,
+                room,
             ));
             if let Some(text) = &form.watch_problem {
                 lines.push(problem(text));
@@ -283,6 +325,7 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                     on(DownloadsRow::Program),
                     editing,
                     false,
+                    room,
                 ));
             } else {
                 let mut spans = label("Run a program on completion", false);
@@ -302,7 +345,7 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                 lines.push(problem(text));
             }
             lines.push(Line::default());
-            lines.push(save_row(on(DownloadsRow::Save), false));
+            lines.push(save_row(on(DownloadsRow::Save), screen.saving()));
         }
         TuiSection::Speed => {
             let form = &screen.speed;
@@ -325,11 +368,12 @@ fn section_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                     on(index),
                     editing,
                     form.invalid == Some(index),
+                    room,
                 ));
             }
             lines.push(muted("  0 or nothing means unlimited"));
             lines.push(Line::default());
-            lines.push(save_row(on(SPEED_SAVE_ROW), false));
+            lines.push(save_row(on(SPEED_SAVE_ROW), screen.saving()));
         }
     }
     lines

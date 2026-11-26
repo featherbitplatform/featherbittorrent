@@ -99,10 +99,6 @@ pub(crate) fn handle(model: &mut Model, key: KeyEvent, snap: &Snapshot) -> Vec<A
                 Vec::new()
             }
             ScreenAnswer::Send(command) => vec![Action::Command(command)],
-            ScreenAnswer::SendThenClose(command) => {
-                model.settings = None;
-                vec![Action::Command(command)]
-            }
         };
     }
     // `Ctrl+O` is the one modified key a dialog has to be given: its whole job is to put a folder into

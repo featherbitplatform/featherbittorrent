@@ -293,6 +293,9 @@ impl Model {
         // A new snapshot may carry settings the open screen was waiting for.
         if let Some(screen) = self.settings.as_mut() {
             screen.sync(snap);
+            if screen.take_close() {
+                self.settings = None;
+            }
         }
         let rows = visible_rows(self, snap);
         if let Some(at) = self.selected_index(&rows) {
