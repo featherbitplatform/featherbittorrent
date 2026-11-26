@@ -114,6 +114,51 @@ fn settings_saved_library_offers_no_server_when_locked() {
     );
 }
 
+/// A config that names a proxy this version cannot use stops the run before anything is started:
+/// one line on stderr and exit 1, not a terminal, not an engine, and not a file renamed aside. The
+/// alternative - the defaults - would connect directly while the person believes their traffic goes
+/// through a proxy, which is the whole reason this setting exists.
+#[test]
+fn a_config_with_an_unusable_proxy_refuses_to_start() {
+    let scratch = Scratch::new("bad_proxy");
+    let config_path = scratch.config_dir.join("config.yaml");
+    fs::write(
+        &config_path,
+        "proxy:\n  type: socks4\n  host: proxy.example\n  port: 1080\n",
+    )
+    .expect("write a config naming a proxy this version cannot use");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_featherbittorrent"))
+        .env("FBTT_CONFIG_DIR", &scratch.config_dir)
+        .env("FBTT_DATA_DIR", &scratch.data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unusable proxy is exit 1: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        stderr.trim(),
+        "Unknown proxy type socks4; use none, http or socks5.",
+        "the one line says what is wrong and nothing else"
+    );
+    assert!(
+        config_path.exists(),
+        "the file is left where it can be fixed"
+    );
+    assert!(
+        !scratch.config_dir.join("config.yaml.bad").exists(),
+        "nothing was renamed aside"
+    );
+}
+
 /// When the terminal cannot be set up, the binary must say so and leave - without ever starting
 /// the engine, which is the bug this test exists for. A run with no tty on any stream is how that
 /// happens in CI. `listen_port: 0` goes in the config first so that an engine which did start

@@ -326,6 +326,31 @@ pub(crate) mod tests {
         assert!(after.server.is_none(), "still no server section on disk");
     }
 
+    /// A config.yaml whose `proxy:` cannot be used is the startup problem: This computer does not start an
+    /// engine that would connect directly, and the line the app shows is the proxy refusal.
+    #[test]
+    fn an_unusable_proxy_is_the_startup_problem() {
+        let dir = ScratchDir::new("desktop-local-bad-proxy");
+        let paths = scratch_paths(&dir);
+        let library = paths.library();
+        let file = library.config_file();
+        std::fs::write(
+            &file,
+            "proxy:\n  type: socks4\n  host: proxy.example\n  port: 1080\n",
+        )
+        .expect("write a config that names a proxy");
+
+        assert_eq!(
+            super::library_config(&library).err().as_deref(),
+            Some("Unknown proxy type socks4; use none, http or socks5.")
+        );
+        assert!(file.exists(), "the file is left in place");
+        assert!(
+            !library.config_file().with_extension("yaml.bad").exists(),
+            "nothing was set aside"
+        );
+    }
+
     /// A library whose config.yaml names no `server:` section (the desktop's default) can add a magnet
     /// into its download folder: the engine's allowed folders are that folder.
     #[tokio::test(flavor = "multi_thread")]

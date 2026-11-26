@@ -23,6 +23,7 @@ pub mod local;
 pub mod lock;
 pub mod paths;
 pub mod player;
+pub mod proxy;
 pub mod remote;
 pub mod settings;
 pub mod stream;
@@ -43,6 +44,9 @@ pub use engine::Engine;
 pub use local::LocalBackend;
 pub use lock::{LibraryLock, LockError};
 pub use paths::Paths;
+pub use proxy::{
+    ProxyHealth, ProxyProblem, ProxySetting, ProxyType, apply_to_settings, network_for,
+};
 pub use remote::{RemoteBackend, Secret};
 pub use settings::{
     DownloadsChange, DownloadsView, OnCompleteSet, OnCompleteView, SettingsProblem, SettingsView,

@@ -29,7 +29,7 @@ use crate::client::{
     LiveLimits, Notice, PlaySource, SettingsChange, SettingsCommand, SettingsState, Snapshot,
     TorrentId, TorrentRow, Totals,
 };
-use crate::config::{Config, ConfigLoad, Limits};
+use crate::config::{Config, ConfigError, ConfigLoad, Limits};
 use crate::downloads::{Automation, AutomationHandle};
 use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
@@ -667,6 +667,14 @@ impl Backend {
                 // The file was read and is left where it is: its settings, the player's at
                 // its default, are what to write on.
                 Ok(ConfigLoad::PlayerProblem { config, .. }) => config,
+                // A file this run cannot read because of its `proxy:` section is never written
+                // over: writing this run's own settings would drop the line and leave a config
+                // that connects directly on the next start, which is the same reason
+                // [`Config::load_for_edit`] refuses one. The line goes to the person instead, and
+                // their bytes stay where they can fix them.
+                Err(problem @ ConfigError::Proxy(_)) => {
+                    return Err(map::clean(&problem.to_string()));
+                }
                 // No file yet, or one that could not be opened at all: keep what this run
                 // started with, which is what the file would have said - its download
                 // folder included, already rooted in the library.
