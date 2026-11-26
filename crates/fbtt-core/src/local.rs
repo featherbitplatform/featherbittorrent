@@ -584,14 +584,15 @@ impl Backend {
         match command {
             SettingsCommand::Load => self.settings_loaded = true,
             SettingsCommand::Save(SettingsChange::Speed(limits)) => {
+                // Loaded even when the save failed, so a refusal still leaves the screen a view to draw.
+                self.settings_loaded = true;
                 if self.set_limits(limits).await {
-                    self.settings_loaded = true;
                     self.notify(Notice::Info(SAVED.to_owned()));
                 }
             }
             SettingsCommand::Save(SettingsChange::Downloads(change)) => {
+                self.settings_loaded = true;
                 if self.save_downloads(change).await {
-                    self.settings_loaded = true;
                     self.notify(Notice::Info(SAVED.to_owned()));
                 }
             }

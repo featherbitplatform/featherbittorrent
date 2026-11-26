@@ -386,6 +386,8 @@ pub enum SettingsChange {
 ///
 /// `Loaded` holds the view itself rather than a box, which is the shape the screens are written against:
 /// one of these lives in each snapshot, so the size of the unused variants costs nothing worth a box.
+/// The paths in a view are raw, because they are values that go back to the server: a surface must pass
+/// them through `fbt::display_safe` when it draws them.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SettingsState {

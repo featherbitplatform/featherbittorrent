@@ -202,6 +202,7 @@ impl RemoteBackend {
                     dirs: None,
                     devices: None,
                     settings: SettingsState::NotLoaded,
+                    settings_asked: false,
                     // The relay starts on the first `Stream` a gateway target is asked
                     // for, and is kept for the run. A plain field: commands are answered
                     // one at a time by the loop, so a second `Stream` cannot race the
@@ -329,6 +330,8 @@ struct Backend {
     devices: Option<Vec<DeviceRow>>,
     /// What the settings routes last answered (see [`SettingsState`]), kept so every later snapshot carries it.
     settings: SettingsState,
+    /// Whether the read made on connecting has been tried, once, whatever it answered.
+    settings_asked: bool,
     /// The loopback relay a gateway target streams through: started on the first
     /// `Stream` that needs it and kept for the run, the same arrangement as the local
     /// endpoint (see [`crate::stream::local::LocalEndpoint`]). A plain field rather than

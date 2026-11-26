@@ -251,6 +251,15 @@ impl Backend {
     /// older than these routes answers `404`, which is [`SettingsState::Unsupported`] and nothing worse:
     /// its limits still save through [`Command::SetLimits`].
     pub(crate) async fn settings(&mut self, command: SettingsCommand) {
+        self.settings_round(command, false).await;
+    }
+
+    /// The same, and with `quiet` an answer that is an error says nothing: the read made on connecting
+    /// is for learning the default folder, not something a person asked for.
+    ///
+    /// The view's paths are the server's own text and are kept raw, because they are values that go back
+    /// to the server; a surface must pass them through [`fbt::display_safe`] when it draws them.
+    pub(crate) async fn settings_round(&mut self, command: SettingsCommand, quiet: bool) {
         let saving = !matches!(command, SettingsCommand::Load);
         let request = match command {
             SettingsCommand::Load => self.api.get("/api/v1/settings"),
@@ -276,14 +285,18 @@ impl Backend {
                     self.limits = view.speed;
                     self.notify(Notice::Info("Saved.".to_owned()));
                 }
+                // Where a torrent goes when the add names no folder, and what the snapshot shows as the
+                // default: the server's own answer, since its roots stay where they were.
+                self.default_dir = view.downloads.default_dir.clone();
                 self.settings = SettingsState::Loaded(view);
             }
             Err(ApiError::NotFound(_)) => {
                 self.settings = SettingsState::Unsupported;
-                if saving {
+                if saving && !quiet {
                     self.notify(Notice::Error(TOO_OLD.to_owned()));
                 }
             }
+            Err(_) if quiet => {}
             Err(problem) => self.notify(problem.notice()),
         }
     }

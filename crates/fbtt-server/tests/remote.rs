@@ -4742,3 +4742,59 @@ async fn old_server_settings_are_unsupported_and_limits_still_save() {
 
     shutdown(&mut client).await;
 }
+
+/// A Default folder changed from a remote screen is where the next add with no folder goes: the server's
+/// roots stay where they were, so the backend follows the answer of the save, not the first root.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_add_without_dir_follows_a_changed_default_folder() {
+    let lib = Library::new("remote_default_follow", vec![alice()], vec![]);
+    let (server, addr) = lib.serve().await;
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+        None,
+    );
+    let connected = wait_for_state(&mut client, true).await;
+    assert_eq!(connected.default_dir, lib.config.download_dir);
+
+    // A folder inside the one root the server serves.
+    let new = lib.config.download_dir.join("elsewhere");
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(fbtt_core::DownloadsChange {
+            default_dir: new.clone(),
+            unfinished_dir: None,
+            start_paused: false,
+            watch_dir: None,
+            on_complete: None,
+        })
+    ))));
+    let shown = wait_for(&mut client, |snapshot| {
+        (snapshot.default_dir == new).then(|| snapshot.default_dir.clone())
+    })
+    .await;
+    assert_eq!(shown, new, "the snapshot shows the new default");
+
+    let uri = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=follows";
+    let id = TorrentId::from_wire_hash(
+        fbt::Magnet::parse(uri)
+            .expect("a magnet")
+            .info_hashes
+            .wire_hash(),
+    );
+    assert!(client.send(Command::Add {
+        source: AddSource::Magnet(uri.to_string()),
+        dir: None,
+    }));
+    let row = wait_for(&mut client, |snapshot| {
+        snapshot.torrents.iter().find(|row| row.id == id).cloned()
+    })
+    .await;
+    assert!(
+        row.save_path.starts_with(&new) || row.save_path.ends_with("elsewhere"),
+        "the add landed in the new default folder: {:?}",
+        row.save_path
+    );
+
+    shutdown(&mut client).await;
+    within(server.shutdown()).await.expect("the last save ran");
+}

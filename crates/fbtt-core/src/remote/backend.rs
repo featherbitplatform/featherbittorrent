@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::client::{
-    Command, Connection, Detail, DetailTab, LinkState, Notice, Snapshot, TorrentId, Totals,
+    Command, Connection, Detail, DetailTab, LinkState, Notice, SettingsCommand, Snapshot,
+    TorrentId, Totals,
 };
 use crate::remote::bodies::ApiError;
 use crate::remote::routes::{tab_path, torrent_route};
@@ -182,6 +183,12 @@ impl Backend {
             // The first root is where a torrent goes when nobody says otherwise, which is the rule the
             // server's own add route follows too.
             self.default_dir = self.roots.first().cloned().unwrap_or_default();
+        }
+        // Once, on connecting: the server's current default folder, so a screen that did not change it
+        // still adds to the right one. An old server, or any error, leaves the roots' first as it was.
+        if !self.settings_asked {
+            self.settings_asked = true;
+            self.settings_round(SettingsCommand::Load, true).await;
         }
         let torrents: Vec<map::TorrentDto> =
             self.api.json(self.api.get("/api/v1/torrents")).await?;
@@ -360,6 +367,7 @@ mod tests {
             dirs: None,
             devices: None,
             settings: SettingsState::NotLoaded,
+            settings_asked: false,
             relay: None,
             torrents: Vec::new(),
             totals: Totals {
