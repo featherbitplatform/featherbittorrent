@@ -40,7 +40,7 @@
 //! answer or log line here carries it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::extract::State;
@@ -50,10 +50,12 @@ use fbt::{RateLimit, Session};
 use fbtt_core::fs_list::inside_roots;
 use fbtt_core::{
     Config, DownloadsChange, DownloadsView, LiveLimits, OnCompleteView, PasswordStorage,
-    ProxyChange, ProxyView, SettingsProblem, SettingsView, validate_downloads,
+    ProxyChange, ProxyProblem, ProxySetting, ProxyView, SettingsProblem, SettingsView,
+    validate_downloads,
 };
 
 use super::{RouteError, Shared};
+use crate::auth::locked;
 
 /// How large a settings body may be, in bytes. The two bodies are a handful of numbers and three paths, so
 /// this is far more room than they need and far less than fbt-api's 32 MiB for a `.torrent`.
@@ -179,30 +181,40 @@ pub(super) async fn put_downloads(
 /// The change is resolved against the password the file holds as it is read for the write (`keep` keeps
 /// it, `clear` removes it, `{"set": ..}` replaces it) and the setting that leaves is checked with the same
 /// rules the engine starts under; one it refuses is `400 invalid_setting` with the line to show, and
-/// neither the file nor the engine changes. `type: none` removes the `proxy:` key and puts back the
-/// switches this run started on. The engine is switched inside the same save, so two saves in quick
-/// succession leave it on the second; a switch that fails after the write (a session shutting down) is
-/// `500 proxy_not_applied` with the engine's reason, never a quiet direct connection.
+/// neither the file nor the engine changes. Keeping a stored password while naming a new host or port is
+/// refused the same way: the password is typed again for a new address. `type: none` removes the
+/// `proxy:` key and puts back the switches this run started on. The engine is switched inside the same
+/// save, so two saves in quick succession leave it on the second. A switch the engine refuses after the
+/// write (its new network stack would not build, or the session is shutting down) leaves the engine on
+/// the previous setting, so the previous setting is written back to the file and the view, and the
+/// answer is `500 proxy_not_applied` with the engine's reason (and the write-back's, if that failed too):
+/// never a quiet direct connection behind a file that names a proxy.
 pub(super) async fn put_proxy(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
     given: Result<Json<ProxyChange>, JsonRejection>,
 ) -> Result<Json<SettingsView>, RouteError> {
     let Json(change) = given?;
+    // The proxy the file held before this change, handed from the change to the apply so a switch the
+    // engine refuses can put it back. Both run inside the same serialized save.
+    let previous: Arc<Mutex<Option<ProxySetting>>> = Arc::default();
+    let before = Arc::clone(&previous);
     let applying = Arc::clone(&shared);
     let config = shared
         .write_config_then(
             move |config| {
-                let resolved = change.resolve(config.proxy.as_ref());
-                if let Some(setting) = &resolved
-                    && let Err(problem) = setting.validate()
-                {
-                    return Err(RouteError::new(
+                let invalid = |problem: ProxyProblem| {
+                    RouteError::new(
                         StatusCode::BAD_REQUEST,
                         "invalid_setting",
                         problem.message(),
-                    ));
+                    )
+                };
+                let resolved = change.resolve(config.proxy.as_ref()).map_err(invalid)?;
+                if let Some(setting) = &resolved {
+                    setting.validate().map_err(invalid)?;
                 }
+                *locked(&before) = config.proxy.clone();
                 config.proxy = resolved;
                 Ok(())
             },
@@ -211,22 +223,39 @@ pub(super) async fn put_proxy(
                 // config handed here is the one just written, under the lock, so it is always the latest.
                 let proxy = config.proxy.clone();
                 async move {
-                    fbtt_core::proxy::apply_now(
+                    let Err(problem) = fbtt_core::proxy::apply_now(
                         applying.session(),
                         proxy.as_ref(),
                         applying.base_settings(),
                     )
                     .await
-                    .map_err(|problem| {
-                        tracing::warn!(problem = %problem, "the saved proxy could not be applied");
-                        RouteError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "proxy_not_applied",
-                            format!(
-                                "The proxy is saved, but the engine could not switch to it: {problem}"
-                            ),
-                        )
-                    })
+                    else {
+                        return Ok(());
+                    };
+                    // The engine refused the new stack (a listen address that will not bind again, a
+                    // session shutting down) and stays on the previous setting. The file and the view go
+                    // back to it too, still under the same lock, so nothing claims a proxy the engine is
+                    // not using.
+                    tracing::warn!(problem = %problem, "the saved proxy could not be applied");
+                    let previous = locked(&previous).take();
+                    let message = match applying
+                        .rewrite_from_apply(move |config| config.proxy = previous)
+                        .await
+                    {
+                        Ok(()) => fbtt_core::proxy::not_applied(&problem),
+                        Err(rollback) => {
+                            tracing::warn!(
+                                problem = %rollback,
+                                "the previous proxy could not be written back",
+                            );
+                            fbtt_core::proxy::not_rolled_back(&problem, &rollback)
+                        }
+                    };
+                    Err(RouteError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "proxy_not_applied",
+                        message,
+                    ))
                 }
             },
         )

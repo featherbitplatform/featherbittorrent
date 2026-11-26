@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::LiveLimits;
 use crate::config::DownloadsConfig;
-use crate::proxy::{ProxySetting, ProxyType};
+use crate::proxy::{ProxyProblem, ProxySetting, ProxyType};
 
 /// What a Settings screen shows: the limits the engine is running under, and the downloads settings.
 ///
@@ -212,27 +212,42 @@ pub struct ProxyChange {
 }
 
 impl ProxyChange {
-    /// The setting this change leaves behind, given the one stored now: `None` for no proxy, otherwise the
-    /// submitted fields with the password [`PasswordChange`] resolves to. An empty user name or password is
-    /// no user name or password, so the file never holds a blank one.
-    pub fn resolve(&self, stored: Option<&ProxySetting>) -> Option<ProxySetting> {
+    /// The setting this change leaves behind, given the one stored now: `Ok(None)` for no proxy,
+    /// otherwise the submitted fields with the password [`PasswordChange`] resolves to. An empty user name
+    /// or password is no user name or password, so the file never holds a blank one.
+    ///
+    /// Keeping a stored password is refused when the change names a different host or port
+    /// ([`ProxyProblem::PasswordForNewAddress`]): the password was given for that address, and sending
+    /// it to whatever a form now names would hand the login to a host nobody typed it for. A changed type
+    /// or user name keeps it, and so does a change with no password stored.
+    pub fn resolve(
+        &self,
+        stored: Option<&ProxySetting>,
+    ) -> Result<Option<ProxySetting>, ProxyProblem> {
         if matches!(self.kind, ProxyType::None) {
-            return None;
+            return Ok(None);
         }
-        let password = match &self.password {
-            // Whatever is stored, whatever else changed: keeping is not the form's to second-guess, and the
-            // validation of the resolved setting is what refuses a login that no longer fits.
-            PasswordChange::Keep => stored.and_then(|stored| stored.password.clone()),
-            PasswordChange::Clear => None,
-            PasswordChange::Set(password) => Some(password.clone()),
-        };
-        Some(ProxySetting {
+        let mut setting = ProxySetting {
             kind: self.kind.clone(),
             host: self.host.clone(),
             port: self.port,
             username: self.username.clone().filter(|user| !user.is_empty()),
-            password: password.filter(|password| !password.is_empty()),
-        })
+            password: None,
+        };
+        setting.password = match &self.password {
+            PasswordChange::Keep => match stored {
+                Some(stored) if stored.password.as_deref().is_some_and(|p| !p.is_empty()) => {
+                    if !stored.same_address(&setting) {
+                        return Err(ProxyProblem::PasswordForNewAddress);
+                    }
+                    stored.password.clone()
+                }
+                _ => None,
+            },
+            PasswordChange::Clear => None,
+            PasswordChange::Set(password) => Some(password.clone()).filter(|p| !p.is_empty()),
+        };
+        Ok(Some(setting))
     }
 }
 
@@ -501,7 +516,7 @@ mod tests {
         batch_file, validate_downloads,
     };
     use crate::client::LiveLimits;
-    use crate::proxy::{ProxySetting, ProxyType};
+    use crate::proxy::{ProxyProblem, ProxySetting, ProxyType};
     use crate::scratch::ScratchDir;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1164,26 +1179,57 @@ mod tests {
     /// is no proxy at all.
     #[test]
     fn proxy_change_resolves_the_password() {
-        let keep = proxy_change(ProxyType::Http, PasswordChange::Keep).resolve(Some(&stored()));
+        let keep = proxy_change(ProxyType::Http, PasswordChange::Keep)
+            .resolve(Some(&stored()))
+            .expect("the same address keeps the password");
         assert_eq!(
             keep.and_then(|setting| setting.password).as_deref(),
             Some("hunter2"),
             "a changed type keeps the stored password"
         );
-        let keep = proxy_change(ProxyType::Socks5, PasswordChange::Keep).resolve(None);
+        let keep = proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+            .resolve(None)
+            .expect("nothing stored, nothing to refuse");
         assert_eq!(keep.and_then(|setting| setting.password), None);
         let clear = proxy_change(ProxyType::Socks5, PasswordChange::Clear)
             .resolve(Some(&stored()))
+            .expect("a change")
             .expect("a proxy");
         assert_eq!(clear.password, None);
         let set = proxy_change(ProxyType::Socks5, PasswordChange::Set("new".to_string()))
             .resolve(Some(&stored()))
+            .expect("a change")
             .expect("a proxy");
         assert_eq!(set.password.as_deref(), Some("new"));
         assert_eq!(
             proxy_change(ProxyType::None, PasswordChange::Keep).resolve(Some(&stored())),
-            None,
+            Ok(None),
             "none removes the section"
+        );
+        // Keep is only for the same address: compared as dialled (one pair of brackets dropped) and
+        // without regard to case, so another spelling of the same host keeps it, and another host or
+        // port does not.
+        let respelled = ProxyChange {
+            host: "PROXY.Example".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert!(respelled.resolve(Some(&stored())).is_ok());
+        let bracketed = ProxySetting {
+            host: "[::1]".to_string(),
+            ..stored()
+        };
+        let bare = ProxyChange {
+            host: "::1".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert!(bare.resolve(Some(&bracketed)).is_ok());
+        let elsewhere = ProxyChange {
+            host: "other.example".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert_eq!(
+            elsewhere.resolve(Some(&stored())),
+            Err(ProxyProblem::PasswordForNewAddress)
         );
         // A SOCKS5 login cleared of its password is a half login, which is the resolved setting's to refuse.
         assert!(clear.validate().is_err());

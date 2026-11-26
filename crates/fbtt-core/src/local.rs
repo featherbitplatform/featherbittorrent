@@ -35,7 +35,7 @@ use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
-use crate::proxy::{apply_now, apply_to_settings};
+use crate::proxy::{apply_now, apply_to_settings, not_applied, not_rolled_back};
 use crate::settings::{
     DownloadsChange, DownloadsView, OnCompleteView, PasswordStorage, ProxyChange, ProxyView,
     SettingsView, validate_downloads,
@@ -51,6 +51,7 @@ const TICK: Duration = Duration::from_millis(500);
 const NO_TORRENT: &str = "the torrent is not in this library";
 /// The line a saved settings section answers with.
 const SAVED: &str = "Saved.";
+
 /// What the screen is told when it asks about devices: which keys may sign in to a featherbittorrent
 /// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
 /// them - not an empty one, none at all.
@@ -630,39 +631,54 @@ impl Backend {
     /// two saves in quick succession leave the engine on the second.
     ///
     /// The resolve and the check happen on the file as it is read for the write, so `Keep` keeps the
-    /// password actually stored and a SOCKS5 login is judged with it put back in.
+    /// password actually stored (and only for the same address) and a SOCKS5 login is judged with it put
+    /// back in.
+    ///
+    /// The engine can still refuse after the write: its new network stack may fail to build (a listen
+    /// address that will not bind again, say), and it then stays on the previous setting. The file and
+    /// this run's view are put back to that previous setting too, so nothing claims a proxy the engine
+    /// is not using, and the person is told.
     async fn save_proxy(&mut self, change: ProxyChange) -> bool {
-        let resolved = self
+        let saved = self
             .save_config_with(move |config| {
-                let resolved = change.resolve(config.proxy.as_ref());
+                let previous = config.proxy.clone();
+                let resolved = change
+                    .resolve(config.proxy.as_ref())
+                    .map_err(|problem| problem.message())?;
                 if let Some(setting) = &resolved {
                     setting.validate().map_err(|problem| problem.message())?;
                 }
                 config.proxy = resolved.clone();
-                Ok(resolved)
+                Ok((resolved, previous))
             })
             .await;
-        let Some(resolved) = resolved else {
+        let Some((resolved, previous)) = saved else {
             return false;
         };
         self.config.proxy = resolved.clone();
-        // The file has it; now the engine. A failure here is the session shutting down (the setting was
-        // checked above), and it is said rather than left for the person to find out later.
-        match apply_now(
+        let applied = apply_now(
             self.engine.session(),
             resolved.as_ref(),
             &self.base_settings,
         )
-        .await
+        .await;
+        let Err(problem) = applied else {
+            return true;
+        };
+        // The engine kept the previous setting; so do the file and this run's view.
+        self.config.proxy = previous.clone();
+        let line = match self
+            .write_config_with(move |config| {
+                config.proxy = previous;
+                Ok(())
+            })
+            .await
         {
-            Ok(()) => true,
-            Err(problem) => {
-                self.notify(Notice::Error(format!(
-                    "The proxy is saved, but the engine could not switch to it: {problem}"
-                )));
-                false
-            }
-        }
+            Ok(()) => not_applied(&problem),
+            Err(rollback) => not_rolled_back(&problem, &rollback),
+        };
+        self.notify(Notice::Error(line));
+        false
     }
 
     /// A downloads section saved: validated, then written, then applied, in that order, so a section the
@@ -739,6 +755,22 @@ impl Backend {
         &self,
         change: impl FnOnce(&mut Config) -> Result<T, String> + Send + 'static,
     ) -> Option<T> {
+        match self.write_config_with(change).await {
+            Ok(value) => Some(value),
+            Err(problem) => {
+                self.notify(Notice::Error(problem));
+                None
+            }
+        }
+    }
+
+    /// The body of [`save_config_with`](Self::save_config_with): the same read, change and write, with
+    /// the reason it did not happen handed back (display-safe) instead of sent as a notice, for a caller
+    /// that has more to say around it.
+    async fn write_config_with<T: Send + 'static>(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         let paths = self.paths.clone();
         let fallback = self.config.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -770,17 +802,11 @@ impl Backend {
         })
         .await;
         match outcome {
-            Ok(Ok(value)) => Some(value),
-            Ok(Err(problem)) => {
-                self.notify(Notice::Error(map::clean(&problem)));
-                None
-            }
-            Err(joined) => {
-                self.notify(Notice::Error(format!(
-                    "the config could not be written: {joined}"
-                )));
-                None
-            }
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(problem)) => Err(map::clean(&problem)),
+            Err(joined) => Err(map::clean(&format!(
+                "the config could not be written: {joined}"
+            ))),
         }
     }
 

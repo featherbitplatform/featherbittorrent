@@ -531,3 +531,128 @@ async fn local_invalid_proxy_change_changes_nothing() {
 
     shutdown(client, task).await;
 }
+
+/// Keeping the stored password while naming another host or another port is refused with the line to
+/// show, and nothing is written; a new user name at the same address keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_keep_needs_the_same_address() {
+    let lib = Library::new("proxy_runtime_keep");
+    let proxy_port = closed_port();
+    let config = proxied(
+        &lib,
+        ProxySetting {
+            username: Some("bob".to_string()),
+            password: Some("local-proxy-password".to_string()),
+            ..socks5(proxy_port)
+        },
+    );
+    let (mut client, task, session) = start(&lib, config).await;
+    let before = session.network_settings();
+    let keep = |host: &str, port: u16, user: &str| ProxyChange {
+        username: Some(user.to_string()),
+        host: host.to_string(),
+        ..socks5_change(port)
+    };
+    let other_port = if proxy_port == u16::MAX {
+        proxy_port - 1
+    } else {
+        proxy_port + 1
+    };
+
+    for change in [
+        keep("127.0.0.2", proxy_port, "bob"),
+        keep("127.0.0.1", other_port, "bob"),
+    ] {
+        let answer = save_proxy(&mut client, change).await;
+        assert_eq!(
+            error_text(answer),
+            "Enter the password again when the proxy's host or port changes."
+        );
+        assert!(
+            !lib.paths.config_file().exists(),
+            "a refused change writes nothing"
+        );
+        assert_eq!(session.network_settings(), before, "nor touches the engine");
+    }
+
+    let answer = save_proxy(&mut client, keep("127.0.0.1", proxy_port, "carol")).await;
+    assert_eq!(info_text(answer), "Saved.");
+    let written = std::fs::read_to_string(lib.paths.config_file()).expect("the save wrote a file");
+    assert!(written.contains("carol"), "{written}");
+    assert!(
+        written.contains("local-proxy-password"),
+        "the password stayed: {written}"
+    );
+    assert_eq!(
+        session.network_settings().proxy.username.as_deref(),
+        Some("carol")
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A proxy change the engine cannot switch to puts the previous setting back: the engine starts on an
+/// HTTP proxy, which binds its BitTorrent port only to learn it and lets it go, and this test takes that
+/// port. Removing the proxy needs the engine to listen there again, which the operating system refuses,
+/// so the new network stack does not build and the engine stays on the HTTP proxy. The answer says so,
+/// and the file, the view and the health still describe the HTTP proxy.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_failed_apply_rolls_back() {
+    let lib = Library::new("proxy_runtime_rollback");
+    let proxy_port = closed_port();
+    let http = ProxySetting {
+        kind: ProxyType::Http,
+        ..socks5(proxy_port)
+    };
+    let (mut client, task, session) = start(&lib, proxied(&lib, http)).await;
+    let engine_port = session
+        .local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+
+    let none = ProxyChange {
+        kind: ProxyType::None,
+        host: String::new(),
+        port: 0,
+        username: None,
+        password: PasswordChange::Keep,
+    };
+    let line = error_text(save_proxy(&mut client, none).await);
+    assert!(
+        line.starts_with(
+            "The engine could not switch to this proxy, so the previous setting is kept: "
+        ),
+        "{line}"
+    );
+
+    let written = std::fs::read_to_string(lib.paths.config_file()).expect("the file is there");
+    assert!(
+        written.contains("proxy:"),
+        "the file still names the proxy: {written}"
+    );
+    assert!(written.contains("http"), "{written}");
+    assert!(
+        client.send(Command::Settings(SettingsCommand::Load)),
+        "the queue takes the load"
+    );
+    let snapshot = wait_for(&mut client, |snapshot| {
+        matches!(snapshot.settings, fbtt_core::SettingsState::Loaded(_))
+    })
+    .await;
+    let fbtt_core::SettingsState::Loaded(view) = &snapshot.settings else {
+        unreachable!("the wait above only returns a loaded view");
+    };
+    assert_eq!(
+        view.proxy.kind,
+        ProxyType::Http,
+        "the view still shows the proxy"
+    );
+    assert_eq!(session.network_settings().proxy.kind, fbt::ProxyKind::Http);
+    assert_ne!(fbtt_core::proxy::health(&session), ProxyHealth::Off);
+
+    drop(squatter);
+    shutdown(client, task).await;
+}

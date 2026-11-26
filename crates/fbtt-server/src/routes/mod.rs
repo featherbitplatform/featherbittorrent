@@ -322,9 +322,9 @@ impl Shared {
     /// same guard, after the save has landed, so two changes take effect in the order they were written -
     /// two proxy saves in quick succession leave the engine on the second. The future may wait on the
     /// session, never on anything that takes the config lock. When it fails, the file and the config this
-    /// run reports from already hold the change, and the error is what the request answers: the change is
-    /// written but did not take hold, and the person is told so rather than left on the old setting
-    /// without knowing.
+    /// run reports from already hold the change, and the error is what the request answers; an apply that
+    /// has to undo its change does so itself, still under the guard, with
+    /// [`rewrite_from_apply`](Self::rewrite_from_apply), before it fails.
     pub(crate) async fn write_config_then<F>(
         self: &Arc<Self>,
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
@@ -433,6 +433,40 @@ impl Shared {
         *locked(&self.current) = resolved.clone();
         apply(&resolved).await?;
         Ok(resolved)
+    }
+
+    /// Writes `edit` into `config.yaml` and into the config this run reports from, for an `apply` handed
+    /// to [`write_config_then`](Self::write_config_then) that has to put back what its change wrote: the
+    /// proxy route, when the engine refuses to switch. It takes no lock, because the apply that calls it
+    /// already runs under [`changing_config`](Self::changing_config); called from anywhere else it would
+    /// race the other writers. The answer is the display-safe reason it could not, naming no path.
+    pub(crate) async fn rewrite_from_apply(
+        &self,
+        edit: impl FnOnce(&mut Config) + Send + 'static,
+    ) -> Result<(), String> {
+        let file = self.paths.config_file();
+        let base = self.base_config.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let mut config = match Config::load_for_edit(&file) {
+                Ok(Some(config)) => config,
+                Ok(None) => base,
+                Err(problem) => {
+                    // The line names the file; the log keeps it and the answer does not.
+                    tracing::warn!(problem = %problem, "the config could not be read again");
+                    return Err("the config could not be read again".to_string());
+                }
+            };
+            edit(&mut config);
+            config
+                .save(&file)
+                .map(|()| config)
+                .map_err(|problem| save_reason(&problem))
+        })
+        .await
+        .map_err(|problem| clean(&problem.to_string()))?
+        .map_err(|problem| clean(&problem))?;
+        *locked(&self.current) = written.resolve(&self.paths);
+        Ok(())
     }
 
     /// The config as the last write left it, this run's own to begin with: what a settings screen reads

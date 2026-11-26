@@ -466,6 +466,19 @@ impl Server {
         self.shared.session().network_settings()
     }
 
+    /// The engine's proxy health right now, in this product's words. Only a test reads this.
+    #[cfg(feature = "test-support")]
+    pub fn proxy_health(&self) -> fbtt_core::ProxyHealth {
+        fbtt_core::proxy::health(self.shared.session())
+    }
+
+    /// The addresses the engine's network stack has bound (its BitTorrent port, not the API's). Only a
+    /// test reads this, to take that port away and make the next network change fail to build.
+    #[cfg(feature = "test-support")]
+    pub fn engine_local_addrs(&self) -> Vec<SocketAddr> {
+        self.shared.session().local_addrs()
+    }
+
     /// Stops serving, saves, and releases the library. Returns once every connection is closed, the last
     /// save has been written or failed to be, and the lock has gone with it - so another
     /// featherbittorrent may start on this library as soon as this returns.

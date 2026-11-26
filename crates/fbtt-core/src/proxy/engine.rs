@@ -25,7 +25,9 @@ use super::{ProxyHealth, ProxySetting, network_for};
 /// the session runs already, this is a no-op. A change closes the connections made under the old
 /// proxy and installs the new stack on the same addresses; no connection is made directly in
 /// between. `Err` is the engine's own one line, display-safe: a proxy or switch combination it
-/// refuses, or a session that has shut down.
+/// refuses, a new network stack that would not build (a listen address that will not bind again,
+/// say), or a session that has shut down. After an `Err` the session is still on the setting it had
+/// before, so a caller that already wrote the new one down has to put the previous one back.
 ///
 /// What the server's proxy route and the local backend's own save call, after the file has the new
 /// setting and inside the same serialized save, so the engine always ends on the last one written.
