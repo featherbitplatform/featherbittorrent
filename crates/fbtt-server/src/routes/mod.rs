@@ -146,6 +146,10 @@ pub(crate) struct Shared {
     /// [`VerifyTally`] for why both the permit and this have to travel with the work rather than with the
     /// request, and [`login::verify_password`] for the check that does it.
     verify_tally: Arc<VerifyTally>,
+    /// What the config saves report to while they run: the hold a test arms, and nothing a run touches
+    /// (see [`ConfigSaves`]). Its own `Arc` because the save carries it down to the blocking pool with the
+    /// job, while the test that arms it holds the other end.
+    config_saves: Arc<ConfigSaves>,
     /// How many of the media routes may run at once, across all four of them: [`media::MEDIA_PERMITS`].
     ///
     /// Every media request is a thread on the blocking pool holding a container demuxer, a file reader and
@@ -214,6 +218,7 @@ impl Shared {
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
             verify_tally: Arc::new(VerifyTally::new()),
+            config_saves: Arc::new(ConfigSaves::new()),
             media_permits: Arc::new(tokio::sync::Semaphore::new(media::MEDIA_PERMITS)),
             media_read_ms: AtomicU64::new(media::READ_TIMEOUT.as_millis() as u64),
         }
@@ -273,7 +278,40 @@ impl Shared {
     /// this route's to do. The path and the reason go to the log; the answer keeps one sentence. A read
     /// failure is a plain `500 internal` for a route to give its own name to, and a save failure is
     /// `500 config_unwritable`, which says what an operator would have to fix.
+    ///
+    /// A request that is dropped halfway through - the browser tab that asked for a change closes while the
+    /// save is being written - still leaves the file and the run in step. The change does not run in the
+    /// request's own future, which hyper drops on a disconnect, but in a task of its own that owns the state
+    /// it needs and is not dropped with what awaits it: the save that has already started finishes, the
+    /// config this run reports from is stored, and `apply` runs, whether or not anybody is left to read the
+    /// answer. This request only awaits that task, and holding nothing but the [`Arc`] means the drop takes
+    /// the request away and leaves the change running. A task that panicked is the same plain `500` a save
+    /// failure gives, and its join error is never unwrapped.
     pub(crate) async fn write_config(
+        self: &Arc<Self>,
+        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
+        apply: impl FnOnce(&Config) + Send + 'static,
+    ) -> Result<Config, RouteError> {
+        // What the task needs: the state, and one more handle on the same `Arc` the request holds.
+        let shared = Arc::clone(self);
+        // Test-support only, and it lives in *this* future rather than in the task's: what a test waits on
+        // is the request being gone, and this is the request (see [`ChangeGuard`]).
+        #[cfg(feature = "test-support")]
+        let _ending = ChangeGuard(Arc::clone(&self.config_saves));
+        tokio::spawn(async move { shared.change_config(change, apply).await })
+            .await
+            .map_err(|problem| {
+                tracing::warn!(problem = %problem, "the config change task did not finish");
+                RouteError::internal("the server could not change its config; see the server log")
+            })?
+    }
+
+    /// The body of [`write_config`](Self::write_config), its only caller: the guard, the read, `change`, the
+    /// save, `current` and `apply`, in that order, all with the guard held. It runs inside the task
+    /// `write_config` spawns, so it runs to the end whether or not the request that asked for it is still
+    /// there, and the guard is what keeps two changes from taking effect in the reverse of the order they
+    /// were written.
+    async fn change_config(
         &self,
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
         apply: impl FnOnce(&Config) + Send,
@@ -317,24 +355,31 @@ impl Shared {
         // server can act on - and the whole path goes into the log line beside it.
         let saving = file.clone();
         let writing = config.clone();
-        tokio::task::spawn_blocking(move || writing.save(&saving))
-            .await
-            .map_err(|problem| {
-                tracing::warn!(
-                    config = %file.display(),
-                    problem = %problem,
-                    "the config save task failed",
-                );
-                config_unwritable(&problem.to_string())
-            })?
-            .map_err(|problem| {
-                tracing::warn!(
-                    config = %file.display(),
-                    problem = %problem,
-                    "the config could not be saved",
-                );
-                config_unwritable(&save_reason(&problem))
-            })?;
+        let saves = Arc::clone(&self.config_saves);
+        tokio::task::spawn_blocking(move || {
+            // Test-support only, and a no-op in a run: a save a test has armed the hold on stops here,
+            // inside the job, so a test can drop the request that asked for it and watch the change finish
+            // anyway. See [`ConfigSaves`].
+            saves.park_inside_save();
+            writing.save(&saving)
+        })
+        .await
+        .map_err(|problem| {
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config save task failed",
+            );
+            config_unwritable(&problem.to_string())
+        })?
+        .map_err(|problem| {
+            tracing::warn!(
+                config = %file.display(),
+                problem = %problem,
+                "the config could not be saved",
+            );
+            config_unwritable(&save_reason(&problem))
+        })?;
         // What this run reports from, what an `apply` is handed and what the caller gets back is the config
         // as this run would use it: the same resolve the startup makes, so a relative folder in the file
         // becomes the folder the run works in rather than the spelling the file happened to use. Stored and
@@ -503,6 +548,32 @@ impl Shared {
     pub(crate) fn release_parked_verifies(&self) {
         self.verify_tally.release_parked();
     }
+
+    /// Arms [`ConfigSaves::park_inside_save`] and returns the count it moves: how many saves have reached
+    /// the hold since it was armed, published in order and only ever rising. Under `test-support` only, and
+    /// arming it twice changes nothing about the saves - both watchers see the same count. See
+    /// [`Server::park_config_saves`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn park_config_saves(&self) -> watch::Receiver<u64> {
+        self.config_saves.park()
+    }
+
+    /// Lets every parked save finish, and stops holding the ones that come after
+    /// ([`Self::park_config_saves`]). Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn release_parked_config_saves(&self) {
+        self.config_saves.release_parked();
+    }
+
+    /// A count of how many config changes have ended since this was read, rising once for every change whose
+    /// request has been answered or dropped. Under `test-support` only: a test hangs up on a change, waits
+    /// here for the request to be gone, and only then lets the parked save finish, so what it goes on to
+    /// measure is the change finishing on its own rather than a race with the disconnect arriving. See
+    /// [`ConfigSaves`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn config_change_endings(&self) -> watch::Receiver<u64> {
+        self.config_saves.endings()
+    }
 }
 
 /// What the Argon2 checks report to while they run: the counts no run reads, and the hold no run arms.
@@ -528,7 +599,7 @@ pub(crate) struct VerifyTally {
     /// once checks are being held, the checks that arrive after the release run through, so there is
     /// nothing to re-arm and nothing to reset.
     #[cfg(feature = "test-support")]
-    hold: OnceLock<VerifyHold>,
+    hold: OnceLock<Hold>,
 }
 
 impl VerifyTally {
@@ -600,7 +671,7 @@ impl VerifyTally {
     /// `test-support` only.
     #[cfg(feature = "test-support")]
     fn park(&self) -> watch::Receiver<u64> {
-        let hold = self.hold.get_or_init(VerifyHold::new);
+        let hold = self.hold.get_or_init(Hold::new);
         hold.counts.subscribe()
     }
 
@@ -614,47 +685,48 @@ impl VerifyTally {
     }
 }
 
-/// A place inside the Argon2 check that only a test can put there: a check that reaches it says how many are
-/// sitting there and then waits until somebody opens it. The waiting is a condvar because it happens on the
-/// blocking pool, where nothing may await; the count is a `watch` because whoever reads it is an async task
-/// sharing this runtime's only worker with the server, so it can afford to be told rather than to sit and
-/// poll. Without `test-support` none of this exists: no test arms a hold, and `Shared` carries neither the
-/// field nor the wait.
+/// A place in some blocking-pool work that only a test can put there: work that reaches it says how many
+/// are sitting there and then waits until somebody opens it. The waiting is a condvar because it happens on
+/// the blocking pool, where nothing may await; the count is a `watch` because whoever reads it is an async
+/// task sharing this runtime's worker with the server, so it can afford to be told rather than to sit and
+/// poll. Two holds are built from it - the one the Argon2 checks stop at ([`VerifyTally`]) and the one the
+/// config saves stop at ([`ConfigSaves`]) - and without `test-support` none of this exists: no test arms a
+/// hold, and `Shared` carries neither the field nor the wait.
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
-struct VerifyHold {
-    /// How many checks have reached the hold since it was armed, and the count a watcher waits on. It is
+struct Hold {
+    /// How many jobs have reached the hold since it was armed, and the count a watcher waits on. It is
     /// arrivals ever, not a count of what is parked right now, and it is published in order and only ever
-    /// rises: a check bumps it and tells watchers in one step, so the number a watcher reads cannot go
-    /// backwards - two checks arriving on two blocking threads once bumped and published as two steps, and the
+    /// rises: a job bumps it and tells watchers in one step, so the number a watcher reads cannot go
+    /// backwards - two jobs arriving on two blocking threads once bumped and published as two steps, and the
     /// second to publish could be the first to arrive, which made a watcher read the count fall by one. Every
     /// arrival bumps it and sends the new number, so a watcher reads a count and waits for the next change
-    /// instead of polling - which is how a test counts what is holding the permits without guessing at how
-    /// long a hash takes on somebody else's machine.
+    /// instead of polling - which is how a test counts what is parked without guessing at how long the work
+    /// takes on somebody else's machine.
     counts: watch::Sender<u64>,
-    /// `false` while checks are being held; [`VerifyHold::release`] makes it `true` for good, so the checks
-    /// that arrive afterwards run through without stopping. A condvar rather than a channel because the
-    /// people waiting here are not on a runtime: they are on the blocking pool, where nothing may await.
+    /// `false` while jobs are being held; [`Hold::release`] makes it `true` for good, so the jobs that
+    /// arrive afterwards run through without stopping. A condvar rather than a channel because the people
+    /// waiting here are not on a runtime: they are on the blocking pool, where nothing may await.
     open: Mutex<bool>,
     waiting: Condvar,
 }
 
 #[cfg(feature = "test-support")]
-impl VerifyHold {
+impl Hold {
     /// A hold nobody has opened yet: everything that arrives waits here until a test says otherwise.
     fn new() -> Self {
         let (counts, _) = watch::channel(0);
-        VerifyHold {
+        Hold {
             counts,
             open: Mutex::new(false),
             waiting: Condvar::new(),
         }
     }
 
-    /// Says this check has reached the inside of the verify, then waits there for the test to stop looking.
+    /// Says this job has reached the hold, then waits there for the test to stop looking.
     fn arrive_and_wait(&self) {
         // The bump and the publish are one step, under the watch's own lock, so the watched number only ever
-        // rises: two checks arriving on two blocking threads take their turns at it rather than each taking a
+        // rises: two jobs arriving on two blocking threads take their turns at it rather than each taking a
         // number and then racing to publish it, which could publish the second arrival before the first and
         // send the count backwards. The number is what a watcher reads; whether anybody is still watching to
         // be told is not its job.
@@ -673,6 +745,92 @@ impl VerifyHold {
         let mut open = locked(&self.open);
         *open = true;
         self.waiting.notify_all();
+    }
+}
+
+/// What the config saves report to: the hold a test arms so a save stops inside the write, and nothing a run
+/// ever touches. Its own `Arc` because the save runs on the blocking pool and carries this with the job,
+/// while the test that arms it holds the other end (see [`Shared::config_saves`]).
+///
+/// The count of endings is not the hold: it rises for every config change whose request is over, finished or
+/// dropped, and a test reads it to know that the server has really let a request go before it opens the hold.
+/// Without that, a test that hangs up on a save and releases it at the same moment is racing the disconnect
+/// across the loopback, and what it measures next is a coin toss rather than the change finishing on its own.
+#[derive(Debug)]
+pub(crate) struct ConfigSaves {
+    /// The hold, and nobody arms it but a test. A `OnceLock` for the same reason the verify hold is one:
+    /// arming it is a one-way door, and once saves are being held the ones that arrive after the release run
+    /// through, so there is nothing to re-arm and nothing to reset.
+    #[cfg(feature = "test-support")]
+    hold: OnceLock<Hold>,
+    /// How many config changes have ended - finished or been dropped - since the server started. Read by
+    /// [`Shared::config_change_endings`] under `test-support`, and the `watch` is always here so that the
+    /// [`ChangeGuard`] that bumps it needs no `cfg` at the point it is made.
+    #[cfg(feature = "test-support")]
+    endings: watch::Sender<u64>,
+}
+
+impl ConfigSaves {
+    /// A report nothing has armed a hold on and nothing has finished, which is what every run has.
+    fn new() -> Self {
+        ConfigSaves {
+            #[cfg(feature = "test-support")]
+            hold: OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            endings: watch::channel(0).0,
+        }
+    }
+
+    /// Stops this save inside the write until a test lets it go, if a test armed a hold
+    /// ([`Shared::park_config_saves`], under `test-support`). Called from inside the blocking job, right
+    /// before the file is written, so what is parked there is the save a request is waiting on. In a run
+    /// nothing has armed a hold, so there is nowhere to stop and this does nothing - the only cost it ever
+    /// has.
+    fn park_inside_save(&self) {
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(hold) = self.hold.get() {
+                hold.arrive_and_wait();
+            }
+        }
+    }
+
+    /// Arms [`park_inside_save`](Self::park_inside_save) and returns the count it moves. Under `test-support`
+    /// only.
+    #[cfg(feature = "test-support")]
+    fn park(&self) -> watch::Receiver<u64> {
+        self.hold.get_or_init(Hold::new).counts.subscribe()
+    }
+
+    /// Lets every parked save finish, and stops holding the ones that come after
+    /// ([`park`](Self::park)). Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn release_parked(&self) {
+        if let Some(hold) = self.hold.get() {
+            hold.release();
+        }
+    }
+
+    /// The count of changes that have ended, with a change to wait for. Under `test-support` only.
+    #[cfg(feature = "test-support")]
+    fn endings(&self) -> watch::Receiver<u64> {
+        self.endings.subscribe()
+    }
+}
+
+/// A handle kept by one [`Shared::write_config`] call until its future goes away, one way or the other, and
+/// counted in [`ConfigSaves`] as it drops. It is the only thing in `write_config`'s own future that outlives
+/// the spawn - the change itself has moved into the task - so its `Drop` is what says the request is over.
+/// Under `test-support` only, and in a run there is no future to watch.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct ChangeGuard(Arc<ConfigSaves>);
+
+#[cfg(feature = "test-support")]
+impl Drop for ChangeGuard {
+    fn drop(&mut self) {
+        // One step, so the count a watcher reads is a change and never a bump it can miss.
+        self.0.endings.send_modify(|count| *count += 1);
     }
 }
 

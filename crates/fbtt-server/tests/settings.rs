@@ -14,14 +14,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{
     AuthConfig, Config, DeviceEntry, DownloadsConfig, LibraryLock, Paths, ServerConfig, UserEntry,
 };
+use fbtt_server::LOGIN_NAMESPACE;
 use fbtt_server::auth::password;
 use fbtt_server::{DesktopAccess, Server};
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, rand_core::UnwrapErr};
 
 /// How long a test waits for anything from the server. Starting an engine takes a moment and an Argon2
 /// verify is meant to be slow; nothing here should take longer than that many times over.
@@ -363,6 +367,120 @@ fn downloads_body(
 /// The bytes of a file, for the tests that say a refused write left it exactly as it was.
 fn bytes(path: &Path) -> Vec<u8> {
     fs::read(path).expect("the file is where it was")
+}
+
+/// A fresh Ed25519 device key whose private half this test owns, so a key login can really be made and then
+/// really refused. What the device routes take is only the public line; the signature needs the private one.
+fn keypair() -> PrivateKey {
+    let mut rng = UnwrapErr(getrandom::SysRng);
+    PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("an ed25519 key")
+}
+
+/// The one-line OpenSSH public key of `key`: what a config stores and what a request names.
+fn public_line(key: &PrivateKey) -> String {
+    key.public_key().to_openssh().expect("the public key line")
+}
+
+/// The armored `sshsig` `key` makes over the challenge nonce spelled `nonce`, in the login namespace -
+/// what a device sends to answer a challenge.
+fn sign(nonce: &str, key: &PrivateKey) -> String {
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(nonce)
+        .expect("the nonce we were given");
+    key.sign(LOGIN_NAMESPACE, HashAlg::Sha512, &bytes)
+        .expect("sign the challenge")
+        .to_pem(LineEnding::LF)
+        .expect("armour the signature")
+}
+
+/// A key login with `key` - the challenge, the answer it is signed with - and the session route's answer.
+/// The challenge route issues a nonce whether or not it knows the key, so a refusal for a key this server no
+/// longer has is the session route's, which is what a test reads.
+async fn key_login(served: &Served, key: &PrivateKey) -> Response {
+    let client = http();
+    let base = served.url("");
+    let line = public_line(key);
+    let challenge = within(
+        client
+            .post(format!("{base}/api/v1/auth/challenge"))
+            .json(&json!({ "public_key": line }))
+            .send(),
+    )
+    .await
+    .expect("the challenge reached the server");
+    assert_eq!(
+        challenge.status(),
+        StatusCode::OK,
+        "a challenge is issued whether or not the key is known",
+    );
+    let nonce = body(challenge).await["nonce"]
+        .as_str()
+        .expect("a nonce")
+        .to_string();
+    within(
+        client
+            .post(format!("{base}/api/v1/auth/session"))
+            .json(&json!({
+                "public_key": line,
+                "nonce": nonce,
+                "signature": sign(&nonce, key),
+            }))
+            .send(),
+    )
+    .await
+    .expect("the login reached the server")
+}
+
+/// The device names the API lists, sorted: what `GET /api/v1/auth/devices` answers, which is the list a key
+/// login is checked against.
+async fn listed_devices(client: &reqwest::Client, url: &str, token: &str) -> Vec<String> {
+    let listed = body(get_bearer(client, url, token).await).await;
+    let mut names: Vec<String> = listed
+        .as_array()
+        .expect("a list of devices")
+        .iter()
+        .map(|row| row["name"].as_str().expect("a name").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The device names `config.yaml` holds, sorted.
+fn file_devices(served: &Served) -> Vec<String> {
+    let config = Config::load_for_edit(&served.file())
+        .expect("the config reads back")
+        .expect("a file was written");
+    let mut names: Vec<String> = config
+        .server
+        .as_ref()
+        .expect("a server section")
+        .auth
+        .devices
+        .iter()
+        .map(|device| device.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Waits until the number a `watch` receiver carries reaches `want`, and returns it. What it counts is
+/// published in order and only ever rises, so a `want`'s worth of arrivals reads back as exactly `want`.
+async fn wait_until(count: &mut tokio::sync::watch::Receiver<u64>, want: u64) -> u64 {
+    while *count.borrow_and_update() < want {
+        within(count.changed()).await.expect("the count moved");
+    }
+    *count.borrow_and_update()
+}
+
+/// Opens the save hold when a test goes out of scope, including on the way out of a failed assertion: tokio
+/// waits for every blocking job when a runtime is dropped, and a parked save only stops waiting when somebody
+/// opens the hold. Releasing twice costs nothing.
+struct ReleaseSaves<'a>(&'a Server);
+
+impl Drop for ReleaseSaves<'_> {
+    fn drop(&mut self) {
+        self.0.release_parked_config_saves();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,6 +1476,93 @@ async fn a_device_remove_racing_an_add_leaves_the_file_and_the_list_agreeing() {
     assert_eq!(
         in_the_list, in_the_file,
         "the list logins check against is the list the file holds, so a removed key is gone from both",
+    );
+
+    served.stop().await;
+}
+
+/// A device removal whose request is dropped partway through still takes effect: the file loses the key, the
+/// list logins check against loses it too, and the key no longer logs in. A request future is dropped the
+/// moment its client disconnects, and so is everything it is waiting on - which here is the save, already
+/// under way. With the whole change run in that future, the save lands but the swap that follows it never
+/// runs, so `config.yaml` no longer has the key while the table logins read still accepts it: a revoked key
+/// that keeps working until a restart, and a second DELETE that finds nothing to remove.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_device_remove_still_takes_effect() {
+    let served = Served::start("settings-cancelled-remove", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    let devices_url = served.url("/api/v1/auth/devices");
+    let key = keypair();
+    let line = public_line(&key);
+
+    // A device that is really there, so removing it is a removal, and a key that really logs in, so the
+    // refusal below is about the removal rather than about a key that never worked.
+    let added = post_bearer(
+        &client,
+        &devices_url,
+        &token,
+        json!({ "name": "stolen", "public_key": line }),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::CREATED, "a device to remove");
+    assert_eq!(
+        key_login(&served, &key).await.status(),
+        StatusCode::OK,
+        "the key logs in before it is removed",
+    );
+
+    // From here every save stops inside the job until this test lets it go.
+    let mut parked = served.server.park_config_saves();
+    let release = ReleaseSaves(&served.server);
+    // And every change reports here when its request is over, whether it finished or was dropped.
+    let mut endings = served.server.config_change_endings();
+    let ended_before = *endings.borrow_and_update();
+
+    // The removal, as a future this test drives and then drops: the tab closing mid-save.
+    let remove_url = format!("{devices_url}/stolen");
+    let removing = tokio::spawn({
+        let client = client.clone();
+        let token = token.clone();
+        async move { client.delete(&remove_url).bearer_auth(&token).send().await }
+    });
+    // Drive it until the save is parked...
+    wait_until(&mut parked, 1).await;
+    // ... then hang up on it: the request's future is dropped while it waits on that save.
+    removing.abort();
+    let _ = removing.await;
+    // Wait until the server has really let the request go before opening the hold, so what comes next is the
+    // change finishing on its own rather than a race with the disconnect arriving.
+    wait_until(&mut endings, ended_before + 1).await;
+
+    // The save finishes now - and so must the change that asked for it.
+    drop(release);
+
+    // A bounded wait for the change to take effect: the list logins check against loses the key, and stays
+    // whatever the file holds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let listed = listed_devices(&client, &devices_url, &token).await;
+        if !listed.iter().any(|name| name == "stolen") {
+            assert_eq!(
+                listed,
+                file_devices(&served),
+                "the list logins check against is the list the file holds",
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the removal never took effect: the list still has the key the file does not ({listed:?})",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // And the key itself no longer logs in: the table logins read is the file's list.
+    assert_eq!(
+        key_login(&served, &key).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "the removed key no longer logs in",
     );
 
     served.stop().await;

@@ -277,7 +277,9 @@ write comes first and the change takes effect only after it lands, inside the sa
 not be recorded leaves the running session as it was, and two saves started together take effect in the
 order they were written rather than in the reverse. A folder in a submitted section is checked after links
 are resolved, so a link inside the allowed folders that leads out is refused `403 outside_roots` rather
-than written through.
+than written through. That check is made when the setting is saved: a link created inside an allowed folder
+afterwards is not re-checked, so a folder that becomes a link out after the fact is written to until the
+setting is saved again.
 
 A changed Default folder is followed at once by the unfinished-folder moves and by the watch folder, but
 an add made through the engine API without a folder (`POST /api/v1/torrents` with no `save_path`) keeps

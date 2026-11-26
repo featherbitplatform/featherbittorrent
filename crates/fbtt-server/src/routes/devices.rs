@@ -122,13 +122,16 @@ pub(super) async fn remove(
     open_for_devices(&shared)?;
     // A name in the path that cannot be read - a stray percent sign - gets this API's error shape too.
     let Path(name) = given?;
-    change(&shared, |devices| {
+    // The closure runs inside the change's task now, so it has to own the name; `name` itself stays for the
+    // log line below.
+    let to_remove = name.clone();
+    change(&shared, move |devices| {
         let before = devices.len();
-        devices.retain(|device| device.name != name);
+        devices.retain(|device| device.name != to_remove);
         if devices.len() == before {
             return Err(RouteError::not_found(format!(
                 "no device named {}",
-                clean(&name),
+                clean(&to_remove),
             )));
         }
         Ok(())
@@ -191,7 +194,7 @@ pub(super) struct NewDevice {
 /// (see [`Shared::write_config`]).
 async fn change(
     shared: &Arc<Shared>,
-    change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError> + Send,
+    change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError> + Send + 'static,
 ) -> Result<(), RouteError> {
     // A second handle on the same state, for the step that runs while the config lock is held: the closure
     // below cannot borrow `shared` again while `write_config` is borrowing it.
