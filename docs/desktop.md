@@ -225,6 +225,10 @@ own log (see [server.md](server.md)). On `This computer` the window has nothing 
 app writes no log of its own, so one of those is silent here for now. None of them fails a download: a
 torrent whose move or program failed keeps the files it has, where they are, and stays in the library.
 
+## Settings in the app
+
+Settings shows one section at a time, with the list of sections on the left ([docs/web-ui.md](web-ui.md) describes the page). The desktop app adds a `This app` group to it with three sections of their own: `Window` (what closing the window does, `Start at login` and, on Linux, `Use the system title bar`), `Serve the web UI` and `Instances`. `Keyboard shortcuts` sits under `Access` and is editable here. The Torrents and Access sections belong to the instance you are connected to; the `This app` sections are the app's own and do not change when you switch instance.
+
 ## Instances
 
 The switcher in the title bar lists `This computer` first, then every instance you added, with a mark on the
@@ -315,7 +319,7 @@ window buttons. The window has a minimum size of 900 by 600, and you resize it f
 
 The first time you close the window the app asks, once: `What should closing the window do?`, with
 `You can change this later in Settings.` under it and two buttons, `Close completely` and
-`Keep running in the tray`. Your answer is saved and the question is never asked again. Settings' Desktop
+`Keep running in the tray`. Your answer is saved and the question is never asked again. Settings' Window
 section changes the answer later under `Close the window`.
 
 Keeping running means the tray. Its menu is `Show featherbittorrent`, a line with the name of the instance the
@@ -399,7 +403,7 @@ they become a login in the library's `config.yaml`, in `server.auth.users`, hash
 written as you typed them, which is what `featherbittorrent user set` writes for a server. Everything else
 stays the server's own rules in that same file: `server.allowed_hosts` for a name behind a proxy,
 `server.allowed_roots` for the folders the API may name, `server.web_ui` and `server.cookie_secure` for what
-the browser side does ([docs/server.md](server.md), [docs/web-ui.md](web-ui.md)). The section shows the
+the browser side does ([docs/server.md](server.md), [docs/web-ui.md](web-ui.md)). The `Serve the web UI` section shows the
 address the page is reachable at, and while the address listens on more than loopback it warns that passwords
 travel unencrypted over `http`: for anything beyond your own network, put the page behind `https`.
 If `config.yaml` is edited later to turn logins off (`server.auth.enabled: false`) or to remove every user,

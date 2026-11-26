@@ -539,3 +539,46 @@ it('bearer_token_is_not_added_to_a_foreign_absolute_stream_url', async () => {
     `${BASE}/stream/relative?token=desk-token`,
   )
 })
+
+const SETTINGS_ANSWER = JSON.stringify({
+  speed: { download_kib: null, upload_kib: null, active_downloads: null, active_seeds: null, active_total: null },
+  downloads: {
+    default_dir: '/data',
+    unfinished_dir: null,
+    start_paused: false,
+    watch_dir: null,
+    on_complete: { program: null, editable: false },
+    watch_problem: null,
+    on_complete_problem: null,
+  },
+})
+
+it('the settings routes use the product paths and carry the csrf token on a change', async () => {
+  const speed = { download_kib: 64, upload_kib: null, active_downloads: 3, active_seeds: null, active_total: 8 }
+  const read = clientFor(200, SETTINGS_ANSWER)
+  expect((await read.client.settings()).downloads.default_dir).toBe('/data')
+  expect([read.seen[0].method, read.seen[0].url]).toEqual(['GET', '/api/v1/settings'])
+
+  const put = clientFor(200, SETTINGS_ANSWER)
+  await put.client.saveSpeed(speed)
+  expect([put.seen[0].method, put.seen[0].url]).toEqual(['PUT', '/api/v1/settings/speed'])
+  expect(JSON.parse(String(put.seen[0].body))).toEqual(speed)
+  expect(put.seen[0].headers.get('x-csrf-token')).toBe('tok')
+})
+
+it('save_downloads_never_sends_on_complete', async () => {
+  const { seen, client } = clientFor(200, SETTINGS_ANSWER)
+  const input = {
+    default_dir: '/data',
+    unfinished_dir: '/data/part',
+    start_paused: true,
+    watch_dir: null,
+    // A caller that holds the whole object must not be able to send the program through this page.
+    on_complete: { program: '/bin/evil', editable: true },
+  }
+  await client.saveDownloads(input)
+  expect([seen[0].method, seen[0].url]).toEqual(['PUT', '/api/v1/settings/downloads'])
+  const sent = JSON.parse(String(seen[0].body)) as Record<string, unknown>
+  expect(sent).toEqual({ default_dir: '/data', unfinished_dir: '/data/part', start_paused: true, watch_dir: null })
+  expect('on_complete' in sent).toBe(false)
+})

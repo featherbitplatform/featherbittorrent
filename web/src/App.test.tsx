@@ -33,12 +33,18 @@ const SESSION_BODY = {
   dht_nodes: 120,
 }
 
+const SETTINGS_BODY = {
+  speed: { download_kib: null, upload_kib: null, active_downloads: null, active_seeds: null, active_total: null },
+  downloads: {},
+}
+
 /** Every read fails the way a dead server makes fetch fail: the promise itself. */
 const dead = (): Promise<unknown> => Promise.reject(new TypeError('fetch failed'))
 
 /** The same server, answering: signed in, an empty table, a session row. */
 function alive(url: string): Promise<unknown> {
   if (url.includes('/auth/')) return answer({ auth: true, subject: 'alice', csrf: 'csrf-value' })
+  if (url.endsWith('/api/v1/settings')) return answer(SETTINGS_BODY)
   if (url.includes('/torrents')) return answer([])
   if (url.includes('/api/v1/session')) return answer(SESSION_BODY)
   return answer({})
@@ -165,7 +171,7 @@ describe('the screens in the desktop frame', () => {
     // The wrapper that keeps the table mounted under Settings still hides it there.
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
     expect(root!.parentElement!.hasAttribute('hidden'), 'the Torrents wrapper is not hidden under Settings').toBe(true)
-    const settings = screen.getByRole('heading', { name: 'Server' }).closest('.min-h-dvh')
+    const settings = screen.getByRole('heading', { name: 'Speed' }).closest('.min-h-dvh')
     expect(settings, 'the Settings root lost min-h-dvh').not.toBeNull()
     expect(boxless(settings!.parentElement, container), 'a box sits between the frame and the Settings root').toEqual([])
     world.behavior = null
@@ -178,11 +184,11 @@ describe('the Settings screen in the page', () => {
     render(<App />)
     await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    expect(screen.getByRole('heading', { name: 'Server' }) !== null, 'Settings did not open').toBe(true)
+    expect(screen.getByRole('heading', { name: 'Speed' }) !== null, 'Settings did not open').toBe(true)
     expect(screen.queryByRole('button', { name: 'Add torrent' }), 'the table stayed under Settings').toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Back to torrents' }))
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
-    expect(screen.queryByRole('heading', { name: 'Server' }), 'Settings stayed after Back').toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Speed' }), 'Settings stayed after Back').toBeNull()
     world.behavior = null
   })
 
@@ -231,7 +237,7 @@ describe('the Settings screen in the page', () => {
       window.dispatchEvent(new PopStateEvent('popstate'))
     })
     expect(
-      screen.queryByRole('heading', { name: 'Server' }),
+      screen.queryByRole('heading', { name: 'Speed' }),
       'the browser back did not close Settings',
     ).toBeNull()
     await waitFor(() => screen.getByRole('button', { name: 'Add torrent' }))
@@ -247,7 +253,7 @@ describe('the Add dialog over the torrents screen', () => {
     await waitFor(() => screen.getByRole('button', { name: 'Settings' }))
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
     expect(
-      screen.getByRole('heading', { name: 'Server' }) !== null,
+      screen.getByRole('heading', { name: 'Speed' }) !== null,
       'Settings did not open',
     ).toBe(true)
 
@@ -258,7 +264,7 @@ describe('the Add dialog over the torrents screen', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add torrent', hidden: true }))
 
     expect(
-      screen.queryByRole('heading', { name: 'Server' }),
+      screen.queryByRole('heading', { name: 'Speed' }),
       'pressing Add left Settings on screen',
     ).toBeNull()
     const dialog = screen.getByRole('dialog', { name: 'Add torrent' })

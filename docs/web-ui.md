@@ -240,18 +240,28 @@ creates parent folders, and a name that already exists is refused. The server al
 
 ## Settings
 
-The `Settings` button in the header opens the Settings screen; `Back to torrents` returns to the list, and
-so does the browser's back button or a phone's back gesture. It has three sections.
+The `Settings` button in the header opens the Settings page; `Back to torrents` stays at the top of it and
+returns to the list, and so does the browser's back button or a phone's back gesture.
 
-### Server
+The page shows one section at a time. A list of sections is on the left, in groups: `Torrents` (Speed),
+`Access` (Devices, Keyboard shortcuts) and, in the desktop app only, `This app` (Window, Serve the web UI,
+Instances). Pick a section, or move through the list with the arrow keys (`Home` and `End` go to the first
+and last), and only that section is shown, with its heading focused. A section that is not built yet is not
+listed. The page opens on the last section you used. On a phone the list becomes a `Jump to` menu at the top.
 
-The five server settings are `Download limit KiB/s`, `Upload limit KiB/s`, `Active downloads`,
-`Active seeds` and `Active total`. The rates are in KiB/s, and 0 or an empty field means unlimited.
-`Save` applies them to the running server and writes them to the server's `config.yaml`, so they are
-there again the next time it starts. A folder or a switch set here is saved the same way and kept
-between runs. A new Default folder is followed at once by the unfinished-folder moves and by the watch
-folder, but an add made through the API without a folder keeps going to the folder this run started with
-until the server is restarted.
+Each section has its own `Save`. If you leave a section that holds changes (by picking another section,
+pressing `Back to torrents` or closing the tab), the page asks `You have unsaved changes in <Section>.`:
+`Save changes` saves them and goes on, `Discard changes` drops them, and `Escape` closes the question and
+keeps you where you were.
+
+### Speed
+
+The five speed settings are `Download limit KiB/s` and `Upload limit KiB/s`, then, under `Queue`, `Active
+downloads`, `Active seeds` and `Active total`. The rates are in KiB/s, and 0 or an empty field means
+unlimited. `Save` applies them to the running server and writes them to the server's `config.yaml`, so they
+are there again the next time it starts. A server older than this page answers without a settings route: the
+section then says `This server is too old to change its settings here. Update it to change them.` and
+still saves the same five numbers through the engine's own routes.
 
 ### Devices
 

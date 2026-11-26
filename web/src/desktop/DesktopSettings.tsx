@@ -1,7 +1,7 @@
 /**
- * The Desktop section of Settings, drawn only inside the app: what closing the window does, Start at
- * login, the system title bar (Linux only, where the drawn bar has a fallback), Serve the web UI, the
- * editable keyboard shortcuts and the instances.
+ * The `This app` sections of Settings, drawn only inside the app: Window (what closing does, Start at
+ * login, the system title bar on Linux), Serve the web UI, Instances, and the editable keyboard shortcuts
+ * that stand in for the browser's read-only list. Settings supplies each section's heading.
  *
  * Every switch goes to the shell, which owns `desktop.yaml`; this section keeps only what it shows. Closing
  * offers `Keep running in the tray` only when the system gave the app a tray. Serve the web UI restarts This
@@ -11,7 +11,7 @@
  * @module desktop/DesktopSettings
  */
 import { useEffect, useState } from 'react'
-import type { FormEvent, ReactNode } from 'react'
+import type { FormEvent } from 'react'
 import Banner from '../components/Banner'
 import Button from '../components/Button'
 import TextField from '../components/TextField'
@@ -42,18 +42,12 @@ import { Instances } from './Instances'
 /** The address serving listens on until the person picks another: every interface, port 8090. */
 export const DEFAULT_BIND = '0.0.0.0:8090'
 
-/** The section ids Settings can be opened at. */
+/** The element ids the single page used; they still open Settings at the section that replaced them (`LEGACY_IDS`). */
 export const DESKTOP_SECTION = 'settings-desktop'
 export const SERVING_SECTION = 'settings-desktop-serving'
 export const INSTANCES_SECTION = 'settings-desktop-instances'
 
-export interface DesktopSettingsProps {
-  /** The instance list, as the switcher has it. */
-  list: InstancesList
-  /** The instance the window is connected to. */
-  current: string
-  /** Read the instance list again: something changed. */
-  onInstancesChanged(): Promise<void>
+export interface ServingSectionProps {
   /**
    * Serving was applied, or refused with `problem`: connect to This computer again if it restarted. The
    * page may remount Settings on that reconnect, so the problem lives with the caller and comes back as
@@ -93,25 +87,12 @@ function unchanged(now: ServingState, asked: ServingRequest): boolean {
 const CHECKBOX = 'h-4 w-4 accent-accent'
 const ROW = 'flex items-center gap-2 text-[13px] text-body'
 
-function Part({ id, title, children }: { id?: string; title: string; children: ReactNode }) {
-  return (
-    <div id={id} className="flex flex-col gap-3">
-      <h3 className="text-[14px] font-medium text-strong">{title}</h3>
-      {children}
-    </div>
-  )
-}
-
 /** Serve the web UI: the switch, where to listen and the login, applied together. */
-function Serving({
+export function ServingSection({
   onServingApplying,
   onServingChanged,
-  problem,
-}: {
-  onServingApplying?(): void
-  onServingChanged(problem: string | null): Promise<void>
-  problem: string | null
-}) {
+  servingProblem: problem = null,
+}: ServingSectionProps) {
   const [state, setState] = useState<ServingState | null>(null)
   const [enabled, setEnabled] = useState(false)
   const [bind, setBind] = useState(DEFAULT_BIND)
@@ -223,19 +204,27 @@ function Serving({
   )
 }
 
-export function DesktopSettings({
-  list,
-  current,
-  onInstancesChanged,
-  onServingApplying,
-  onServingChanged,
-  servingProblem = null,
-}: DesktopSettingsProps) {
+/** The shell's refusal or a fallback, shown above a section's switches. */
+function useChange(): [string | null, (act: () => Promise<void>, fallback: string) => Promise<void>] {
+  const [error, setError] = useState<string | null>(null)
+  async function change(act: () => Promise<void>, fallback: string): Promise<void> {
+    setError(null)
+    try {
+      await act()
+    } catch (cause) {
+      setError(line(cause, fallback))
+    }
+  }
+  return [error, change]
+}
+
+/** Window: what closing does, Start at login and, on Linux, the system title bar. */
+export function WindowSection() {
   const [platform, setPlatform] = useState<DesktopInfo['platform'] | null>(null)
   const [tray, setTray] = useState(false)
   const [prefs, setPrefs] = useState<DesktopPreferences | null>(null)
   const [systemBar, setSystemBar] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, change] = useChange()
 
   useEffect(() => {
     let live = true
@@ -261,15 +250,6 @@ export function DesktopSettings({
     }
   }, [])
 
-  async function change(act: () => Promise<void>, fallback: string): Promise<void> {
-    setError(null)
-    try {
-      await act()
-    } catch (cause) {
-      setError(line(cause, fallback))
-    }
-  }
-
   function close(action: CloseAction): void {
     void change(async () => {
       await setCloseAction(action)
@@ -290,18 +270,12 @@ export function DesktopSettings({
     }, 'The title bar could not be changed.')
   }
 
-  function saveShortcuts(overrides: ShortcutOverride[]): void {
-    void change(() => setShortcuts(overrides), 'The shortcuts could not be saved.')
-  }
-
   return (
-    <section id={DESKTOP_SECTION} aria-labelledby="settings-desktop-title" className="flex flex-col gap-6">
-      <h2 id="settings-desktop-title" className="text-base font-medium text-strong">
-        Desktop
-      </h2>
+    <div className="flex flex-col gap-6">
       {error !== null && <Banner tone="danger">{error}</Banner>}
 
-      <Part title="Close the window">
+      <div className="flex flex-col gap-3">
+        <h3 className="text-[14px] font-medium text-strong">Close the window</h3>
         <div role="radiogroup" aria-label="Close the window" className="flex flex-col gap-2">
           <label className={ROW}>
             <input
@@ -326,7 +300,7 @@ export function DesktopSettings({
             </label>
           )}
         </div>
-      </Part>
+      </div>
 
       <div className="flex flex-col gap-3">
         <label className={ROW}>
@@ -350,24 +324,36 @@ export function DesktopSettings({
           </label>
         )}
       </div>
-
-      <Part id={SERVING_SECTION} title="Serve the web UI">
-        <Serving
-          onServingApplying={onServingApplying}
-          onServingChanged={onServingChanged}
-          problem={servingProblem}
-        />
-      </Part>
-
-      <Part title="Keyboard shortcuts">
-        <Shortcuts editable onChange={saveShortcuts} />
-      </Part>
-
-      <Part id={INSTANCES_SECTION} title="Instances">
-        <Instances embedded list={list} current={current} onChanged={onInstancesChanged} />
-      </Part>
-    </section>
+    </div>
   )
 }
 
-export default DesktopSettings
+/** The editable keyboard shortcuts: changes are saved through the shell and applied at once. */
+export function DesktopShortcuts() {
+  const [error, change] = useChange()
+  function saveShortcuts(overrides: ShortcutOverride[]): void {
+    void change(() => setShortcuts(overrides), 'The shortcuts could not be saved.')
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      {error !== null && <Banner tone="danger">{error}</Banner>}
+      <Shortcuts editable onChange={saveShortcuts} />
+    </div>
+  )
+}
+
+/** Instances: the saved servers this window can connect to. */
+export function InstancesSection({
+  list,
+  current,
+  onInstancesChanged,
+}: {
+  /** The instance list, as the switcher has it. */
+  list: InstancesList
+  /** The instance the window is connected to. */
+  current: string
+  /** Read the instance list again: something changed. */
+  onInstancesChanged(): Promise<void>
+}) {
+  return <Instances embedded list={list} current={current} onChanged={onInstancesChanged} />
+}

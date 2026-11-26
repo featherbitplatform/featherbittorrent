@@ -32,11 +32,11 @@
  * ({@link OpenedHost}) sit beside the screens too, so a switch never loses one. A failed start of This
  * computer ({@link StartupProblemHost}) replaces all of it.
  *
- * Settings gets the Desktop section through {@link DesktopSettingsContext}. The switcher's `Manage
- * instances` opens Settings at its Instances part (the standalone manager is kept for when no workspace
+ * Settings gets the `This app` sections through {@link DesktopSettingsContext}. The switcher's `Manage
+ * instances` opens Settings at its Instances section (the standalone manager is kept for when no workspace
  * is on screen: connecting, unreachable, or a remote's sign-in). Applying Serve the web UI restarts This
  * computer with a new launch secret: the page then asks the shell for `local` again at once, rather than
- * waiting for a `401`, and reopens Settings at the serving part. The saved keyboard shortcuts are applied
+ * waiting for a `401`, and reopens Settings at Serve the web UI. The saved keyboard shortcuts are applied
  * when the page starts.
  *
  * @module desktop/DesktopRoot
@@ -75,7 +75,14 @@ import {
 } from './bridge'
 import type { InstancesList, Probe } from './bridge'
 import { CloseChoiceHost } from './CloseChoice'
-import { DesktopSettings, INSTANCES_SECTION, SERVING_SECTION } from './DesktopSettings'
+import {
+  DesktopShortcuts,
+  INSTANCES_SECTION,
+  InstancesSection,
+  SERVING_SECTION,
+  ServingSection,
+  WindowSection,
+} from './DesktopSettings'
 import { InstanceSwitcher } from './InstanceSwitcher'
 import { OpenedHost } from './OpenedAdd'
 import { StartupProblemHost } from './StartupProblem'
@@ -444,16 +451,24 @@ function DesktopScreens() {
 
   const desktopSettings = useMemo<DesktopSettingsSlot>(
     () => ({
-      sections: (
-        <DesktopSettings
-          list={list}
-          current={current}
-          onInstancesChanged={onChanged}
-          onServingApplying={onServingApplying}
-          onServingChanged={onServingChanged}
-          servingProblem={servingProblem}
-        />
-      ),
+      sections: [
+        { id: 'window', render: () => <WindowSection /> },
+        {
+          id: 'serving',
+          render: () => (
+            <ServingSection
+              onServingApplying={onServingApplying}
+              onServingChanged={onServingChanged}
+              servingProblem={servingProblem}
+            />
+          ),
+        },
+        {
+          id: 'instances',
+          render: () => <InstancesSection list={list} current={current} onInstancesChanged={onChanged} />,
+        },
+      ],
+      shortcuts: <DesktopShortcuts />,
       request: settingsRequest,
       onOpened: (seq) => setSettingsRequest((was) => (was?.seq === seq ? null : was)),
     }),
