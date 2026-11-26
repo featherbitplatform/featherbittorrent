@@ -1127,7 +1127,7 @@ async fn watch_folder_adds_and_renames_to_added() {
     );
     drop(added);
 
-    wait_for_file(watch.join("watched.torrent.added"), true).await;
+    wait_for_file(watch.join("watched.torrent"), false).await;
     assert_eq!(
         list_dir(&watch),
         vec!["watched.torrent.added".to_string()],
@@ -1189,7 +1189,7 @@ async fn watch_folder_waits_for_a_growing_file() {
         "the completed file went to the default folder"
     );
     drop(added);
-    wait_for_file(watch.join("growing.torrent.added"), true).await;
+    wait_for_file(watch.join("growing.torrent"), false).await;
     assert_eq!(
         list_dir(&watch),
         vec!["growing.torrent.added".to_string()],
@@ -1222,7 +1222,7 @@ async fn watch_folder_marks_garbage_invalid() {
         line.contains("junk.torrent"),
         "the line names the file: {line}"
     );
-    wait_for_file(watch.join("junk.torrent.invalid"), true).await;
+    wait_for_file(watch.join("junk.torrent"), false).await;
     assert_eq!(
         list_dir(&watch),
         vec!["junk.torrent.invalid".to_string()],
@@ -1272,7 +1272,7 @@ async fn watch_folder_refuses_a_file_past_the_size_limit() {
         line.contains("16 MiB"),
         "the reason is the size, named in the units the setting is stated in: {line}"
     );
-    wait_for_file(watch.join("huge.torrent.invalid"), true).await;
+    wait_for_file(watch.join("huge.torrent"), false).await;
     assert_eq!(
         list_dir(&watch),
         vec!["huge.torrent.invalid".to_string()],
@@ -1337,7 +1337,7 @@ async fn watch_folder_refuses_a_symlink_swapped_in() {
         Some(line.as_str()),
         "the same line is what the watch folder's field shows"
     );
-    wait_for_file(watch.join("swapped.torrent.invalid"), true).await;
+    wait_for_file(watch.join("swapped.torrent"), false).await;
 
     let snapshot = client.snapshot();
     assert!(
@@ -1404,7 +1404,7 @@ async fn watch_folder_refuses_a_file_grown_past_the_limit_after_settling() {
         line.contains("16 MiB"),
         "named in the units the limit is set in: {line}"
     );
-    wait_for_file(watch.join("grown.torrent.invalid"), true).await;
+    wait_for_file(watch.join("grown.torrent"), false).await;
 
     let snapshot = client.snapshot();
     assert!(
@@ -1604,8 +1604,8 @@ async fn watch_folder_duplicate_is_added_once() {
         added.torrents
     );
     drop(added);
-    wait_for_file(watch.join("first.torrent.added"), true).await;
-    wait_for_file(watch.join("second.torrent.added"), true).await;
+    wait_for_file(watch.join("first.torrent"), false).await;
+    wait_for_file(watch.join("second.torrent"), false).await;
 
     assert_eq!(
         list_dir(&watch),
@@ -1749,7 +1749,7 @@ async fn update_takes_effect_without_restart() {
         "added into the default folder the update named"
     );
     drop(added);
-    wait_for_file(new_watch.join("late.torrent.added"), true).await;
+    wait_for_file(new_watch.join("late.torrent"), false).await;
     assert_eq!(
         list_dir(&old_watch),
         Vec::<String>::new(),
@@ -1964,8 +1964,33 @@ async fn a_readded_torrent_is_new_to_a_run_that_lost_its_removal() {
 /// torrent behind the pass. The proof is the file *beside* the pipe: it is added if and only if the
 /// pass moved on past the open.
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_folder_adds_the_real_file_beside_a_fifo() {
+#[test]
+fn watch_folder_adds_the_real_file_beside_a_fifo() {
+    // The runtime is the test's own, not the macro's, because of what a mutated build does: a sweep
+    // whose candidate `open()` blocks parks a tokio blocking-pool thread, and dropping a runtime
+    // drains that pool - a wait that never ends when one of its jobs never returns. So the runtime
+    // is dropped the ordinary way only when the body finished; after a panic it is deliberately
+    // leaked (its pool may be holding a thread stuck in `open()`) and the process exits right there,
+    // with the failure printed. A test that hangs on its bug proves nothing; this one fails.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the watch folder test");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(watch_folder_adds_the_real_file_beside_a_fifo_body())
+    }));
+    if let Err(problem) = outcome {
+        // Leak, do not drop: after a panic the pool may hold the very thread the failure was about,
+        // and `Drop` would wait for it forever. Leaked threads die with the process, and the panic
+        // carries on past this function so the harness reports it the usual way - the message the
+        // failing assertion raised is what ends up in the log.
+        std::mem::forget(runtime);
+        std::panic::resume_unwind(problem);
+    }
+}
+
+#[cfg(unix)]
+async fn watch_folder_adds_the_real_file_beside_a_fifo_body() {
     let lib = Library::new("watch_fifo");
     let watch = lib.dir.path().join("watch");
     let (bytes, id) = torrent_in_seed_dir(&lib, "fifo", "shown.bin").await;
@@ -1994,7 +2019,24 @@ async fn watch_folder_adds_the_real_file_beside_a_fifo() {
     // the moment it appears, before a later pass - which finds the name already renamed out of the way,
     // has nothing left to say, and clears the field - goes by: the watch folder's field only carries
     // this pass's complaint, which is the moment the notice goes out.
-    let line = notice_where(&mut client, |text| text.contains("blocked.torrent")).await;
+    // The wait is bounded, and that is what makes a poisoned sweep *fail* this test instead of
+    // hanging it: a pass whose `open()` blocks on the swapped-in pipe never produces this line, and
+    // a deadline is the only witness that will ever say so. Twelve seconds is many times what a
+    // healthy pass takes to settle on the name and complain about it (two watch periods and a
+    // wake), so the deadline never fires on working code, but a sweep stuck inside `open()` is
+    // named, out loud, within seconds of the pass failing to come back.
+    let line = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        notice_where(&mut client, |text| text.contains("blocked.torrent")),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the watch sweep never came back from blocked.torrent within 12 seconds: the pass is \
+             sitting inside the candidate open() - without O_NONBLOCK a FIFO with no writer stops \
+             the whole scan, and the real torrent beside it waits behind that open too"
+        )
+    });
     assert!(
         line.contains("changed between the look and the read"),
         "the reason is that the name stopped being the file that was looked at: {line}"
@@ -2004,7 +2046,7 @@ async fn watch_folder_adds_the_real_file_beside_a_fifo() {
         Some(line.as_str()),
         "the same line is what the watch folder's field shows"
     );
-    wait_for_file(watch.join("blocked.torrent.invalid"), true).await;
+    wait_for_file(watch.join("blocked.torrent"), false).await;
 
     // And the point of the test: the file beside the pipe was added anyway, because the pass moved on
     // past the open instead of waiting inside it.
@@ -2017,7 +2059,7 @@ async fn watch_folder_adds_the_real_file_beside_a_fifo() {
         "a pipe in the folder did not stop a real torrent from being added",
     );
     drop(added);
-    wait_for_file(watch.join("show.torrent.added"), true).await;
+    wait_for_file(watch.join("show.torrent"), false).await;
     let kept = fs::metadata(watch.join("blocked.torrent.invalid")).expect("a refused name is kept");
     assert!(
         kept.file_type().is_fifo(),
