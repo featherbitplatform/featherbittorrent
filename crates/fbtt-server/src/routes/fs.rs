@@ -28,7 +28,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use fbtt_core::fs_list::{self, ListingError, inside_lexically};
+use fbtt_core::fs_list::{self, ListingError, inside_lexically, inside_resolved};
 use serde::{Deserialize, Serialize};
 
 use super::{RouteError, Shared, clean};
@@ -206,10 +206,7 @@ fn confirm_inside(roots: &[Root], created: &Path, shown: &str) -> Result<(), Rou
             return Err(refused());
         }
     };
-    if roots
-        .iter()
-        .any(|root| resolved.starts_with(&root.canonical))
-    {
+    if inside_resolved(roots, &resolved) {
         return Ok(());
     }
     tracing::warn!("a new folder resolved outside the allowed folders and was removed again");

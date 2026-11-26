@@ -183,31 +183,41 @@ pub(super) struct NewDevice {
 /// the config, changes it, and only its own edit is this route's - the accounts, the folders and the limits
 /// in the file belong to whoever wrote it.
 ///
-/// A refusal from `change` - a name that is already there, a name to remove that is not - writes nothing,
-/// and a file this server cannot read is answered `500 internal` and left exactly where it is (see
-/// [`Shared::write_config`]).
+/// The list logins check against is replaced inside the lock, with the config the write just saved, so a
+/// remove racing an add cannot leave the two of them swapped: two swaps made after the lock was released
+/// could land in the reverse order and leave a key the file no longer has still accepted. A refusal from
+/// `change` - a name that is already there, a name to remove that is not - writes nothing and swaps
+/// nothing, and a file this server cannot read is answered `500 internal` and left exactly where it is
+/// (see [`Shared::write_config`]).
 async fn change(
     shared: &Arc<Shared>,
     change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError> + Send,
 ) -> Result<(), RouteError> {
-    let config = shared
-        .write_config(move |config| {
-            // The device list is part of the server section. A config that never named one gets it here:
-            // this route only answers to a server that is already running, so registering a key with it is
-            // the same choice `featherbittorrent device add` makes from a command line.
-            let server = config.server.get_or_insert_with(ServerConfig::default);
-            change(&mut server.auth.devices)
-        })
+    // A second handle on the same state, for the step that runs while the config lock is held: the closure
+    // below cannot borrow `shared` again while `write_config` is borrowing it.
+    let applying = Arc::clone(shared);
+    shared
+        .write_config(
+            move |config| {
+                // The device list is part of the server section. A config that never named one gets it here:
+                // this route only answers to a server that is already running, so registering a key with it is
+                // the same choice `featherbittorrent device add` makes from a command line.
+                let server = config.server.get_or_insert_with(ServerConfig::default);
+                change(&mut server.auth.devices)
+            },
+            move |config| {
+                // What logins check against becomes what was just written, so from here the file and this run
+                // agree. A key in it that cannot be used says so here too, where a person who has just edited
+                // the list by hand would want to hear it.
+                let devices = config
+                    .server
+                    .as_ref()
+                    .map(|server| server.auth.devices.clone())
+                    .unwrap_or_default();
+                *locked(&applying.devices) = DeviceTable::build(&devices);
+            },
+        )
         .await?;
-    // What logins check against becomes what was just written, so from here the file and this run agree.
-    // A key in it that cannot be used says so here too, where a person who has just edited the list by
-    // hand would want to hear it.
-    let devices = config
-        .server
-        .as_ref()
-        .map(|server| server.auth.devices.clone())
-        .unwrap_or_default();
-    *locked(&shared.devices) = DeviceTable::build(&devices);
     Ok(())
 }
 

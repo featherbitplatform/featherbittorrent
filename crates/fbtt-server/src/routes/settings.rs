@@ -17,7 +17,16 @@
 //! Every write is ordered the same way - validate, write `config.yaml`, apply - and a write that fails
 //! applies nothing. The file is the promise; a limit the file does not have must not take hold in a run that
 //! could not record it. A file the server cannot read is answered `500 config_unreadable` and left where it
-//! is, with nothing written and the running session untouched.
+//! is, with nothing written and the running session untouched; a file that cannot be written is
+//! `500 config_unwritable`, saying what the operating system said - neither answer names the config's path
+//! or file name, which is where the server's log comes in. The apply is the last step of
+//! the same write rather than something that follows it: it runs with the config lock still held, so two
+//! changes written in one order cannot take effect in the other.
+//!
+//! A folder in a submitted section is checked twice over: lexically against the folders this run serves, in
+//! both the spelling `config.yaml` gives them and the one the file system resolves them to, and then for real
+//! by resolving the deepest part of the path that exists and requiring it inside a root. A link inside the
+//! roots that leads out is refused by the second check, and a folder this server does not serve by either.
 //!
 //! The program a finished torrent runs is the one setting a client may not name on a server: it lives in the
 //! server's `config.yaml`, and a request that carries the desktop app's launch secret - and only as a bearer
@@ -25,7 +34,7 @@
 //! secret arriving in a URL all get `403 set_in_config_file`, which is the same line a read-only screen
 //! shows.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
@@ -33,7 +42,7 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
 use fbt::{RateLimit, Session};
-use fbtt_core::fs_list::inside_lexically;
+use fbtt_core::fs_list::inside_roots;
 use fbtt_core::{
     Config, DownloadsChange, DownloadsView, LiveLimits, OnCompleteView, SettingsProblem,
     SettingsView, validate_downloads,
@@ -77,14 +86,20 @@ pub(super) async fn put_speed(
     // A body that is not JSON of this shape comes back in this API's error shape rather than axum's
     // plain-text one.
     let Json(limits) = given?;
+    // The engine is put under the limits inside the same lock the file was written under, so a speed save
+    // racing another one cannot land on the older limits after the newer save has already been written.
+    // `LiveLimits` is `Copy`, so the same value goes to both halves.
+    let session = shared.session().clone();
     let config = shared
-        .write_config(move |config| {
-            config.limits = limits.into();
-            Ok(())
-        })
+        .write_config(
+            move |config| {
+                config.limits = limits.into();
+                Ok(())
+            },
+            move |_config| apply_speed(&session, limits),
+        )
         .await
-        .map_err(|error| error.with_code(CONFIG_UNREADABLE))?;
-    apply_speed(shared.session(), limits);
+        .map_err(|error| error.named(CONFIG_UNREADABLE))?;
     Ok(Json(view(&shared, &config, &headers)))
 }
 
@@ -94,9 +109,10 @@ pub(super) async fn put_speed(
 /// The checks come before the write, in this order: the program may only be named by a request carrying the
 /// launch secret (`403 set_in_config_file`); the section has to be one this server could run, every folder
 /// inside the folders it serves (`403 outside_roots` for one that is not, `400 invalid_setting` with the
-/// plan's own line for the rest); and a folder has to be somewhere this server may really write, by the same
-/// canonical check the file routes make. Nothing is written for a refusal. Once it is written, the downloads
-/// automation is put under the new settings.
+/// plan's own line for the rest); and every folder has to be somewhere this server may really write, checked
+/// against the roots once the deepest part of the path that exists is resolved, so a link inside the roots
+/// that leads out is refused the same way. Nothing is written for a refusal. Once it is written, the
+/// downloads automation is put under the new settings, inside the same lock the write was made under.
 pub(super) async fn put_downloads(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -113,40 +129,75 @@ pub(super) async fn put_downloads(
             SettingsProblem::NotEditable.message(),
         ));
     }
-    // What this server may name: the folders it serves, as `config.yaml` spells them. The section has to be
-    // one this run could work in, and the three folders have to be different places.
-    let roots = shared.served_roots();
+    // What this server may name: the folders it serves, in both the spelling `config.yaml` gives them and the
+    // one the file system resolves them to. The section has to be one this run could work in, and the three
+    // folders have to be different places.
+    let roots = shared.served_roots_for_validation();
     if let Err(problem) = validate_downloads(&change, Some(&roots)) {
         return Err(problem_error(problem));
     }
-    // And a folder has to be really inside one of them, not only spelled that way: the same canonical
-    // comparison the file routes make, so a `..` or a symlink that leads out is refused here too.
-    for dir in submitted_folders(&change) {
-        if !inside_lexically(&shared.roots, dir) {
-            return Err(problem_error(SettingsProblem::OutsideRoots));
-        }
-    }
+    // And every folder has to be really inside one of them, not only spelled that way: below a root as
+    // spelled, and below a root again once the deepest part of it that exists is resolved, so a link inside
+    // the roots that leads out - or a folder named past one - is refused rather than written through. This
+    // asks the file system, so it runs on the blocking pool like every other disk call here.
+    folders_are_inside(&shared, &change).await?;
+    // The roots this run serves, as spelled: pinned into the file before a change moves the download folder,
+    // so the allowed folders do not move with it.
     let roots = shared.served_roots();
+    // The automation is put under the settings the file now holds - inside the same lock the write was made
+    // under - so the watch folder and the completion program follow a save without a restart, and two saves
+    // racing cannot leave it on the older settings. This runs after the write: a write that failed changed
+    // nothing and applies nothing.
+    let applying = Arc::clone(&shared);
     let config = shared
-        .write_config(move |config| {
-            pin_roots_before_moving(config, &change, &roots);
-            config.download_dir = change.default_dir.clone();
-            config.downloads.apply(&change);
-            Ok(())
-        })
+        .write_config(
+            move |config| {
+                pin_roots_before_moving(config, &change, &roots);
+                config.download_dir = change.default_dir.clone();
+                config.downloads.apply(&change);
+                Ok(())
+            },
+            move |config| {
+                applying
+                    .automation()
+                    .update(config.download_dir.clone(), config.downloads.clone());
+            },
+        )
         .await
-        .map_err(|error| error.with_code(CONFIG_UNREADABLE))?;
-    // The automation is put under the settings the file now holds, so the watch folder and the completion
-    // program follow a save without a restart. This comes after the write: a write that failed changed
-    // nothing, and neither must this.
-    shared
-        .automation()
-        .update(config.download_dir.clone(), config.downloads.clone());
+        .map_err(|error| error.named(CONFIG_UNREADABLE))?;
     Ok(Json(view(&shared, &config, &headers)))
 }
 
+/// Whether every folder a submitted section names is somewhere this server may really write: below a root as
+/// spelled, and below a root again once the deepest part of the path that exists is resolved
+/// ([`inside_roots`]). A folder outside every root is `403 outside_roots`.
+///
+/// The check asks the file system for each folder, so it runs on the blocking pool: a request waits on it,
+/// and a config directory on a slow disk must not hold the connection's task while it does.
+async fn folders_are_inside(
+    shared: &Arc<Shared>,
+    change: &DownloadsChange,
+) -> Result<(), RouteError> {
+    let roots = Arc::clone(&shared.roots);
+    let folders: Vec<PathBuf> = submitted_folders(change).map(Path::to_path_buf).collect();
+    let inside = tokio::task::spawn_blocking(move || {
+        folders.iter().all(|folder| inside_roots(&roots, folder))
+    })
+    .await
+    .map_err(|problem| {
+        tracing::warn!(problem = %problem, "the downloads folders could not be checked");
+        RouteError::internal("the downloads folder could not be checked")
+    })?;
+    if inside {
+        Ok(())
+    } else {
+        Err(problem_error(SettingsProblem::OutsideRoots))
+    }
+}
+
 /// The error code a settings write answers when `config.yaml` cannot be read for edit: the same `500` a
-/// device add gives, under the name a client of these routes reads.
+/// device add gives, under the name a client of these routes reads. A config that cannot be *written* keeps
+/// its own `config_unwritable` ([`Shared::write_config`]).
 const CONFIG_UNREADABLE: &str = "config_unreadable";
 
 /// The view one request reads: the live limits and the downloads section, with `editable` answering about
@@ -206,7 +257,7 @@ fn apply_speed(session: &Session, limits: LiveLimits) {
 }
 
 /// The folders a submitted section names, so the canonical check can see each one.
-fn submitted_folders(change: &DownloadsChange) -> impl Iterator<Item = &std::path::Path> {
+fn submitted_folders(change: &DownloadsChange) -> impl Iterator<Item = &Path> {
     [
         Some(change.default_dir.as_path()),
         change.unfinished_dir.as_deref(),

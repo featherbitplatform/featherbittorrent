@@ -240,30 +240,43 @@ impl Shared {
         &self.automation
     }
 
-    /// Reads `config.yaml`, gives `change` the config to alter, writes it back atomically and keeps it as
-    /// what this run reports its settings from - one write at a time, which is what makes a change a change
-    /// rather than a race.
+    /// Reads `config.yaml`, gives `change` the config to alter, writes it back atomically, keeps it as
+    /// what this run reports its settings from and only then hands it to `apply` - all under one lock, so
+    /// every write and everything it makes happen to this run is one change at a time.
     ///
     /// Every product route that writes the file goes through here and therefore through
     /// [`changing_config`](Self::changing_config): the devices, the speed and the downloads. Two of them
     /// that each read the file, changed their own field and wrote it back would leave one with a change
     /// nobody asked for and the other with none - a speed save and a device add started together must both
-    /// survive. Held while the disk work runs on the blocking pool, which is why it is an async lock.
+    /// survive. Held while the disk work runs on the blocking pool and while `apply` runs, which is why it
+    /// is an async lock.
+    ///
+    /// `apply` is the in-memory half of a change - the session put under new limits, the downloads
+    /// automation given the settings the file now holds, the device list logins check against replaced -
+    /// and it runs with the guard still held, after the save has landed. That order is the guarantee: with
+    /// the apply outside the lock, two changes written in one order could take effect in the other, leaving
+    /// the run under limits (or a device list) the file no longer has. Nothing an `apply` may do may wait
+    /// on anything that takes this lock, or the server would wait on itself; the three applies are local
+    /// calls on the session, the automation and the device list, so none of them does. `apply` is
+    /// synchronous for the same reason.
     ///
     /// With no file yet, what `change` alters is the config this run started on, so a save cannot invent a
     /// different library than the one being served. The bytes go into a temp file beside the target and are
     /// renamed over it ([`Config::save`]), so a crash leaves the old file or the new one and never half of
-    /// each. `change` refusing - a device that is already there, a name that is not - writes nothing.
+    /// each. `change` refusing - a device that is already there, a name that is not - writes nothing and
+    /// applies nothing.
     ///
     /// A file that cannot be read is answered and left exactly where it is, with nothing written and
     /// nothing applied: reading is [`Config::load_for_edit`], which renames nothing, unlike
     /// [`Config::load`](fbtt_core::Config::load), whose job is to let a *run* start on something. A request
     /// has no such need - it can fail - and an ordinary save renaming somebody's hand-edited file is not
-    /// this route's to do. The path and the reason go to the log; the answer keeps one sentence and names
-    /// no directory.
+    /// this route's to do. The path and the reason go to the log; the answer keeps one sentence. A read
+    /// failure is a plain `500 internal` for a route to give its own name to, and a save failure is
+    /// `500 config_unwritable`, which says what an operator would have to fix.
     pub(crate) async fn write_config(
         &self,
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
+        apply: impl FnOnce(&Config) + Send,
     ) -> Result<Config, RouteError> {
         let _guard = self.changing_config.lock().await;
         // Read on the blocking pool, like every other disk call here. Each call takes a copy of the path
@@ -297,10 +310,11 @@ impl Shared {
             }
         };
         change(&mut config)?;
-        // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`): a
-        // folder this server has no write permission on, or a disk with no room left, is news for whoever
-        // runs this server and not for the client, so the reason goes to the log and the answer keeps one
-        // sentence with no path in it.
+        // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`). A
+        // folder this server has no write permission on, a disk with no room left, a path somebody made
+        // read-only: this is an operator's problem, not a client's mistake, so it is answered
+        // `500 config_unwritable` with what the operating system said - the one thing whoever runs this
+        // server can act on - and the whole path goes into the log line beside it.
         let saving = file.clone();
         let writing = config.clone();
         tokio::task::spawn_blocking(move || writing.save(&saving))
@@ -311,7 +325,7 @@ impl Shared {
                     problem = %problem,
                     "the config save task failed",
                 );
-                RouteError::internal("the server could not save its config; see the server log")
+                config_unwritable(&problem.to_string())
             })?
             .map_err(|problem| {
                 tracing::warn!(
@@ -319,12 +333,17 @@ impl Shared {
                     problem = %problem,
                     "the config could not be saved",
                 );
-                RouteError::internal("the server could not save its config; see the server log")
+                config_unwritable(&save_reason(&problem))
             })?;
-        // What the settings route reports from becomes what was just written, so a screen reads back what
-        // a save wrote rather than what the file said before it.
-        *locked(&self.current) = config.clone();
-        Ok(config)
+        // What this run reports from, what an `apply` is handed and what the caller gets back is the config
+        // as this run would use it: the same resolve the startup makes, so a relative folder in the file
+        // becomes the folder the run works in rather than the spelling the file happened to use. Stored and
+        // applied here, before the guard is released, so two changes take effect in the order they were
+        // written and never in the reverse.
+        let resolved = config.resolve(&self.paths);
+        *locked(&self.current) = resolved.clone();
+        apply(&resolved);
+        Ok(resolved)
     }
 
     /// The config as the last write left it, this run's own to begin with: what a settings screen reads
@@ -337,6 +356,23 @@ impl Shared {
     /// be inside, and what gets pinned into the file before a change moves the download folder.
     pub(crate) fn served_roots(&self) -> Vec<std::path::PathBuf> {
         self.roots.iter().map(|root| root.given.clone()).collect()
+    }
+
+    /// The folders this run serves in both spellings, given and canonical: what a submitted downloads
+    /// folder is judged against before anything touches the disk.
+    ///
+    /// Both are needed because a folder reaches this server in whichever spelling the client has: the one
+    /// the file names, or the one the file system resolves it to. They differ for an ordinary folder on
+    /// some platforms - on macOS `/var` is a link to `/private/var`, so a root below a temp directory has
+    /// two absolute spellings that are not prefixes of one another, and a client that resolved the path
+    /// before sending it would be refused for a folder the server serves. Case is deliberately not
+    /// repaired: on Windows two spellings differing only in case are one folder, and a client that gets
+    /// that wrong is refused rather than walked through a guess.
+    pub(crate) fn served_roots_for_validation(&self) -> Vec<std::path::PathBuf> {
+        self.roots
+            .iter()
+            .flat_map(|root| [root.given.clone(), root.canonical.clone()])
+            .collect()
     }
 
     /// Whether this request may name the program a finished torrent runs on this machine.
@@ -711,6 +747,42 @@ impl DeviceTable {
     }
 }
 
+/// The answer for a save that could not be written down: `500 config_unwritable`, saying which file failed
+/// and what the operating system said, and pointing at the log for the rest.
+///
+/// The answer names the file by what it is - the server's config - and not by where it lives or what it is
+/// called: that directory is the operator's business, and an answer that printed it would tell a signed-in
+/// stranger how this machine is laid out. The rule is not new here; a *read* failure keeps the same silence
+/// for the same reason, and `tests/server.rs` holds a device add to it. The whole path is in the log line
+/// this answer points at, which is where whoever runs this server needs it.
+fn config_unwritable(reason: &str) -> RouteError {
+    RouteError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "config_unwritable",
+        format!(
+            "the server could not write its config file ({}); see the server log",
+            clean(reason),
+        ),
+    )
+}
+
+/// What to say about a save that failed: what the operating system said, with none of where.
+///
+/// [`ConfigError::Write`] prints the file's own path in its line (`cannot write <path>: ...`), which is
+/// exactly the part an answer must not carry, so only the error underneath it - the operating system's own
+/// words - is taken from it. That is also what makes the answer useful: it says a folder could not be
+/// written to rather than how this machine is laid out. Anything else is said as it is.
+fn save_reason(problem: &fbtt_core::ConfigError) -> String {
+    match problem {
+        fbtt_core::ConfigError::Write { source, .. } => source.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The code [`RouteError::internal`] gives, and the one [`RouteError::named`] will rename: a `500` that
+/// says only that something went wrong.
+const INTERNAL: &str = "internal";
+
 /// An error one of these routes answers with, in the shape fbt-api's errors have: a status, a
 /// snake_case code from the same vocabulary (`invalid_request`, `unauthorized`, `path_not_allowed`,
 /// `forbidden`, `not_found`, `request_timeout`, `already_exists`, `too_many_requests`, `busy`,
@@ -821,14 +893,20 @@ impl RouteError {
 
     /// `500 internal`: something this server could not do, said as briefly as it can be.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL, message)
     }
 
-    /// The same error with a different code, for a route that gives a shared failure its own name. The
+    /// The same error with a different code, for a route that gives a shared failure its own name: the
     /// settings routes answer a config they cannot read as `500 config_unreadable`; a device add keeps the
     /// `500 internal` [`Shared::write_config`] builds, and both come from the same write.
-    fn with_code(mut self, code: &'static str) -> Self {
-        self.code = code;
+    ///
+    /// Only an error that says nothing of its own is renamed. A save failure already carries
+    /// `config_unwritable`, which names what really went wrong, so a route asking for `config_unreadable`
+    /// there does not claim a file it could read is one it could not.
+    fn named(mut self, code: &'static str) -> Self {
+        if self.code == INTERNAL {
+            self.code = code;
+        }
         self
     }
 

@@ -45,7 +45,9 @@ own. Answering `no`, or pasting nothing, adds no device key.
 
 The wizard runs only when there is no `config.yaml`, when the file has no `server:` section (one
 written by the TUI never has), or when its bytes could not be read. A config that parses and names a
-server is used as it stands. The library lock comes first, before any of these questions: while another
+server is used as it stands. A config with no `server:` section is served on the defaults, which means
+the API may name the folder `download_dir` points at and nothing else: moving the Default folder moves
+what is browsable with it. The library lock comes first, before any of these questions: while another
 run holds the library, `serve` neither asks anything nor writes anything, and exits 3 with the usual
 "already using this library" line.
 
@@ -266,8 +268,20 @@ share one lock with them so two saves started together both survive. A save writ
 (a temp file beside it, renamed over it) and keeps every key it did not change, including keys from a
 version this one does not know; comments are not kept, because a save writes new bytes rather than
 editing the old ones. A file this server cannot read is answered `500 config_unreadable` and left exactly
-where it is, with nothing written and nothing applied. The write comes first and the change takes effect
-only after it lands: a save that could not be recorded leaves the running session as it was.
+where it is, with nothing written and nothing applied; a file it can read but cannot write is answered
+`500 config_unwritable`, saying what the operating system said, and left as it was too. Neither answer
+names the config's path or file name - that is the server's own business and the log line's - so a
+`config_unwritable` is read as "the server could not write its config file (reason)" and the reason is
+what to act on. The
+write comes first and the change takes effect only after it lands, inside the same lock: a save that could
+not be recorded leaves the running session as it was, and two saves started together take effect in the
+order they were written rather than in the reverse. A folder in a submitted section is checked after links
+are resolved, so a link inside the allowed folders that leads out is refused `403 outside_roots` rather
+than written through.
+
+A changed Default folder is followed at once by the unfinished-folder moves and by the watch folder, but
+an add made through the engine API without a folder (`POST /api/v1/torrents` with no `save_path`) keeps
+going to the folder this run started with until the server is restarted: fbt has no runtime setter for it.
 
 The engine's own `PUT /api/v1/session/limits` and `/api/v1/session/queue` still set the running limits and
 still write nothing: an older client keeps working exactly as it did, and only the settings routes

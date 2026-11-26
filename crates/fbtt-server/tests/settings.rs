@@ -40,10 +40,16 @@ const CSRF: &str = "x-csrf-token";
 /// A real Ed25519 public key line, for the one test that puts a device in the file by hand: what a
 /// person pastes into `authorized_keys`. Nothing here verifies a signature; the key only has to be one.
 const PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ8DMsPmXeaez8OSQsPlY1gfyaNUfLtK9VVHPGZJ8ay8 settings test";
-/// The stand-in program these tests name as `downloads.on_complete`: `fbtt-fake-player`, the binary this
-/// workspace builds for its tests. Making the engine names it here is about the *value* the route takes:
-/// a program by its full path that is really there and is not a batch file. Nothing here starts it.
-const FAKE: &str = env!("CARGO_BIN_EXE_fbtt-fake-player");
+/// A second real Ed25519 public key line, so a test that races a device removal against a device add is
+/// about two different keys rather than one key under two names. A key line, nothing more; nothing here
+/// verifies a signature with it.
+const OTHER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDhj3vphewkV33lT9kbTx4mTkKc5zaWFUuQlm65H6IG/ settings race test";
+/// The stand-in program these tests name as `downloads.on_complete`: this test binary's own path, which is
+/// absolute, is really there and is not a batch file - the three things the route checks a program for.
+/// Making the engine name it is about the *value* the route takes; nothing here starts it.
+fn fake() -> PathBuf {
+    std::env::current_exe().expect("this test binary's own path")
+}
 
 /// Runs `what` under the deadline, so a server that never answers is a failure with a message rather than
 /// a hung test job.
@@ -406,6 +412,42 @@ async fn get_settings_reports_live_speed_and_downloads() {
     served.stop().await;
 }
 
+/// A folder written relatively in `config.yaml` is a folder in the library directory once the run resolves
+/// it, and the settings screen has to report the folder the run would work in rather than the spelling the
+/// file happens to use. The file is read back on the first write, so that is where a stale unresolved copy
+/// would surface: after a save, `GET` answers the resolved folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_report_a_relative_download_dir_resolved() {
+    let served = Served::start("settings-relative", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    // A config a person wrote by hand, naming the download folder relatively: the run resolves that against
+    // the library directory, and so must anything that reads the file back.
+    let mut written = with_alice(served.dir.path());
+    written.download_dir = PathBuf::from("downloads");
+    served.save_config(&written);
+
+    // A write is what reads the file back in; a speed save is the smallest one that does.
+    let response = put_bearer(
+        &client,
+        &served.url("/api/v1/settings/speed"),
+        &token,
+        speed(64, 0, (None, None, None)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "a speed save");
+
+    let expected = served.paths.data_dir.join("downloads");
+    let view = body(get_bearer(&client, &served.url("/api/v1/settings"), &token).await).await;
+    assert_eq!(
+        view["downloads"]["default_dir"],
+        expected.to_string_lossy().as_ref(),
+        "a relative folder is reported as the absolute one this run would work in: {view}",
+    );
+
+    served.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Speed: applied and saved
 // ---------------------------------------------------------------------------
@@ -596,8 +638,128 @@ async fn put_downloads_outside_roots_is_403() {
     served.stop().await;
 }
 
-/// An unfinished folder that is the default folder splits nothing: a torrent would work in the folder it
-/// is supposed to be moved out of. Refused as a bad setting, with the plan's exact line.
+/// A link inside the roots that leads out is outside them too. Its own spelling is below a root, so the
+/// lexical check the plan makes accepts it; resolved, it points somewhere this server does not serve, so
+/// the folder has to be refused before it is written down - otherwise a torrent would land wherever the
+/// link leads, and a change that looked local would write outside the library.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn put_downloads_through_a_symlink_out_of_the_roots_is_403() {
+    let served = Served::start("settings-symlink", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    // Somewhere this server does not serve, and a link to it inside the folder it does serve.
+    let outside = served.dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("a folder outside the roots");
+    let link = served.download_dir().join("out");
+    std::os::unix::fs::symlink(&outside, &link).expect("a link inside the roots that leads out");
+    // A config on disk, so a refusal can be told apart from "nothing had been written anyway".
+    served.save_config(&with_alice(served.dir.path()));
+    let before = bytes(&served.file());
+
+    let response = put_bearer(
+        &client,
+        &served.url("/api/v1/settings/downloads"),
+        &token,
+        downloads_body(&link, None, None, false, None),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a link that leads out is outside the roots",
+    );
+    let (status, code, message) = error_of(response).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a link that leads out is outside the roots: {message}",
+    );
+    assert_eq!(code, "outside_roots");
+    assert_eq!(
+        bytes(&served.file()),
+        before,
+        "the file is exactly as it was: nothing was written for a refused change",
+    );
+
+    served.stop().await;
+}
+
+/// The deepest part of a folder that exists is what decides: a folder that is not there yet is judged by
+/// the root above it, so a downloads change may name one before anything has made it. This is the other
+/// half of the symlink rule - the check must not refuse a plain new folder just because it does not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_downloads_may_name_a_folder_that_is_not_there_yet() {
+    let served = Served::start("settings-new-folder", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+
+    let fresh = served.download_dir().join("not-made-yet");
+    assert!(!fresh.exists(), "the folder really is not there");
+    let response = put_bearer(
+        &client,
+        &served.url("/api/v1/settings/downloads"),
+        &token,
+        downloads_body(&fresh, None, None, false, None),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a folder below a root is accepted whether or not it is there yet",
+    );
+
+    served.stop().await;
+}
+
+/// A root reached through a link of its own has two spellings, and a client may arrive with either: the one
+/// `config.yaml` names, or the one the file system resolves it to. On a machine where they differ - a link
+/// in the download folder's own path, and by default on macOS, where `/var` is a link to `/private/var` -
+/// a folder spelled the way the file system spells it is inside a root just as much as the other, so the
+/// check is handed both. Refusing the resolved spelling would refuse a person the folder the server itself
+/// had just shown them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn put_downloads_accepts_a_root_spelled_the_way_the_file_system_resolves_it() {
+    let served = Served::start("settings-root-spellings", |scratch| {
+        let real = scratch.join("real");
+        fs::create_dir_all(&real).expect("the folder the library really is in");
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("a link to it");
+        let mut config = with_alice(scratch);
+        // The library is served through the link, so the root this run serves has the link as its own
+        // spelling and `real` as the form the file system resolves.
+        config.download_dir = link;
+        config
+    })
+    .await;
+    let client = http();
+    let token = bearer(&served).await;
+
+    // The same root, spelled the way the file system resolves it: on this machine the scratch directory's
+    // own prefix resolves too, which is what makes the two spellings differ even without a link of ours.
+    let root_resolved = served
+        .dir
+        .path()
+        .join("link")
+        .canonicalize()
+        .expect("the root resolves");
+    let resolved = root_resolved.join("shows");
+    let response = put_bearer(
+        &client,
+        &served.url("/api/v1/settings/downloads"),
+        &token,
+        downloads_body(&resolved, None, None, false, None),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the folder spelled the way the file system resolves the root is inside a root",
+    );
+
+    served.stop().await;
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn put_downloads_unfinished_equal_default_is_400() {
     let served = Served::start("settings-unfinished", with_alice).await;
@@ -648,7 +810,7 @@ async fn run_a_program_from_a_password_session_is_403() {
             None,
             None,
             false,
-            Some(Some(Path::new(FAKE))),
+            Some(Some(&fake())),
         ),
     )
     .await;
@@ -685,7 +847,7 @@ async fn run_a_program_from_the_web_cookie_session_is_403() {
             None,
             None,
             false,
-            Some(Some(Path::new(FAKE))),
+            Some(Some(&fake())),
         ),
     )
     .await;
@@ -722,7 +884,7 @@ async fn run_a_program_with_the_launch_secret_is_saved() {
                 None,
                 None,
                 false,
-                Some(Some(Path::new(FAKE))),
+                Some(Some(&fake())),
             ))
             .send(),
     )
@@ -739,7 +901,7 @@ async fn run_a_program_with_the_launch_secret_is_saved() {
         .expect("the file was written");
     assert_eq!(
         after.downloads.on_complete,
-        Some(PathBuf::from(FAKE)),
+        Some(fake()),
         "the program is in the file",
     );
 
@@ -759,7 +921,7 @@ async fn exposed_desktop_password_user_cannot_set_the_program() {
         None,
         None,
         false,
-        Some(Some(Path::new(FAKE))),
+        Some(Some(&fake())),
     );
     let response = put_bearer(
         &client,
@@ -789,7 +951,7 @@ async fn exposed_desktop_password_user_cannot_set_the_program() {
     let after = Config::load_for_edit(&served.file())
         .expect("the config reads back")
         .expect("the file was written");
-    assert_eq!(after.downloads.on_complete, Some(PathBuf::from(FAKE)));
+    assert_eq!(after.downloads.on_complete, Some(fake()));
 
     served.stop().await;
 }
@@ -816,7 +978,7 @@ async fn query_token_secret_does_not_count_as_launch_secret() {
             None,
             None,
             false,
-            Some(Some(Path::new(FAKE))),
+            Some(Some(&fake())),
         ),
     )
     .await;
@@ -840,6 +1002,72 @@ async fn query_token_secret_does_not_count_as_launch_secret() {
     served.stop().await;
 }
 
+/// The same rule with no session at all: a `?token=<launch secret>` and nothing else is refused before any
+/// handler runs, because the launch secret is only ever read from the `Authorization` header. The query
+/// token is a credential for the file-stream and event routes and for nothing else, so on a settings route
+/// there is nothing in it for the guard to accept and the answer is `401`, not a `200` and not a `403` from
+/// inside the handler.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_token_on_its_own_does_not_reach_the_settings_routes() {
+    let served = Served::start_desktop("settings-query-alone", true, with_alice).await;
+    let client = http();
+    let url = format!(
+        "{}?token={LAUNCH_SECRET}",
+        served.url("/api/v1/settings/downloads")
+    );
+
+    let response = within(
+        client
+            .put(&url)
+            .json(&downloads_body(
+                &served.download_dir(),
+                None,
+                None,
+                false,
+                Some(Some(&fake())),
+            ))
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "the launch secret in a URL is not the desktop app naming a program",
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "and it is not a credential on this route at all: it is refused before the handler runs",
+    );
+    assert!(
+        !served.file().exists(),
+        "nothing was written for a refused change",
+    );
+
+    served.stop().await;
+}
+
+/// A `GET` with the same query token and no header is refused the same way: the settings routes read no
+/// credential from the URL, so the address alone is not enough to read a server's settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_token_on_its_own_does_not_read_the_settings() {
+    let served = Served::start_desktop("settings-query-get", true, with_alice).await;
+    let client = http();
+    let url = format!("{}?token={LAUNCH_SECRET}", served.url("/api/v1/settings"));
+
+    let response = within(client.get(&url).send())
+        .await
+        .expect("the server answered");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a query token is not a session on the settings routes",
+    );
+
+    served.stop().await;
+}
+
 /// The view says whether *this* request may change the program, and shows the configured one either way:
 /// the field is not hidden from a password session, it is shown as read-only, which is the difference
 /// between "you cannot change this" and "there is nothing here".
@@ -848,7 +1076,7 @@ async fn get_reports_program_not_editable_without_the_secret() {
     let served = Served::start_desktop("settings-program-view", true, |scratch| {
         let mut config = with_alice(scratch);
         config.downloads = DownloadsConfig {
-            on_complete: Some(PathBuf::from(FAKE)),
+            on_complete: Some(fake()),
             ..DownloadsConfig::default()
         };
         config
@@ -859,7 +1087,8 @@ async fn get_reports_program_not_editable_without_the_secret() {
 
     let view = body(get_bearer(&client, &served.url("/api/v1/settings"), &token).await).await;
     assert_eq!(
-        view["downloads"]["on_complete"]["program"], FAKE,
+        view["downloads"]["on_complete"]["program"],
+        fake().to_string_lossy().as_ref(),
         "the configured program is shown to a password session: {view}",
     );
     assert_eq!(
@@ -877,7 +1106,8 @@ async fn get_reports_program_not_editable_without_the_secret() {
     .expect("the server answered");
     let view = body(response).await;
     assert_eq!(
-        view["downloads"]["on_complete"]["program"], FAKE,
+        view["downloads"]["on_complete"]["program"],
+        fake().to_string_lossy().as_ref(),
         "the secret sees the same value: {view}",
     );
     assert_eq!(
@@ -1014,6 +1244,125 @@ async fn concurrent_section_saves_keep_both() {
     served.stop().await;
 }
 
+/// Two speed saves at once: the file gets one, then the engine is put under it, both inside one lock, so
+/// whichever save is written last is the one the engine ends up under. With the engine put under the
+/// limits after the lock is released, the two applies can land in the reverse order and leave the running
+/// engine on limits the file no longer holds - a client reads 128 KiB/s from the file and the engine is
+/// still on 64.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_speed_saves_leave_the_engine_on_the_file() {
+    let served = Served::start("settings-speed-race", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    let url = served.url("/api/v1/settings/speed");
+
+    let (one, two) = tokio::join!(
+        put_bearer(&client, &url, &token, speed(64, 8, (None, None, None))),
+        put_bearer(&client, &url, &token, speed(128, 16, (None, None, None))),
+    );
+    for (what, response) in [
+        ("the first speed save", one),
+        ("the second speed save", two),
+    ] {
+        assert!(
+            response.status().is_success(),
+            "{what} did not succeed: {}",
+            response.status(),
+        );
+    }
+
+    let after = Config::load_for_edit(&served.file())
+        .expect("the config reads back")
+        .expect("the file was written");
+    let in_the_file = after.limits.download_kib;
+    assert!(
+        in_the_file == 64 || in_the_file == 128,
+        "one of the two saves is in the file: {in_the_file}",
+    );
+    let session = body(get_bearer(&client, &served.url("/api/v1/session"), &token).await).await;
+    assert_eq!(
+        session["download_limit"],
+        in_the_file * 1024,
+        "the engine is running under the limits the file holds, not the other save's: {session} against {in_the_file} KiB/s",
+    );
+
+    served.stop().await;
+}
+
+/// A device removed while another is added: each change reads what the last one wrote, so the list logins
+/// check against is the list the file holds when both have answered - the removed key is gone from both.
+/// With the list swapped after the lock is released, two swaps can land in the reverse order and leave a
+/// key the file no longer has still accepted, which is the worst kind of stale: a revoked key that keeps
+/// working.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_remove_racing_an_add_leaves_the_file_and_the_list_agreeing() {
+    let served = Served::start("settings-device-race", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    let devices_url = served.url("/api/v1/auth/devices");
+
+    // A key that is really there to begin with, so removing it is a removal rather than a no-op.
+    let added = post_bearer(
+        &client,
+        &devices_url,
+        &token,
+        json!({ "name": "old", "public_key": PUBLIC_KEY }),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::CREATED, "a device to remove");
+
+    let remove_url = format!("{devices_url}/old");
+    let (removed, added_again) = tokio::join!(
+        within(client.delete(&remove_url).bearer_auth(&token).send()),
+        post_bearer(
+            &client,
+            &devices_url,
+            &token,
+            json!({ "name": "new", "public_key": OTHER_KEY }),
+        ),
+    );
+    let removed = removed.expect("the server answered");
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT, "the remove");
+    assert_eq!(
+        added_again.status(),
+        StatusCode::CREATED,
+        "the add beside it",
+    );
+
+    let after = Config::load_for_edit(&served.file())
+        .expect("the config reads back")
+        .expect("the file was written");
+    let mut in_the_file: Vec<String> = after
+        .server
+        .as_ref()
+        .expect("a server section")
+        .auth
+        .devices
+        .iter()
+        .map(|device| device.name.clone())
+        .collect();
+    in_the_file.sort();
+    assert!(
+        !in_the_file.iter().any(|name| name == "old"),
+        "the removal is in the file whatever order the two changes were written in: {in_the_file:?}",
+    );
+
+    let listed = body(get_bearer(&client, &devices_url, &token).await).await;
+    let mut in_the_list: Vec<String> = listed
+        .as_array()
+        .expect("a list of devices")
+        .iter()
+        .map(|row| row["name"].as_str().expect("a name").to_string())
+        .collect();
+    in_the_list.sort();
+    assert_eq!(
+        in_the_list, in_the_file,
+        "the list logins check against is the list the file holds, so a removed key is gone from both",
+    );
+
+    served.stop().await;
+}
+
 /// A file this server cannot read is not one to write over: the change is answered and nothing happens.
 /// In particular the engine is not put under limits the file does not have, so the running session is
 /// exactly where it was.
@@ -1051,6 +1400,86 @@ async fn unreadable_config_is_500_and_applies_nothing() {
     assert_eq!(
         session["download_limit"], 0,
         "the limits the file does not have were not applied: {session}",
+    );
+
+    served.stop().await;
+}
+
+/// A config this server can read but not write is a different failure from one it cannot read, and gets a
+/// different name: `500 config_unwritable`, saying what the operating system said, so whoever runs this
+/// server can act on it instead of looking for a parse error that is not there. Like every other answer
+/// here it names no path and no file name - that is what the log line is for - and the file is left exactly
+/// as it was, with the engine not put under limits the file does not hold.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_that_cannot_be_written_is_500_config_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let served = Served::start("settings-unwritable", with_alice).await;
+    let client = http();
+    let token = bearer(&served).await;
+    served.save_config(&with_alice(served.dir.path()));
+    let before = bytes(&served.file());
+    // The folder the config lives in, made read-only: the file can still be read, so the failure is the
+    // save's and not the read's.
+    let config_dir = served
+        .file()
+        .parent()
+        .expect("the config directory")
+        .to_path_buf();
+    let original = fs::metadata(&config_dir)
+        .expect("the config directory")
+        .permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    fs::set_permissions(&config_dir, read_only).expect("make the config folder read-only");
+
+    let response = put_bearer(
+        &client,
+        &served.url("/api/v1/settings/speed"),
+        &token,
+        speed(64, 0, (None, None, None)),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a config that cannot be written is not a client's mistake",
+    );
+    let (status, code, message) = error_of(response).await;
+    // Put the folder back first, so the scratch directory can be removed even if an assertion below fails.
+    fs::set_permissions(&config_dir, original).expect("make the config folder writable again");
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a config that cannot be written is not a client's mistake: {message}",
+    );
+    assert_eq!(code, "config_unwritable");
+    assert!(
+        message.contains("write its config file"),
+        "the answer says which file failed: {message}",
+    );
+    assert!(
+        message.to_lowercase().contains("permission"),
+        "and says what the operating system said: {message}",
+    );
+    // The same silence every other answer here keeps: a caller is not told where the config lives or what
+    // it is called, however useful that would be to an operator - they have the log line for it.
+    let directory = config_dir.to_string_lossy().into_owned();
+    assert!(
+        !message.contains(&directory) && !message.contains("config.yaml"),
+        "the answer names neither the path nor the file: {message}",
+    );
+    assert_eq!(
+        bytes(&served.file()),
+        before,
+        "the file is exactly as it was: nothing was written",
+    );
+    let session = body(get_bearer(&client, &served.url("/api/v1/session"), &token).await).await;
+    assert_eq!(
+        session["download_limit"], 0,
+        "and the limits the file does not have were not applied: {session}",
     );
 
     served.stop().await;

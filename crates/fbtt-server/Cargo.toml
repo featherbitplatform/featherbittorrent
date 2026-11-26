@@ -112,18 +112,8 @@ required-features = ["test-support"]
 
 # The settings routes: what a change writes to `config.yaml`, and which credential may name a program for
 # the server to run. The last two tests hand a value to `downloads.on_complete` and the route checks it is
-# a program by its full path - so the tests name `fbtt-core`'s own `fbtt-fake-player`, and need it built.
-# `CARGO_BIN_EXE_<name>` is set for a test target only in the package that declares the binary, so the
-# same binary is declared here too: same source, same name, and behind the same `test-support` feature, so
-# a release build carries neither.
+# a program by its full path; the tests name this test binary's own path (`std::env::current_exe()`) for
+# that, which is a real file and needs no extra binary declared here.
 [[test]]
 name = "settings"
 required-features = ["test-support"]
-
-[[bin]]
-name = "fbtt-fake-player"
-path = "../fbtt-core/testbin/fake_player.rs"
-required-features = ["test-support"]
-# `fbtt-core` declares the same binary, so `cargo doc` would write the same page twice and refuse. This
-# copy is only ever built to run in a test, and nothing here documents it.
-doc = false

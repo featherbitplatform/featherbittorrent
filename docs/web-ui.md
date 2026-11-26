@@ -249,7 +249,9 @@ The five server settings are `Download limit KiB/s`, `Upload limit KiB/s`, `Acti
 `Active seeds` and `Active total`. The rates are in KiB/s, and 0 or an empty field means unlimited.
 `Save` applies them to the running server and writes them to the server's `config.yaml`, so they are
 there again the next time it starts. A folder or a switch set here is saved the same way and kept
-between runs.
+between runs. A new Default folder is followed at once by the unfinished-folder moves and by the watch
+folder, but an add made through the API without a folder keeps going to the folder this run started with
+until the server is restarted.
 
 ### Devices
 
