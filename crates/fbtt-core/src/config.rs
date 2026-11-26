@@ -917,11 +917,22 @@ fn is_proxy_key(key: &str) -> bool {
 /// itself parse as its proxy. A file whose merges cannot be read or applied is taken to bring one
 /// (fail closed): refusing costs little, and a leak costs a lot. Keys are read with
 /// [`Value::as_str`], which drops tags, so a tagged key is the word it spells.
+///
+/// A top level that still has a `<<` after [`Value::apply_merge`] is also taken to bring one. A
+/// merge nested a level deeper (an anchor whose own mapping merges another) copies that inner `<<`
+/// into the top level, and `apply_merge` does not revisit the top level, so the proxy it carries
+/// would be left unmerged and the file would load with no proxy.
 fn merge_brings_a_proxy(bytes: &[u8], proxy_is_parsed: bool) -> bool {
     let Ok(mut value) = serde_norway::from_slice::<Value>(bytes) else {
         return true;
     };
     if value.apply_merge().is_err() {
+        return true;
+    }
+    if value
+        .as_mapping()
+        .is_some_and(|mapping| mapping.contains_key("<<"))
+    {
         return true;
     }
     !proxy_is_parsed
@@ -2853,6 +2864,15 @@ mod tests {
             ("foo: 1\nfoo: 2\n\"pro\\x78y\":\n", no_host),
             (
                 "base: &b\n  \"pro\\x78y\":\n    type: socks5\n    host: 10.0.0.1\n    port: 1080\n<<: *b\n",
+                merge,
+            ),
+            // A merge nested a level deeper leaves a `<<` at the top level once merges are applied.
+            (
+                "c: &c\n  proxy: {type: socks5, host: 10.0.0.1, port: 1080}\nb: &b\n  <<: *c\n<<: *b\n",
+                merge,
+            ),
+            (
+                "c: &c\n  proxy: {type: socks5, host: 10.0.0.1, port: 1080}\nb: &b\n  <<: *c\n<<: [*b]\n",
                 merge,
             ),
         ];
