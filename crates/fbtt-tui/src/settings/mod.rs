@@ -343,10 +343,12 @@ pub struct SettingsScreen {
     confirm: Option<Pending>,
     /// A save has gone out and its answer has not come back.
     in_flight: Option<InFlight>,
-    /// How many sends were given up on (discarded or timed out) that may still be answered. Those
-    /// answers arrive in the order the sends went out, so the first this many are theirs and are
-    /// ignored rather than taken for the answer to a newer save.
-    stale_answers: usize,
+    /// The sends that were discarded and may still be answered, oldest first, each with the moment its
+    /// answer stops being waited for (its send time plus [`SAVE_TIMEOUT`]; `None` until the next tick
+    /// or notice says what time it is). Answers arrive in send order, so while one is inside its
+    /// deadline the next answer is its and is ignored rather than taken for a newer save's. A send
+    /// that timed out is never listed: it is already past its deadline.
+    abandoned: Vec<Option<Instant>>,
     /// A save answered well on the way out: the model closes the screen.
     close_requested: bool,
     /// What a refused Load said, drawn in place of the loading line.
@@ -370,7 +372,7 @@ impl SettingsScreen {
             editing: false,
             confirm: None,
             in_flight: None,
-            stale_answers: 0,
+            abandoned: Vec::new(),
             close_requested: false,
             load_error: None,
             error: None,
@@ -529,17 +531,31 @@ impl SettingsScreen {
 
     /// Gives up on the save that is out, if any: its answer, when it comes, is not about what the form
     /// holds now.
-    fn abandon_save(&mut self) {
+    ///
+    /// `may_answer` is true for a discard, whose answer can still arrive inside the deadline, and false
+    /// for a timeout, whose deadline has passed.
+    fn abandon_save(&mut self, may_answer: bool) {
         if let Some(flight) = self.in_flight.take() {
             // A send through `SetLimits` has no answer to wait for or to skip.
-            if !matches!(flight.sent, SentValues::Speed(_, Some(_))) {
-                self.stale_answers += 1;
+            if may_answer && !matches!(flight.sent, SentValues::Speed(_, Some(_))) {
+                self.abandoned
+                    .push(flight.started.map(|at| at + SAVE_TIMEOUT));
             }
         }
     }
 
+    /// Settles the abandoned sends against the clock: those with no deadline yet get one, and those
+    /// past it are forgotten.
+    fn settle_abandoned(&mut self, now: Instant) {
+        for deadline in &mut self.abandoned {
+            deadline.get_or_insert(now + SAVE_TIMEOUT);
+        }
+        self.abandoned
+            .retain(|deadline| deadline.is_some_and(|at| at > now));
+    }
+
     fn discard(&mut self) {
-        self.abandon_save();
+        self.abandon_save(true);
         self.error = None;
         self.editing = false;
         match self.section {
@@ -782,12 +798,13 @@ impl SettingsScreen {
     /// Counts the time a save has been waiting. After [`SAVE_TIMEOUT`] without an answer the screen
     /// says so and frees the Save row; the form stays as typed, still unsaved.
     pub(crate) fn tick(&mut self, now: Instant) {
+        self.settle_abandoned(now);
         let Some(flight) = self.in_flight.as_mut() else {
             return;
         };
         let started = *flight.started.get_or_insert(now);
         if now.saturating_duration_since(started) >= SAVE_TIMEOUT {
-            self.abandon_save();
+            self.abandon_save(false);
             self.error = Some(NO_ANSWER.to_string());
         }
     }
@@ -802,12 +819,13 @@ impl SettingsScreen {
     /// While a save is out, the first `Saved.` or the first error is its answer and nothing else is:
     /// a line about another torrent is not about this form. A refused Load is shown where the loading
     /// line was.
-    pub(crate) fn on_notice(&mut self, notice: &Notice) -> bool {
+    pub(crate) fn on_notice(&mut self, notice: &Notice, now: Instant) -> bool {
         // An answer to a send that was given up on is not about the one that is out now.
         let answer = matches!(notice, Notice::Error(_) | Notice::SignInRefused(_))
             || matches!(notice, Notice::Info(text) if text == SAVED);
-        if self.stale_answers > 0 && answer {
-            self.stale_answers -= 1;
+        self.settle_abandoned(now);
+        if answer && !self.abandoned.is_empty() {
+            self.abandoned.remove(0);
             return false;
         }
         if self.in_flight.is_none() {

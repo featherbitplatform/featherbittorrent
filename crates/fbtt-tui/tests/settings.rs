@@ -717,3 +717,51 @@ fn a_wide_value_keeps_the_caret_in_view() {
         "the end of a wide value is not in view:\n{text}"
     );
 }
+
+#[test]
+fn a_timed_out_save_then_a_retry_is_confirmed() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    replace_field(&mut model, &snap, "64");
+    model.handle_key(ctrl_s(), &snap);
+    let start = Instant::now();
+    model.tick(start);
+    model.tick(start + std::time::Duration::from_secs(11));
+    assert_eq!(
+        model.handle_key(ctrl_s(), &snap).len(),
+        1,
+        "the retry did not go out"
+    );
+    // The retry is answered: that answer is the retry's, not a leftover of the timed-out send.
+    model.push_notice(
+        Notice::Info("Saved.".to_string()),
+        start + std::time::Duration::from_secs(12),
+    );
+    assert!(
+        !is_dirty(&mut model, &snap),
+        "the retry's answer was swallowed"
+    );
+}
+
+#[test]
+fn a_discarded_save_answer_after_its_deadline_is_not_swallowed() {
+    let snap = loaded(false);
+    let mut model = open_speed(&snap);
+    discard_with_a_save_out(&mut model, &snap);
+    let start = Instant::now();
+    model.tick(start);
+    model.tick(start + std::time::Duration::from_secs(11));
+    // A new save, answered well after the discarded one could still be answered.
+    press(&mut model, &snap, KeyCode::Down);
+    press(&mut model, &snap, KeyCode::Tab);
+    replace_field(&mut model, &snap, "66");
+    assert_eq!(model.handle_key(ctrl_s(), &snap).len(), 1);
+    model.push_notice(
+        Notice::Info("Saved.".to_string()),
+        start + std::time::Duration::from_secs(12),
+    );
+    assert!(
+        !is_dirty(&mut model, &snap),
+        "an expired stale entry swallowed the answer"
+    );
+}

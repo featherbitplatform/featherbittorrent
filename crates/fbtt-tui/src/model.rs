@@ -227,7 +227,7 @@ impl Model {
         // marks the section saved, a refusal is shown inside the screen, and a save asked for on the
         // way out finishes leaving.
         if let Some(screen) = self.settings.as_mut()
-            && screen.on_notice(&notice)
+            && screen.on_notice(&notice, now)
         {
             self.settings = None;
         }
