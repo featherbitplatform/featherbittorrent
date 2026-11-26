@@ -1,10 +1,15 @@
 //! A media player for the tests to start instead of a real one: it writes down what it was handed,
 //! holds on if asked to, and exits. No window, no codec, nothing over the network.
 //!
-//! `fbtt-fake-player --log <file> [--hold-ms <n>] <media...>` appends one JSON line to `<file>`: the
+//! `fbtt-fake-player [--log <file>] [--hold-ms <n>] <media...>` appends one JSON line to `<file>`: the
 //! arguments this process was given, and - when the last of them is an `.m3u` file - what was in it.
 //! Those are the two questions a play test has to ask about a launch: what reached the process, where
 //! another user could read it, and what reached it only through the private file.
+//!
+//! With no `--log` it is standing in for the program a finished torrent runs, which is handed the
+//! torrent's name and its folder and nothing else: the line then goes to `.fbtt-fake-player.log` in the
+//! folder it was run for, which is the only place a completion test can look without the program being
+//! told where to write.
 
 // Its stderr is for whoever runs it by hand: these tests close it.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -15,6 +20,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
+
+/// Where the record goes when nobody named a file: beside the folder this was run for.
+const RECORD: &str = ".fbtt-fake-player.log";
 
 fn main() -> ExitCode {
     // `args_os` rather than `args`: a scratch path on a Unix box need not be valid UTF-8, and a panic
@@ -43,10 +51,24 @@ fn main() -> ExitCode {
         }
     }
 
-    // Nothing to write to is a wrong command line, not a run with no log to keep.
-    let Some(log) = log else {
-        eprintln!("usage: fbtt-fake-player --log <file> [--hold-ms <n>] <media...>");
-        return ExitCode::from(2);
+    // Nothing named to write to: this is the completion program standing in for a real one, so the
+    // record goes beside the folder it was run for. A last argument that is not a folder is a wrong
+    // command line, not a run with no log to keep.
+    let log = match log {
+        Some(log) => log,
+        None => match given.last() {
+            Some(folder) if Path::new(folder).is_dir() => Path::new(folder)
+                .join(RECORD)
+                .to_string_lossy()
+                .into_owned(),
+            _ => {
+                eprintln!(
+                    "usage: fbtt-fake-player [--log <file>] [--hold-ms <n>] <media...> \
+                     (with no --log, the last argument must be a folder)"
+                );
+                return ExitCode::from(2);
+            }
+        },
     };
 
     if let Err(problem) = append(&log, &record(&given, playlist_contents(&given[media..]))) {

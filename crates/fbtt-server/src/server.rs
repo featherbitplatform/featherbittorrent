@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use fbt::{SessionError, Settings};
 use fbt_api::{ApiConfig, ApiError, ApiServer, Auth};
+use fbtt_core::downloads::Automation;
 use fbtt_core::engine::SAVE_EVERY;
 use fbtt_core::{Config, Engine, LibraryLock, Notice, Paths};
 use thiserror::Error;
@@ -269,6 +270,25 @@ impl Server {
             warn_notice(&problem);
         }
 
+        // Per-torrent reports from the saves this task makes: a torrent whose resume data would not come
+        // back is worth a line every time it is left out, and the queue is bounded on purpose - the save
+        // must not wait on a log that has stopped keeping up. The downloads automation reports on the
+        // same queue, so it is made here, once, and both of them are handed a handle on it.
+        let (reports, reading_reports) = mpsc::channel::<Notice>(REPORTS);
+        engine.report_to(reports.clone());
+        // The unfinished folder, the watch folder and the program a finished torrent runs, beside the
+        // engine this server serves. `editable` is false: a server reads the program from its own
+        // `config.yaml` and a browser has no business naming a program to run on the machine it is only
+        // visiting (see `OnCompleteView`). The handle goes to the routes so the settings they answer with
+        // can carry what went wrong with these two things (Task A3), and `shutdown` stops it.
+        let automation = Automation::spawn(
+            engine.session().clone(),
+            config.download_dir.clone(),
+            config.downloads.clone(),
+            false,
+            reports,
+        );
+
         // What the routes know, built on the library they answer about: the torrent routes - the one that
         // hands out an address to stream a file from included - read the same session fbt-api is handed
         // below, and every clone of a session is the same session. It comes after the engine for that
@@ -280,13 +300,8 @@ impl Server {
             dummy_password_hash,
             engine.session().clone(),
             launch,
+            automation,
         ));
-
-        // Per-torrent reports from the saves this task makes: a torrent whose resume data would not come
-        // back is worth a line every time it is left out, and the queue is bounded on purpose - the save
-        // must not wait on a log that has stopped keeping up.
-        let (reports, reading_reports) = mpsc::channel::<Notice>(REPORTS);
-        engine.report_to(reports);
 
         // What fbt-api is configured with: our bind address, our authenticator and the same folders this
         // server's own routes may name. `ApiConfig` is non-exhaustive, so its fields are set one by one
@@ -408,17 +423,19 @@ impl Server {
     /// save has been written or failed to be, and the lock has gone with it - so another
     /// featherbittorrent may start on this library as soon as this returns.
     ///
-    /// The API goes first, for the reason in this module's comment: no handler may still be answering a
-    /// request from a session that is about to be written out. The `Err` is the last save's own failure,
-    /// one line about it; nothing here can fix that, and the library on disk stays the one from before
-    /// this run.
+    /// The downloads automation is told first, so it is not asking this session to move files while that
+    /// session is being written out, and the API goes next, for the reason in this module's comment: no
+    /// handler may still be answering a request from a session that is about to be written out. The
+    /// `Err` is the last save's own failure, one line about it; nothing here can fix that, and the library
+    /// on disk stays the one from before this run.
     pub async fn shutdown(self) -> Result<(), String> {
         let Server {
             api,
-            shared: _,
+            shared,
             stop,
             saving,
         } = self;
+        shared.automation().shutdown();
         api.shutdown().await;
         // The save task's cue to do the last one. A full queue means it has already been told, or the
         // task is gone; either way the send has nothing to wait for.

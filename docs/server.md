@@ -74,7 +74,7 @@ keep the annotations somewhere else.
 | `downloads.unfinished_dir` | the download folder | Where a torrent's files live until it is whole, so a partial torrent is not mixed in with finished ones. A relative value means below the library directory, as `download_dir` does. It must be a different folder from `download_dir`. |
 | `downloads.start_paused` | `false` | Whether a new torrent starts paused: nothing arrives until you start it. |
 | `downloads.watch_dir` | none | A folder whose `.torrent` files are added as they appear. A relative value means below the library directory. It must be a different folder from `download_dir` and from `downloads.unfinished_dir`. |
-| `downloads.on_complete` | none | A program to start when a torrent finishes, named by its full path. It is handed the torrent's name and its folder as two separate arguments, and the app does not wait for it. Left as written, so a relative value means whatever the program's own directory is. |
+| `downloads.on_complete` | none | A program to start when a torrent finishes, named by its whole path: a relative value or a bare name is not started, refused with a warning line, because which file either one means depends on where the server was started. It is handed the torrent's name and its folder as two separate arguments, and the app does not wait for it. |
 | `server.bind` | `127.0.0.1:8090` | The address and port the API listens on, as `<ip>:<port>`. `0.0.0.0:8090` serves every interface this machine has. |
 | `server.allowed_roots` | the download folder alone | The directories the API may name in a request: save paths, move targets, folders to browse through `/api/v1/fs/roots` and `/api/v1/fs/list`. An empty list means the download folder alone; entries are made absolute. |
 | `server.allowed_hosts` | empty | Names this server answers, beside `localhost` and any literal address. With logins off these are the whole host-name defence, and every request's name is checked against them. With logins on they still decide one thing, the web UI: a browser that reaches the server at the server's own name needs nothing listed (its `Origin` is the name the request arrived at, and the sign-in and the cookie's changes accept that), but behind a proxy that rewrites `Host`, which the featherbit gateway does, the public name must be listed or the web UI's sign-in is refused. Spell each entry a bare name (`bit.local`, not `https://bit.local:8090`). At startup, an entry no request could ever carry is named in a warning line. |
@@ -84,6 +84,100 @@ keep the annotations somewhere else.
 | `server.web_ui` | on | Whether `serve` also serves the browser UI. Only `false` turns it off; a value the file does not name is on, and `FBTT_WEB_UI` in the environment replaces the file's answer when it holds a word the switch understands (`0`, `false`, `off`, `no`, or the on words `1`, `true`, `on`, `yes`). This key decides nothing in a headless build, which has no UI to serve: it accepts the key, ignores it, and logs one line when it is set. Which build you have is what `featherbittorrent --version` says. See [docs/web-ui.md](web-ui.md). |
 | `server.cookie_secure` | `auto` | When the browser session cookie carries the `Secure` flag. `auto` adds it when the request arrived over https (which behind a proxy means when the proxy sends `X-Forwarded-Proto: https`); `always` adds it whatever the request says. A proxy that terminates TLS but does not send `X-Forwarded-Proto` needs `always`. See [docs/web-ui.md](web-ui.md). |
 | `server.cors_origins` | empty | Origins of clients served from somewhere else that may call this API, answered by its CORS layer. This is for the featherbittorrent desktop app connecting to this server: list `tauri://localhost` (macOS and Linux) and `http://tauri.localhost` (Windows). Write each entry as a whole origin, scheme included. Listing an origin grants nothing by itself: a client from it still signs in with a password or a device key like any other, and the web UI's cookie session keeps its own origin rule. Empty means no cross-origin caller at all. |
+
+### What the `downloads:` keys do
+
+Two of these move a torrent's files, one starts a program, and none of them deletes anything. Everything
+they run into is one warning line naming the torrent or file and what went wrong, and none of it fails a
+download.
+
+**`downloads.unfinished_dir`** is where a torrent works, and it gives the torrent up as soon as it is
+whole: the engine is told to move the files to `download_dir` on the last piece. It moves the folder
+rather than copying it, which is why a 200 GiB download changes folders as cheaply as a 200 MiB one and
+leaves nothing behind in the folder it came from. Two cases move anything at all: a torrent still arriving
+and saving in `download_dir` goes to the unfinished folder, and a torrent whole and sitting in the
+unfinished folder comes back. A torrent you put somewhere else when you added it, a folder picked in the
+Add dialog or a `save_path` named in the request, downloads there and stays there, because you chose it,
+and a torrent whole in some other folder is left alone. A refusal of a move comes in two kinds. The engine
+is still checking that torrent's data, which is ordinary just after an add: it is asked again at the next
+look, within two seconds, and on until the move goes through. Anything else - a target that is somebody
+else's file, a folder it cannot move into - is one warning line said once, and the files stay where they
+are until the settings change, the torrent goes, or the torrent ends up somewhere else; after a restart
+the asking starts fresh. A torrent that is whole runs its completion program even when its move failed,
+for the folder the files are really in, because a finished torrent does not go without its program over a
+move that could not be done.
+
+What a run can ask of the torrents the library already holds, within its first two seconds: a torrent
+still arriving into the download folder moves into the unfinished one, and a torrent whole and sitting in
+the folder the setting names today comes back - so a torrent that finished while this server was stopped,
+whole in that folder, is handed to `download_dir` and gets its completion program run then, once, because
+it was never reported finished. An older unfinished folder is not fetched from: a torrent already working
+there, or already whole there, stays there, because the setting says where unfinished torrents belong from
+now on, not that everything ever filed there should be moved.
+
+**`downloads.start_paused`** decides what a torrent this run brings in by itself does: on, it waits for you
+to start it. Torrents the watch folder adds obey it, and so do the terminal client's own adds. An add over
+the API is not covered by it. `POST /api/v1/torrents` starts whatever it adds unless the request itself
+says otherwise: its `paused` field, in the JSON body or in the query string, means add it paused, and
+leaving it out means start it.
+
+**`downloads.watch_dir`** is looked at every two seconds, the first look within two seconds of the run
+starting. Only its own files are candidates: a regular file sitting directly in it, whose name ends
+`.torrent` in either case, and not one whose name starts with `.` (which is how the `._show.torrent` macOS
+writes beside a downloaded file hides itself). A candidate is read only after two consecutive looks have
+seen the same size and the same modification time, so a `.torrent` somebody is still copying in is not
+added half-written; one that has stopped growing is added within about four seconds of arriving. Then it is
+added and renamed `<name>.torrent.added`, or it is refused and gets the `.invalid` rename with a line
+saying why: the file is bigger than 16 MiB, which is decided from its size alone without reading a byte of
+it; the name answers to a different file than the two looks agreed on - a link or somebody else's file
+swapped in between the look and the read, and the folder reads the file it looked at or nothing at all; a
+file that grew past 16 MiB between those looks is judged by its size at the read, not by the size they
+saw; its bytes are not a torrent; or the engine will not take it. What is added goes to `download_dir`,
+paused or not per `start_paused`. A `.torrent` for a torrent the library already has puts nothing new in
+the library: the file gets its `.added` name like any other, and nothing is said about it. Nothing is
+copied and nothing is deleted, so what you put in that folder stays yours under a different name, and the
+rename is also what keeps a file from being added a second time after a restart. A marker name that is
+already taken comes back numbered, `<name>.torrent.added.2`, `.3` and on to `.999`, and a folder holding
+all of those - or one that will not take the rename for any other reason - leaves the file where it is with
+its one line said once, rather than replacing somebody's file or reading it again every two seconds for the
+same answer. A watch folder that is not there, or that goes away while the server runs, is
+named once rather than every two seconds; it is named again if it comes back and goes away again, and a
+look that works clears the reason: what there is to say about this folder is what went wrong the last time
+it was read.
+
+**`downloads.on_complete`** starts a program when a torrent finishes, after the unfinished folder has given
+it up, so the folder the program is handed is where the files ended up. It is started with two arguments
+and nothing else: the torrent's name, and that folder. No shell is involved, so nothing is re-parsed on the
+way and there is nothing to quote: a name carrying a space, a `;` or `$(...)` arrives as one argument and
+cannot become a command. Its standard input, output and error are the null device, so it has nowhere to
+print and nobody to answer, and the app does not wait for it to exit: one torrent finishing does not hold
+up another, and a program that never returns is no trouble for the library. One finish is one run, and a
+whole torrent whose move failed still gets its program, for the folder the files are really in. Arriving
+whole is not finishing: a torrent the watch folder or the API brings in already whole and left where you
+put it never finished here, and gets nothing for the add - a program is run for a finish, and for whole
+files the unfinished folder hands back. A program this run will not start is one warning line beginning
+`Could not start the program run on completion`, naming the program and the reason, and it is not retried.
+The name must be the whole path to the program: a relative path means below whatever directory the server
+was started in, and a bare name is looked up on `PATH`, which on a service is not the `PATH` of the person
+who wrote the line, so anything that is not a whole path is refused before anything is tried. On Windows a
+name ending `.bat` or `.cmd` - trailing dots and spaces count, capitalisation makes no difference - is
+refused the same way, because Windows starts those through `cmd.exe`, where arguments are re-parsed and a
+torrent's own name stops being safely one argument; so is a name carrying a `:` after the drive letter,
+which to Windows names an alternate data stream of a file - bytes stored under a name, not a program to
+start. The program runs on the machine this server is on, as
+whoever this server runs as, with the server's own environment and the directory the server was started in
+as its own: variables the server holds are the program's, and a path the program opens relatively is
+opened against that directory. The torrent's name arrives as the first argument, and BitTorrent names can
+begin with `-`, which to a program that takes options reads like one; programs written for this should
+stop reading options at `--`. The two folder
+keys and `download_dir` name places on that machine too, and the watch folder is scanned there: a folder
+set on a LAN server is a folder on that server's disk, not on the machine you are browsing from.
+
+A server reads `on_complete` from `config.yaml` and nowhere else. It belongs to the machine the program
+would run on, so nothing over the API changes it, and a program you change in the file takes effect when
+the server is restarted, as a new or changed user does. The desktop app's `This computer` follows these
+same four keys in the `config.yaml` the app keeps for its own engine: see
+[desktop.md](desktop.md).
 
 A LAN server that anyone on the network signs in to:
 

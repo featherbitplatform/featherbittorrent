@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Unfinished folder, watch folder, start paused and run a program on completion (`downloads:` in `config.yaml`). ([#45](https://github.com/featherbitplatform/featherbittorrent/pull/45))
+
 ### Changed
 
-- Saving settings keeps keys in `config.yaml` that this version does not know about. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- Saving settings keeps keys in `config.yaml` that this version does not know about. ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
 
 ## [0.4.1] - 2026-11-24
 
