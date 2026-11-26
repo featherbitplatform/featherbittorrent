@@ -52,6 +52,17 @@ use crate::auth::{FbttAuth, keys, locked};
 /// device name from a config file, the words of a parse error about something a client sent. The
 /// workspace rule is that remote text is display-safe, and these routes are where remote text first
 /// reaches something a person will read.
+/// Reads `config.yaml` for an edit: [`Config::load_for_edit_keychained`] on the desktop app's engine with a
+/// keychain, where the file holds a proxy login without its password, and [`Config::load_for_edit`]
+/// everywhere else.
+fn load_for_edit(path: &std::path::Path, keychained: bool) -> Result<Option<Config>, String> {
+    if keychained {
+        Config::load_for_edit_keychained(path)
+    } else {
+        Config::load_for_edit(path)
+    }
+}
+
 pub(crate) fn clean(text: &str) -> String {
     fbt::display_safe(text, fbt::MAX_DISPLAY_CHARS)
 }
@@ -127,6 +138,9 @@ pub(crate) struct Shared {
     /// API is derived over ([`fbtt_core::network_for`]), so removing one brings back the switches it had
     /// turned off rather than leaving them off until a restart. Never changed after the start.
     base_settings: fbt::Settings,
+    /// Where the proxy password is kept instead of `config.yaml`, on the desktop app's engine
+    /// ([`crate::DesktopAccess::proxy_password`]); `None` on any other server. Not in a `Debug` printing.
+    proxy_password: Option<Arc<dyn crate::ProxyPasswordStore>>,
     /// The unfinished folder, the watch folder and the completion program this server runs beside the
     /// engine it serves. The settings routes read its two complaints - what went wrong with the watch
     /// folder last time it was read, and with the program last time it was run - so a browser sees them
@@ -198,6 +212,7 @@ impl Shared {
         session: fbt::Session,
         base_settings: fbt::Settings,
         launch: Option<(String, bool)>,
+        proxy_password: Option<Arc<dyn crate::ProxyPasswordStore>>,
         automation: fbtt_core::downloads::AutomationHandle,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
@@ -224,6 +239,7 @@ impl Shared {
             roots: roots.into(),
             session,
             base_settings,
+            proxy_password,
             automation,
             dummy_password_hash,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(parallel_verifies())),
@@ -252,6 +268,25 @@ impl Shared {
     /// derives a saved proxy's network settings over.
     pub(crate) fn base_settings(&self) -> &fbt::Settings {
         &self.base_settings
+    }
+
+    /// The keychain the proxy password is kept in, when this is the desktop app's engine on a system that
+    /// has one: the proxy route writes the password there and the view says `keychain`. `None` when the
+    /// password lives in `config.yaml` ([`proxy_password_storage`](Self::proxy_password_storage)).
+    pub(crate) fn proxy_keychain(&self) -> Option<&Arc<dyn crate::ProxyPasswordStore>> {
+        self.proxy_password
+            .as_ref()
+            .filter(|store| store.available())
+    }
+
+    /// Where this run keeps the proxy password: the keychain, `config.yaml` because the desktop app's
+    /// system has no keychain, or `config.yaml` because this is a server.
+    pub(crate) fn proxy_password_storage(&self) -> fbtt_core::PasswordStorage {
+        match &self.proxy_password {
+            Some(store) if store.available() => fbtt_core::PasswordStorage::Keychain,
+            Some(_) => fbtt_core::PasswordStorage::Unavailable,
+            None => fbtt_core::PasswordStorage::ConfigFile,
+        }
     }
 
     /// The unfinished folder, the watch folder and the completion program this run acts on, for the two
@@ -366,7 +401,8 @@ impl Shared {
         // request actually used.
         let file = self.paths.config_file();
         let reading = file.clone();
-        let read = tokio::task::spawn_blocking(move || Config::load_for_edit(&reading))
+        let keychained = self.proxy_keychain().is_some();
+        let read = tokio::task::spawn_blocking(move || load_for_edit(&reading, keychained))
             .await
             .map_err(|problem| {
                 tracing::warn!(
@@ -446,8 +482,9 @@ impl Shared {
     ) -> Result<(), String> {
         let file = self.paths.config_file();
         let base = self.base_config.clone();
+        let keychained = self.proxy_keychain().is_some();
         let written = tokio::task::spawn_blocking(move || {
-            let mut config = match Config::load_for_edit(&file) {
+            let mut config = match load_for_edit(&file, keychained) {
                 Ok(Some(config)) => config,
                 Ok(None) => base,
                 Err(problem) => {

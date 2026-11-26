@@ -186,6 +186,22 @@ pub enum PasswordStorage {
     Unavailable,
 }
 
+/// What the Proxy section says beside the password on a system with no keychain
+/// ([`PasswordStorage::Unavailable`]).
+pub const PROXY_PASSWORD_IN_CONFIG: &str =
+    "This system has no keychain, so the proxy password is kept in config.yaml.";
+
+impl PasswordStorage {
+    /// The line the Proxy section shows beside the password field, when there is one to show: only a
+    /// desktop app with no keychain says where the password went instead.
+    pub fn explanation(self) -> Option<&'static str> {
+        match self {
+            PasswordStorage::Unavailable => Some(PROXY_PASSWORD_IN_CONFIG),
+            PasswordStorage::ConfigFile | PasswordStorage::Keychain => None,
+        }
+    }
+}
+
 /// The proxy section as a person submitted it: every field of the form, and what to do with the stored
 /// password.
 ///
@@ -1092,6 +1108,17 @@ mod tests {
             again, cleared,
             "a cleared program reads back as a cleared program"
         );
+    }
+
+    /// Only a desktop app with no keychain explains where the proxy password went, in the plan's words.
+    #[test]
+    fn only_a_missing_keychain_explains_the_password() {
+        assert_eq!(
+            PasswordStorage::Unavailable.explanation(),
+            Some("This system has no keychain, so the proxy password is kept in config.yaml.")
+        );
+        assert_eq!(PasswordStorage::Keychain.explanation(), None);
+        assert_eq!(PasswordStorage::ConfigFile.explanation(), None);
     }
 
     /// A SOCKS5 setting with a login, the stored side of every proxy test below.

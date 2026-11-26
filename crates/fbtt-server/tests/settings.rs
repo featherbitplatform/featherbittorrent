@@ -111,6 +111,7 @@ impl Served {
             launch_secret: LAUNCH_SECRET.to_string(),
             origins: Vec::new(),
             expose,
+            proxy_password: None,
         };
         let server = within(Server::start_desktop(
             loopback(&config),

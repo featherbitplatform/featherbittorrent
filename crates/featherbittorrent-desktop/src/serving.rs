@@ -22,7 +22,10 @@ use fbtt_desktop_core::DesktopPaths;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+use fbtt_server::ProxyPasswordStore;
+
 use crate::commands::DesktopState;
+use crate::keychain::ProxyKeychain;
 use crate::lifecycle::Lifecycle;
 use crate::local::{self, ThisComputer};
 use crate::settings_store::SettingsStore;
@@ -75,11 +78,13 @@ pub struct ServingView {
     pub problem: Option<String>,
 }
 
-/// What the serving commands keep: where the library is and the shell's one settings store.
+/// What the serving commands keep: where the library is, the shell's one settings store and the keychain
+/// This computer's proxy password is kept in.
 #[derive(Debug, Clone)]
 pub struct Serving {
     paths: DesktopPaths,
     settings: SettingsStore,
+    proxy_password: Arc<ProxyKeychain>,
     /// The line from a first start that could not serve, until an apply succeeds.
     problem: Arc<Mutex<Option<String>>>,
 }
@@ -94,11 +99,17 @@ struct Change {
 }
 
 impl Serving {
-    /// The serving state for the app's library in `paths`, saving its switch through `settings`.
-    pub fn new(paths: DesktopPaths, settings: SettingsStore) -> Self {
+    /// The serving state for the app's library in `paths`, saving its switch through `settings`, with
+    /// This computer's proxy password in `proxy_password`.
+    pub fn new(
+        paths: DesktopPaths,
+        settings: SettingsStore,
+        proxy_password: ProxyKeychain,
+    ) -> Self {
         Serving {
             paths,
             settings,
+            proxy_password: Arc::new(proxy_password),
             problem: Arc::new(Mutex::new(None)),
         }
     }
@@ -129,19 +140,34 @@ impl Serving {
         {
             local::LOGINS_OFF.to_string()
         } else {
-            match local::start_with(&self.paths, serve, settings.clone()).await {
+            match local::start_with(&self.paths, serve, self.keychain(), settings.clone()).await {
                 Ok(running) => return Ok(running),
                 Err(problem) if !serve || problem == local::ALREADY_RUNNING => return Err(problem),
                 Err(problem) => problem,
             }
         };
         eprintln!("{problem}");
-        let running = local::start_with(&self.paths, false, settings).await?;
+        let running = local::start_with(&self.paths, false, self.keychain(), settings).await?;
         if let Err(saving) = self.save_switch(false) {
             eprintln!("Serving is off, but the switch could not be saved: {saving}");
         }
         self.set_problem(Some(problem));
         Ok(running)
+    }
+
+    /// Reads the library's config for an edit, its proxy login without a password when the keychain holds
+    /// that ([`Config::load_for_edit_keychained`]).
+    fn load_for_edit(&self, file: &std::path::Path) -> Result<Option<Config>, String> {
+        if self.proxy_password.available() {
+            Config::load_for_edit_keychained(file)
+        } else {
+            Config::load_for_edit(file)
+        }
+    }
+
+    /// The keychain This computer's proxy password is kept in, as the engine is handed it.
+    fn keychain(&self) -> Arc<dyn ProxyPasswordStore> {
+        self.proxy_password.clone()
     }
 
     fn set_problem(&self, problem: Option<String>) {
@@ -160,7 +186,7 @@ impl Serving {
 
     /// The library's config as it is on disk now; `None` when there is none yet or it cannot be read.
     fn config(&self) -> Option<Config> {
-        Config::load_for_edit(&self.paths.library().config_file())
+        self.load_for_edit(&self.paths.library().config_file())
             .ok()
             .flatten()
     }
@@ -270,7 +296,8 @@ impl Serving {
                 ));
             }
         };
-        let mut config = Config::load_for_edit(&library.config_file())?
+        let mut config = self
+            .load_for_edit(&library.config_file())?
             .unwrap_or_else(|| Config::default_for(&library));
         let server = config.server.get_or_insert_with(ServerConfig::default);
         server.bind = change.bind;
@@ -368,20 +395,31 @@ impl Serving {
             && let Err(problem) = self.write_config(&change)
         {
             // Back to the window's own engine, and the switch saved off to match it.
-            let back = local::start_with(&self.paths, false, settings).await.ok();
+            let back = local::start_with(&self.paths, false, self.keychain(), settings)
+                .await
+                .ok();
             if let Err(saving) = self.save_switch(false) {
                 eprintln!("Serving is off, but the switch could not be saved: {saving}");
             }
             return (back, Err(problem));
         }
-        match local::start_with(&self.paths, change.enabled, settings.clone()).await {
+        match local::start_with(
+            &self.paths,
+            change.enabled,
+            self.keychain(),
+            settings.clone(),
+        )
+        .await
+        {
             Ok(running) => {
                 let saved = self.save_switch(change.enabled);
                 (Some(running), saved)
             }
             Err(problem) if change.enabled => {
                 // Back to the window's own engine, and the switch saved off: the line says why.
-                let back = local::start_with(&self.paths, false, settings).await.ok();
+                let back = local::start_with(&self.paths, false, self.keychain(), settings)
+                    .await
+                    .ok();
                 if let Err(saving) = self.save_switch(false) {
                     eprintln!("Serving is off, but the switch could not be saved: {saving}");
                 }
@@ -472,11 +510,17 @@ mod tests {
 
     use super::{PASSWORD_NEEDED, Serving, ServingRequest};
     use crate::commands::DesktopState;
+    use crate::keychain::{MemoryKeychain, ProxyKeychain};
     use crate::lifecycle::Lifecycle;
     use crate::local::tests::{offline, scratch_paths, start_offline};
     use crate::settings_store::SettingsStore;
 
     const DEADLINE: Duration = Duration::from_secs(60);
+
+    /// This computer's proxy password in a keychain of its own in memory.
+    fn memory_keychain() -> ProxyKeychain {
+        ProxyKeychain::new(std::sync::Arc::new(MemoryKeychain::new()))
+    }
 
     struct Running {
         _dir: ScratchDir,
@@ -500,7 +544,7 @@ mod tests {
         let this = start_offline(&paths).await.expect("This computer starts");
         Running {
             downloads: config.download_dir.clone(),
-            serving: Serving::new(paths, store.clone()),
+            serving: Serving::new(paths, store.clone(), memory_keychain()),
             lifecycle: Lifecycle::new(store),
             state: DesktopState::running(this),
             _dir: dir,
@@ -741,7 +785,7 @@ mod tests {
         let dir = ScratchDir::new("desktop-serving-waits-for-start");
         let paths = scratch_paths(&dir);
         let store = SettingsStore::new(paths.settings_file());
-        let serving = Serving::new(paths.clone(), store.clone());
+        let serving = Serving::new(paths.clone(), store.clone(), memory_keychain());
         let lifecycle = Lifecycle::new(store);
         let state = DesktopState::starting();
 
@@ -801,7 +845,7 @@ mod tests {
         }
 
         // Next launch: the saved switch is on, the first start serves.
-        let serving = Serving::new(paths.clone(), store.clone());
+        let serving = Serving::new(paths.clone(), store.clone(), memory_keychain());
         let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
             .await
             .expect("in time")
@@ -812,7 +856,7 @@ mod tests {
 
         // The port is taken by something else: the window still gets its engine.
         let squatter = TcpListener::bind(bind).expect("the port is free again");
-        let serving = Serving::new(paths, store);
+        let serving = Serving::new(paths, store, memory_keychain());
         let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
             .await
             .expect("in time")
@@ -886,7 +930,7 @@ mod tests {
                     Ok(())
                 })
                 .expect("the switch is saved on");
-            let serving = Serving::new(paths.clone(), store.clone());
+            let serving = Serving::new(paths.clone(), store.clone(), memory_keychain());
             let this = tokio::time::timeout(DEADLINE, serving.start_this_computer(true, offline))
                 .await
                 .expect("in time")
@@ -961,7 +1005,14 @@ mod tests {
         let restart = app.lifecycle.restart_this_computer(&app.state, || async {
             inside.notify_one();
             release.notified().await;
-            match crate::local::start_with(&paths, true, offline).await {
+            match crate::local::start_with(
+                &paths,
+                true,
+                crate::local::tests::memory_store(),
+                offline,
+            )
+            .await
+            {
                 Ok(running) => (Some(running), Ok(())),
                 Err(problem) => (None, Err(problem)),
             }

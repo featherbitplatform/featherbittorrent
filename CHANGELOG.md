@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Desktop app: This computer's proxy password is kept in the system keychain, and a password already in its `config.yaml` is moved there at the next start. On a system with no keychain it stays in `config.yaml`, and the Proxy section says so. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
 - The proxy can be changed while the app runs, from the local engine or over `PUT /api/v1/settings/proxy` on a server, and takes effect without a restart. The stored proxy password is never sent back; the settings say only whether one is saved, and it is kept only while the host and port stay the same. A proxy the engine cannot switch to leaves the previous setting in place, in `config.yaml` as well. ([#53](https://github.com/featherbitplatform/featherbittorrent/pull/53))
 - Downloads settings in the web UI and the desktop app: default and unfinished folders, start paused, a watch folder, and a program to run on completion (This computer only). ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Unfinished folder, watch folder, start paused and run a program on completion (`downloads:` in `config.yaml`). ([#45](https://github.com/featherbitplatform/featherbittorrent/pull/45))

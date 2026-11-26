@@ -529,7 +529,7 @@ mod tests {
             ..Config::default()
         }
         .resolve(&paths);
-        let mut settings = config.session_settings();
+        let mut settings = config.settings_before_proxy();
         settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
         settings.dht_enabled = false;
         settings.enable_lsd = false;

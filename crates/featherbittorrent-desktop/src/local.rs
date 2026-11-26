@@ -10,11 +10,12 @@
 //! second app (or a `serve` pointed at the same directories) is refused before it changes anything.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use fbtt_core::config::ConfigError;
 use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths, ServerConfig};
 use fbtt_desktop_core::{DesktopPaths, launch_secret};
-use fbtt_server::{DesktopAccess, Server};
+use fbtt_server::{DesktopAccess, ProxyPasswordStore, Server};
 
 /// What the app says, and the whole of what it says, when its library is already held by another run.
 pub const ALREADY_RUNNING: &str = "featherbittorrent is already running.";
@@ -87,12 +88,18 @@ impl std::fmt::Debug for ThisComputer {
 ///
 /// The engine's settings are made from the config by `settings`: [`Config::settings_before_proxy`] for real,
 /// and a test keeps the engine on loopback with no DHT and no multicast while everything else runs as it
-/// does for real. The app's own start goes through [`crate::serving::Serving::start_this_computer`].
+/// does for real. The config `settings` is handed carries the proxy password the engine logs in with,
+/// wherever it is kept. The app's own start goes through [`crate::serving::Serving::start_this_computer`].
+///
+/// The proxy password lives in `proxy_password`, the system keychain, when the system has one: a password
+/// `config.yaml` still holds (written by hand, or by a run on a system with no keychain) is moved there
+/// before the engine starts ([`move_password_to_keychain`]).
 ///
 /// The error is the line to show. A library another run holds is exactly [`ALREADY_RUNNING`].
 pub(crate) async fn start_with(
     paths: &DesktopPaths,
     serve: bool,
+    proxy_password: Arc<dyn ProxyPasswordStore>,
     settings: impl FnOnce(&Config) -> fbt::Settings,
 ) -> Result<ThisComputer, String> {
     let library = paths.library();
@@ -106,14 +113,26 @@ pub(crate) async fn start_with(
             ));
         }
     };
-    let config = with_allowed_roots(library_config(&library)?, &library);
+    let mut config = library_config(&library, proxy_password.available())?;
+    move_password_to_keychain(&mut config, &library, proxy_password.as_ref());
+    let config = with_allowed_roots(config, &library);
+    // The engine logs in with the keychain's password; `config` keeps saying what the file holds, which
+    // is what the server reports from and writes back.
+    let mut engine = config.clone();
+    if let Some(proxy) = engine.proxy.as_mut()
+        && proxy.password.as_deref().is_none_or(str::is_empty)
+        && proxy_password.available()
+    {
+        proxy.password = proxy_password.get();
+    }
     let secret = launch_secret();
     let access = DesktopAccess {
         launch_secret: secret.clone(),
         origins: vec![desktop_origin().to_string()],
         expose: serve,
+        proxy_password: Some(proxy_password),
     };
-    let server = Server::start_desktop(settings(&config), config, &library, lock, access)
+    let server = Server::start_desktop(settings(&engine), config, &library, lock, access)
         .await
         .map_err(|problem| format!("This computer could not start: {problem}"))?;
     Ok(ThisComputer {
@@ -126,8 +145,16 @@ pub(crate) async fn start_with(
 /// The config This computer starts on: the library's file as read, this library's defaults written out
 /// when there is none yet, and the defaults (with the file left where it is) when it cannot be read. A
 /// problem worth knowing about that does not stop the start goes to stderr.
-fn library_config(paths: &Paths) -> Result<Config, String> {
-    match Config::load(paths) {
+///
+/// `keychained`: the system has a keychain, where the proxy password is kept, so the file's proxy login
+/// is read without one ([`Config::load_keychained`]).
+fn library_config(paths: &Paths, keychained: bool) -> Result<Config, String> {
+    let loaded = if keychained {
+        Config::load_keychained(paths)
+    } else {
+        Config::load(paths)
+    };
+    match loaded {
         Ok(ConfigLoad::Loaded(config)) => Ok(config.resolve(paths)),
         Ok(ConfigLoad::Missing) => {
             let config = Config::default_for(paths).resolve(paths);
@@ -142,6 +169,53 @@ fn library_config(paths: &Paths) -> Result<Config, String> {
             Ok(config)
         }
         Err(problem) => Err(problem.to_string()),
+    }
+}
+
+/// Moves a proxy password `config.yaml` holds into `store`, when the system has a keychain: the keychain
+/// first, then the file without it, in one save. The config This computer starts on (`config`, as read)
+/// stops holding the password only once the file does.
+///
+/// A keychain that will not take it leaves the file as it is, and the engine starts on the file's
+/// password; a file that will not save after the keychain took it is left too, and the engine starts on
+/// the keychain's (the same password), and the next start tries again. Either is one line on stderr,
+/// which never carries the password.
+fn move_password_to_keychain(config: &mut Config, paths: &Paths, store: &dyn ProxyPasswordStore) {
+    let Some(password) = config
+        .proxy
+        .as_ref()
+        .and_then(|proxy| proxy.password.clone())
+        .filter(|password| !password.is_empty())
+    else {
+        return;
+    };
+    if !store.available() {
+        return;
+    }
+    if let Err(problem) = store.set(&password) {
+        eprintln!("The proxy password stays in config.yaml: {problem}");
+        return;
+    }
+    let file = paths.config_file();
+    let saved = match Config::load_for_edit_keychained(&file) {
+        Ok(Some(mut on_disk)) => {
+            if let Some(proxy) = on_disk.proxy.as_mut() {
+                proxy.password = None;
+            }
+            on_disk.save(&file).map_err(|problem| problem.to_string())
+        }
+        Ok(None) => Ok(()),
+        Err(problem) => Err(problem.to_string()),
+    };
+    match saved {
+        Ok(()) => {
+            if let Some(proxy) = config.proxy.as_mut() {
+                proxy.password = None;
+            }
+        }
+        Err(problem) => eprintln!(
+            "The proxy password is in the keychain, but config.yaml still holds it: {problem}"
+        ),
     }
 }
 
@@ -184,6 +258,12 @@ impl ThisComputer {
         self.exposed
     }
 
+    /// The network settings the engine runs under right now. Only a test reads this.
+    #[cfg(test)]
+    pub(crate) fn network_settings(&self) -> fbt::NetworkSettings {
+        self.server.network_settings()
+    }
+
     /// Stops the engine: the API closes, the last save runs, the library is released. A save that did not
     /// complete is said on stderr; there is nobody left to show it to.
     pub async fn stop(self) {
@@ -195,21 +275,25 @@ impl ThisComputer {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use fbtt_core::Config;
     use fbtt_core::scratch::ScratchDir;
+    use fbtt_core::{Config, ProxySetting, ProxyType};
     use fbtt_desktop_core::DesktopPaths;
+    use fbtt_server::ProxyPasswordStore;
     use reqwest::StatusCode;
 
     use super::{ALREADY_RUNNING, ThisComputer, paths_problem, start_with};
+    use crate::keychain::{Keychain, MemoryKeychain, PROXY_ACCOUNT, ProxyKeychain};
 
     /// How long a test waits for anything from the engine.
     const DEADLINE: Duration = Duration::from_secs(60);
 
     /// The engine settings every test runs on: nothing leaves loopback, and nothing asks a router.
     pub(crate) fn offline(config: &Config) -> fbt::Settings {
-        let mut settings = config.session_settings();
+        // Before the proxy, as the app hands them: a proxy removed at runtime goes back to these.
+        let mut settings = config.settings_before_proxy();
         settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
         settings.dht_enabled = false;
         settings.enable_lsd = false;
@@ -238,9 +322,257 @@ pub(crate) mod tests {
 
     /// This computer on `paths`, kept off the network.
     pub(crate) async fn start_offline(paths: &DesktopPaths) -> Result<ThisComputer, String> {
-        tokio::time::timeout(DEADLINE, start_with(paths, false, offline))
+        start_keychained(paths, memory_store()).await
+    }
+
+    /// This computer on `paths`, kept off the network, with its proxy password in `store`.
+    async fn start_keychained(
+        paths: &DesktopPaths,
+        store: Arc<dyn ProxyPasswordStore>,
+    ) -> Result<ThisComputer, String> {
+        tokio::time::timeout(DEADLINE, start_with(paths, false, store, offline))
             .await
             .expect("This computer started within the deadline")
+    }
+
+    /// A proxy password store over an empty keychain in memory.
+    pub(crate) fn memory_store() -> Arc<dyn ProxyPasswordStore> {
+        Arc::new(ProxyKeychain::new(Arc::new(MemoryKeychain::new())))
+    }
+
+    /// The proxy password the tests below store. A test value, not anybody's credential.
+    const PROXY_PASSWORD: &str = "proxy-pass-hunter2";
+
+    /// A port nothing listens on: the proxy the tests below name, which the engine never reaches.
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let port = listener.local_addr().expect("its address").port();
+        drop(listener);
+        port
+    }
+
+    /// Writes a `kind` proxy at `127.0.0.1:<closed port>` into the scratch library's config, logged in to
+    /// as `bob` with `password` when there is one, keeping the download folder the scratch config named.
+    fn write_proxy(paths: &DesktopPaths, kind: ProxyType, password: Option<&str>) {
+        let file = paths.library().config_file();
+        let mut config = Config::load_for_edit_keychained(&file)
+            .expect("the scratch config reads")
+            .expect("it is there");
+        config.proxy = Some(ProxySetting {
+            kind,
+            host: "127.0.0.1".to_string(),
+            port: closed_port(),
+            username: password.map(|_| "bob".to_string()),
+            password: password.map(str::to_string),
+        });
+        config.save(&file).expect("write the proxy");
+    }
+
+    fn file_text(paths: &DesktopPaths) -> String {
+        std::fs::read_to_string(paths.library().config_file()).expect("the config file")
+    }
+
+    /// A password `config.yaml` holds moves into the keychain at the start, and out of the file in the
+    /// same start; the engine logs in with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_moves_a_file_password_into_the_keychain() {
+        let dir = ScratchDir::new("desktop-local-move-password");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let keychain = Arc::new(MemoryKeychain::new());
+        let store: Arc<dyn ProxyPasswordStore> = Arc::new(ProxyKeychain::new(keychain.clone()));
+
+        let this = start_keychained(&paths, store)
+            .await
+            .expect("This computer starts");
+        assert_eq!(
+            keychain.get(PROXY_ACCOUNT).as_deref(),
+            Some(PROXY_PASSWORD),
+            "the keychain has it"
+        );
+        let written = file_text(&paths);
+        assert!(!written.contains(PROXY_PASSWORD), "{written}");
+        assert!(!written.contains("password:"), "{written}");
+        assert!(written.contains("username: bob"), "{written}");
+        assert_eq!(
+            this.network_settings().proxy.password.as_deref(),
+            Some(PROXY_PASSWORD)
+        );
+        this.stop().await;
+    }
+
+    /// The engine logs in with the keychain's password when the file holds none: the config the settings
+    /// are made from carries it, and so does the engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_uses_the_keychain_password() {
+        let dir = ScratchDir::new("desktop-local-keychain-password");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let file = paths.library().config_file();
+        let mut config = Config::load_for_edit(&file).expect("reads").expect("there");
+        if let Some(proxy) = config.proxy.as_mut() {
+            proxy.password = None;
+        }
+        config.save(&file).expect("the file without the password");
+        let keychain = Arc::new(MemoryKeychain::new());
+        keychain
+            .set(PROXY_ACCOUNT, PROXY_PASSWORD)
+            .expect("the keychain holds it");
+        let store: Arc<dyn ProxyPasswordStore> = Arc::new(ProxyKeychain::new(keychain));
+
+        let seen: Arc<Mutex<Option<String>>> = Arc::default();
+        let seeing = Arc::clone(&seen);
+        let this = tokio::time::timeout(
+            DEADLINE,
+            start_with(&paths, false, store, move |config: &Config| {
+                *seeing.lock().expect("the lock") = config
+                    .proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.password.clone());
+                offline(config)
+            }),
+        )
+        .await
+        .expect("within the deadline")
+        .expect("This computer starts");
+        assert_eq!(
+            seen.lock().expect("the lock").as_deref(),
+            Some(PROXY_PASSWORD),
+            "the settings are made from the keychain's password"
+        );
+        assert_eq!(
+            this.network_settings().proxy.password.as_deref(),
+            Some(PROXY_PASSWORD)
+        );
+        assert!(!file_text(&paths).contains(PROXY_PASSWORD));
+        this.stop().await;
+    }
+
+    /// A keychain that will not take the password leaves the file as it is, and the engine starts on the
+    /// file's password.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_keeps_the_file_password_when_the_keychain_refuses() {
+        let dir = ScratchDir::new("desktop-local-keychain-refuses");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let before = file_text(&paths);
+        let keychain = Arc::new(MemoryKeychain::new());
+        keychain.fail_writes(true);
+        let store: Arc<dyn ProxyPasswordStore> = Arc::new(ProxyKeychain::new(keychain.clone()));
+
+        let this = start_keychained(&paths, store)
+            .await
+            .expect("This computer starts");
+        assert_eq!(file_text(&paths), before, "the file is as it was");
+        assert_eq!(keychain.get(PROXY_ACCOUNT), None);
+        assert_eq!(
+            this.network_settings().proxy.password.as_deref(),
+            Some(PROXY_PASSWORD)
+        );
+        this.stop().await;
+    }
+
+    /// A file that will not save after the keychain took the password is left as it is (the next start
+    /// tries again), and the engine starts on the keychain's password.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_keeps_the_keychain_password_when_the_file_will_not_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScratchDir::new("desktop-local-file-refuses");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let before = file_text(&paths);
+        let folder = paths.library().config_dir.clone();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500))
+            .expect("make the config folder read-only");
+        let keychain = Arc::new(MemoryKeychain::new());
+        let store: Arc<dyn ProxyPasswordStore> = Arc::new(ProxyKeychain::new(keychain.clone()));
+
+        let started = start_keychained(&paths, store).await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+            .expect("make it writable again");
+        let this = started.expect("This computer starts");
+        assert_eq!(file_text(&paths), before, "the file is left");
+        assert_eq!(keychain.get(PROXY_ACCOUNT).as_deref(), Some(PROXY_PASSWORD));
+        assert_eq!(
+            this.network_settings().proxy.password.as_deref(),
+            Some(PROXY_PASSWORD)
+        );
+        this.stop().await;
+    }
+
+    /// On a system with no keychain the password stays in `config.yaml`, and the engine logs in with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_without_keychain_keeps_the_file_password() {
+        let dir = ScratchDir::new("desktop-local-no-keychain");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let before = file_text(&paths);
+        let store: Arc<dyn ProxyPasswordStore> =
+            Arc::new(ProxyKeychain::new(Arc::new(MemoryKeychain::unavailable())));
+
+        let this = start_keychained(&paths, store)
+            .await
+            .expect("This computer starts");
+        assert_eq!(file_text(&paths), before, "the file keeps it");
+        assert_eq!(
+            this.network_settings().proxy.password.as_deref(),
+            Some(PROXY_PASSWORD)
+        );
+        this.stop().await;
+    }
+
+    /// Removing the proxy at runtime over This computer's own route brings back the switches it turned
+    /// off: the engine is handed its settings before the proxy, as the app's own start hands them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_the_proxy_at_runtime_restores_the_switches() {
+        let dir = ScratchDir::new("desktop-local-proxy-removed");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let this = start_offline(&paths).await.expect("This computer starts");
+        let proxied = this.network_settings();
+        assert_eq!(proxied.proxy.kind, fbt::ProxyKind::Socks5);
+        assert!(
+            !proxied.enable_incoming_tcp,
+            "the proxy turned incoming off"
+        );
+
+        let (base, secret) = this.endpoint();
+        let answer = tokio::time::timeout(
+            DEADLINE,
+            reqwest::Client::new()
+                .put(format!("{base}/api/v1/settings/proxy"))
+                .bearer_auth(&secret)
+                .json(&serde_json::json!({
+                    "type": "none", "host": "", "port": 0, "username": null, "password": "keep"
+                }))
+                .send(),
+        )
+        .await
+        .expect("an answer within the deadline")
+        .expect("the request completed");
+        let status = answer.status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            answer.text().await.unwrap_or_default()
+        );
+
+        let running = this.network_settings();
+        let config = Config::load_for_edit(&paths.library().config_file())
+            .expect("reads")
+            .expect("there");
+        assert!(config.proxy.is_none(), "the file names no proxy");
+        assert_eq!(running.proxy.kind, fbt::ProxyKind::None);
+        assert!(running.enable_incoming_tcp, "incoming connections are back");
+        assert_eq!(
+            running,
+            offline(&config.resolve(&paths.library())).network(),
+            "the switches are what This computer had before its proxy"
+        );
+        this.stop().await;
     }
 
     async fn status(request: reqwest::RequestBuilder) -> StatusCode {
@@ -308,7 +640,7 @@ pub(crate) mod tests {
         let library = paths.library();
         assert!(!library.config_file().exists(), "a fresh library");
 
-        let config = super::library_config(&library).expect("the defaults");
+        let config = super::library_config(&library, false).expect("the defaults");
         let written = Config::load_for_edit(&library.config_file())
             .expect("the config reads")
             .expect("the first run wrote one");
@@ -341,7 +673,7 @@ pub(crate) mod tests {
         .expect("write a config that names a proxy");
 
         assert_eq!(
-            super::library_config(&library).err().as_deref(),
+            super::library_config(&library, false).err().as_deref(),
             Some("Unknown proxy type \"socks4\"; use none, http or socks5.")
         );
         assert!(file.exists(), "the file is left in place");

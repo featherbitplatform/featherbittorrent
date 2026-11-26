@@ -309,6 +309,28 @@ the app says so beside the option instead of offering it: `This system has no ke
 saved.` It asks for the password at every connect. It never falls back to a plain file, because a plain file
 is where a password is read by whoever can read the file.
 
+### This computer's proxy password
+
+The proxy password of This computer's own engine goes into the same keychain, under the account
+`proxy:this-computer`, and This computer's `config.yaml` keeps the rest of the proxy (type, host, port and user
+name) without it. A password already in `config.yaml`, written by hand or by a run on a system with no
+keychain, is moved into the keychain the next time the app starts, and taken out of the file in the same
+start. If the keychain will not take it, the file is left as it is and the engine uses the password from the
+file; the app tries again at the next start.
+
+Saving the Proxy section writes the password to the keychain and never to the file. The password is never
+shown again: the field says `saved`, and you can replace it or clear it. If the keychain will not save it, or
+will not let the old one go, nothing changes: not the file, not the keychain, not the engine. If the engine
+cannot switch to the new proxy, the previous proxy goes back into `config.yaml` and the previous password back
+into the keychain.
+
+Where the system has no keychain, the proxy password is kept in `config.yaml` as the terminal client keeps it,
+and the Proxy section says so: `This system has no keychain, so the proxy password is kept in config.yaml.`
+Unlike an instance password, the proxy password has to be stored somewhere, or the app could not log in to the
+proxy at its next start. If the keychain loses the password (an entry removed by hand), This computer still
+starts on the proxy, with no login: the proxy refuses it, and typing the password again in the Proxy section
+fixes it. It never connects directly.
+
 ## The window
 
 The app draws its own top bar: the instance switcher, the web UI's own header actions, and on Windows and

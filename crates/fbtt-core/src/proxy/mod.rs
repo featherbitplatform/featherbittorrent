@@ -282,6 +282,25 @@ impl ProxySetting {
         Ok(())
     }
 
+    /// [`validate`](Self::validate) for a setting whose password is kept somewhere else (the desktop
+    /// app's keychain): a SOCKS5 user name with no password beside it is accepted, because the password
+    /// is filled in from that store before the engine is handed the setting. Every other rule holds,
+    /// and the setting the engine gets is validated in full once its password is in.
+    pub fn validate_password_elsewhere(&self) -> Result<(), ProxyProblem> {
+        let user = self.username.as_deref().filter(|user| !user.is_empty());
+        let pass = self.password.as_deref().filter(|pass| !pass.is_empty());
+        if matches!(self.kind, ProxyType::Socks5) && user.is_some() && pass.is_none() {
+            // Any password the engine would accept stands in for the one kept elsewhere; only its
+            // presence is being checked.
+            let stood_in = ProxySetting {
+                password: Some("kept-elsewhere".to_string()),
+                ..self.clone()
+            };
+            return stood_in.validate();
+        }
+        self.validate()
+    }
+
     /// The engine's proxy config for this setting: the address and credentials as written, all three
     /// routing switches on, and `proxy_only` set so the engine treats every bypass as off. A value
     /// here is only ever reached after [`validate`](Self::validate) accepted it (a config that names
@@ -659,6 +678,17 @@ mod tests {
             ..socks5("proxy.example", 1080)
         };
         assert_eq!(half_login.validate(), Err(ProxyProblem::IncompleteLogin));
+        // With the password kept in the keychain, the user name alone is the whole login in the file;
+        // every other rule still holds.
+        assert_eq!(half_login.validate_password_elsewhere(), Ok(()));
+        let half_and_hostless = ProxySetting {
+            host: String::new(),
+            ..half_login.clone()
+        };
+        assert_eq!(
+            half_and_hostless.validate_password_elsewhere(),
+            Err(ProxyProblem::NoHost)
+        );
         assert_eq!(
             half_login.validate().unwrap_err().message(),
             "A SOCKS5 login needs both a user name and a password."

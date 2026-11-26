@@ -7,14 +7,20 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbtt_core::scratch::ScratchDir;
-use fbtt_core::{AuthConfig, Config, LibraryLock, Paths, ServerConfig, UserEntry};
+use fbtt_core::{
+    AuthConfig, Config, LibraryLock, Paths, ProxySetting, ProxyType, ServerConfig, UserEntry,
+};
 use fbtt_server::auth::password;
-use fbtt_server::{DesktopAccess, MIN_LAUNCH_SECRET_CHARS, Server, ServerError};
+use fbtt_server::{
+    DesktopAccess, MIN_LAUNCH_SECRET_CHARS, ProxyPasswordStore, Server, ServerError,
+};
 use reqwest::{Response, StatusCode};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// How long a test waits for anything from the server.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -56,6 +62,7 @@ impl Served {
             launch_secret: LAUNCH_SECRET.to_string(),
             origins: vec![DESKTOP_ORIGIN.to_string()],
             expose,
+            proxy_password: None,
         };
         let server = within(Server::start_desktop(
             loopback(&config),
@@ -418,6 +425,7 @@ async fn start_with_secret(tag: &str, secret: String) -> Result<(), ServerError>
         launch_secret: secret,
         origins: vec![DESKTOP_ORIGIN.to_string()],
         expose: false,
+        proxy_password: None,
     };
     let started = within(Server::start_desktop(
         loopback(&config),
@@ -461,4 +469,456 @@ async fn desktop_mode_refuses_a_launch_secret_one_character_short() {
     start_with_secret("desktop-enough-secret", enough)
         .await
         .expect("a 43-character secret starts the engine");
+}
+
+/// The proxy password the keychain tests store. A test value, not anybody's credential.
+const PROXY_PASSWORD: &str = "proxy-pass-hunter2";
+
+/// A keychain in memory: the desktop app's store as the server sees it, available or not, and refusing
+/// every write when a test says so. Its `Debug` is never asked for.
+#[derive(Default)]
+struct MemoryStore {
+    password: Mutex<Option<String>>,
+    unavailable: bool,
+    refuse_writes: AtomicBool,
+}
+
+impl MemoryStore {
+    fn holding(password: Option<&str>) -> Arc<MemoryStore> {
+        Arc::new(MemoryStore {
+            password: Mutex::new(password.map(str::to_string)),
+            ..MemoryStore::default()
+        })
+    }
+
+    fn missing() -> Arc<MemoryStore> {
+        Arc::new(MemoryStore {
+            unavailable: true,
+            ..MemoryStore::default()
+        })
+    }
+
+    fn held(&self) -> Option<String> {
+        self.password.lock().expect("the store's lock").clone()
+    }
+}
+
+impl ProxyPasswordStore for MemoryStore {
+    fn get(&self) -> Option<String> {
+        if self.unavailable {
+            return None;
+        }
+        self.held()
+    }
+
+    fn set(&self, password: &str) -> Result<(), String> {
+        if self.unavailable || self.refuse_writes.load(Ordering::SeqCst) {
+            return Err("The keychain did not save the password: refused by the test".to_string());
+        }
+        *self.password.lock().expect("the store's lock") = Some(password.to_string());
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        if self.refuse_writes.load(Ordering::SeqCst) {
+            return Err(
+                "The keychain did not remove the password: refused by the test".to_string(),
+            );
+        }
+        *self.password.lock().expect("the store's lock") = None;
+        Ok(())
+    }
+
+    fn available(&self) -> bool {
+        !self.unavailable
+    }
+}
+
+/// A port nothing listens on: the proxy every keychain test names, which the engine never reaches.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let port = listener.local_addr().expect("its address").port();
+    drop(listener);
+    port
+}
+
+/// A `kind` proxy at `127.0.0.1:port` logged in to as `bob`, with `password` (none for one the keychain
+/// holds).
+fn proxy_at(kind: ProxyType, port: u16, password: Option<&str>) -> ProxySetting {
+    ProxySetting {
+        kind,
+        host: "127.0.0.1".to_string(),
+        port,
+        username: Some("bob".to_string()),
+        password: password.map(str::to_string),
+    }
+}
+
+/// A secret-only desktop engine whose `config.yaml` holds `proxy`, with `store` as its keychain (none for
+/// a server with no keychain at all). The file is written before the start, as the app's own start finds
+/// it, and the config the engine starts on is the file's.
+async fn start_keychained(
+    tag: &str,
+    proxy: ProxySetting,
+    store: Option<Arc<MemoryStore>>,
+) -> (Served, Paths) {
+    let dir = ScratchDir::new(tag);
+    let paths = Paths {
+        config_dir: dir.path().join("config"),
+        data_dir: dir.path().join("data"),
+    };
+    let file = paths.config_file();
+    std::fs::create_dir_all(file.parent().expect("the config directory"))
+        .expect("make the config directory");
+    Config {
+        proxy: Some(proxy),
+        ..plain(dir.path())
+    }
+    .save(&file)
+    .expect("write the config file");
+    let config = Config::load_for_edit_keychained(&file)
+        .expect("the config reads")
+        .expect("it is there")
+        .resolve(&paths);
+    let lock = LibraryLock::acquire(&paths.lock_file()).expect("lock the library");
+    let access = DesktopAccess {
+        launch_secret: LAUNCH_SECRET.to_string(),
+        origins: vec![DESKTOP_ORIGIN.to_string()],
+        expose: false,
+        proxy_password: store.map(|store| store as Arc<dyn ProxyPasswordStore>),
+    };
+    let server = within(Server::start_desktop(
+        offline_before_proxy(&config),
+        config,
+        &paths,
+        lock,
+        access,
+    ))
+    .await
+    .expect("start the server");
+    (Served { dir, server }, paths)
+}
+
+/// [`loopback`] before the proxy, as the app hands its settings: a proxy removed at runtime goes back to
+/// these.
+fn offline_before_proxy(config: &Config) -> fbt::Settings {
+    let mut settings = config.settings_before_proxy();
+    settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
+    settings.dht_enabled = false;
+    settings.enable_lsd = false;
+    settings.enable_upnp = false;
+    settings.enable_natpmp = false;
+    settings
+}
+
+/// A `PUT /api/v1/settings/proxy` of `body` with the launch secret, answered as the status and the text.
+async fn put_proxy(served: &Served, body: Value) -> (StatusCode, String) {
+    let response = within(
+        http()
+            .put(served.url("/api/v1/settings/proxy"))
+            .bearer_auth(LAUNCH_SECRET)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("the server answered");
+    let status = response.status();
+    let text = within(response.text()).await.expect("a body");
+    (status, text)
+}
+
+/// `GET /api/v1/settings` with the launch secret, as text.
+async fn settings_text(served: &Served) -> String {
+    let response = get(
+        &http(),
+        &served.url("/api/v1/settings"),
+        Some(LAUNCH_SECRET),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    within(response.text()).await.expect("a body")
+}
+
+fn file_text(paths: &Paths) -> String {
+    std::fs::read_to_string(paths.config_file()).expect("the config file")
+}
+
+/// On the desktop app's engine with a keychain, a new proxy password goes to the keychain and never into
+/// `config.yaml`, and the view says it is saved there without carrying it.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_proxy_password_goes_to_the_store_not_the_file() {
+    let store = MemoryStore::holding(None);
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-keychain",
+        ProxySetting {
+            username: None,
+            ..proxy_at(ProxyType::Socks5, port, None)
+        },
+        Some(store.clone()),
+    )
+    .await;
+
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": port, "username": "bob",
+               "password": {"set": PROXY_PASSWORD}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
+    let written = file_text(&paths);
+    assert!(!written.contains(PROXY_PASSWORD), "{written}");
+    assert!(!written.contains("password:"), "{written}");
+    assert!(written.contains("proxy:"), "{written}");
+    assert_eq!(
+        served.server.network_settings().proxy.password.as_deref(),
+        Some(PROXY_PASSWORD),
+        "the engine logs in with it"
+    );
+
+    let view: Value = serde_json::from_str(&settings_text(&served).await).expect("JSON");
+    assert_eq!(view["proxy"]["password_saved"], true, "{view}");
+    assert_eq!(view["proxy"]["password_storage"], "keychain", "{view}");
+    assert!(!view.to_string().contains(PROXY_PASSWORD));
+    served.stop().await;
+}
+
+/// The engine starts on the keychain's password when the file holds none.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_engine_starts_on_the_keychain_password() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let (served, _paths) = start_keychained(
+        "desktop-proxy-start",
+        proxy_at(ProxyType::Socks5, closed_port(), None),
+        Some(store),
+    )
+    .await;
+    let running = served.server.network_settings();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::Socks5);
+    assert_eq!(running.proxy.password.as_deref(), Some(PROXY_PASSWORD));
+    served.stop().await;
+}
+
+/// A SOCKS5 login whose password the keychain no longer holds still starts the engine on the proxy, with
+/// no login: never a direct connection, and never an app that cannot start.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_engine_without_the_keychain_password_stays_on_the_proxy() {
+    let (served, _paths) = start_keychained(
+        "desktop-proxy-lost",
+        proxy_at(ProxyType::Socks5, closed_port(), None),
+        Some(MemoryStore::holding(None)),
+    )
+    .await;
+    let running = served.server.network_settings();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::Socks5);
+    assert_eq!(running.proxy.username, None);
+    assert!(!running.enable_incoming_tcp, "still nothing bypasses it");
+    served.stop().await;
+}
+
+/// `keep` keeps the keychain's password, and B3's rule holds with the keychain as the store: keeping it
+/// for a new host or port is refused, with nothing changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_keep_uses_the_keychain_password_for_the_same_address_only() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-keep",
+        proxy_at(ProxyType::Socks5, port, None),
+        Some(store.clone()),
+    )
+    .await;
+
+    let before = file_text(&paths);
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": closed_port(), "username": "bob",
+               "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.contains("Enter the password again when the proxy's host or port changes."),
+        "{text}"
+    );
+    assert_eq!(file_text(&paths), before, "the file is unchanged");
+    assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
+
+    // The same address with another type keeps it: a SOCKS5 login needs both halves, so this is accepted
+    // only because the keychain's password counts as the stored one.
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "http", "host": "127.0.0.1", "port": port, "username": "bob",
+               "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
+    let running = served.server.network_settings();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::Http);
+    assert_eq!(running.proxy.password.as_deref(), Some(PROXY_PASSWORD));
+    assert!(!file_text(&paths).contains("password:"));
+    served.stop().await;
+}
+
+/// A keychain that will not take the password is `500` with its reason, and nothing changes: not the
+/// file, not the keychain, not the engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_keychain_refusal_is_500_and_changes_nothing() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-refused",
+        proxy_at(ProxyType::Socks5, port, None),
+        Some(store.clone()),
+    )
+    .await;
+    store.refuse_writes.store(true, Ordering::SeqCst);
+    let before = file_text(&paths);
+    let engine_before = served.server.network_settings();
+
+    for body in [
+        json!({"type": "socks5", "host": "127.0.0.1", "port": closed_port(), "username": "bob",
+               "password": {"set": "another-password"}}),
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    ] {
+        let (status, text) = put_proxy(&served, body).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(text.contains("proxy_password_not_saved"), "{text}");
+        assert!(text.contains("refused by the test"), "{text}");
+        assert!(!text.contains(PROXY_PASSWORD), "{text}");
+        assert!(!text.contains("another-password"), "{text}");
+        assert_eq!(file_text(&paths), before, "the file is as it was");
+        assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
+        assert_eq!(served.server.network_settings(), engine_before);
+    }
+    served.stop().await;
+}
+
+/// A switch the engine refuses after the save puts the keychain's password back too, with the same real
+/// failure B3's rollback test uses: the engine starts on an HTTP proxy, which lets its BitTorrent port go,
+/// the test takes that port, and removing the proxy cannot listen on it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_failed_apply_puts_the_keychain_password_back() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let proxy_port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-rollback",
+        proxy_at(ProxyType::Http, proxy_port, None),
+        Some(store.clone()),
+    )
+    .await;
+    let before = file_text(&paths);
+    let engine_port = served
+        .server
+        .engine_local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(text.contains("proxy_not_applied"), "{text}");
+    assert!(
+        text.contains(
+            "The engine could not switch to this proxy, so the previous setting is kept: "
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        store.held().as_deref(),
+        Some(PROXY_PASSWORD),
+        "the keychain has the password back"
+    );
+    assert_eq!(file_text(&paths), before, "the file names the proxy again");
+    let running = served.server.network_settings();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::Http);
+    assert_eq!(running.proxy.password.as_deref(), Some(PROXY_PASSWORD));
+
+    drop(squatter);
+    served.stop().await;
+}
+
+/// On a system with no keychain the desktop app's engine keeps the password in `config.yaml`, as the CLI
+/// does, and the view says the keychain is unavailable.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_without_keychain_keeps_the_password_in_the_file() {
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-no-keychain",
+        // No login yet: the file has to read as a config where the password lives in it.
+        ProxySetting {
+            username: None,
+            ..proxy_at(ProxyType::Socks5, port, None)
+        },
+        Some(MemoryStore::missing()),
+    )
+    .await;
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": port, "username": "bob",
+               "password": {"set": PROXY_PASSWORD}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    let stored = Config::load_for_edit(&paths.config_file())
+        .expect("reads")
+        .expect("there")
+        .proxy
+        .expect("a proxy");
+    assert_eq!(stored.password.as_deref(), Some(PROXY_PASSWORD));
+    let view: Value = serde_json::from_str(&settings_text(&served).await).expect("JSON");
+    assert_eq!(view["proxy"]["password_storage"], "unavailable", "{view}");
+    assert_eq!(view["proxy"]["password_saved"], true, "{view}");
+    served.stop().await;
+}
+
+/// A server with no keychain at all keeps the password in `config.yaml`, as B3 does.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_server_keeps_the_password_in_the_file() {
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-cli",
+        // No login yet: the file has to read as a config where the password lives in it.
+        ProxySetting {
+            username: None,
+            ..proxy_at(ProxyType::Socks5, port, None)
+        },
+        None,
+    )
+    .await;
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": port, "username": "bob",
+               "password": {"set": PROXY_PASSWORD}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(file_text(&paths).contains(PROXY_PASSWORD));
+    let view: Value = serde_json::from_str(&settings_text(&served).await).expect("JSON");
+    assert_eq!(view["proxy"]["password_storage"], "config_file", "{view}");
+    served.stop().await;
+}
+
+/// `DesktopAccess`'s `Debug` says whether there is a keychain, never what it holds.
+#[test]
+fn desktop_access_debug_never_prints_the_proxy_password() {
+    let access = DesktopAccess {
+        launch_secret: LAUNCH_SECRET.to_string(),
+        origins: Vec::new(),
+        expose: false,
+        proxy_password: Some(MemoryStore::holding(Some(PROXY_PASSWORD))),
+    };
+    let printed = format!("{access:?}");
+    assert!(!printed.contains(PROXY_PASSWORD), "{printed}");
+    assert!(!printed.contains(LAUNCH_SECRET), "{printed}");
 }

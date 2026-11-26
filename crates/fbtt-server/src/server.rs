@@ -97,16 +97,53 @@ pub struct DesktopAccess {
     /// accept the launch secret alone. `true`: serve the config's `server` section exactly as
     /// [`Server::start`] does, and accept the launch secret beside its logins.
     pub expose: bool,
+    /// Where the proxy password is kept instead of `config.yaml`: the system keychain the app files its
+    /// passwords in. With one that is [`available`](ProxyPasswordStore::available), the engine starts on
+    /// the password it holds, a proxy save writes the password there and never into the file, and the
+    /// view says `keychain`. With one that is not, the password stays in `config.yaml` as for the CLI and
+    /// the view says `unavailable`. `None` is a server with no keychain at all (the view says
+    /// `config_file`).
+    pub proxy_password: Option<Arc<dyn ProxyPasswordStore>>,
 }
 
 impl std::fmt::Debug for DesktopAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the secret: a `Debug` printing ends up beside a panic message.
+        // Never the secret: a `Debug` printing ends up beside a panic message. Nor the store: only
+        // whether there is one that saves.
         f.debug_struct("DesktopAccess")
             .field("origins", &self.origins)
             .field("expose", &self.expose)
+            .field(
+                "proxy_password_store",
+                &self.proxy_password.as_ref().map(|store| store.available()),
+            )
             .finish_non_exhaustive()
     }
+}
+
+/// The one place the desktop app keeps This computer's proxy password: the system keychain, behind this
+/// trait so a test answers from memory and never wakes the real store.
+///
+/// The password never leaves the process through it: nothing here is logged, and an implementation's
+/// `Debug`, if it has one, must not print what it holds. The errors are one line to show, and carry no
+/// password.
+pub trait ProxyPasswordStore: Send + Sync {
+    /// The password saved, or `None` when there is none or the store would not say.
+    fn get(&self) -> Option<String>;
+    /// Saves `password`, replacing whatever was there.
+    ///
+    /// # Errors
+    ///
+    /// The line to show when the store did not save it.
+    fn set(&self, password: &str) -> Result<(), String>;
+    /// Takes the password out. Nothing saved is already done.
+    ///
+    /// # Errors
+    ///
+    /// The line to show when the store did not take it out.
+    fn clear(&self) -> Result<(), String>;
+    /// Whether this system has a store to save in at all.
+    fn available(&self) -> bool;
 }
 
 /// A running featherbittorrent server: the library, the API and the save in between them.
@@ -236,6 +273,9 @@ impl Server {
                 cors_origins.push(origin.clone());
             }
         }
+        let proxy_password = desktop
+            .as_ref()
+            .and_then(|access| access.proxy_password.clone());
         let launch = desktop.map(|access| (access.launch_secret, !access.expose));
         // No password is taken on the secret-only engine: its login routes are not there.
         let passwords_in_use = !secret_only && !server.auth.users.is_empty();
@@ -270,7 +310,26 @@ impl Server {
         // whatever the caller did, so a run never starts direct on a config that names a proxy.
         let base_settings = settings.clone();
         let mut settings = settings;
-        fbtt_core::apply_to_settings(&mut settings, config.proxy.as_ref());
+        // On the desktop app's engine with a keychain, the file holds no password: the keychain's is the
+        // one the engine logs in with. A password the file still holds (one the keychain would not take
+        // at the app's start) is used as it is. A SOCKS5 login whose password the keychain no longer has
+        // cannot be handed to the engine, so the engine starts on the proxy with no login: the proxy
+        // refuses it, the Proxy section says so, and the password can be typed again. Never direct.
+        let mut proxy = config.proxy.clone();
+        if let (Some(setting), Some(store)) = (proxy.as_mut(), proxy_password.as_ref())
+            && store.available()
+            && setting.password.as_deref().is_none_or(str::is_empty)
+        {
+            setting.password = store.get();
+            if setting.validate().is_err() && setting.validate_password_elsewhere().is_ok() {
+                tracing::warn!(
+                    "the keychain has no proxy password; the proxy is used with no login until one is saved"
+                );
+                setting.username = None;
+            }
+        }
+        fbtt_core::apply_to_settings(&mut settings, proxy.as_ref());
+        drop(proxy);
         let (mut engine, start_problems) = Engine::start(settings, paths, lock)
             .await
             .map_err(ServerError::Engine)?;
@@ -311,6 +370,7 @@ impl Server {
             engine.session().clone(),
             base_settings,
             launch,
+            proxy_password,
             automation,
         ));
 

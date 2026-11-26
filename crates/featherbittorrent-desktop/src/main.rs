@@ -65,6 +65,11 @@ fn main() {
     // context before the builder takes it.
     let own_origins = navigation::own_origins(context.config().build.dev_url.as_ref());
 
+    // One keychain for the instance passwords and This computer's proxy password, asked once whether it
+    // is there.
+    let system_keychain: std::sync::Arc<dyn keychain::Keychain> =
+        std::sync::Arc::new(keychain::SystemKeychain::probe());
+
     let app = tauri::Builder::default()
         // First among the plugins, as its documentation requires: a second launch forwards what it was
         // opened with to this copy, which shows its window, and exits without starting anything.
@@ -90,11 +95,15 @@ fn main() {
         // The player's playlist folder, beside This computer's files. Made before `paths` moves into
         // Serving on the next line: the command and the sweep at app start share it (`player::Playlists`).
         .manage(player::Playlists::new(&paths.data_dir))
-        .manage(serving::Serving::new(paths, settings_store.clone()))
+        .manage(serving::Serving::new(
+            paths,
+            settings_store.clone(),
+            keychain::ProxyKeychain::new(system_keychain.clone()),
+        ))
         .manage(window::ChromeState::new(settings_store.clone()))
         .manage(instances::Instances::new(
             settings_store.clone(),
-            std::sync::Arc::new(keychain::SystemKeychain::probe()),
+            system_keychain,
             local::desktop_origin(),
         ))
         .manage(lifecycle::Lifecycle::new(settings_store))
