@@ -113,8 +113,17 @@ pub enum ProxyProblem {
     UnknownType(String),
     /// A SOCKS5 proxy named only one half of a login: SOCKS5 has both or neither.
     IncompleteLogin,
+    /// A password was given with an empty or missing user name: a login, HTTP or SOCKS5, names
+    /// its user.
+    LoginNeedsUser,
     /// An HTTP user name carries a `:`: HTTP Basic splits on it, so it cannot.
     UsernameColon,
+    /// A top-level key spells `proxy` in another case (`Proxy:`, `PROXY:`): the parser keeps it as
+    /// an unknown key, so the run would otherwise go without the proxy it names.
+    KeyCase,
+    /// A file that mentions a proxy has a top-level YAML merge (`<<`): the parser does not apply
+    /// merges, so a proxy carried by one would be dropped.
+    MergeKey,
     /// The engine refuses the proxy this product built, with fbt's own words. The last word, for a
     /// case this product's own checks do not cover.
     Engine(String),
@@ -140,7 +149,13 @@ impl ProxyProblem {
             ProxyProblem::IncompleteLogin => {
                 "A SOCKS5 login needs both a user name and a password.".to_string()
             }
+            ProxyProblem::LoginNeedsUser => "A proxy login needs a user name.".to_string(),
             ProxyProblem::UsernameColon => "The user name cannot contain a colon.".to_string(),
+            ProxyProblem::KeyCase => "Write the proxy setting as proxy: in lower case.".to_string(),
+            ProxyProblem::MergeKey => {
+                "Write the proxy: section out in full; a YAML merge (<<) cannot carry it."
+                    .to_string()
+            }
             ProxyProblem::Engine(problem) => {
                 // The engine's own sentence, made display-safe in case its wording ever carries a
                 // character a screen should not draw.
@@ -195,8 +210,8 @@ impl ProxySetting {
 
     /// Checks that a run can act on this section: the type is one this product knows, the host is a
     /// name or an address (1 to 253 characters, no whitespace, not spelled as a URL), the port is
-    /// not 0, and the credentials can be sent (at most 255 bytes each; a SOCKS5 login is both halves
-    /// or neither; an HTTP user name carries no `:`). The engine's own check runs last, so a case
+    /// not 0, and the credentials can be sent (at most 255 bytes each; a password needs a user name;
+    /// a SOCKS5 login is both halves or neither; an HTTP user name carries no `:`). The engine's own check runs last, so a case
     /// this product does not cover is still refused - with fbt's sentence rather than engine-worded
     /// text at start.
     pub fn validate(&self) -> Result<(), ProxyProblem> {
@@ -239,8 +254,13 @@ impl ProxySetting {
         }
         let user = self.username.as_deref().filter(|user| !user.is_empty());
         let pass = self.password.as_deref().filter(|pass| !pass.is_empty());
-        // A SOCKS5 login is both halves or neither: a user name without a password (or the other way
-        // around) is a login the engine would refuse at start.
+        // A password names a login, and a login names its user, for HTTP as much as SOCKS5: an
+        // empty user name would otherwise reach the engine as `Some("")`.
+        if pass.is_some() && user.is_none() {
+            return Err(ProxyProblem::LoginNeedsUser);
+        }
+        // A SOCKS5 login is both halves or neither: a user name without a password is a login the
+        // engine would refuse at start.
         if matches!(self.kind, ProxyType::Socks5) && user.is_some() != pass.is_some() {
             return Err(ProxyProblem::IncompleteLogin);
         }
@@ -613,6 +633,28 @@ mod tests {
             half_login.validate().unwrap_err().message(),
             "A SOCKS5 login needs both a user name and a password."
         );
+
+        // A password with an empty user name is refused for both types, with its own sentence: the
+        // engine would otherwise be handed an empty user name.
+        for kind in [ProxyType::Http, ProxyType::Socks5] {
+            for username in [None, Some(String::new())] {
+                let no_user = ProxySetting {
+                    kind: kind.clone(),
+                    username: username.clone(),
+                    password: Some("hunter2".to_string()),
+                    ..socks5("proxy.example", 1080)
+                };
+                assert_eq!(
+                    no_user.validate(),
+                    Err(ProxyProblem::LoginNeedsUser),
+                    "{kind:?} with user name {username:?}"
+                );
+                assert_eq!(
+                    no_user.validate().unwrap_err().message(),
+                    "A proxy login needs a user name."
+                );
+            }
+        }
 
         // An HTTP user name cannot carry a colon, with this product's own sentence.
         let user_colon = ProxySetting {

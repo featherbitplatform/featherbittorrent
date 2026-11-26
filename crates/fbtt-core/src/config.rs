@@ -815,8 +815,8 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     // Either would leave the engine connecting directly, so the raw key is looked for as well: a
     // file that names a proxy may not come back as "no proxy". This asks the parsed mapping, not the
     // bytes: a folder path that merely contains the word "proxy" is not a proxy setting.
-    if config.proxy.is_none() && names_a_proxy_key(&bytes) {
-        return Ok(Reading::ProxyProblem(ProxyProblem::NoHost));
+    if let Some(problem) = hidden_proxy_problem(&bytes, config.proxy.is_some()) {
+        return Ok(Reading::ProxyProblem(problem));
     }
     // A `proxy:` section this run may not use stops it here, before the player's setting is looked at:
     // everything a bypass could leak is a larger fact than a player line a person mistyped.
@@ -845,7 +845,7 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
 /// anywhere (ASCII, case-insensitive) counts - an indented or quoted key, a flow-style `{"proxy": ...}`
 /// and a key spelled with unknown spacing all match. Refusing to set aside an unparsable file costs
 /// little; a leak, if one is missed, costs a lot. A file that *does* parse is asked
-/// [`names_a_proxy_key`] instead, which is precise, so a folder path that merely contains the word
+/// [`hidden_proxy_problem`] instead, which is precise, so a folder path that merely contains the word
 /// "proxy" does not stop a valid file from loading.
 fn names_a_proxy(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
@@ -856,18 +856,38 @@ fn names_a_proxy(bytes: &[u8]) -> bool {
     })
 }
 
-/// Whether these bytes carry a `proxy` key at the top level, asked of the parsed mapping: a section
-/// that read as null, or one whose indentation was lost, comes back as `config.proxy == None` and
-/// would otherwise mean "no proxy". Parsing as a value and looking for the key is precise about the
-/// YAML's own keys, which a plain text match is not. Bytes that do not parse at all are
-/// [`names_a_proxy`]'s question, not this one.
-fn names_a_proxy_key(bytes: &[u8]) -> bool {
+/// What hides a proxy this file names from the parsed config, asked of the parsed mapping. Every
+/// case here would otherwise leave the engine connecting directly while the file names a proxy:
+///
+/// * a `proxy` key that read as null, or one whose section lost its indentation, comes back as
+///   `config.proxy == None` ([`ProxyProblem::NoHost`]);
+/// * a top-level key that is `proxy` in another case or with spaces around it (`Proxy:`, `PROXY:`)
+///   is an unknown key to the config ([`ProxyProblem::KeyCase`]);
+/// * a top-level YAML merge (`<<`) in a file that mentions a proxy anywhere: the parser does not
+///   apply merges, so a proxy carried by one would be dropped ([`ProxyProblem::MergeKey`]).
+///
+/// Parsing as a value and looking at the keys is precise about the YAML's own keys, which a plain
+/// text match is not. A value parse can still fail on bytes the config parse accepted (a duplicate
+/// key, which the config keeps the last of and the value parse refuses); then the precise question
+/// cannot be asked, so with no parsed proxy the over-eager [`names_a_proxy`] answers instead, and a
+/// file that mentions a proxy is refused rather than run without one. Bytes that do not parse as a
+/// config at all are [`names_a_proxy`]'s question alone.
+fn hidden_proxy_problem(bytes: &[u8], proxy_is_parsed: bool) -> Option<ProxyProblem> {
     let Ok(value) = serde_norway::from_slice::<Value>(bytes) else {
-        return false;
+        return (!proxy_is_parsed && names_a_proxy(bytes)).then_some(ProxyProblem::NoHost);
     };
-    value
-        .as_mapping()
-        .is_some_and(|mapping| mapping.contains_key("proxy"))
+    let mapping = value.as_mapping()?;
+    if mapping
+        .keys()
+        .filter_map(Value::as_str)
+        .any(|key| key != "proxy" && key.trim().eq_ignore_ascii_case("proxy"))
+    {
+        return Some(ProxyProblem::KeyCase);
+    }
+    if mapping.contains_key("<<") && names_a_proxy(bytes) {
+        return Some(ProxyProblem::MergeKey);
+    }
+    (!proxy_is_parsed && mapping.contains_key("proxy")).then_some(ProxyProblem::NoHost)
 }
 
 /// What is wrong with a config's player setting, or `None` when the program and its arguments
@@ -2751,19 +2771,46 @@ mod tests {
     fn null_proxy_key_refuses_to_start() {
         let dir = ScratchDir::new("config_proxy_null");
         let paths = library(&dir);
+        let no_host = "Enter the proxy's host name or address.";
+        let key_case = "Write the proxy setting as proxy: in lower case.";
+        let merge = "Write the proxy: section out in full; a YAML merge (<<) cannot carry it.";
         let cases = [
-            "proxy:\n",
-            "proxy: ~\n",
+            ("proxy:\n", no_host),
+            ("proxy: ~\n", no_host),
             // The indentation lost: `proxy` reads as null and the rest lands at the top level.
-            "proxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+            (
+                "proxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+                no_host,
+            ),
+            // A duplicate unknown key: the config keeps the last one, but a mapping parse refuses
+            // the file, so the precise question cannot be asked and the over-eager scan answers.
+            ("foo: 1\nfoo: 2\nproxy:\n", no_host),
+            (
+                "foo: 1\nfoo: 2\nproxy:\ntype: socks5\nhost: 10.0.0.1\nport: 1080\n",
+                no_host,
+            ),
+            // A key in another case is an unknown key to the config, not its proxy.
+            (
+                "Proxy:\n  type: socks5\n  host: 10.0.0.1\n  port: 1080\n",
+                key_case,
+            ),
+            (
+                "PROXY:\n  type: socks5\n  host: 10.0.0.1\n  port: 1080\n",
+                key_case,
+            ),
+            // A merge is not applied by the parser, so a proxy carried by one would be dropped.
+            (
+                "base: &b\n  proxy:\n    type: socks5\n    host: 10.0.0.1\n    port: 1080\n<<: *b\n",
+                merge,
+            ),
         ];
-        for text in cases {
+        for (text, expected) in cases {
             fs::write(paths.config_file(), text).expect("write a config whose proxy is null");
             match Config::load(&paths) {
                 Err(ConfigError::Proxy(problem)) => {
                     assert_eq!(
-                        problem, "Enter the proxy's host name or address.",
-                        "a null proxy is refused as a host to enter: {text:?}"
+                        problem, expected,
+                        "a hidden proxy is refused with its own line: {text:?}"
                     );
                 }
                 other => panic!("a null proxy key refuses the run ({text:?}), got {other:?}"),
@@ -2797,6 +2844,16 @@ mod tests {
             panic!("a folder named proxy is not a proxy setting");
         };
         assert_eq!(loaded.download_dir, folder, "the folder is read as written");
+        assert!(loaded.proxy.is_none(), "and no proxy was invented");
+
+        // A merge that has nothing to do with a proxy is not refused, as long as the word appears
+        // nowhere in the file.
+        fs::write(paths.config_file(), "shared: &s\n  note: kept\n<<: *s\n")
+            .expect("write a valid config with an unrelated merge");
+        let ConfigLoad::Loaded(loaded) = Config::load(&paths).expect("a file with a merge loads")
+        else {
+            panic!("a merge that carries no proxy is not a proxy setting");
+        };
         assert!(loaded.proxy.is_none(), "and no proxy was invented");
     }
 
