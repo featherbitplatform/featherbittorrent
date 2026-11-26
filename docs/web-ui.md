@@ -247,7 +247,9 @@ so does the browser's back button or a phone's back gesture. It has three sectio
 
 The five server settings are `Download limit KiB/s`, `Upload limit KiB/s`, `Active downloads`,
 `Active seeds` and `Active total`. The rates are in KiB/s, and 0 or an empty field means unlimited.
-`Save` applies them to the running server.
+`Save` applies them to the running server and writes them to the server's `config.yaml`, so they are
+there again the next time it starts. A folder or a switch set here is saved the same way and kept
+between runs.
 
 ### Devices
 

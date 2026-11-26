@@ -18,6 +18,7 @@ mod devices;
 pub(crate) mod fs;
 mod login;
 mod media;
+mod settings;
 mod stream;
 mod web_session;
 
@@ -37,7 +38,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use fbtt_core::{Config, DeviceEntry, Paths, UserEntry};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -88,14 +89,27 @@ pub(crate) struct Shared {
     users: Vec<UserEntry>,
     /// The devices a key login recognises, swapped whole whenever `config.yaml` is rewritten.
     devices: Mutex<DeviceTable>,
-    /// One device change at a time: the routes read `config.yaml`, change one field of it and write it
-    /// back, and two requests doing that at once would lose one another's device. Held across the disk
-    /// work, which is why it is an async lock - nothing blocking runs inside it.
-    changing_devices: tokio::sync::Mutex<()>,
+    /// One config change at a time: the routes read `config.yaml`, change one field of it and write it
+    /// back, and two requests doing that at once would lose one another's change - whichever read first
+    /// would write its own copy of a file the other had already changed. Every product route that writes
+    /// the file goes through [`Shared::write_config`] and therefore through this one lock: the devices,
+    /// the speed and the downloads. Held across the disk work, which is why it is an async lock -
+    /// nothing blocking runs inside it.
+    changing_config: tokio::sync::Mutex<()>,
     /// What this run started on, its folders already rooted in the library. The config to write back
     /// when `config.yaml` is not there yet, so that saving a device cannot invent a different library
     /// than the one being served.
     base_config: Config,
+    /// The config as the last write left it, this run's own to begin with: what the settings route
+    /// reports the downloads section from, so a screen reads back what a save wrote rather than what the
+    /// file said before it. Swapped whole under [`changing_config`](Self::changing_config).
+    current: Mutex<Config>,
+    /// Whether this run has a launch secret at all: the desktop app started this engine, so a request
+    /// carrying that secret may name the program a finished torrent runs. A plain `serve` reads the
+    /// program from its own `config.yaml` and a browser may not name one, so this is false there and the
+    /// route answers `403 set_in_config_file`. What a *request* carries is asked separately
+    /// ([`Shared::program_is_editable`]).
+    program_editable: bool,
     /// Where `config.yaml` is.
     paths: Paths,
     /// The folders the file routes may name, as configured and canonicalised: what a request names is
@@ -177,6 +191,11 @@ impl Shared {
         // what `Server::build` serves on in the same case.
         let server = config.server.clone().unwrap_or_default();
         let devices = Mutex::new(DeviceTable::build(&server.auth.devices));
+        // A launch secret means the desktop app started this engine - with `expose` off it is the app's
+        // own alone, with it on the secret is accepted beside the config's logins - and only then may a
+        // request that carries it name the program a finished torrent runs (see `program_editable`).
+        let program_editable = launch.is_some();
+        let current = Mutex::new(config.clone());
         Shared {
             auth: Arc::new(match launch {
                 Some((secret, only)) => FbttAuth::new(&server).with_launch_secret(secret, only),
@@ -184,8 +203,10 @@ impl Shared {
             }),
             users: server.auth.users.clone(),
             devices,
-            changing_devices: tokio::sync::Mutex::new(()),
+            changing_config: tokio::sync::Mutex::new(()),
             base_config: config,
+            current,
+            program_editable,
             paths,
             roots: roots.into(),
             session,
@@ -217,6 +238,124 @@ impl Shared {
     /// the settings routes (Task A3) read its complaints beside the fields they belong to.
     pub(crate) fn automation(&self) -> &fbtt_core::downloads::AutomationHandle {
         &self.automation
+    }
+
+    /// Reads `config.yaml`, gives `change` the config to alter, writes it back atomically and keeps it as
+    /// what this run reports its settings from - one write at a time, which is what makes a change a change
+    /// rather than a race.
+    ///
+    /// Every product route that writes the file goes through here and therefore through
+    /// [`changing_config`](Self::changing_config): the devices, the speed and the downloads. Two of them
+    /// that each read the file, changed their own field and wrote it back would leave one with a change
+    /// nobody asked for and the other with none - a speed save and a device add started together must both
+    /// survive. Held while the disk work runs on the blocking pool, which is why it is an async lock.
+    ///
+    /// With no file yet, what `change` alters is the config this run started on, so a save cannot invent a
+    /// different library than the one being served. The bytes go into a temp file beside the target and are
+    /// renamed over it ([`Config::save`]), so a crash leaves the old file or the new one and never half of
+    /// each. `change` refusing - a device that is already there, a name that is not - writes nothing.
+    ///
+    /// A file that cannot be read is answered and left exactly where it is, with nothing written and
+    /// nothing applied: reading is [`Config::load_for_edit`], which renames nothing, unlike
+    /// [`Config::load`](fbtt_core::Config::load), whose job is to let a *run* start on something. A request
+    /// has no such need - it can fail - and an ordinary save renaming somebody's hand-edited file is not
+    /// this route's to do. The path and the reason go to the log; the answer keeps one sentence and names
+    /// no directory.
+    pub(crate) async fn write_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send,
+    ) -> Result<Config, RouteError> {
+        let _guard = self.changing_config.lock().await;
+        // Read on the blocking pool, like every other disk call here. Each call takes a copy of the path
+        // of its own and `file` stays here, because the log line about a failure wants the file this
+        // request actually used.
+        let file = self.paths.config_file();
+        let reading = file.clone();
+        let read = tokio::task::spawn_blocking(move || Config::load_for_edit(&reading))
+            .await
+            .map_err(|problem| {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config read task failed",
+                );
+                RouteError::internal("the server could not read its config; see the server log")
+            })?;
+        let mut config = match read {
+            Ok(Some(config)) => config,
+            // Nothing there yet: this run's own config is the only one to change.
+            Ok(None) => self.base_config.clone(),
+            Err(problem) => {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config could not be read or applied",
+                );
+                return Err(RouteError::internal(
+                    "the server's config has a setting to fix; see the server log",
+                ));
+            }
+        };
+        change(&mut config)?;
+        // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`): a
+        // folder this server has no write permission on, or a disk with no room left, is news for whoever
+        // runs this server and not for the client, so the reason goes to the log and the answer keeps one
+        // sentence with no path in it.
+        let saving = file.clone();
+        let writing = config.clone();
+        tokio::task::spawn_blocking(move || writing.save(&saving))
+            .await
+            .map_err(|problem| {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config save task failed",
+                );
+                RouteError::internal("the server could not save its config; see the server log")
+            })?
+            .map_err(|problem| {
+                tracing::warn!(
+                    config = %file.display(),
+                    problem = %problem,
+                    "the config could not be saved",
+                );
+                RouteError::internal("the server could not save its config; see the server log")
+            })?;
+        // What the settings route reports from becomes what was just written, so a screen reads back what
+        // a save wrote rather than what the file said before it.
+        *locked(&self.current) = config.clone();
+        Ok(config)
+    }
+
+    /// The config as the last write left it, this run's own to begin with: what a settings screen reads
+    /// the downloads section from. A clone, so the caller does not hold the lock while it builds a view.
+    pub(crate) fn current_config(&self) -> Config {
+        locked(&self.current).clone()
+    }
+
+    /// The folders this run serves, as `config.yaml` spells them: what a submitted downloads folder has to
+    /// be inside, and what gets pinned into the file before a change moves the download folder.
+    pub(crate) fn served_roots(&self) -> Vec<std::path::PathBuf> {
+        self.roots.iter().map(|root| root.given.clone()).collect()
+    }
+
+    /// Whether this request may name the program a finished torrent runs on this machine.
+    ///
+    /// Two things have to hold. This run has a launch secret at all: the desktop app started this engine,
+    /// and the app is then the one thing that may name a program
+    /// ([`program_editable`](Self::program_editable)). And *this request* carries that secret, as a bearer
+    /// header and nothing else ([`FbttAuth::carries_launch_secret`]). A password or key session, a browser's
+    /// cookie session and the secret arriving in a URL all answer false, so a client merely visiting this
+    /// machine never reaches the file's program.
+    pub(crate) fn program_is_editable(&self, headers: &HeaderMap) -> bool {
+        self.program_editable && self.carries_launch_secret(headers)
+    }
+
+    /// Whether these request headers carry the launch secret, as a bearer header alone. Delegated to
+    /// [`FbttAuth`] so the secret lives in one place: this asks about a request, and only the
+    /// authenticator holds the secret to compare against.
+    pub(crate) fn carries_launch_secret(&self, headers: &HeaderMap) -> bool {
+        self.auth.carries_launch_secret(headers)
     }
 
     /// The pool the media routes take a place from before they start demuxing: `media`'s `media_permit` is
@@ -510,6 +649,7 @@ impl std::fmt::Debug for Shared {
             .field("auth", &self.auth)
             .field("users", &self.users.len())
             .field("devices", &devices.entries.len())
+            .field("program_editable", &self.program_editable)
             .field("roots", &self.roots.len())
             .finish()
     }
@@ -682,6 +822,14 @@ impl RouteError {
     /// `500 internal`: something this server could not do, said as briefly as it can be.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// The same error with a different code, for a route that gives a shared failure its own name. The
+    /// settings routes answer a config they cannot read as `500 config_unreadable`; a device add keeps the
+    /// `500 internal` [`Shared::write_config`] builds, and both come from the same write.
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
     }
 
     /// An extractor's own refusal - a body over the limit, a query string that does not parse - put in
@@ -958,6 +1106,19 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/api/v1/media/{torrent}/{file}/subtitles/{sub}",
             get(media::subtitle_file),
+        )
+        // The server's own settings, read and written over the API: the running limits and the downloads
+        // section, saved to `config.yaml` so a change survives a restart. Every write goes through one lock
+        // ([`Shared::write_config`]) with the device routes, and every body is a handful of fields, so the two
+        // `PUT`s get a cap of their own rather than fbt-api's room for a `.torrent`.
+        .route("/api/v1/settings", get(settings::get))
+        .route(
+            "/api/v1/settings/speed",
+            put(settings::put_speed).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
+        )
+        .route(
+            "/api/v1/settings/downloads",
+            put(settings::put_downloads).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
         )
         .with_state(shared)
 }

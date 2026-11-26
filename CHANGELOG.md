@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saving settings keeps keys in `config.yaml` that this version does not know about. ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
 - Built on fbt-lib 0.13.0. ([#46](https://github.com/featherbitplatform/featherbittorrent/pull/46))
 
+### Fixed
+
+- Speed limits and queue counts set from the web UI or the desktop app are now saved to the server's `config.yaml` and survive a restart. ([#46](https://github.com/featherbitplatform/featherbittorrent/pull/46))
+
 ## [0.4.1] - 2026-11-24
 
 ### Added

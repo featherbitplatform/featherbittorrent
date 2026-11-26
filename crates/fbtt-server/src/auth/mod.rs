@@ -494,6 +494,28 @@ impl FbttAuth {
             && token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
     }
 
+    /// Whether the credential this request offers, as a bearer header and nothing else, is the launch
+    /// secret: the one thing a client says when it is the desktop app that started this engine.
+    ///
+    /// [`offers_launch_secret`](Self::offers_launch_secret) is the question for signing in, and it takes
+    /// the query token on the routes fbt-api gives one for - a player cannot send a header. This is the
+    /// narrower question a route asks when the launch secret would authorise something more than reaching
+    /// the API at all, such as naming a program for this machine to run. A secret that arrived in a URL,
+    /// which is a value a log, a browser history or a `Referer` keeps, is not the app saying "this is my
+    /// machine", so the query token never counts here however well the guard treats it elsewhere. A cookie
+    /// session does not count either: a page the browser signed in to is not the app that made the secret.
+    ///
+    /// Compared in constant time, as the secret is. An empty secret is never a credential, even one that
+    /// got this far, for the same reason [`offers_launch_secret`](Self::offers_launch_secret) refuses it.
+    pub(crate) fn carries_launch_secret(&self, headers: &HeaderMap) -> bool {
+        let Some(secret) = self.launch_secret.as_deref() else {
+            return false;
+        };
+        !secret.is_empty()
+            && bearer(headers)
+                .is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
+    }
+
     /// Whether this request is a player's stream token on the file-stream route, for the path it was issued
     /// for, with no header for it to answer behind. See [`Authenticator::authorize`] for why only there.
     fn offers_stream_token(&self, request: &AuthRequest<'_>) -> bool {

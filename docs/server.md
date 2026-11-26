@@ -174,9 +174,11 @@ keys and `download_dir` name places on that machine too, and the watch folder is
 set on a LAN server is a folder on that server's disk, not on the machine you are browsing from.
 
 A server reads `on_complete` from `config.yaml` and nowhere else. It belongs to the machine the program
-would run on, so nothing over the API changes it, and a program you change in the file takes effect when
-the server is restarted, as a new or changed user does. The desktop app's `This computer` follows these
-same four keys in the `config.yaml` the app keeps for its own engine: see
+would run on, so nothing over the API changes it: `PUT /api/v1/settings/downloads` refuses a body that
+names one with `403 set_in_config_file`, and a program you change in the file takes effect when the
+server is restarted, as a new or changed user does. The one exception is the desktop app's own engine,
+whose app may name the program with the launch secret it made for that run. The desktop app's
+`This computer` follows these same four keys in the `config.yaml` the app keeps for its own engine: see
 [desktop.md](desktop.md).
 
 A LAN server that anyone on the network signs in to:
@@ -255,6 +257,23 @@ product adds:
 | `GET /api/v1/fs/roots`, `GET /api/v1/fs/list` | Browse inside `server.allowed_roots` while adding a torrent: the folder picker (`Ctrl+O`) and the add dialog read this instead of the client's own disk, which is not where the server saves. |
 | `POST /api/v1/fs/mkdir` | Creates one folder, `{"parent": ..., "name": ...}`, directly inside a folder within `server.allowed_roots` (the web UI's folder picker, `New folder`). The name is one path component of at most 255 bytes that reads exactly as it is shown (no invisible characters, no leading, trailing or doubled spaces), does not start with a dot (the listing hides those), contains none of `< > : " | ? *`, does not end in a dot or a space and is not a Windows device name such as `CON`, `LPT1` or `CONIN$`; the parent is checked after links are resolved, so a link that leads out is refused. Answers `201 {"path": ...}`, or `400` for a bad name, `403` outside the allowed folders, `404` for a missing parent and `409` when the name is taken. Never creates intermediate folders. |
 | `POST /api/v1/stream-tokens` | Asks for an address to stream one file from, for a media player that cannot send headers; its own section below. |
+| `GET /api/v1/settings` | The server's own settings as it is running: `speed` is the limits the session is under (read back off it, in KiB/s) and `downloads` is the folders, the switch, the completion program and whether *this* request may change it. |
+| `PUT /api/v1/settings/speed` | Sets the running rates and queue counts (`{"download_kib": .., "upload_kib": .., "active_downloads": .., "active_seeds": .., "active_total": ..}`) and saves them to `config.yaml`, so the next run starts under the same limits. Answers the settings it made. |
+| `PUT /api/v1/settings/downloads` | Sets the download folder, the unfinished folder, the start-paused switch and the watch folder (`{"default_dir": .., "unfinished_dir": .., "start_paused": .., "watch_dir": ..}`, with an optional `on_complete`) and saves them to `config.yaml`. Answers the settings it made. `400 invalid_setting` with the line to show for a section that cannot work, `403 outside_roots` for a folder outside the allowed folders and `403 set_in_config_file` when the body names `on_complete` without the launch secret. |
+
+The two `PUT`s are the only product routes that write `config.yaml`, beside the device routes, and they
+share one lock with them so two saves started together both survive. A save writes the file atomically
+(a temp file beside it, renamed over it) and keeps every key it did not change, including keys from a
+version this one does not know; comments are not kept, because a save writes new bytes rather than
+editing the old ones. A file this server cannot read is answered `500 config_unreadable` and left exactly
+where it is, with nothing written and nothing applied. The write comes first and the change takes effect
+only after it lands: a save that could not be recorded leaves the running session as it was.
+
+The engine's own `PUT /api/v1/session/limits` and `/api/v1/session/queue` still set the running limits and
+still write nothing: an older client keeps working exactly as it did, and only the settings routes
+persist. The completion program is the one setting a client may not name over the product API: it belongs
+to the machine the program runs on, so it is set in `config.yaml` and nowhere else, except that the
+desktop app that started this engine may name it with the launch secret it made for that run.
 
 ### A stream address
 

@@ -29,7 +29,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use fbtt_core::{Config, DeviceEntry, ServerConfig};
+use fbtt_core::{DeviceEntry, ServerConfig};
 use serde::Deserialize;
 
 use super::{DeviceRow, DeviceTable, RouteError, Shared, clean, locked};
@@ -176,96 +176,37 @@ pub(super) struct NewDevice {
 /// Reads `config.yaml`, gives `change` its device list to alter, writes the file and puts the new list
 /// where logins read it - one request at a time, which is what makes this a change rather than a race.
 ///
-/// The config written back is the one that was on disk with only `server.auth.devices` touched: the
-/// accounts, the folders and the limits in it belong to whoever wrote the file, not to this route. With no
-/// file yet, what gets written is the config this run started on, so adding a device cannot quietly change
-/// which library is being served.
+/// This is [`Shared::write_config`]'s read-modify-write under the one lock every product write shares: the
+/// speed and downloads saves go through it too, so a device add and a settings save started together both
+/// survive. What this adds on top is putting the list logins check against where the write left it: a key
+/// can log in as soon as this answers, without a restart. The change itself brings the device list out of
+/// the config, changes it, and only its own edit is this route's - the accounts, the folders and the limits
+/// in the file belong to whoever wrote it.
 ///
-/// A file that cannot be read as YAML is answered and left alone. It used to be [`Config::load`]'s job to
-/// decide what happens to one, and what it decides is right for a run that has to start on something: the
-/// bytes move aside under another name and defaults take their place. A request has no such need - it can
-/// fail - and doing that from inside one would mean an ordinary `POST` renaming somebody's config file, then
-/// writing a different file in its place, on the strength of YAML it could not read. So this reads with
-/// [`Config::load_for_edit`], which renames nothing: the answer is `500` and the person's own bytes stay
-/// where they can fix them. A folder this server cannot write to is answered the same way, and neither
-/// answer names the file: the path and the reason for the failure go to the log, where whoever runs this
-/// server reads such things, and a browser that has never seen this machine gets one sentence with no
-/// directory in it.
+/// A refusal from `change` - a name that is already there, a name to remove that is not - writes nothing,
+/// and a file this server cannot read is answered `500 internal` and left exactly where it is (see
+/// [`Shared::write_config`]).
 async fn change(
     shared: &Arc<Shared>,
-    change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError>,
+    change: impl FnOnce(&mut Vec<DeviceEntry>) -> Result<(), RouteError> + Send,
 ) -> Result<(), RouteError> {
-    let _guard = shared.changing_devices.lock().await;
-    // Read on the blocking pool, like every other disk call here, and with nothing written on the way: a
-    // file this server cannot parse is somebody's hand-edited file, and the only honest answer is to say so
-    // and leave it where they can fix it. Each disk call takes a copy of the path of its own and `file`
-    // stays here, because the log line about a failure wants the file this request actually used.
-    let file = shared.paths.config_file();
-    let reading = file.clone();
-    let read = tokio::task::spawn_blocking(move || Config::load_for_edit(&reading))
-        .await
-        .map_err(|problem| {
-            // The task failing at all - a panic in the read, or a runtime on its way out - is this program's
-            // own failure, and it goes where whoever runs the server reads such things rather than into an
-            // answer that cannot act on it.
-            tracing::warn!(
-                config = %file.display(),
-                problem = %problem,
-                "the config read task failed",
-            );
-            RouteError::internal("the server could not read its config; see the server log")
-        })?;
-    let mut config = match read {
-        Ok(Some(config)) => config,
-        // Nothing there yet: this run's own config is the only one to add a device to.
-        Ok(None) => shared.base_config.clone(),
-        Err(problem) => {
-            // Where the file sits and what is wrong with it are things its owner can act on, and an owner
-            // reads the server log. A browser that has never seen this machine gets one sentence and no
-            // path: naming `config.yaml` and its directory tells a stranger how the disk is laid out.
-            tracing::warn!(
-                config = %file.display(),
-                problem = %problem,
-                "the config could not be read or applied",
-            );
-            return Err(RouteError::internal(
-                "the server's config has a setting to fix; see the server log",
-            ));
-        }
-    };
-    // The device list is part of the server section. A config that never named one gets it here: this
-    // route only answers to a server that is already running, so registering a key with it is the same
-    // choice `featherbittorrent device add` makes from a command line.
-    let server = config.server.get_or_insert_with(ServerConfig::default);
-    change(&mut server.auth.devices)?;
-    let devices = server.auth.devices.clone();
-    // The bytes go into a temp file beside it, are synced and renamed over it (`Config::save`), so a
-    // crash leaves either the old list or the new one and never half of each. A folder this server has no
-    // write permission on, or a disk with no room left on it, is news for whoever runs this server and not
-    // for the browser: `ConfigError::Write` prints the absolute path it tried to put in place, so the reason
-    // goes to the log and the answer keeps one sentence with no path in it.
-    let saving = file.clone();
-    tokio::task::spawn_blocking(move || config.save(&saving))
-        .await
-        .map_err(|problem| {
-            tracing::warn!(
-                config = %file.display(),
-                problem = %problem,
-                "the config save task failed",
-            );
-            RouteError::internal("the server could not save its config; see the server log")
-        })?
-        .map_err(|problem| {
-            tracing::warn!(
-                config = %file.display(),
-                problem = %problem,
-                "the config could not be saved",
-            );
-            RouteError::internal("the server could not save its config; see the server log")
-        })?;
+    let config = shared
+        .write_config(move |config| {
+            // The device list is part of the server section. A config that never named one gets it here:
+            // this route only answers to a server that is already running, so registering a key with it is
+            // the same choice `featherbittorrent device add` makes from a command line.
+            let server = config.server.get_or_insert_with(ServerConfig::default);
+            change(&mut server.auth.devices)
+        })
+        .await?;
     // What logins check against becomes what was just written, so from here the file and this run agree.
     // A key in it that cannot be used says so here too, where a person who has just edited the list by
     // hand would want to hear it.
+    let devices = config
+        .server
+        .as_ref()
+        .map(|server| server.auth.devices.clone())
+        .unwrap_or_default();
     *locked(&shared.devices) = DeviceTable::build(&devices);
     Ok(())
 }
