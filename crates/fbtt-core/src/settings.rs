@@ -24,18 +24,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::LiveLimits;
 use crate::config::DownloadsConfig;
+use crate::proxy::{ProxyProblem, ProxySetting, ProxyType};
 
 /// What a Settings screen shows: the limits the engine is running under, and the downloads settings.
 ///
 /// Both are the engine's own state as this run reads it, never a form's half-edited values, so two
-/// surfaces on one engine see the same numbers. The proxy view arrives with the proxy task and sits
-/// beside these two.
+/// surfaces on one engine see the same numbers. The proxy sits beside them, without its password.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsView {
     /// The rates and queue counts the running session is under, in the units a person states them in.
     pub speed: LiveLimits,
     /// Where downloads go, and what happens when one finishes.
     pub downloads: DownloadsView,
+    /// The proxy every connection goes through, as a form shows it: never the password itself. A server
+    /// from before this section answers without it, which reads as no proxy.
+    #[serde(default)]
+    pub proxy: ProxyView,
 }
 
 /// The downloads section of the view: the folders, the switch, the program, and the latest complaint
@@ -107,6 +111,170 @@ pub struct OnCompleteSet {
     /// The program to run, by its full path, or `None` to run nothing.
     #[serde(default)]
     pub program: Option<PathBuf>,
+}
+
+/// The proxy section of the view: the setting as a form shows it, with the password replaced by whether
+/// one is stored.
+///
+/// The password never leaves the process that stores it: not in a view, not in a response, not in a log
+/// line. A form that shows `saved` in the field and offers to replace or clear it needs nothing more than
+/// `password_saved`, and a change that keeps it says [`PasswordChange::Keep`] rather than sending it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyView {
+    /// Which proxy, `none` when there is none.
+    #[serde(rename = "type")]
+    pub kind: ProxyType,
+    /// The proxy's host name or address, empty with no proxy.
+    pub host: String,
+    /// The proxy's port, 0 with no proxy.
+    pub port: u16,
+    /// The user name the proxy is logged in to with, when there is one.
+    pub username: Option<String>,
+    /// Whether a password is stored for the proxy. The password itself is never in a view.
+    pub password_saved: bool,
+    /// Where that password is kept, so a form can say so.
+    pub password_storage: PasswordStorage,
+}
+
+impl Default for ProxyView {
+    /// No proxy, nothing stored, and the config file as the place a password would go.
+    fn default() -> Self {
+        ProxyView {
+            kind: ProxyType::None,
+            host: String::new(),
+            port: 0,
+            username: None,
+            password_saved: false,
+            password_storage: PasswordStorage::ConfigFile,
+        }
+    }
+}
+
+impl ProxyView {
+    /// The view of `setting` (the config's `proxy:`, `None` for no section), with its password kept to
+    /// whether there is one. A section that names no proxy (`type: none`) reads as the default view.
+    pub fn of(setting: Option<&ProxySetting>, password_storage: PasswordStorage) -> ProxyView {
+        match setting.filter(|setting| setting.is_set()) {
+            Some(setting) => ProxyView {
+                kind: setting.kind.clone(),
+                host: setting.host.clone(),
+                port: setting.port,
+                username: setting.username.clone(),
+                password_saved: setting
+                    .password
+                    .as_deref()
+                    .is_some_and(|password| !password.is_empty()),
+                password_storage,
+            },
+            None => ProxyView {
+                password_storage,
+                ..ProxyView::default()
+            },
+        }
+    }
+}
+
+/// Where the proxy password is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordStorage {
+    /// In `config.yaml`, beside the rest of the setting: the CLI and a server.
+    ConfigFile,
+    /// In the system keychain: the desktop app's own engine.
+    Keychain,
+    /// The desktop app's own engine on a system with no keychain, so in `config.yaml` after all.
+    Unavailable,
+}
+
+/// The proxy section as a person submitted it: every field of the form, and what to do with the stored
+/// password.
+///
+/// The password is not sent back to be kept, because a form never has it: [`PasswordChange::Keep`] keeps
+/// whatever is stored, [`PasswordChange::Clear`] removes it and [`PasswordChange::Set`] replaces it. What
+/// is checked is the setting this resolves to ([`ProxyChange::resolve`]), not the request: a SOCKS5 login
+/// needs both halves once the kept password is put back in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyChange {
+    /// Which proxy; `none` removes the `proxy:` section and its password with it.
+    #[serde(rename = "type")]
+    pub kind: ProxyType,
+    /// The proxy's host name or address.
+    #[serde(default)]
+    pub host: String,
+    /// The proxy's port.
+    #[serde(default)]
+    pub port: u16,
+    /// The user name to log in with; absent or empty for none.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// What to do with the stored password.
+    pub password: PasswordChange,
+}
+
+impl ProxyChange {
+    /// The setting this change leaves behind, given the one stored now: `Ok(None)` for no proxy,
+    /// otherwise the submitted fields with the password [`PasswordChange`] resolves to. An empty user name
+    /// or password is no user name or password, so the file never holds a blank one.
+    ///
+    /// Keeping a stored password is refused when the change names a different host or port
+    /// ([`ProxyProblem::PasswordForNewAddress`]): the password was given for that address, and sending
+    /// it to whatever a form now names would hand the login to a host nobody typed it for. A changed type
+    /// or user name keeps it, and so does a change with no password stored.
+    pub fn resolve(
+        &self,
+        stored: Option<&ProxySetting>,
+    ) -> Result<Option<ProxySetting>, ProxyProblem> {
+        if matches!(self.kind, ProxyType::None) {
+            return Ok(None);
+        }
+        let mut setting = ProxySetting {
+            kind: self.kind.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone().filter(|user| !user.is_empty()),
+            password: None,
+        };
+        setting.password = match &self.password {
+            PasswordChange::Keep => match stored {
+                Some(stored) if stored.password.as_deref().is_some_and(|p| !p.is_empty()) => {
+                    if !stored.same_address(&setting) {
+                        return Err(ProxyProblem::PasswordForNewAddress);
+                    }
+                    stored.password.clone()
+                }
+                _ => None,
+            },
+            PasswordChange::Clear => None,
+            PasswordChange::Set(password) => Some(password.clone()).filter(|p| !p.is_empty()),
+        };
+        Ok(Some(setting))
+    }
+}
+
+/// What a proxy change does with the stored password. On the wire: `"keep"`, `"clear"` or
+/// `{"set": "..."}`.
+///
+/// `Debug` prints a set password as `<redacted>`: a change that reaches a log line, a panic message or a
+/// command's `Debug` must not carry the password out with it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordChange {
+    /// Keep whatever password is stored, including none.
+    Keep,
+    /// Remove the stored password.
+    Clear,
+    /// Store this password instead.
+    Set(String),
+}
+
+impl std::fmt::Debug for PasswordChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasswordChange::Keep => formatter.write_str("Keep"),
+            PasswordChange::Clear => formatter.write_str("Clear"),
+            PasswordChange::Set(_) => formatter.write_str("Set(<redacted>)"),
+        }
+    }
 }
 
 /// What is wrong with a submitted downloads section, one variant per thing a person can get wrong.
@@ -344,9 +512,11 @@ pub(crate) fn batch_file(program: &Path) -> bool {
 mod tests {
     use super::{
         DownloadsChange, DownloadsConfig, DownloadsView, OnCompleteSet, OnCompleteView,
-        SettingsProblem, SettingsView, batch_file, validate_downloads,
+        PasswordChange, PasswordStorage, ProxyChange, ProxyView, SettingsProblem, SettingsView,
+        batch_file, validate_downloads,
     };
     use crate::client::LiveLimits;
+    use crate::proxy::{ProxyProblem, ProxySetting, ProxyType};
     use crate::scratch::ScratchDir;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -849,6 +1019,7 @@ mod tests {
                 watch_problem: Some("No watch folder at that path.".to_string()),
                 on_complete_problem: None,
             },
+            proxy: ProxyView::default(),
         };
 
         let json = serde_json::to_value(&view).expect("a view is JSON");
@@ -921,5 +1092,146 @@ mod tests {
             again, cleared,
             "a cleared program reads back as a cleared program"
         );
+    }
+
+    /// A SOCKS5 setting with a login, the stored side of every proxy test below.
+    fn stored() -> ProxySetting {
+        ProxySetting {
+            kind: ProxyType::Socks5,
+            host: "proxy.example".to_string(),
+            port: 1080,
+            username: Some("alice".to_string()),
+            password: Some("hunter2".to_string()),
+        }
+    }
+
+    /// A change to `kind` at proxy.example:1080 as `alice`, doing `password` with the stored password.
+    fn proxy_change(kind: ProxyType, password: PasswordChange) -> ProxyChange {
+        ProxyChange {
+            kind,
+            host: "proxy.example".to_string(),
+            port: 1080,
+            username: Some("alice".to_string()),
+            password,
+        }
+    }
+
+    /// The view of a stored proxy says a password is saved and never carries it: not in its JSON, not in
+    /// its `Debug`.
+    #[test]
+    fn proxy_view_never_carries_the_password() {
+        let view = ProxyView::of(Some(&stored()), PasswordStorage::ConfigFile);
+        assert!(
+            view.password_saved,
+            "a stored password is reported as saved"
+        );
+        assert_eq!(view.username.as_deref(), Some("alice"));
+        let json = serde_json::to_string(&view).expect("a view is JSON");
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(json.contains("\"type\":\"socks5\""), "{json}");
+        assert!(
+            json.contains("\"password_storage\":\"config_file\""),
+            "{json}"
+        );
+        assert!(!format!("{view:?}").contains("hunter2"));
+
+        // No section, and a section that names no proxy, read the same: no proxy and nothing saved.
+        assert_eq!(
+            ProxyView::of(None, PasswordStorage::ConfigFile),
+            ProxyView::default()
+        );
+        let none = ProxySetting {
+            kind: ProxyType::None,
+            ..stored()
+        };
+        let view = ProxyView::of(Some(&none), PasswordStorage::ConfigFile);
+        assert!(!view.password_saved);
+        assert_eq!(view.kind, ProxyType::None);
+    }
+
+    /// The password change has the wire shape the remote backend and the web UI send, and a set password
+    /// never shows in a `Debug`, the change's or a command's.
+    #[test]
+    fn password_change_wire_shape_and_debug() {
+        let as_json = |change: &PasswordChange| serde_json::to_value(change).expect("JSON");
+        assert_eq!(as_json(&PasswordChange::Keep), serde_json::json!("keep"));
+        assert_eq!(as_json(&PasswordChange::Clear), serde_json::json!("clear"));
+        assert_eq!(
+            as_json(&PasswordChange::Set("hunter2".to_string())),
+            serde_json::json!({"set": "hunter2"})
+        );
+        let read: PasswordChange =
+            serde_json::from_value(serde_json::json!({"set": "s3"})).expect("a set reads");
+        assert_eq!(read, PasswordChange::Set("s3".to_string()));
+
+        let change = proxy_change(
+            ProxyType::Socks5,
+            PasswordChange::Set("hunter2".to_string()),
+        );
+        assert!(!format!("{change:?}").contains("hunter2"), "{change:?}");
+        let command = crate::Command::Settings(crate::SettingsCommand::Save(
+            crate::SettingsChange::Proxy(change),
+        ));
+        assert!(!format!("{command:?}").contains("hunter2"), "{command:?}");
+    }
+
+    /// Keep keeps whatever is stored, whatever else changed; Clear removes it; Set replaces it; `none`
+    /// is no proxy at all.
+    #[test]
+    fn proxy_change_resolves_the_password() {
+        let keep = proxy_change(ProxyType::Http, PasswordChange::Keep)
+            .resolve(Some(&stored()))
+            .expect("the same address keeps the password");
+        assert_eq!(
+            keep.and_then(|setting| setting.password).as_deref(),
+            Some("hunter2"),
+            "a changed type keeps the stored password"
+        );
+        let keep = proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+            .resolve(None)
+            .expect("nothing stored, nothing to refuse");
+        assert_eq!(keep.and_then(|setting| setting.password), None);
+        let clear = proxy_change(ProxyType::Socks5, PasswordChange::Clear)
+            .resolve(Some(&stored()))
+            .expect("a change")
+            .expect("a proxy");
+        assert_eq!(clear.password, None);
+        let set = proxy_change(ProxyType::Socks5, PasswordChange::Set("new".to_string()))
+            .resolve(Some(&stored()))
+            .expect("a change")
+            .expect("a proxy");
+        assert_eq!(set.password.as_deref(), Some("new"));
+        assert_eq!(
+            proxy_change(ProxyType::None, PasswordChange::Keep).resolve(Some(&stored())),
+            Ok(None),
+            "none removes the section"
+        );
+        // Keep is only for the same address: compared as dialled (one pair of brackets dropped) and
+        // without regard to case, so another spelling of the same host keeps it, and another host or
+        // port does not.
+        let respelled = ProxyChange {
+            host: "PROXY.Example".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert!(respelled.resolve(Some(&stored())).is_ok());
+        let bracketed = ProxySetting {
+            host: "[::1]".to_string(),
+            ..stored()
+        };
+        let bare = ProxyChange {
+            host: "::1".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert!(bare.resolve(Some(&bracketed)).is_ok());
+        let elsewhere = ProxyChange {
+            host: "other.example".to_string(),
+            ..proxy_change(ProxyType::Socks5, PasswordChange::Keep)
+        };
+        assert_eq!(
+            elsewhere.resolve(Some(&stored())),
+            Err(ProxyProblem::PasswordForNewAddress)
+        );
+        // A SOCKS5 login cleared of its password is a half login, which is the resolved setting's to refuse.
+        assert!(clear.validate().is_err());
     }
 }

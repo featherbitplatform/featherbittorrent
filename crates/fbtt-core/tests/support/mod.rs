@@ -45,9 +45,10 @@ pub async fn changed(client: &mut Client) -> bool {
 }
 
 /// The settings every session in these tests runs on: loopback on a port the OS
-/// picks, and no DHT, LSD, UPnP or NAT-PMP.
+/// picks, and no DHT, LSD, UPnP or NAT-PMP. Before the proxy, as a run hands them in: the backend
+/// applies the config's proxy itself and keeps these as what a proxy removed at runtime goes back to.
 pub fn loopback(config: &Config) -> fbt::Settings {
-    let mut settings = config.session_settings();
+    let mut settings = config.settings_before_proxy();
     settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
     settings.dht_enabled = false;
     settings.enable_lsd = false;

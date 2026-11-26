@@ -4556,6 +4556,97 @@ async fn remote_settings_round_trip() {
     within(server.shutdown()).await.expect("the last save ran");
 }
 
+/// `Save(Proxy)` against a real server: the change goes out as `PUT /api/v1/settings/proxy`, the server
+/// writes it and switches its engine, and the view that comes back shows the proxy with the password
+/// reported as saved and never carried. `none` then takes it away again.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_proxy_save_round_trip() {
+    let lib = Library::new("remote_proxy", vec![alice()], vec![]);
+    let (server, addr) = lib.serve().await;
+    let mut client = RemoteBackend::start(
+        target(addr, LoginMethod::Password, Some("alice"), None),
+        Secret::Password("hunter2".to_string().into()),
+        None,
+    );
+    wait_for_state(&mut client, true).await;
+
+    // Nothing listens on this port: the server's engine cannot reach the proxy, and nothing leaves the
+    // machine.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        listener.local_addr().expect("its address").port()
+    };
+    let password = "remote-proxy-password";
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Proxy(fbtt_core::ProxyChange {
+            kind: fbtt_core::ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: Some("bob".to_string()),
+            password: fbtt_core::PasswordChange::Set(password.to_string()),
+        })
+    ))));
+    let saved = wait_for(&mut client, |snapshot| match &snapshot.settings {
+        SettingsState::Loaded(view) if view.proxy.kind == fbtt_core::ProxyType::Socks5 => {
+            Some(view.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(saved.proxy.port, port);
+    assert_eq!(saved.proxy.username.as_deref(), Some("bob"));
+    assert!(
+        saved.proxy.password_saved,
+        "the server says a password is saved"
+    );
+    assert_eq!(
+        saved.proxy.password_storage,
+        fbtt_core::PasswordStorage::ConfigFile
+    );
+    assert!(
+        !format!("{:?}", client.snapshot()).contains(password),
+        "the snapshot carries no password"
+    );
+    let lines = notices_until(&mut client, |lines| {
+        lines.iter().any(|line| line == "Saved.")
+    })
+    .await;
+    assert!(lines.iter().any(|line| line == "Saved."), "{lines:?}");
+    let stored = Config::load_for_edit(&lib.paths.config_file())
+        .expect("read the server's config back")
+        .expect("a file was written")
+        .proxy
+        .expect("the server wrote the proxy");
+    assert_eq!(stored.port, port);
+    assert_eq!(stored.password.as_deref(), Some(password));
+
+    // And `none` takes it away, the stored password with it.
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Proxy(fbtt_core::ProxyChange {
+            kind: fbtt_core::ProxyType::None,
+            host: String::new(),
+            port: 0,
+            username: None,
+            password: fbtt_core::PasswordChange::Keep,
+        })
+    ))));
+    let cleared = wait_for(&mut client, |snapshot| match &snapshot.settings {
+        SettingsState::Loaded(view) if view.proxy.kind == fbtt_core::ProxyType::None => {
+            Some(view.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(!cleared.proxy.password_saved);
+    let config = Config::load_for_edit(&lib.paths.config_file())
+        .expect("read the server's config back")
+        .expect("a file was written");
+    assert_eq!(config.proxy, None, "the proxy key is gone");
+
+    shutdown(&mut client).await;
+    within(server.shutdown()).await.expect("the last save ran");
+}
+
 /// The settings a stub server answers: a view whose program is shown and not editable, as a real server
 /// answers every request that does not carry the launch secret.
 fn stub_view(program: &Path) -> Value {

@@ -457,7 +457,7 @@ pub async fn set_serving(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ServingView, String> {
     serving
-        .apply(&lifecycle, &state, request, Config::session_settings)
+        .apply(&lifecycle, &state, request, Config::settings_before_proxy)
         .await
 }
 

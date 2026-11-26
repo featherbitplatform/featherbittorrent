@@ -18,7 +18,8 @@ use base64::Engine as _;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use fbtt_core::scratch::ScratchDir;
 use fbtt_core::{
-    AuthConfig, Config, DeviceEntry, DownloadsConfig, LibraryLock, Paths, ServerConfig, UserEntry,
+    AuthConfig, Config, DeviceEntry, DownloadsConfig, LibraryLock, Paths, ProxySetting, ProxyType,
+    ServerConfig, UserEntry,
 };
 use fbtt_server::LOGIN_NAMESPACE;
 use fbtt_server::auth::password;
@@ -179,7 +180,8 @@ impl Served {
 /// The settings every engine here runs on: this config's, with the listening moved to loopback on a port
 /// the OS picks and with DHT, LSD, UPnP and NAT-PMP turned off.
 fn loopback(config: &Config) -> fbt::Settings {
-    let mut settings = config.session_settings();
+    // Before the proxy: the server applies the config's own and keeps these as what removing it restores.
+    let mut settings = config.settings_before_proxy();
     settings.listen_addrs = vec!["127.0.0.1:0".parse().expect("a loopback listen address")];
     settings.dht_enabled = false;
     settings.enable_lsd = false;
@@ -1730,5 +1732,526 @@ async fn engine_routes_still_work_and_do_not_persist() {
         "and the file was not touched: the engine's route does not persist",
     );
 
+    served.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The proxy, saved and applied at runtime
+// ---------------------------------------------------------------------------
+
+/// The proxy password the tests below store. A test value: what is checked is that no answer carries it.
+const PROXY_PASSWORD: &str = "proxy-pass-hunter2";
+
+/// A loopback port with nothing listening on it, so a proxy there is one the engine cannot reach and
+/// nothing leaves the machine.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let port = listener.local_addr().expect("its address").port();
+    drop(listener);
+    port
+}
+
+/// [`with_alice`], plus a SOCKS5 proxy at `127.0.0.1:port` logged in to as `bob` with [`PROXY_PASSWORD`].
+fn with_proxy(port: u16) -> impl FnOnce(&Path) -> Config {
+    move |scratch| Config {
+        proxy: Some(ProxySetting {
+            kind: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: Some("bob".to_string()),
+            password: Some(PROXY_PASSWORD.to_string()),
+        }),
+        ..with_alice(scratch)
+    }
+}
+
+/// The proxy section `config.yaml` holds now, read the way a run reads it.
+fn file_proxy(served: &Served) -> Option<ProxySetting> {
+    Config::load_for_edit(&served.file())
+        .expect("the config reads back")
+        .expect("a file was written")
+        .proxy
+}
+
+/// A `PUT /api/v1/settings/proxy` of `body`, answered as the status and the body's text, so a test can look
+/// for the password in exactly what went over the wire.
+async fn put_proxy(served: &Served, token: &str, body: Value) -> (StatusCode, String) {
+    let response = put_bearer(&http(), &served.url("/api/v1/settings/proxy"), token, body).await;
+    let status = response.status();
+    let text = within(response.text()).await.expect("a body");
+    (status, text)
+}
+
+/// The stored proxy password is never sent back: the settings view says only that one is saved, and its
+/// text does not hold the password anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_never_returns_the_password() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-get", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+
+    let response = get_bearer(&http(), &served.url("/api/v1/settings"), &token).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = within(response.text()).await.expect("a body");
+    assert!(
+        !text.contains(PROXY_PASSWORD),
+        "the answer carries the password: {text}"
+    );
+    let view: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(view["proxy"]["password_saved"], true, "{view}");
+    assert_eq!(view["proxy"]["type"], "socks5", "{view}");
+    assert_eq!(view["proxy"]["username"], "bob", "{view}");
+    assert_eq!(view["proxy"]["password_storage"], "config_file", "{view}");
+    assert!(view["proxy"].get("password").is_none(), "{view}");
+
+    served.stop().await;
+}
+
+/// `keep` keeps the stored password while the type changes at the same address, and the answer does not
+/// carry it.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_keep_preserves_the_stored_password() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-keep", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+
+    let (status, text) = put_proxy(
+        &served,
+        &token,
+        json!({"type": "http", "host": "127.0.0.1", "port": proxy_port, "username": "bob", "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    let stored = file_proxy(&served).expect("a proxy in the file");
+    assert_eq!(
+        stored.kind,
+        ProxyType::Http,
+        "the rest of the section changed"
+    );
+    assert_eq!(
+        stored.password.as_deref(),
+        Some(PROXY_PASSWORD),
+        "and the password stayed"
+    );
+    assert_eq!(
+        served.server.network_settings().proxy.kind,
+        fbt::ProxyKind::Http,
+        "the engine runs on it"
+    );
+
+    served.stop().await;
+}
+
+/// Keeping the stored password while naming another host is refused with the line to show, and nothing
+/// changes: the password was given for the old address.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_keep_refused_for_a_new_host() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-keep-host", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let before = bytes(&served.file());
+    let engine_before = served.server.network_settings();
+
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/proxy"),
+        &token,
+        json!({"type": "socks5", "host": "127.0.0.2", "port": proxy_port, "username": "bob", "password": "keep"}),
+    )
+    .await;
+    let (status, code, message) = error_of(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "invalid_setting");
+    assert_eq!(
+        message,
+        "Enter the password again when the proxy's host or port changes."
+    );
+    assert_eq!(bytes(&served.file()), before, "the file is as it was");
+    assert_eq!(
+        served.server.network_settings(),
+        engine_before,
+        "and so is the engine"
+    );
+
+    served.stop().await;
+}
+
+/// Keeping the stored password while naming another port is refused the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_keep_refused_for_a_new_port() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-keep-port", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let before = bytes(&served.file());
+    let engine_before = served.server.network_settings();
+    let other_port = if proxy_port == u16::MAX {
+        proxy_port - 1
+    } else {
+        proxy_port + 1
+    };
+
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/proxy"),
+        &token,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": other_port, "username": "bob", "password": "keep"}),
+    )
+    .await;
+    let (status, code, message) = error_of(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "invalid_setting");
+    assert_eq!(
+        message,
+        "Enter the password again when the proxy's host or port changes."
+    );
+    assert_eq!(bytes(&served.file()), before, "the file is as it was");
+    assert_eq!(
+        served.server.network_settings(),
+        engine_before,
+        "and so is the engine"
+    );
+
+    served.stop().await;
+}
+
+/// A new user name at the same address keeps the stored password: only the address decides. The host
+/// is compared the way it is dialled, so the same address spelled in another case is the same address.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_keep_allowed_for_a_new_user_name() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-keep-user", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+
+    let (status, text) = put_proxy(
+        &served,
+        &token,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": proxy_port, "username": "carol", "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let stored = file_proxy(&served).expect("a proxy in the file");
+    assert_eq!(stored.username.as_deref(), Some("carol"));
+    assert_eq!(stored.password.as_deref(), Some(PROXY_PASSWORD));
+    assert_eq!(
+        served.server.network_settings().proxy.username.as_deref(),
+        Some("carol"),
+        "the engine logs in as the new user"
+    );
+
+    served.stop().await;
+}
+
+/// `clear` removes the stored password from the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_clear_removes_it() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-clear", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+
+    // A SOCKS5 login is both halves or neither, so clearing the password goes with the user name.
+    let (status, text) = put_proxy(
+        &served,
+        &token,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": closed_port(), "username": null, "password": "clear"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let view: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(view["proxy"]["password_saved"], false, "{view}");
+    let stored = file_proxy(&served).expect("a proxy in the file");
+    assert_eq!(stored.password, None);
+    assert!(
+        !fs::read_to_string(served.file())
+            .expect("the file")
+            .contains(PROXY_PASSWORD)
+    );
+
+    served.stop().await;
+}
+
+/// `{"set": ..}` replaces the stored password, and neither the old one nor the new one is in the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_set_replaces_it() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-set", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let new_password = "a-new-proxy-password";
+
+    let (status, text) = put_proxy(
+        &served,
+        &token,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": closed_port(), "username": "bob", "password": {"set": new_password}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        !text.contains(new_password),
+        "the answer carries the new password: {text}"
+    );
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    let stored = file_proxy(&served).expect("a proxy in the file");
+    assert_eq!(stored.password.as_deref(), Some(new_password));
+    assert_eq!(
+        served.server.network_settings().proxy.password.as_deref(),
+        Some(new_password),
+        "the engine logs in with the new password"
+    );
+
+    served.stop().await;
+}
+
+/// `none` removes the `proxy:` key and takes the proxy off the engine, with the switches it turned off
+/// back to what this run started on.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_none_removes_the_key_and_restores_switches() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-none", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let proxied = served.server.network_settings();
+    assert_eq!(
+        proxied.proxy.kind,
+        fbt::ProxyKind::Socks5,
+        "the run starts on the proxy"
+    );
+    assert!(
+        !proxied.enable_incoming_tcp,
+        "and with incoming connections off"
+    );
+
+    let (status, text) = put_proxy(
+        &served,
+        &token,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let written = fs::read_to_string(served.file()).expect("the file");
+    assert!(!written.contains("proxy:"), "{written}");
+    assert!(!written.contains(PROXY_PASSWORD), "{written}");
+
+    let running = served.server.network_settings();
+    let started_on = loopback(&with_alice(served.dir.path())).network();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::None);
+    assert_eq!(
+        running, started_on,
+        "the switches are what this run had before its proxy, DHT and LSD still off"
+    );
+
+    served.stop().await;
+}
+
+/// A change the checks refuse is `400 invalid_setting` with the line to show, and changes nothing: not
+/// the file, not the engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_invalid_is_400_and_nothing_changes() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-invalid", with_proxy(proxy_port)).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let before = bytes(&served.file());
+    let engine_before = served.server.network_settings();
+
+    for (body, line) in [
+        (
+            json!({"type": "socks5", "host": "", "port": 1080, "username": null, "password": "clear"}),
+            "Enter the proxy's host name or address.",
+        ),
+        (
+            // Clearing the password leaves the SOCKS5 login with one half: the resolved setting is refused.
+            json!({"type": "socks5", "host": "127.0.0.1", "port": 1080, "username": "bob", "password": "clear"}),
+            "A SOCKS5 login needs both a user name and a password.",
+        ),
+    ] {
+        let response =
+            put_bearer(&http(), &served.url("/api/v1/settings/proxy"), &token, body).await;
+        let (status, code, message) = error_of(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_setting");
+        assert_eq!(message, line);
+        assert_eq!(bytes(&served.file()), before, "the file is as it was");
+        assert_eq!(
+            served.server.network_settings(),
+            engine_before,
+            "and so is the engine"
+        );
+    }
+
+    served.stop().await;
+}
+
+/// Two proxy saves in quick succession leave the engine on the second, the one the file holds: the first
+/// is held inside its save while the second waits behind it, and the apply happens inside the same
+/// serialized save as the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_quick_proxy_saves_leave_the_engine_on_the_second() {
+    let served = Served::start("settings-proxy-race", with_alice).await;
+    let token = bearer(&served).await;
+    let (first, second) = (closed_port(), closed_port());
+    let body = |port: u16| json!({"type": "socks5", "host": "127.0.0.1", "port": port, "username": null, "password": "keep"});
+
+    let mut parked = served.server.park_config_saves();
+    let release = ReleaseSaves(&served.server);
+    let url = served.url("/api/v1/settings/proxy");
+    let saving_first = tokio::spawn({
+        let (url, token, body) = (url.clone(), token.clone(), body(first));
+        async move {
+            http()
+                .put(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        }
+    });
+    // The first save is inside its write, holding the config lock.
+    wait_until(&mut parked, 1).await;
+    let saving_second = tokio::spawn({
+        let (url, token, body) = (url.clone(), token.clone(), body(second));
+        async move {
+            http()
+                .put(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        }
+    });
+    // Give the second request time to reach the server and queue behind the first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(release);
+
+    for saving in [saving_first, saving_second] {
+        let response = within(saving)
+            .await
+            .expect("the task ran")
+            .expect("an answer");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        file_proxy(&served).expect("a proxy").port,
+        second,
+        "the file holds the second"
+    );
+    assert_eq!(
+        served.server.network_settings().proxy.port,
+        second,
+        "and the engine runs on the second, not the first"
+    );
+
+    served.stop().await;
+}
+
+/// A speed save on a server whose `config.yaml` has a `proxy:` it cannot read is refused rather than
+/// written: writing would drop the line and leave a config that connects directly on the next start.
+#[tokio::test(flavor = "multi_thread")]
+async fn speed_save_never_drops_a_proxy_it_cannot_read() {
+    let served = Served::start("settings-proxy-unreadable", with_alice).await;
+    let token = bearer(&served).await;
+    served.save_config(&with_alice(served.dir.path()));
+    let mut written = fs::read_to_string(served.file()).expect("the file");
+    written.push_str("proxy:\n  type: socks4\n  host: proxy.example\n  port: 1080\n");
+    fs::write(served.file(), &written).expect("write the file");
+
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/speed"),
+        &token,
+        speed(10, 0, (None, None, None)),
+    )
+    .await;
+    let (status, code, _) = error_of(response).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(code, "config_unreadable");
+    assert_eq!(
+        fs::read_to_string(served.file()).expect("the file"),
+        written,
+        "the file was not written over"
+    );
+
+    served.stop().await;
+}
+
+/// [`with_alice`], plus an HTTP proxy at `127.0.0.1:port` with no login.
+fn with_http_proxy(port: u16) -> impl FnOnce(&Path) -> Config {
+    move |scratch| Config {
+        proxy: Some(ProxySetting {
+            kind: ProxyType::Http,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: None,
+            password: None,
+        }),
+        ..with_alice(scratch)
+    }
+}
+
+/// A proxy change the engine cannot switch to puts the previous setting back. The engine starts on an
+/// HTTP proxy, which takes no incoming connections, so it binds its BitTorrent port only to learn it and
+/// lets it go; this test then takes that port with a listener of its own. Removing the proxy needs the
+/// engine to listen on that port again, which the operating system refuses, so the engine's new network
+/// stack does not build and the engine stays on the HTTP proxy. The answer is `500 proxy_not_applied`,
+/// and the file, the view and the engine all still describe the HTTP proxy, never a direct connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_failed_apply_rolls_back() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-rollback", with_http_proxy(proxy_port)).await;
+    served.save_config(&with_http_proxy(proxy_port)(served.dir.path()));
+    let token = bearer(&served).await;
+    let engine_port = served
+        .server
+        .engine_local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/proxy"),
+        &token,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    let (status, code, message) = error_of(response).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{message}");
+    assert_eq!(code, "proxy_not_applied");
+    assert!(
+        message.starts_with(
+            "The engine could not switch to this proxy, so the previous setting is kept: "
+        ),
+        "{message}"
+    );
+
+    let stored = file_proxy(&served).expect("the file still names the proxy");
+    assert_eq!(stored.kind, ProxyType::Http);
+    assert_eq!(stored.port, proxy_port);
+    let view = body(get_bearer(&http(), &served.url("/api/v1/settings"), &token).await).await;
+    assert_eq!(
+        view["proxy"]["type"], "http",
+        "the view still shows the proxy: {view}"
+    );
+    assert_eq!(view["proxy"]["port"], proxy_port, "{view}");
+    assert_eq!(
+        served.server.network_settings().proxy.kind,
+        fbt::ProxyKind::Http,
+        "the engine is still on the proxy"
+    );
+    assert_ne!(
+        served.server.proxy_health(),
+        fbtt_core::ProxyHealth::Off,
+        "and its health does not say there is no proxy"
+    );
+
+    drop(squatter);
     served.stop().await;
 }

@@ -24,16 +24,14 @@ use super::{ProxyHealth, ProxySetting, network_for};
 /// [`network_for`] takes as today's values and overrides with what the proxy implies. Equal to what
 /// the session runs already, this is a no-op. A change closes the connections made under the old
 /// proxy and installs the new stack on the same addresses; no connection is made directly in
-/// between. `Err` is the engine's own one line: a proxy or switch combination it refuses, or a
-/// session that has shut down.
+/// between. `Err` is the engine's own one line, display-safe: a proxy or switch combination it
+/// refuses, a new network stack that would not build (a listen address that will not bind again,
+/// say), or a session that has shut down. After an `Err` the session is still on the setting it had
+/// before, so a caller that already wrote the new one down has to put the previous one back.
 ///
-/// Written for the runtime proxy routes and the local backend's own save (the settings round's next
-/// task); this task only writes the adapter they call.
-#[allow(
-    dead_code,
-    reason = "called by the runtime proxy routes in the next task"
-)]
-pub(crate) async fn apply_now(
+/// What the server's proxy route and the local backend's own save call, after the file has the new
+/// setting and inside the same serialized save, so the engine always ends on the last one written.
+pub async fn apply_now(
     session: &Session,
     proxy: Option<&ProxySetting>,
     base: &Settings,
@@ -41,7 +39,8 @@ pub(crate) async fn apply_now(
     session
         .set_network_settings(network_for(proxy, base))
         .await
-        .map_err(|problem| problem.to_string())
+        // Display-safe, because this one line goes to a screen and into a response as it is.
+        .map_err(|problem| fbt::display_safe(&problem.to_string(), fbt::MAX_DISPLAY_CHARS))
 }
 
 /// The session's proxy health as this product holds it: `Off` without a proxy, and otherwise what

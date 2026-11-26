@@ -85,7 +85,7 @@ impl std::fmt::Debug for ThisComputer {
 /// the Serve the web UI switch: on, the library's `server:` section applies as it does for `serve`; off,
 /// the engine is the window's alone.
 ///
-/// The engine's settings are made from the config by `settings`: [`Config::session_settings`] for real,
+/// The engine's settings are made from the config by `settings`: [`Config::settings_before_proxy`] for real,
 /// and a test keeps the engine on loopback with no DHT and no multicast while everything else runs as it
 /// does for real. The app's own start goes through [`crate::serving::Serving::start_this_computer`].
 ///

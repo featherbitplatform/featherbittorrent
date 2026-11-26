@@ -39,6 +39,7 @@ fn view(editable: bool) -> SettingsView {
             watch_problem: None,
             on_complete_problem: None,
         },
+        proxy: fbtt_core::ProxyView::default(),
     }
 }
 

@@ -15,9 +15,10 @@
 //!   the only message that task answers to is its stop signal going away - which happens by itself when
 //!   the [`Server`] is dropped, so a run that forgets to shut down still ends with the state written.
 //!
-//! The engine settings come from [`Config::session_settings`]; [`Server::start_with_settings`] takes
-//! them as an argument instead, which is how a test - or the binary's debug-only offline mode - keeps
-//! every socket where the caller put it.
+//! The engine settings come from [`Config::settings_before_proxy`], with the config's `proxy:` applied
+//! when the engine starts; [`Server::start_with_settings`] takes them as an argument instead, which is how
+//! a test - or the binary's debug-only offline mode - keeps every socket where the caller put it. The
+//! settings as handed in are kept as the base a proxy changed at runtime is derived over.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -149,7 +150,7 @@ impl Server {
         paths: &Paths,
         lock: LibraryLock,
     ) -> Result<Self, ServerError> {
-        Self::build(config.session_settings(), config, paths, lock, None).await
+        Self::build(config.settings_before_proxy(), config, paths, lock, None).await
     }
 
     /// [`start`](Self::start) with the engine's settings given rather than taken from the config.
@@ -159,7 +160,10 @@ impl Server {
     /// serve` uses it for its debug-only offline mode - every socket on loopback, no DHT, no multicast -
     /// and a test uses it for the same reason on a bigger scale, keeping one run's traffic inside the
     /// machine while still serving the same config file. [`start`](Self::start) is this call with
-    /// [`Config::session_settings`] handed to it, which is what a normal run wants.
+    /// [`Config::settings_before_proxy`] handed to it, which is what a normal run wants.
+    ///
+    /// The config's `proxy:` is applied to `settings` when the engine starts, whatever they say: hand in
+    /// the settings before the proxy, because they are what a proxy removed over the API goes back to.
     ///
     /// # Errors
     ///
@@ -261,6 +265,12 @@ impl Server {
             None
         };
 
+        // The settings as handed in are the base a proxy saved at runtime is derived over, so removing it
+        // brings back what this run started on; the engine starts on them with the config's proxy applied,
+        // whatever the caller did, so a run never starts direct on a config that names a proxy.
+        let base_settings = settings.clone();
+        let mut settings = settings;
+        fbtt_core::apply_to_settings(&mut settings, config.proxy.as_ref());
         let (mut engine, start_problems) = Engine::start(settings, paths, lock)
             .await
             .map_err(ServerError::Engine)?;
@@ -299,6 +309,7 @@ impl Server {
             roots,
             dummy_password_hash,
             engine.session().clone(),
+            base_settings,
             launch,
             automation,
         ));
@@ -445,6 +456,27 @@ impl Server {
     #[cfg(feature = "test-support")]
     pub fn config_change_endings(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.config_change_endings()
+    }
+
+    /// The network settings the engine is running under right now: the proxy and the switches it implies.
+    /// Only a test reads this, to see that a proxy saved over the API took hold, and the `Debug` of what it
+    /// returns hides the proxy password (fbt-lib prints it as `***`).
+    #[cfg(feature = "test-support")]
+    pub fn network_settings(&self) -> fbt::NetworkSettings {
+        self.shared.session().network_settings()
+    }
+
+    /// The engine's proxy health right now, in this product's words. Only a test reads this.
+    #[cfg(feature = "test-support")]
+    pub fn proxy_health(&self) -> fbtt_core::ProxyHealth {
+        fbtt_core::proxy::health(self.shared.session())
+    }
+
+    /// The addresses the engine's network stack has bound (its BitTorrent port, not the API's). Only a
+    /// test reads this, to take that port away and make the next network change fail to build.
+    #[cfg(feature = "test-support")]
+    pub fn engine_local_addrs(&self) -> Vec<SocketAddr> {
+        self.shared.session().local_addrs()
     }
 
     /// Stops serving, saves, and releases the library. Returns once every connection is closed, the last

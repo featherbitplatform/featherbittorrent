@@ -30,7 +30,7 @@ pub mod engine;
 
 // The two questions a screen asks of a session, where a caller looks for the proxy's own words
 // rather than the adapter's path: `fbtt_core::proxy::health(&session)`.
-pub use engine::{health, health_from_event};
+pub use engine::{apply_now, health, health_from_event};
 
 /// The longest proxy host this product accepts, in characters: the DNS name limit.
 const MAX_HOST_CHARS: usize = 253;
@@ -127,6 +127,9 @@ pub enum ProxyProblem {
     /// The engine refuses the proxy this product built, with fbt's own words. The last word, for a
     /// case this product's own checks do not cover.
     Engine(String),
+    /// A change asked to keep the stored password while naming a different host or port: the
+    /// password was given for the old address and is not sent to a new one unless it is typed again.
+    PasswordForNewAddress,
 }
 
 impl ProxyProblem {
@@ -155,6 +158,9 @@ impl ProxyProblem {
             ProxyProblem::MergeKey => {
                 "Write the proxy: section out in full; a YAML merge (<<) cannot carry it."
                     .to_string()
+            }
+            ProxyProblem::PasswordForNewAddress => {
+                "Enter the password again when the proxy's host or port changes.".to_string()
             }
             ProxyProblem::Engine(problem) => {
                 // The engine's own sentence, made display-safe in case its wording ever carries a
@@ -306,6 +312,14 @@ impl ProxySetting {
         config
     }
 
+    /// Whether `other` names the same proxy address as this setting: the same port, and the same host
+    /// once one surrounding pair of brackets is dropped (as [`to_engine`](Self::to_engine) dials it),
+    /// compared without regard to ASCII case, since a host name is not case-sensitive.
+    pub fn same_address(&self, other: &ProxySetting) -> bool {
+        self.port == other.port
+            && unbracketed(&self.host).eq_ignore_ascii_case(unbracketed(&other.host))
+    }
+
     /// This setting's [`ProxyType`] as the engine's kind. `Other` never comes from a config a run
     /// acts on (see [`ProxyType`]): an empty one is no proxy, and any other maps to SOCKS5 so the
     /// fallback is still a proxy rather than nothing.
@@ -380,6 +394,22 @@ pub fn network_for(proxy: Option<&ProxySetting>, base: &fbt::Settings) -> fbt::N
 pub fn apply_to_settings(settings: &mut fbt::Settings, proxy: Option<&ProxySetting>) {
     let network = network_for(proxy, settings);
     settings.set_network(network);
+}
+
+/// What a proxy save answers when the engine could not switch to it and the previous setting was put
+/// back in `config.yaml`. `problem` is the engine's display-safe reason.
+pub fn not_applied(problem: &str) -> String {
+    format!("The engine could not switch to this proxy, so the previous setting is kept: {problem}")
+}
+
+/// The same, when putting the previous setting back in `config.yaml` failed too: the engine is on the
+/// previous setting while the file names the new one, and the person has to know that. Both reasons
+/// are display-safe and neither carries a password.
+pub fn not_rolled_back(problem: &str, rollback: &str) -> String {
+    format!(
+        "The engine could not switch to this proxy and is still on the previous setting, but config.yaml \
+         could not be put back and names the new one: {rollback}. The engine's reason: {problem}"
+    )
 }
 
 /// The health of the session's proxy, in this product's own words.

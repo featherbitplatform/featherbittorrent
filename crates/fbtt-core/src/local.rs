@@ -35,8 +35,10 @@ use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
+use crate::proxy::{apply_now, apply_to_settings, not_applied, not_rolled_back};
 use crate::settings::{
-    DownloadsChange, DownloadsView, OnCompleteView, SettingsView, validate_downloads,
+    DownloadsChange, DownloadsView, OnCompleteView, PasswordStorage, ProxyChange, ProxyView,
+    SettingsView, validate_downloads,
 };
 use crate::stream::local::{Choice, LocalEndpoint, choose_file, local_source};
 
@@ -49,6 +51,7 @@ const TICK: Duration = Duration::from_millis(500);
 const NO_TORRENT: &str = "the torrent is not in this library";
 /// The line a saved settings section answers with.
 const SAVED: &str = "Saved.";
+
 /// What the screen is told when it asks about devices: which keys may sign in to a featherbittorrent
 /// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
 /// them - not an empty one, none at all.
@@ -84,12 +87,18 @@ impl LocalBackend {
         // The session and the downloads automation come back too and are dropped here: the engine the
         // task owns already holds the session, and so does the task's own handle on the automation (see
         // `crate::downloads`).
-        let (client, task, ..) = spawn(config.session_settings(), config, paths, lock).await?;
+        // The settings before the proxy: `spawn` applies the config's proxy itself and keeps these as the
+        // base a proxy changed at runtime is derived over.
+        let (client, task, ..) = spawn(config.settings_before_proxy(), config, paths, lock).await?;
         Ok((client, task))
     }
 
     /// [`start`](Self::start) with the engine settings spelled out rather than derived
     /// from the config, which is how a test keeps every session on loopback.
+    ///
+    /// The config's `proxy:` is applied to `settings` here whatever they say, so hand in
+    /// [`Config::settings_before_proxy`] and your own changes: those are what a proxy removed at
+    /// runtime goes back to.
     pub async fn start_with(
         settings: Settings,
         config: Config,
@@ -149,6 +158,12 @@ async fn spawn(
     // directory (`Config::resolve`), so a snapshot's default folder, an add with no
     // folder typed in, and the fallback a save writes are all the same place.
     let config = config.resolve(paths);
+    // The settings as handed in are the base a proxy changed at runtime is derived over; the engine
+    // starts on them with this config's proxy applied, so a run never starts on a proxy-less session
+    // because a caller forgot to apply one.
+    let base_settings = settings.clone();
+    let mut settings = settings;
+    apply_to_settings(&mut settings, config.proxy.as_ref());
     let (mut engine, problems) = Engine::start(settings, paths, lock).await?;
 
     // The first snapshot is taken here rather than in the task, so a client never sees
@@ -196,6 +211,7 @@ async fn spawn(
 
     let backend = Backend {
         engine,
+        base_settings,
         config,
         paths: paths.clone(),
         watching: None,
@@ -314,6 +330,10 @@ struct Backend {
     /// The engine this task drives alone: its session, its state file and this library's lock,
     /// which it releases after the last save.
     engine: Engine,
+    /// The engine settings this run started on before its proxy was applied: what a proxy saved at
+    /// runtime is derived over ([`crate::proxy::network_for`]), so removing one brings back the
+    /// switches it had turned off.
+    base_settings: Settings,
     /// What the run started with, its download folder already rooted in the library
     /// (see [`Config::resolve`]), kept current so a missing config file has something
     /// sensible to fall back to.
@@ -596,7 +616,69 @@ impl Backend {
                     self.notify(Notice::Info(SAVED.to_owned()));
                 }
             }
+            SettingsCommand::Save(SettingsChange::Proxy(change)) => {
+                self.settings_loaded = true;
+                if self.save_proxy(change).await {
+                    self.notify(Notice::Info(SAVED.to_owned()));
+                }
+            }
         }
+    }
+
+    /// A proxy section saved: resolved against the password the file holds, validated, written, then
+    /// applied to the running engine, in that order and all inside this one task. A change the checks
+    /// refuse writes nothing and leaves the engine as it was. Commands are answered one at a time, so
+    /// two saves in quick succession leave the engine on the second.
+    ///
+    /// The resolve and the check happen on the file as it is read for the write, so `Keep` keeps the
+    /// password actually stored (and only for the same address) and a SOCKS5 login is judged with it put
+    /// back in.
+    ///
+    /// The engine can still refuse after the write: its new network stack may fail to build (a listen
+    /// address that will not bind again, say), and it then stays on the previous setting. The file and
+    /// this run's view are put back to that previous setting too, so nothing claims a proxy the engine
+    /// is not using, and the person is told.
+    async fn save_proxy(&mut self, change: ProxyChange) -> bool {
+        let saved = self
+            .save_config_with(move |config| {
+                let previous = config.proxy.clone();
+                let resolved = change
+                    .resolve(config.proxy.as_ref())
+                    .map_err(|problem| problem.message())?;
+                if let Some(setting) = &resolved {
+                    setting.validate().map_err(|problem| problem.message())?;
+                }
+                config.proxy = resolved.clone();
+                Ok((resolved, previous))
+            })
+            .await;
+        let Some((resolved, previous)) = saved else {
+            return false;
+        };
+        self.config.proxy = resolved.clone();
+        let applied = apply_now(
+            self.engine.session(),
+            resolved.as_ref(),
+            &self.base_settings,
+        )
+        .await;
+        let Err(problem) = applied else {
+            return true;
+        };
+        // The engine kept the previous setting; so do the file and this run's view.
+        self.config.proxy = previous.clone();
+        let line = match self
+            .write_config_with(move |config| {
+                config.proxy = previous;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => not_applied(&problem),
+            Err(rollback) => not_rolled_back(&problem, &rollback),
+        };
+        self.notify(Notice::Error(line));
+        false
     }
 
     /// A downloads section saved: validated, then written, then applied, in that order, so a section the
@@ -647,6 +729,8 @@ impl Backend {
                 watch_problem,
                 on_complete_problem,
             },
+            // The CLI keeps the proxy password in `config.yaml`; the view says only whether there is one.
+            proxy: ProxyView::of(self.config.proxy.as_ref(), PasswordStorage::ConfigFile),
         }
     }
 
@@ -655,6 +739,38 @@ impl Backend {
     /// because this task answers commands and should not wait on a disk. True when the file was written;
     /// otherwise the reason is already a notice.
     async fn save_config(&self, change: impl FnOnce(&mut Config) + Send + 'static) -> bool {
+        self.save_config_with(move |config| {
+            change(config);
+            Ok(())
+        })
+        .await
+        .is_some()
+    }
+
+    /// [`save_config`](Self::save_config) with a change that may refuse: `change` sees the config as
+    /// read for the write and either alters it and returns a value, or returns the one line to show,
+    /// in which case nothing is written. `Some` with that value when the file was written; otherwise the
+    /// reason is already a notice.
+    async fn save_config_with<T: Send + 'static>(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<T, String> + Send + 'static,
+    ) -> Option<T> {
+        match self.write_config_with(change).await {
+            Ok(value) => Some(value),
+            Err(problem) => {
+                self.notify(Notice::Error(problem));
+                None
+            }
+        }
+    }
+
+    /// The body of [`save_config_with`](Self::save_config_with): the same read, change and write, with
+    /// the reason it did not happen handed back (display-safe) instead of sent as a notice, for a caller
+    /// that has more to say around it.
+    async fn write_config_with<T: Send + 'static>(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         let paths = self.paths.clone();
         let fallback = self.config.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -680,22 +796,17 @@ impl Backend {
                 // folder included, already rooted in the library.
                 Ok(ConfigLoad::Missing) | Err(_) => fallback,
             };
-            change(&mut config);
-            config.save(&file).map_err(|error| error.to_string())
+            let value = change(&mut config)?;
+            config.save(&file).map_err(|error| error.to_string())?;
+            Ok(value)
         })
         .await;
         match outcome {
-            Ok(Ok(())) => true,
-            Ok(Err(problem)) => {
-                self.notify(Notice::Error(map::clean(&problem)));
-                false
-            }
-            Err(joined) => {
-                self.notify(Notice::Error(format!(
-                    "the config could not be written: {joined}"
-                )));
-                false
-            }
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(problem)) => Err(map::clean(&problem)),
+            Err(joined) => Err(map::clean(&format!(
+                "the config could not be written: {joined}"
+            ))),
         }
     }
 
