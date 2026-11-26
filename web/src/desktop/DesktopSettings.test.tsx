@@ -8,6 +8,8 @@
  */
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { SectionDirtyContext } from '../components/settings/useSectionDirty'
+import type { DirtyEntry } from '../components/settings/useSectionDirty'
 import { DesktopSettingsContext } from '../desktopSettings'
 import { effectiveBindings, KEY_BINDINGS, setOverrides } from '../keys'
 import type { Api } from '../api/client'
@@ -105,7 +107,8 @@ function slot(request: { section: string; seq: number } | null = null) {
 }
 
 it('this_app_sections_only_in_desktop', async () => {
-  const client = {} as Api
+  // Downloads opens first on a fresh page and reads the settings; this test is about the other sections.
+  const client = { settings: () => new Promise(() => {}) } as unknown as Api
   const { unmount } = render(<Settings client={client} onBack={vi.fn()} />)
   expect(screen.queryByRole('button', { name: 'Window' })).toBeNull()
   expect(screen.queryByRole('button', { name: 'Serve the web UI' })).toBeNull()
@@ -198,6 +201,25 @@ it('serving_is_applied_with_its_login_and_shows_the_address', async () => {
   })
   await waitFor(() => expect(onServingChanged).toHaveBeenCalledWith(null))
   expect((screen.getByLabelText('Password') as HTMLInputElement).value, 'the password is not kept').toBe('')
+})
+
+it('an_unapplied_serving_form_registers_as_unsaved_changes', async () => {
+  let entry: (() => DirtyEntry) | null = null
+  const registry = { register: (next: (() => DirtyEntry) | null) => void (entry = next) }
+  shell.setServing.mockResolvedValue({ ...OFF, enabled: true, user: 'alice', address: 'http://localhost:8090' })
+  render(
+    <SectionDirtyContext.Provider value={registry}>
+      <ServingSection onServingChanged={vi.fn().mockResolvedValue(undefined)} />
+    </SectionDirtyContext.Provider>,
+  )
+  await screen.findByText('Off')
+  expect(entry!().dirty, 'a form nobody touched is not unsaved').toBe(false)
+  fireEvent.click(screen.getByLabelText('Serve the web UI'))
+  expect(entry!().dirty).toBe(true)
+  fireEvent.change(screen.getByLabelText('User name'), { target: { value: 'alice' } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter2' } })
+  await expect(entry!().save()).resolves.toBe(true)
+  await waitFor(() => expect(entry!().dirty).toBe(false))
 })
 
 it('a_refused_serving_change_hands_the_line_to_the_page', async () => {

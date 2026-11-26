@@ -44,6 +44,7 @@ import { useConnection } from './connection'
 import { useDesktopSettings } from './desktopSettings'
 import { useSession } from './session'
 import { Settings } from './screens/Settings'
+import type { ExitGuard } from './screens/Settings'
 import SignIn from './screens/SignIn'
 import Torrents from './screens/Torrents'
 
@@ -59,9 +60,22 @@ export default function App() {
   // Whether Settings owns a history entry, and the number of the last one it pushed.
   const settingsPushed = useRef(false)
   const settingsToken = useRef(0)
+  // The open Settings page's unsaved-changes question, for the exits that are App's own.
+  const exitGuard = useRef<ExitGuard | null>(null)
+  const setExitGuard = useCallback((guard: ExitGuard | null): void => {
+    exitGuard.current = guard
+  }, [])
   // The desktop app asks for Settings at a section (Manage instances, or after This computer restarted).
   const desktop = useDesktopSettings()
   const [settingsSection, setSettingsSection] = useState<string | null>(null)
+
+  /** Back to torrents: through the history when Settings owns an entry, so the entry is consumed. */
+  const closeSettings = useCallback((): void => {
+    const owned = settingsPushed.current
+    settingsPushed.current = false
+    setSettingsOpen(false)
+    if (owned) window.history.back()
+  }, [])
 
   useEffect(() => {
     const onPop = (event: PopStateEvent): void => {
@@ -69,6 +83,16 @@ export default function App() {
       // A stale answer to either screen's earlier `history.back()` (Settings' or the full view's).
       const landed = event.state as { fbttSettings?: number; fbttFull?: number } | null
       if (landed?.fbttSettings !== undefined || landed?.fbttFull !== undefined) return
+      const guarded = exitGuard.current
+      if (guarded?.dirty() === true) {
+        // Settings has changes that were not saved: put the entry the browser just left back, so the
+        // page and the history still agree, and ask. Settings closes (and consumes that entry) only on
+        // an answer that lets it.
+        settingsToken.current += 1
+        window.history.pushState({ fbttSettings: settingsToken.current }, '')
+        guarded.guard(closeSettings)
+        return
+      }
       settingsPushed.current = false
       setSettingsOpen(false)
     }
@@ -76,7 +100,7 @@ export default function App() {
     return () => {
       window.removeEventListener('popstate', onPop)
     }
-  }, [])
+  }, [closeSettings])
 
   const openSettings = useCallback((section: string | null = null): void => {
     setSettingsSection(section)
@@ -88,12 +112,15 @@ export default function App() {
     setSettingsOpen(true)
   }, [])
 
-  /** Back to torrents: through the history when Settings owns an entry, so the entry is consumed. */
-  function closeSettings(): void {
-    const owned = settingsPushed.current
-    settingsPushed.current = false
-    setSettingsOpen(false)
-    if (owned) window.history.back()
+  /** The header's own way back to Torrents: asks first when Settings holds changes. False when it is waiting for the answer. */
+  function showTorrents(): boolean {
+    const guarded = exitGuard.current
+    if (guarded?.dirty() === true) {
+      guarded.guard(closeSettings)
+      return false
+    }
+    closeSettings()
+    return true
   }
 
   // The announcer writes into the two nodes above and follows the store. The regions are React's;
@@ -187,7 +214,7 @@ export default function App() {
       ) : (
         <>
           {settingsOpen && (
-            <Settings onBack={closeSettings} section={settingsSection} />
+            <Settings onExitGuard={setExitGuard} onBack={closeSettings} section={settingsSection} />
           )}
           {/* Hidden, not unmounted: the filter and the selection stay in state, and the table puts its scroll position back when it is measured again.
               `contents` while shown, so the wrapper draws no box and the screen's own root is the one
@@ -199,7 +226,7 @@ export default function App() {
             <Torrents
               hidden={settingsOpen}
               onSettings={() => openSettings()}
-              onShowTorrents={closeSettings}
+              onShowTorrents={showTorrents}
               signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}
               onSignOut={() => void signOut()}

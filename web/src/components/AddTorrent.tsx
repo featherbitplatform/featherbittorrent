@@ -31,7 +31,7 @@
  *
  * @module components/AddTorrent
  */
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from 'react'
 import { Upload, X } from 'lucide-react'
 import { errorMessage } from '../api/client'
@@ -76,6 +76,9 @@ function looksLikeMagnet(value: string): boolean {
 function isTorrentName(name: string): boolean {
   return name.toLowerCase().endsWith('.torrent')
 }
+
+/** How long the dialog waits for the settings before it shows the folder tree with today's defaults. */
+const SETTINGS_WAIT_MS = 3000
 
 /** What is wrong with this already-accepted file, in the person's language, or null when it is worth uploading. */
 function fileProblem(file: File | null): string | null {
@@ -144,6 +147,10 @@ export default function AddTorrent({
   const path = signIn === undefined && picked.client === client ? picked.path : ''
   const [file, setFile] = useState<File | null>(initialFile)
   const [startPaused, setStartPaused] = useState(false)
+  // What the server's settings say a new torrent starts with, for the client they were read from. Null
+  // until that client has answered (an answer of any kind, a 404 from an old server included).
+  const [defaults, setDefaults] = useState<{ client: Api | null; dir: string | undefined } | null>(null)
+  const pausedTouched = useRef(false)
   const [refusal, setRefusal] = useState<string | null>(() => fileProblem(initialFile))
   const [busy, setBusy] = useState(false)
   const magnetRef = useRef<HTMLInputElement>(null)
@@ -160,6 +167,41 @@ export default function AddTorrent({
     if (submittingRef.current) return
     onClose()
   }
+
+  // `Start paused` and the folder start from the server's settings. A server too old to have them (404), or
+  // one that cannot be asked, leaves today's defaults: unticked, and the first root. A tick the person
+  // already made is never taken back by a late answer.
+  useEffect(() => {
+    if (client === null) return
+    let cancelled = false
+    // A server that never answers must not hide the folder tree for good: after this long the tree
+    // starts with today's defaults, and a late answer then changes nothing the person could have used.
+    let gaveUp = false
+    const timer = setTimeout(() => {
+      gaveUp = true
+      setDefaults({ client, dir: undefined })
+    }, SETTINGS_WAIT_MS)
+    const ask = async (): Promise<void> => {
+      let dir: string | undefined
+      let paused: boolean | undefined
+      try {
+        const downloads = (await client.settings())?.downloads
+        if (typeof downloads?.default_dir === 'string' && downloads.default_dir !== '') dir = downloads.default_dir
+        if (typeof downloads?.start_paused === 'boolean') paused = downloads.start_paused
+      } catch {
+        // Today's defaults.
+      }
+      clearTimeout(timer)
+      if (cancelled) return
+      if (paused !== undefined && !pausedTouched.current) setStartPaused(paused)
+      if (!gaveUp) setDefaults({ client, dir })
+    }
+    void ask()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [client])
 
   const { ref, onKeyDown } = useModalDialog(requestClose, '#add-magnet')
   const onPathChange = useCallback(
@@ -364,9 +406,18 @@ export default function AddTorrent({
         {instancePicker}
 
         {signIn ??
-          (client !== null && (
-            <FolderPicker key={clientKey(client)} client={client} value={path} onPathChange={onPathChange} />
-          ))}
+          (client !== null &&
+            (defaults?.client === client ? (
+              <FolderPicker
+                key={clientKey(client)}
+                client={client}
+                value={path}
+                start={defaults.dir}
+                onPathChange={onPathChange}
+              />
+            ) : (
+              <p className="px-3 py-2 font-mono text-[12px] text-muted">Reading the folders...</p>
+            )))}
 
         {refusal !== null && <Banner tone="danger">{refusal}</Banner>}
 
@@ -376,6 +427,7 @@ export default function AddTorrent({
               type="checkbox"
               checked={startPaused}
               onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                pausedTouched.current = true
                 setStartPaused(event.target.checked)
               }}
               className="h-4 w-4 accent-accent"

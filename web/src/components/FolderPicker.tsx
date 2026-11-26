@@ -193,6 +193,18 @@ export interface FolderPickerProps {
   value: string
   /** Called once when the tree opens (with the server's default folder) and after every pick. */
   onPathChange(path: string): void
+  /**
+   * The folder to start in instead of the first root, when it is inside one of the roots (the Add dialog
+   * starts in the default folder the settings name). Anything else starts in the first root, as before.
+   */
+  start?: string
+  /**
+   * The value is the caller's own and loading must never replace it: the tree opens onto `value` and
+   * `onPathChange` is called only by a pick (Settings, where a folder not under the roots stays as saved).
+   */
+  keep?: boolean
+  /** The word over the tree. Defaults to `Save to`, the Add dialog's. */
+  label?: string
 }
 
 /**
@@ -202,7 +214,7 @@ export interface FolderPickerProps {
  * component's roots request depends on it, and a new function identity on every render would ask the
  * server for the roots again while somebody was opening a folder.
  */
-export default function FolderPicker({ client, value, onPathChange }: FolderPickerProps) {
+export default function FolderPicker({ client, value, onPathChange, start, keep = false, label = 'Save to' }: FolderPickerProps) {
   const [roots, setRoots] = useState<string[] | null>(null)
   const [rootsError, setRootsError] = useState<string | null>(null)
   const [openSet, setOpenSet] = useState<ReadonlySet<string>>(new Set())
@@ -212,6 +224,10 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const newFolderRef = useRef<HTMLButtonElement>(null)
+  // The roots are read once per client; what the tree opens onto is the value and start of that moment.
+  const valueRef = useRef(value)
+  const startRef = useRef(start)
+  const keepRef = useRef(keep)
 
   /** Open this folder and every folder above it, so a pick is visible instead of remembered off screen. */
   const expand = useCallback((path: string): void => {
@@ -230,10 +246,16 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
         const list = await client.roots()
         if (cancelled) return
         setRoots(list)
-        if (list.length > 0) {
+        if (keepRef.current) {
+          // Nothing chosen yet: open the first root so there is something to pick, without picking it.
+          if (valueRef.current !== '') expand(valueRef.current)
+          else if (list.length > 0) expand(list[0] as string)
+        } else if (list.length > 0) {
           // The dialog starts inside the server's default folder, not at the roof of the filesystem,
           // and it starts *inside* it: the folder is picked and opened in the same breath.
-          const first = list[0] as string
+          const asked = startRef.current
+          const inside = (root: string): boolean => asked === root || (asked?.startsWith(`${root}/`) ?? false)
+          const first = asked !== undefined && list.some(inside) ? asked : (list[0] as string)
           expand(first)
           onPathChange(first)
         }
@@ -316,7 +338,7 @@ export default function FolderPicker({ client, value, onPathChange }: FolderPick
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[13px] text-body">Save to</span>
+        <span className="text-[13px] text-body">{label}</span>
         {!naming && (
           <Button
             ref={newFolderRef}

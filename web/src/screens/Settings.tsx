@@ -1,13 +1,18 @@
 /**
  * The Settings screen: a list of sections on the left and one section at a time on the right.
  *
- * `Back to torrents` stays fixed at the top. Groups: Torrents (Speed so far), Access (Devices, Keyboard
+ * `Back to torrents` stays fixed at the top. Groups: Torrents (Downloads, Speed), Access (Devices, Keyboard
  * shortcuts) and, inside the desktop app only, This app (Window, Serve the web UI, Instances, supplied
  * by {@link useDesktopSettings}); a section that is not built yet is not listed. Each section has its
  * own Save and tells the page when it holds changes (`useSectionDirty`): switching section, pressing
  * `Back to torrents` or unloading the tab then asks to keep or discard them. The page opens on the
  * section a link asked for (`section`: a section id or an old element id), else the last one used. Below
- * the `sm` breakpoint the list is a `Jump to` menu. The section's heading takes focus when it opens.
+ * the `sm` breakpoint the list is a `Jump to` menu. The section's heading takes focus when it opens by a
+ * click, Enter or Space or a request; the arrow keys keep the focus on the list.
+ *
+ * The page does not own every way out: the header's `show torrents` action and the browser's Back button
+ * live in `App`. `onExitGuard` is how App reaches the same question: the page hands it `guard` (ask
+ * first, then go) and `dirty` (is there anything to ask about).
  *
  * @module screens/Settings
  */
@@ -17,6 +22,7 @@ import { ArrowLeft } from 'lucide-react'
 import { useConnection } from '../connection'
 import type { Api } from '../api/client'
 import Button from '../components/Button'
+import DownloadsSection from '../components/settings/DownloadsSection'
 import Devices from '../components/settings/Devices'
 import SectionList from '../components/settings/SectionList'
 import { BUILT_SECTIONS, resolveSection, visibleSections, writeLastSection } from '../components/settings/sections'
@@ -28,14 +34,24 @@ import { SectionDirtyContext } from '../components/settings/useSectionDirty'
 import type { DirtyEntry, SectionDirtyRegistry } from '../components/settings/useSectionDirty'
 import { useDesktopSettings } from '../desktopSettings'
 
+/** What App holds to ask the open Settings page's unsaved-changes question on the exits the page does not own. */
+export interface ExitGuard {
+  /** Run `go` now, or once the person has answered the question about the open section's changes. */
+  guard(go: () => void): void
+  /** Whether the open section holds changes that were not saved. */
+  dirty(): boolean
+}
+
 export interface SettingsProps {
   client?: Api
+  /** Told by the page while it is open (and null when it closes), so App's own exits (the header, the browser's Back) ask too. */
+  onExitGuard?(guard: ExitGuard | null): void
   onBack(): void
   /** The section to open at: a section id or an old element id; the last used when not given. */
   section?: string | null
 }
 
-export function Settings({ client: given, onBack, section = null }: SettingsProps) {
+export function Settings({ client: given, onExitGuard, onBack, section = null }: SettingsProps) {
   const connection = useConnection()
   const desktop = useDesktopSettings()
   const client = given ?? connection.api
@@ -65,10 +81,22 @@ export function Settings({ client: given, onBack, section = null }: SettingsProp
     else go()
   }, [])
 
+  useEffect(() => {
+    onExitGuard?.({ guard, dirty: () => entry.current?.().dirty === true })
+    return () => onExitGuard?.(null)
+  }, [onExitGuard, guard])
+
+  // Set when an arrow key opened the section: the focus stays on the list, not the heading.
+  const quiet = useRef(false)
   const choose = useCallback(
-    (id: SectionId): void => {
-      if (id === current) return
+    (id: SectionId, how: 'arrow' | 'click'): void => {
+      if (id === current) {
+        // Pressing the open section's own entry takes the person to its heading.
+        if (how === 'click') title.current?.focus()
+        return
+      }
       guard(() => {
+        quiet.current = how === 'arrow'
         setCurrent(id)
         writeLastSection(id)
       })
@@ -95,6 +123,10 @@ export function Settings({ client: given, onBack, section = null }: SettingsProp
       return
     }
     opened.current = true
+    if (quiet.current) {
+      quiet.current = false
+      return
+    }
     title.current?.focus()
   }, [current, section])
 
@@ -133,6 +165,8 @@ export function Settings({ client: given, onBack, section = null }: SettingsProp
   const def = sections.find((s) => s.id === current) ?? sections[0]
   function body(): ReactNode {
     switch (def.id) {
+      case 'downloads':
+        return <DownloadsSection client={client} />
       case 'speed':
         return <SpeedSection client={client} />
       case 'devices':

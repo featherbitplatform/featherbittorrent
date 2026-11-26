@@ -170,14 +170,18 @@ it, and nothing is written over it, because the app has no way of guessing what 
 
 Four settings say what happens to a torrent once it is added: the folder its files work in while they
 arrive, whether a new torrent starts on its own, a folder whose `.torrent` files are picked up as they land
-there, and a program to start when one finishes. None of them are in the window yet. They are the
-`downloads:` keys of a `config.yaml`: the app's own, the one beside `desktop.yaml`, decides what
+there, and a program to start when one finishes. Settings' `Downloads` section edits them for the instance you are connected to (see
+[web-ui.md](web-ui.md#downloads)); they are also the `downloads:` keys of a `config.yaml`: the app's own, the one beside `desktop.yaml`, decides what
 `This computer` does (see [Where the app's files live](#where-the-apps-files-live)); an instance that is a
 server follows its own file, which is the file [server.md](server.md) describes, and the section after its
 config table is what each of these four does in full. What follows is the short version, plus the parts an
 app user needs and that document does not spell out.
 
-An engine reads this file when it starts, so restart the app for a change you made in it to take effect. A
+In Settings, `Run a program on completion` is a field only for `This computer`; for an instance that is a
+server the section shows the program configured in that server's `config.yaml` and says `Set in the
+server's config file`, because only the file can name it there. Saving the section from Settings takes effect
+at once; an engine reads the file itself only when it starts, so restart the app for a change you made in the
+file by hand to take effect. A
 `downloads:` section the app did not write is left alone when the app saves that file itself, so a section
 you keep there survives a settings save.
 

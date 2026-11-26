@@ -101,6 +101,15 @@ export interface DownloadsInput {
   watch_dir: string | null
 }
 
+/**
+ * The program on completion, sent only on purpose: the desktop app's This computer view (the server says
+ * `editable`) names it through this, and `program: null` means run nothing. A save that does not pass it
+ * leaves the key out, which the server reads as "keep what the config has".
+ */
+export interface OnCompleteChange {
+  program: string | null
+}
+
 /** The whole settings object, as every settings route answers it. */
 export interface ProductSettings {
   speed: SpeedSettings
@@ -242,7 +251,7 @@ export interface Api {
   setQueueSettings(settings: components['schemas']['QueueSettingsDto']): Promise<void>
   settings(): Promise<ProductSettings>
   saveSpeed(speed: SpeedSettings): Promise<ProductSettings>
-  saveDownloads(downloads: DownloadsInput): Promise<ProductSettings>
+  saveDownloads(downloads: DownloadsInput, options?: { onComplete?: OnCompleteChange }): Promise<ProductSettings>
   devices(): Promise<DeviceRow[]>
   addDevice(name: string, publicKey: string): Promise<DeviceRow>
   removeDevice(name: string): Promise<void>
@@ -450,9 +459,9 @@ export function createClient(
         }),
         'application/json',
       ),
-    // Picked field by field: the program on completion is never sent from this page, even when the
-    // caller's object carries one.
-    saveDownloads: (downloads) =>
+    // Picked field by field: the program on completion is never taken from the caller's object, even
+    // when it carries one. It goes only through the explicit `onComplete` option.
+    saveDownloads: (downloads, options) =>
       json(
         `${SETTINGS}/downloads`,
         'PUT',
@@ -461,6 +470,7 @@ export function createClient(
           unfinished_dir: downloads.unfinished_dir,
           start_paused: downloads.start_paused,
           watch_dir: downloads.watch_dir,
+          ...(options?.onComplete === undefined ? {} : { on_complete: { program: options.onComplete.program } }),
         }),
         'application/json',
       ),
