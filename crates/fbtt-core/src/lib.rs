@@ -32,8 +32,8 @@ pub use auth::LOGIN_NAMESPACE;
 pub use client::{
     AddSource, Client, ClientParts, Clock, Command, Commands, Connection, Detail, DetailTab,
     DeviceCommand, DeviceRow, DirListing, FilePriority, FileRow, LinkState, LiveLimits, Notice,
-    PeerRow, PlaySource, PlayTarget, RowState, Snapshot, StreamUrl, TorrentId, TorrentRow, Totals,
-    TrackerRow,
+    PeerRow, PlaySource, PlayTarget, RowState, SettingsChange, SettingsCommand, SettingsState,
+    Snapshot, StreamUrl, TorrentId, TorrentRow, Totals, TrackerRow,
 };
 pub use config::{
     AuthConfig, Config, ConfigError, ConfigLoad, CookieSecure, DeviceEntry, DownloadsConfig,

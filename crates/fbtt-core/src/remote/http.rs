@@ -267,9 +267,12 @@ impl Api {
             // only a refusal with no business answer behind it is about the credential.
             let answer = self.problem(response).await?;
             if !self.refused(status, answer.as_deref()).await {
-                return Err(ApiError::Answer(
-                    answer.unwrap_or_else(|| status_line(status)),
-                ));
+                let line = answer.unwrap_or_else(|| status_line(status));
+                return Err(if status == reqwest::StatusCode::NOT_FOUND {
+                    ApiError::NotFound(line)
+                } else {
+                    ApiError::Answer(line)
+                });
             }
             if attempt == 1 {
                 // Refused twice, with a new credential in between: this connection's proof is not good.

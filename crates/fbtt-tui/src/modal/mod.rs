@@ -669,6 +669,7 @@ mod tests {
             default_dir: std::path::PathBuf::from("/downloads"),
             dirs: None,
             devices: None,
+            settings: fbtt_core::SettingsState::NotLoaded,
         };
 
         let mut model = Model::new();

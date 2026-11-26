@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use fbtt_core::{
     AddSource, Client, ClientParts, Command, Config, ConfigLoad, Connection, Detail, DetailTab,
-    DeviceCommand, DirListing, FilePriority, FileRow, LiveLimits, Notice, RowState, Snapshot,
-    TorrentId,
+    DeviceCommand, DirListing, DownloadsChange, FilePriority, FileRow, LiveLimits, Notice,
+    OnCompleteSet, RowState, SettingsChange, SettingsCommand, SettingsState, Snapshot, TorrentId,
 };
 
 mod support;
@@ -1275,5 +1275,213 @@ async fn local_devices_is_a_notice() {
     );
     drop(snapshot);
 
+    shutdown(client, task).await;
+}
+
+/// The settings the snapshot carries, when they have been loaded.
+fn loaded(snapshot: &Snapshot) -> Option<fbtt_core::SettingsView> {
+    match &snapshot.settings {
+        SettingsState::Loaded(view) => Some(view.clone()),
+        _ => None,
+    }
+}
+
+/// A downloads change that keeps what the library has, going to `default_dir`.
+fn downloads_to(default_dir: PathBuf) -> DownloadsChange {
+    DownloadsChange {
+        default_dir,
+        unfinished_dir: None,
+        start_paused: false,
+        watch_dir: None,
+        on_complete: None,
+    }
+}
+
+/// `Load` fills the settings in, and a speed save changes the running view, says `Saved.` and writes the
+/// limits to the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_settings_load_and_save_speed_persist() {
+    let lib = Library::new("local_settings_speed");
+    let (mut client, task, _) = lib.start().await;
+    assert_eq!(client.snapshot().settings, SettingsState::NotLoaded);
+
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let first = wait_for(&mut client, |snapshot| loaded(snapshot).is_some()).await;
+    let view = loaded(&first).expect("loaded");
+    assert_eq!(view.speed, LiveLimits::from(lib.config.limits));
+    assert_eq!(view.downloads.default_dir, lib.config.download_dir);
+    drop(first);
+
+    let mut limits = LiveLimits::from(lib.config.limits);
+    limits.download_kib = 123;
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Speed(limits)
+    ))));
+    assert_eq!(info_text(notice(&mut client).await), "Saved.");
+    let saved = wait_for(&mut client, |snapshot| {
+        loaded(snapshot).is_some_and(|view| view.speed.download_kib == 123)
+    })
+    .await;
+    assert_eq!(saved.limits.download_kib, 123);
+    drop(saved);
+
+    match Config::load(&lib.paths).expect("read the config back") {
+        ConfigLoad::Loaded(config) => assert_eq!(config.limits.download_kib, 123),
+        other => panic!("the new limits are in the config file, got {other:?}"),
+    }
+    shutdown(client, task).await;
+}
+
+/// A downloads save moves the default folder: the snapshot says so, and a torrent added with no folder
+/// lands there. The file holds it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_downloads_save_changes_default_dir_for_new_adds() {
+    let lib = Library::new("local_settings_default_dir");
+    let (mut client, task, _) = lib.start().await;
+    let elsewhere = lib.dir.path().join("elsewhere");
+
+    let mut change = downloads_to(elsewhere.clone());
+    change.start_paused = true;
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(change)
+    ))));
+    assert_eq!(info_text(notice(&mut client).await), "Saved.");
+    let snapshot = wait_for(&mut client, |snapshot| snapshot.default_dir == elsewhere).await;
+    assert_eq!(
+        loaded(&snapshot)
+            .expect("a save publishes the view")
+            .downloads
+            .default_dir,
+        elsewhere
+    );
+    drop(snapshot);
+
+    let uri = "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=lands-there";
+    let id = id_of(&fbt::Magnet::parse(uri).expect("a magnet").info_hashes);
+    assert!(client.send(Command::Add {
+        source: AddSource::Magnet(uri.to_string()),
+        dir: None,
+    }));
+    let added = wait_for(&mut client, |snapshot| row_of(snapshot, &id).is_some()).await;
+    assert_eq!(
+        row_of(&added, &id).expect("the row").save_path,
+        elsewhere,
+        "an add with no folder goes where the save said"
+    );
+    drop(added);
+
+    match Config::load(&lib.paths).expect("read the config back") {
+        ConfigLoad::Loaded(config) => {
+            assert_eq!(config.download_dir, elsewhere);
+            assert!(config.downloads.start_paused);
+        }
+        other => panic!("the downloads section is in the file, got {other:?}"),
+    }
+    shutdown(client, task).await;
+}
+
+/// The program is the TUI's own to set, because the engine runs in this process.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_program_is_editable() {
+    let lib = Library::new("local_settings_program");
+    let (mut client, task, _) = lib.start().await;
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let snapshot = wait_for(&mut client, |snapshot| loaded(snapshot).is_some()).await;
+    let view = loaded(&snapshot).expect("loaded");
+    assert!(view.downloads.on_complete.editable);
+    assert_eq!(view.downloads.on_complete.program, None);
+    drop(snapshot);
+
+    // A program that exists and is never run: validation looks, and the engine is not asked to finish
+    // anything here.
+    let program = std::env::current_exe().expect("this test's own binary");
+    let mut change = downloads_to(lib.config.download_dir.clone());
+    change.on_complete = Some(OnCompleteSet {
+        program: Some(program.clone()),
+    });
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(change)
+    ))));
+    assert_eq!(info_text(notice(&mut client).await), "Saved.");
+    let snapshot = wait_for(&mut client, |snapshot| {
+        loaded(snapshot).is_some_and(|view| view.downloads.on_complete.program.is_some())
+    })
+    .await;
+    assert_eq!(
+        loaded(&snapshot)
+            .expect("loaded")
+            .downloads
+            .on_complete
+            .program,
+        Some(program)
+    );
+    drop(snapshot);
+    shutdown(client, task).await;
+}
+
+/// A change that fails validation says why and changes nothing: not the snapshot, not the file, and not
+/// where the next add goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_invalid_downloads_is_an_error_and_changes_nothing() {
+    let lib = Library::new("local_settings_invalid");
+    let (mut client, task, _) = lib.start().await;
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    wait_for(&mut client, |snapshot| loaded(snapshot).is_some()).await;
+
+    // The unfinished folder is the default folder, which is a refusal on every host.
+    let elsewhere = lib.dir.path().join("elsewhere");
+    let mut change = downloads_to(elsewhere.clone());
+    change.unfinished_dir = Some(elsewhere.clone());
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(change)
+    ))));
+    assert_eq!(
+        error_text(notice(&mut client).await),
+        "The unfinished folder must be different from the default folder."
+    );
+
+    // A command after it is answered after it, so by the time this snapshot is here the refused one has
+    // been handled.
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let snapshot = wait_for(&mut client, |snapshot| loaded(snapshot).is_some()).await;
+    assert_eq!(snapshot.default_dir, lib.config.download_dir);
+    assert_eq!(
+        loaded(&snapshot).expect("loaded").downloads.default_dir,
+        lib.config.download_dir
+    );
+    assert_eq!(
+        loaded(&snapshot).expect("loaded").downloads.unfinished_dir,
+        None
+    );
+    drop(snapshot);
+    assert!(
+        !lib.paths.config_file().exists(),
+        "a refused save writes no file"
+    );
+    shutdown(client, task).await;
+}
+
+/// The order is validate, write, apply: a write that fails applies nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_failed_write_applies_nothing() {
+    let lib = Library::new("local_settings_unwritable");
+    // A folder where the file belongs: it cannot be replaced by a file.
+    fs::create_dir_all(lib.paths.config_file()).expect("a folder in the file's place");
+    let (mut client, task, _) = lib.start().await;
+    let elsewhere = lib.dir.path().join("elsewhere");
+
+    assert!(client.send(Command::Settings(SettingsCommand::Save(
+        SettingsChange::Downloads(downloads_to(elsewhere))
+    ))));
+    let line = error_text(notice(&mut client).await);
+    assert!(!line.is_empty());
+
+    assert!(client.send(Command::Settings(SettingsCommand::Load)));
+    let snapshot = wait_for(&mut client, |snapshot| loaded(snapshot).is_some()).await;
+    assert_eq!(
+        snapshot.default_dir, lib.config.download_dir,
+        "nothing was applied for a save that was not written"
+    );
+    drop(snapshot);
     shutdown(client, task).await;
 }

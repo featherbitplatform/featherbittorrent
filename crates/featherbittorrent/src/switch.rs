@@ -2483,6 +2483,7 @@ mod tests {
             default_dir: std::path::PathBuf::new(),
             dirs: None,
             devices: None,
+            settings: fbtt_core::SettingsState::NotLoaded,
         }
     }
 

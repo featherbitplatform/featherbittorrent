@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::client::{
-    Command, Connection, Detail, DetailTab, LinkState, Notice, Snapshot, TorrentId, Totals,
+    Command, Connection, Detail, DetailTab, LinkState, Notice, SettingsCommand, Snapshot,
+    TorrentId, Totals,
 };
 use crate::remote::bodies::ApiError;
 use crate::remote::routes::{tab_path, torrent_route};
@@ -183,6 +184,12 @@ impl Backend {
             // server's own add route follows too.
             self.default_dir = self.roots.first().cloned().unwrap_or_default();
         }
+        // Once, on connecting: the server's current default folder, so a screen that did not change it
+        // still adds to the right one. An old server, or any error, leaves the roots' first as it was.
+        if !self.settings_asked {
+            self.settings_asked = true;
+            self.settings_round(SettingsCommand::Load, true).await;
+        }
         let torrents: Vec<map::TorrentDto> =
             self.api.json(self.api.get("/api/v1/torrents")).await?;
         let session: map::SessionDto = self.api.json(self.api.get("/api/v1/session")).await?;
@@ -199,7 +206,9 @@ impl Backend {
                 }
                 // A server that will not answer its queue route still has rates to show: the counts stay
                 // unknown rather than being invented as unlimited.
-                Err(ApiError::Answer(_)) => self.limits = map::rate_limits(&session),
+                Err(ApiError::Answer(_) | ApiError::NotFound(_)) => {
+                    self.limits = map::rate_limits(&session)
+                }
                 Err(problem) => return Err(problem),
             }
             self.want_limits = false;
@@ -284,6 +293,7 @@ impl Backend {
             default_dir: self.default_dir.clone(),
             dirs: self.dirs.clone(),
             devices: self.devices.clone(),
+            settings: self.settings.clone(),
         });
         if next == self.published {
             return;
@@ -307,7 +317,7 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::LiveLimits;
+    use crate::client::{LiveLimits, SettingsState};
     use crate::remote::Secret;
     use crate::remote::blank;
     use crate::remote::http::Api;
@@ -356,6 +366,8 @@ mod tests {
             watching: None,
             dirs: None,
             devices: None,
+            settings: SettingsState::NotLoaded,
+            settings_asked: false,
             relay: None,
             torrents: Vec::new(),
             totals: Totals {

@@ -26,7 +26,8 @@ use tokio::task::JoinHandle;
 
 use crate::client::{
     AddSource, Client, Command, Connection, Detail, DetailTab, DirListing, FilePriority,
-    LiveLimits, Notice, PlaySource, Snapshot, TorrentId, TorrentRow, Totals,
+    LiveLimits, Notice, PlaySource, SettingsChange, SettingsCommand, SettingsState, Snapshot,
+    TorrentId, TorrentRow, Totals,
 };
 use crate::config::{Config, ConfigLoad, Limits};
 use crate::downloads::{Automation, AutomationHandle};
@@ -34,6 +35,9 @@ use crate::engine::{Engine, SAVE_EVERY, map, prefer_for_playback};
 use crate::fs_list;
 use crate::lock::LibraryLock;
 use crate::paths::Paths;
+use crate::settings::{
+    DownloadsChange, DownloadsView, OnCompleteView, SettingsView, validate_downloads,
+};
 use crate::stream::local::{Choice, LocalEndpoint, choose_file, local_source};
 
 /// How often the snapshot is rebuilt, and with it the watched pane. Short enough that
@@ -43,6 +47,8 @@ const TICK: Duration = Duration::from_millis(500);
 /// the screen (and, from milestone 2, from a server), so a stale or malformed one is an
 /// ordinary answer rather than a failure.
 const NO_TORRENT: &str = "the torrent is not in this library";
+/// The line a saved settings section answers with.
+const SAVED: &str = "Saved.";
 /// What the screen is told when it asks about devices: which keys may sign in to a featherbittorrent
 /// server is that server's `config.yaml` to hold, and a library running its own engine has no list of
 /// them - not an empty one, none at all.
@@ -158,6 +164,7 @@ async fn spawn(
         default_dir: config.download_dir.clone(),
         dirs: None,
         devices: None,
+        settings: SettingsState::NotLoaded,
     });
     let (client, channels) = Client::paired(Arc::clone(&initial));
     // The screen may not be reading yet, so these wait in the queue, and past its room they are
@@ -195,6 +202,7 @@ async fn spawn(
         dirs: None,
         stalled,
         stream: None,
+        settings_loaded: false,
         automation: automation.clone(),
         published: initial,
         snapshot_tx: channels.snapshot,
@@ -324,6 +332,9 @@ struct Backend {
     /// The loopback stream endpoint, started on the first `Stream` command that
     /// needs it and reused after that; shut down before the engine on `Shutdown`.
     stream: Option<LocalEndpoint>,
+    /// Whether a screen has asked for the settings, after which every snapshot carries them (a screen
+    /// draws snapshots rather than replies, and the two complaints in the view change by themselves).
+    settings_loaded: bool,
     /// The unfinished folder, the watch folder and the completion program, running beside the engine.
     /// It reports on this task's notice queue, and it is stopped before the engine is: it should not be
     /// asking a session to move files while that session is being saved and closed.
@@ -420,6 +431,11 @@ impl Backend {
             // runs its own engine has no device list to publish: `Devices` answers that with a notice.
             dirs: self.dirs.clone(),
             devices: None,
+            settings: if self.settings_loaded {
+                SettingsState::Loaded(self.settings_view())
+            } else {
+                SettingsState::NotLoaded
+            },
         });
         if next == self.published {
             return;
@@ -456,7 +472,10 @@ impl Backend {
             Command::SetFilePriority { id, file, priority } => {
                 self.set_file_priority(&id, file, priority).await;
             }
-            Command::SetLimits(limits) => self.set_limits(limits).await,
+            Command::SetLimits(limits) => {
+                self.set_limits(limits).await;
+            }
+            Command::Settings(command) => self.settings(command).await,
             // The next publish brings this pane, so the answer is already on its way.
             Command::Watch(target) => self.watching = target,
             // The listing is the answer, and it goes where a picker reads it: see [`Self::list_dirs`].
@@ -538,8 +557,8 @@ impl Backend {
     }
 
     /// Changes the running rates and queue counts, then writes them to `config.yaml` so
-    /// the next run starts under the same limits.
-    async fn set_limits(&mut self, limits: LiveLimits) {
+    /// the next run starts under the same limits. True when the engine took them and the file has them.
+    async fn set_limits(&mut self, limits: LiveLimits) -> bool {
         let session = self.engine.session();
         session.set_rate_limit(RateLimit::new(
             map::rate_bytes(limits.download_kib),
@@ -551,18 +570,93 @@ impl Backend {
         queue.active_limit = limits.active_total;
         // The counts are the engine's own to refuse, so it answers rather than us guessing.
         let outcome = session.set_queue_settings(queue);
+        let taken = outcome.is_ok();
         self.report(outcome);
         self.config.limits = Limits::from(limits);
-        self.save_config().await;
+        let written = self
+            .save_config(move |config| config.limits = Limits::from(limits))
+            .await;
+        taken && written
     }
 
-    /// Writes the config file with these limits, leaving everything else in it alone: it
-    /// is read first, only `limits` changes. The write goes through a blocking thread
-    /// because this task answers commands and should not wait on a disk.
-    async fn save_config(&self) {
+    /// One [`Command::Settings`] answered.
+    async fn settings(&mut self, command: SettingsCommand) {
+        match command {
+            SettingsCommand::Load => self.settings_loaded = true,
+            SettingsCommand::Save(SettingsChange::Speed(limits)) => {
+                // Loaded even when the save failed, so a refusal still leaves the screen a view to draw.
+                self.settings_loaded = true;
+                if self.set_limits(limits).await {
+                    self.notify(Notice::Info(SAVED.to_owned()));
+                }
+            }
+            SettingsCommand::Save(SettingsChange::Downloads(change)) => {
+                self.settings_loaded = true;
+                if self.save_downloads(change).await {
+                    self.notify(Notice::Info(SAVED.to_owned()));
+                }
+            }
+        }
+    }
+
+    /// A downloads section saved: validated, then written, then applied, in that order, so a section the
+    /// file could not take changes nothing in this run. A run driving its own engine serves no folders to
+    /// anybody else, so it is confined to nothing (`roots` is `None`) and may name the program.
+    async fn save_downloads(&mut self, change: DownloadsChange) -> bool {
+        if let Err(problem) = validate_downloads(&change, None) {
+            self.notify(Notice::Error(problem.message().to_owned()));
+            return false;
+        }
+        let default_dir = change.default_dir.clone();
+        let mut downloads = self.config.downloads.clone();
+        downloads.apply(&change);
+        let written = {
+            let default_dir = default_dir.clone();
+            let downloads = downloads.clone();
+            self.save_config(move |config| {
+                config.download_dir = default_dir;
+                config.downloads = downloads;
+            })
+            .await
+        };
+        if !written {
+            return false;
+        }
+        self.config.download_dir = default_dir.clone();
+        self.config.downloads = downloads.clone();
+        self.automation.update(default_dir, downloads);
+        true
+    }
+
+    /// The settings as a screen reads them: the engine's own limits, this run's downloads section and the
+    /// two complaints the automation last filed. The program is editable because the engine runs here.
+    fn settings_view(&self) -> SettingsView {
+        let (watch_problem, on_complete_problem) = self.automation.problems();
+        let downloads = &self.config.downloads;
+        SettingsView {
+            speed: map::limits(self.engine.session()),
+            downloads: DownloadsView {
+                default_dir: self.config.download_dir.clone(),
+                unfinished_dir: downloads.unfinished_dir.clone(),
+                start_paused: downloads.start_paused,
+                watch_dir: downloads.watch_dir.clone(),
+                on_complete: OnCompleteView {
+                    program: downloads.on_complete.clone(),
+                    editable: true,
+                },
+                watch_problem,
+                on_complete_problem,
+            },
+        }
+    }
+
+    /// Writes the config file after `change` has been made to it, leaving everything else in it alone: it
+    /// is read first, only what `change` touches differs. The write goes through a blocking thread
+    /// because this task answers commands and should not wait on a disk. True when the file was written;
+    /// otherwise the reason is already a notice.
+    async fn save_config(&self, change: impl FnOnce(&mut Config) + Send + 'static) -> bool {
         let paths = self.paths.clone();
         let fallback = self.config.clone();
-        let limits = self.config.limits;
         let outcome = tokio::task::spawn_blocking(move || {
             let file = paths.config_file();
             let mut config = match Config::load(&paths) {
@@ -578,16 +672,22 @@ impl Backend {
                 // folder included, already rooted in the library.
                 Ok(ConfigLoad::Missing) | Err(_) => fallback,
             };
-            config.limits = limits;
+            change(&mut config);
             config.save(&file).map_err(|error| error.to_string())
         })
         .await;
         match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(problem)) => self.notify(Notice::Error(map::clean(&problem))),
-            Err(joined) => self.notify(Notice::Error(format!(
-                "the config could not be written: {joined}"
-            ))),
+            Ok(Ok(())) => true,
+            Ok(Err(problem)) => {
+                self.notify(Notice::Error(map::clean(&problem)));
+                false
+            }
+            Err(joined) => {
+                self.notify(Notice::Error(format!(
+                    "the config could not be written: {joined}"
+                )));
+                false
+            }
         }
     }
 
