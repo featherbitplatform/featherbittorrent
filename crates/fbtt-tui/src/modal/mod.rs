@@ -17,14 +17,12 @@ mod devices;
 mod folders;
 mod help;
 mod input;
-mod settings;
 
 pub use add::AddForm;
 pub use connect::{ConnectForm, ConnectRequest, ConnectTarget, SecretInput};
 pub use devices::DevicesForm;
 pub use folders::FolderPicker;
 pub use input::{Input, Masked};
-pub use settings::SettingsForm;
 
 use std::sync::Arc;
 
@@ -60,8 +58,6 @@ pub enum Modal {
         /// Its name, so the question can say which one it means.
         name: String,
     },
-    /// The rates and queue counts the session runs under.
-    Settings(SettingsForm),
     /// Every key and what pressing it does.
     Help,
     /// A name fragment typed along the bottom, which filters the table as it is typed.
@@ -86,11 +82,6 @@ impl Modal {
         Modal::Devices(DevicesForm::new())
     }
 
-    /// The settings dialog, prefilled with the limits this snapshot says are running.
-    pub fn settings(snap: &Snapshot) -> Modal {
-        Modal::Settings(SettingsForm::new(&snap.limits))
-    }
-
     /// The delete question about one torrent row.
     pub fn delete(row: &TorrentRow) -> Modal {
         Modal::Delete {
@@ -106,7 +97,6 @@ impl Modal {
             Modal::Add(form) => form.on_key(key, snap),
             Modal::Connect(form) => form.on_key(key),
             Modal::Devices(form) => form.on_key(key, snap),
-            Modal::Settings(form) => form.on_key(key),
             Modal::Delete { id, .. } => delete::on_key(key, id),
             Modal::Help => help::on_key(key),
             Modal::Filter => filter_on_key(model, key, snap),
@@ -193,7 +183,6 @@ pub(crate) fn draw(
         Some(Modal::Delete { name, .. }) => {
             draw_box(frame, area, "Delete torrent", delete::lines(name))
         }
-        Some(Modal::Settings(form)) => draw_box(frame, area, "Settings", settings::lines(form)),
         Some(Modal::Help) => {
             // The mark the box has room for, when it does: it stands at the top of the box, above
             // the keys, in rows the box leaves for it. A box that would have to grow to hold the

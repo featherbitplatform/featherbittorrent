@@ -14,6 +14,7 @@ use fbtt_core::{Command, DetailTab, Notice, RowState, Snapshot, TorrentId, Torre
 
 use crate::keys;
 use crate::modal::{ConnectRequest, ConnectTarget, Modal};
+use crate::settings::SettingsScreen;
 use fbtt_core::ui_state::RemoteTarget;
 
 /// Which of the two screens is on.
@@ -123,6 +124,8 @@ pub struct Model {
     pub detail_tab: DetailTab,
     /// The dialog over the main view, when one is open.
     pub modal: Option<Modal>,
+    /// The full-screen settings view, when it is open. It replaces the table while it is.
+    pub settings: Option<SettingsScreen>,
     /// Whether the cursor is in the detail pane's file list, which `Enter` puts it in and `Esc`
     /// takes out again. While it is there, `j` and `k` mean files rather than torrents.
     pub files_focused: bool,
@@ -156,6 +159,7 @@ impl Model {
             filter: String::new(),
             detail_tab: DetailTab::Files,
             modal: None,
+            settings: None,
             files_focused: false,
             file_cursor: 0,
             quit: false,
@@ -219,6 +223,14 @@ impl Model {
     /// while somebody has the box open. `now` is a parameter rather than a clock reading so that
     /// a test can say when a notice arrived instead of waiting for one.
     pub fn push_notice(&mut self, notice: Notice, now: Instant) {
+        // The settings screen is waiting on the answer to a save when one is out: a good answer
+        // marks the section saved, a refusal is shown inside the screen, and a save asked for on the
+        // way out finishes leaving.
+        if let Some(screen) = self.settings.as_mut()
+            && screen.on_notice(&notice)
+        {
+            self.settings = None;
+        }
         match self.modal.take() {
             // This dialog asked the question this notice answers.
             Some(Modal::Add(mut form)) if form.awaiting_answer => match &notice {
@@ -278,6 +290,10 @@ impl Model {
     /// cursor was put into one torrent's list, and once the pane describes another torrent the
     /// list it points into is not on the screen any more.
     pub fn sync_selection(&mut self, snap: &Snapshot) {
+        // A new snapshot may carry settings the open screen was waiting for.
+        if let Some(screen) = self.settings.as_mut() {
+            screen.sync(snap);
+        }
         let rows = visible_rows(self, snap);
         if let Some(at) = self.selected_index(&rows) {
             self.index_hint = at;

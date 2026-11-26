@@ -25,6 +25,7 @@ mod detail;
 mod footer;
 mod header;
 mod minimal;
+pub(crate) mod settings;
 mod table;
 
 /// The header's lines when there is room for them: the title and version, the connection,
@@ -91,6 +92,13 @@ pub fn draw_with(
     // The canvas goes down first. A terminal with a light default background would show
     // through every cell the widgets leave empty otherwise.
     frame.render_widget(Fill::new(" ").bg(theme::INK_950), area);
+
+    // The settings view replaces the table, the header and the footer while it is open. It has no
+    // marks, and no dialog is open over it.
+    if let Some(screen) = &model.settings {
+        settings::draw(frame, area, model, screen);
+        return Vec::new();
+    }
 
     // The marks, when the screen has any to place. They are applied last, after the dialog:
     // a mark the open dialog covers is dropped rather than drawn under it, and the ones that
