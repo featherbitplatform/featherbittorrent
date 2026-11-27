@@ -22,7 +22,7 @@ use fbtt_desktop_core::DesktopPaths;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use fbtt_server::ProxyPasswordStore;
+use fbtt_server::KeychainWorker;
 
 use crate::commands::DesktopState;
 use crate::keychain::ProxyKeychain;
@@ -84,7 +84,7 @@ pub struct ServingView {
 pub struct Serving {
     paths: DesktopPaths,
     settings: SettingsStore,
-    proxy_password: Arc<ProxyKeychain>,
+    proxy_password: Arc<KeychainWorker>,
     /// The line from a first start that could not serve, until an apply succeeds.
     problem: Arc<Mutex<Option<String>>>,
 }
@@ -109,7 +109,9 @@ impl Serving {
         Serving {
             paths,
             settings,
-            proxy_password: Arc::new(proxy_password),
+            // One worker for every start this run makes: a keychain call that lands late lands before
+            // anything a later start hands in.
+            proxy_password: KeychainWorker::new(Arc::new(proxy_password)),
             problem: Arc::new(Mutex::new(None)),
         }
     }
@@ -162,7 +164,7 @@ impl Serving {
     }
 
     /// The keychain This computer's proxy password is kept in, as the engine is handed it.
-    fn keychain(&self) -> Arc<dyn ProxyPasswordStore> {
+    fn keychain(&self) -> Arc<KeychainWorker> {
         self.proxy_password.clone()
     }
 

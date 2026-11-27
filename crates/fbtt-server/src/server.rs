@@ -103,7 +103,10 @@ pub struct DesktopAccess {
     /// view says `keychain`. With one that is not, the password stays in `config.yaml` as for the CLI and
     /// the view says `unavailable`. `None` is a server with no keychain at all (the view says
     /// `config_file`).
-    pub proxy_password: Option<Arc<dyn ProxyPasswordStore>>,
+    ///
+    /// Every call goes through one [`KeychainWorker`](crate::KeychainWorker), in order, the app's own
+    /// start included, so a call that runs late never lands after one handed in behind it.
+    pub proxy_password: Option<Arc<crate::KeychainWorker>>,
 }
 
 impl std::fmt::Debug for DesktopAccess {
@@ -322,10 +325,13 @@ impl Server {
         {
             // A keychain that does not answer in time is no password at hand, not a start that waits.
             if store.available() {
-                setting.password = routes::Shared::keychain_call(store, |store| store.get())
-                    .await
-                    .ok()
-                    .flatten();
+                setting.password = match store.get().await {
+                    Ok(password) => password,
+                    Err(problem) => {
+                        tracing::warn!("{}", problem.message());
+                        None
+                    }
+                };
             }
             if setting.validate().is_err() && setting.validate_password_elsewhere().is_ok() {
                 tracing::warn!(

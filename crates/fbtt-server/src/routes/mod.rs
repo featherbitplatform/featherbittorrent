@@ -63,13 +63,6 @@ fn load_for_edit(path: &std::path::Path, keychained: bool) -> Result<Option<Conf
     }
 }
 
-/// How long a keychain call may take before it counts as no answer: the desktop app's own deadline for the
-/// session bus (`SESSION_BUS_DEADLINE` in its `deadline` module), which this crate cannot reach.
-pub(crate) const KEYCHAIN_DEADLINE: Duration = Duration::from_secs(2);
-
-/// What a keychain call that ran past [`KEYCHAIN_DEADLINE`] answers.
-pub(crate) const KEYCHAIN_TIMED_OUT: &str = "the keychain did not answer in time";
-
 pub(crate) fn clean(text: &str) -> String {
     fbt::display_safe(text, fbt::MAX_DISPLAY_CHARS)
 }
@@ -147,7 +140,7 @@ pub(crate) struct Shared {
     base_settings: fbt::Settings,
     /// Where the proxy password is kept instead of `config.yaml`, on the desktop app's engine
     /// ([`crate::DesktopAccess::proxy_password`]); `None` on any other server. Not in a `Debug` printing.
-    proxy_password: Option<Arc<dyn crate::ProxyPasswordStore>>,
+    proxy_password: Option<Arc<crate::KeychainWorker>>,
     /// The unfinished folder, the watch folder and the completion program this server runs beside the
     /// engine it serves. The settings routes read its two complaints - what went wrong with the watch
     /// folder last time it was read, and with the program last time it was run - so a browser sees them
@@ -219,7 +212,7 @@ impl Shared {
         session: fbt::Session,
         base_settings: fbt::Settings,
         launch: Option<(String, bool)>,
-        proxy_password: Option<Arc<dyn crate::ProxyPasswordStore>>,
+        proxy_password: Option<Arc<crate::KeychainWorker>>,
         automation: fbtt_core::downloads::AutomationHandle,
     ) -> Self {
         // The login stores are built from the server section; a config with none is the defaults, which is
@@ -280,41 +273,10 @@ impl Shared {
     /// The keychain the proxy password is kept in, when this is the desktop app's engine on a system that
     /// has one: the proxy route writes the password there and the view says `keychain`. `None` when the
     /// password lives in `config.yaml` ([`proxy_password_storage`](Self::proxy_password_storage)).
-    pub(crate) fn proxy_keychain(&self) -> Option<&Arc<dyn crate::ProxyPasswordStore>> {
+    pub(crate) fn proxy_keychain(&self) -> Option<&Arc<crate::KeychainWorker>> {
         self.proxy_password
             .as_ref()
             .filter(|store| store.available())
-    }
-
-    /// Runs `call` on the keychain on a thread of its own and waits at most [`KEYCHAIN_DEADLINE`] for it,
-    /// as the desktop app waits for the session bus: a Secret Service that hangs, or a collection waiting
-    /// on an unlock prompt, must not hold a request (or the engine's start) for as long as it takes. A call
-    /// that has not answered by then, or that panicked, is a failure with a plain line to show; its thread
-    /// is left to finish (or not) on its own.
-    pub(crate) async fn keychain_call<T: Send + 'static>(
-        store: &Arc<dyn crate::ProxyPasswordStore>,
-        call: impl FnOnce(&dyn crate::ProxyPasswordStore) -> T + Send + 'static,
-    ) -> Result<T, String> {
-        let store = Arc::clone(store);
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("keychain".to_string())
-            .spawn(move || {
-                // The receiver may be gone by now: the deadline passed, and nobody wants the answer.
-                let _ = answer.send(call(store.as_ref()));
-            })
-            .map_err(|problem| {
-                tracing::warn!(problem = %problem, "the keychain thread did not start");
-                "the keychain could not be asked".to_string()
-            })?;
-        match tokio::time::timeout(KEYCHAIN_DEADLINE, answered).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err("the keychain could not be asked".to_string()),
-            Err(_) => {
-                tracing::warn!("the keychain did not answer in time");
-                Err(KEYCHAIN_TIMED_OUT.to_string())
-            }
-        }
     }
 
     /// Where this run keeps the proxy password: the keychain, `config.yaml` because the desktop app's

@@ -340,8 +340,14 @@ the keychain is back (the next start finds the password again) or you type the p
 The app never waits on a keychain that does not answer (a Secret Service that hangs, or a collection
 waiting on an unlock prompt) for more than two seconds. At the start, a keychain that has not answered by then
 counts as no password at hand: a password still in `config.yaml` stays there, and otherwise This computer
-starts on the proxy with no login, as above. Saving the Proxy section with such a keychain answers that the
-keychain did not answer in time, and nothing changes.
+starts on the proxy with no login, as above. Saving the Proxy section with such a keychain answers `The
+system keychain did not answer in time, so the saved proxy password may still change.`
+
+A call the keychain answers late still lands, so the app hands every call for the proxy password to one
+worker that runs them in order, the start and the Proxy section alike: a password put back after a failed save
+always lands after the write it undoes. While that worker still has a call from an earlier save, a new save is
+refused before anything is written, with `The system keychain is still busy with the last change. Try again
+in a moment.`, and the Proxy section shows whether a password was saved as the keychain last said.
 
 If the engine cannot switch to a new proxy, `config.yaml` goes back first, and the previous password goes
 back into the keychain only once the file names the previous proxy again. If the file cannot be put back, the

@@ -54,8 +54,8 @@ use fbtt_core::{
 };
 
 use super::{RouteError, Shared, clean};
-use crate::ProxyPasswordStore;
 use crate::auth::locked;
+use crate::{KEYCHAIN_BUSY, KEYCHAIN_TIMED_OUT, KeychainCallError, KeychainWorker};
 
 /// How large a settings body may be, in bytes. The two bodies are a handful of numbers and three paths, so
 /// this is far more room than they need and far less than fbt-api's 32 MiB for a `.torrent`.
@@ -213,12 +213,23 @@ pub(super) async fn put_proxy(
                         problem.message(),
                     )
                 };
+                // A keychain still working on an earlier request's call is not asked again: a save now
+                // would queue behind a call nobody knows the outcome of. Refused before anything is
+                // written.
+                if keychain.as_ref().is_some_and(|store| store.busy()) {
+                    return Err(RouteError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "keychain_busy",
+                        KEYCHAIN_BUSY,
+                    ));
+                }
                 // With a keychain, the stored password is the keychain's (or one the file still holds,
                 // which the app's start could not move): `keep` keeps that one, under B3's same rules.
                 let held = match &keychain {
-                    Some(store) => Shared::keychain_call(store, |store| store.get())
+                    Some(store) => store
+                        .get()
                         .await
-                        .map_err(|problem| keychain_error(&problem))?,
+                        .map_err(|problem| keychain_error(&problem.message()))?,
                     None => None,
                 };
                 let mut stored = config.proxy.clone();
@@ -241,14 +252,14 @@ pub(super) async fn put_proxy(
                     };
                 let mut now = held.clone();
                 if moving && let Some(store) = &keychain {
-                    let cleared = Shared::keychain_call(store, |store| store.clear())
-                        .await
-                        .and_then(|cleared| cleared);
-                    if let Err(problem) = cleared {
-                        let problem = clean(&problem);
-                        tracing::warn!(problem = %problem, "the old proxy password could not be removed");
-                        // Nothing is written yet: the file, the keychain and the engine are as they were.
-                        return Err(not_saved(password_not_saved(&problem)));
+                    if let Err(problem) = store.put(None).await {
+                        // Nothing is written yet: the file and the engine are as they were, and so is the
+                        // keychain unless the call is still to land (which the answer then says).
+                        tracing::warn!(problem = %clean(&problem.message()), "the old proxy password could not be removed");
+                        return Err(not_saved(match problem {
+                            KeychainCallError::TimedOut => KEYCHAIN_TIMED_OUT.to_string(),
+                            other => password_not_saved(&clean(&other.message())),
+                        }));
                     }
                     now = None;
                 }
@@ -283,29 +294,24 @@ pub(super) async fn put_proxy(
                 // take the password leaves the engine on the setting it has, and the file goes back.
                 if let Some(store) = &keychain
                     && wanted != keychain_now
+                    && let Err(problem) = store.put(wanted.as_deref()).await
                 {
-                    let writing = wanted.clone();
-                    let written = Shared::keychain_call(store, move |store| match &writing {
-                        Some(password) => store.set(password),
-                        None => store.clear(),
-                    })
-                    .await
-                    .and_then(|written| written);
-                    if let Err(problem) = written {
-                        let problem = clean(&problem);
+                        let timed_out = problem == KeychainCallError::TimedOut;
+                        let problem = clean(&problem.message());
                         tracing::warn!(problem = %problem, "the proxy password could not be saved");
                         // The file first, and the previous password back only once the file names
-                        // the previous address again (`roll_back`).
-                        let rollback = roll_back(
-                            &applying,
-                            &previous,
-                            Some(store),
-                            keychain_now.as_ref() != keychain_before.as_ref(),
-                            keychain_before,
-                        )
-                        .await;
-                        return Err(not_saved(keychain_refused(&problem, &rollback)));
-                    }
+                        // the previous address again (`roll_back`). A write that timed out may still
+                        // land, so the previous password is queued behind it whatever the keychain
+                        // held when this save began.
+                        let changed = timed_out || keychain_now != keychain_before;
+                        let rollback =
+                            roll_back(&applying, &previous, Some(store), changed, keychain_before)
+                                .await;
+                        return Err(not_saved(if timed_out {
+                            KEYCHAIN_TIMED_OUT.to_string()
+                        } else {
+                            keychain_refused(&problem, &rollback)
+                        }));
                 }
                 // The setting just resolved, applied over the settings this run started on: the
                 // change step ran under the same lock, so it is always the latest.
@@ -332,7 +338,13 @@ pub(super) async fn put_proxy(
                     keychain_before,
                 )
                 .await;
-                let message = engine_refused(&problem, &rollback);
+                // A keychain that did not answer in time is said exactly so: the call is still queued
+                // and lands after everything before it.
+                let message = if rollback.timed_out {
+                    KEYCHAIN_TIMED_OUT.to_string()
+                } else {
+                    engine_refused(&problem, &rollback)
+                };
                 Err(RouteError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "proxy_not_applied",
@@ -371,6 +383,8 @@ struct Rollback {
     /// The file could not go back, so the previous password was left out of the keychain, which now holds
     /// none: putting it back beside a file that names the new address would hand it to the new host.
     keychain_left_empty: bool,
+    /// The keychain did not answer the restore in time; it is queued and lands after every earlier call.
+    timed_out: bool,
 }
 
 /// Puts a failed proxy save back: `config.yaml` first, then (only once the file names the previous
@@ -379,7 +393,7 @@ struct Rollback {
 async fn roll_back(
     shared: &Shared,
     previous: &Mutex<Previous>,
-    store: Option<&Arc<dyn ProxyPasswordStore>>,
+    store: Option<&Arc<KeychainWorker>>,
     changed: bool,
     password: Option<String>,
 ) -> Rollback {
@@ -390,23 +404,25 @@ async fn roll_back(
     {
         return Rollback {
             file: Some(problem),
-            keychain: None,
             keychain_left_empty: store.is_some() && changed && password.is_some(),
+            ..Rollback::default()
         };
     }
     let Some(store) = store.filter(|_| changed) else {
         return Rollback::default();
     };
-    let restored = Shared::keychain_call(store, move |store| match &password {
-        Some(password) => store.set(password),
-        None => store.clear(),
-    })
-    .await
-    .and_then(|restored| restored);
-    match restored {
+    match store.put(password.as_deref()).await {
         Ok(()) => Rollback::default(),
+        Err(KeychainCallError::TimedOut) => {
+            tracing::warn!("{KEYCHAIN_TIMED_OUT}");
+            Rollback {
+                keychain: Some(KEYCHAIN_TIMED_OUT.to_string()),
+                timed_out: true,
+                ..Rollback::default()
+            }
+        }
         Err(problem) => {
-            let problem = clean(&problem);
+            let problem = clean(&problem.message());
             tracing::warn!(problem = %problem, "the previous proxy password could not be put back");
             Rollback {
                 keychain: Some(problem),
@@ -549,16 +565,21 @@ async fn proxy_view(shared: &Shared, config: &Config) -> Result<ProxyView, Route
         && !view.password_saved
         && let Some(store) = shared.proxy_keychain()
     {
-        view.password_saved = Shared::keychain_call(store, |store| {
-            store.get().is_some_and(|password| !password.is_empty())
-        })
-        .await
-        .map_err(|problem| keychain_error(&problem))?;
+        // Never waits past the deadline, and never queues behind a call that is still running: while the
+        // keychain is busy, or when it does not answer, the view says what the last answer said.
+        view.password_saved = if store.busy() {
+            store.last_known_saved()
+        } else {
+            match store.get().await {
+                Ok(password) => password.is_some(),
+                Err(_) => store.last_known_saved(),
+            }
+        };
     }
     Ok(view)
 }
 
-/// A keychain the blocking pool could not ask: `500` with the line to show.
+/// A keychain that could not be asked, or did not answer in time: `500` with the line to show.
 fn keychain_error(problem: &str) -> RouteError {
     RouteError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -664,8 +685,8 @@ mod tests {
             "locked",
             &Rollback {
                 file: Some("disk full".to_string()),
-                keychain: None,
                 keychain_left_empty: true,
+                ..Rollback::default()
             },
         );
         assert_eq!(
@@ -700,8 +721,8 @@ mod tests {
             "port taken",
             &Rollback {
                 file: Some("disk full".to_string()),
-                keychain: None,
                 keychain_left_empty: true,
+                ..Rollback::default()
             },
         );
         assert!(

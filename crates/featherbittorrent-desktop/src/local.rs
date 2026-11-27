@@ -15,7 +15,7 @@ use std::sync::Arc;
 use fbtt_core::config::ConfigError;
 use fbtt_core::{Config, ConfigLoad, LibraryLock, LockError, Paths, ServerConfig};
 use fbtt_desktop_core::{DesktopPaths, launch_secret};
-use fbtt_server::{DesktopAccess, ProxyPasswordStore, Server};
+use fbtt_server::{DesktopAccess, KeychainCallError, KeychainWorker, Server};
 
 /// What the app says, and the whole of what it says, when its library is already held by another run.
 pub const ALREADY_RUNNING: &str = "featherbittorrent is already running.";
@@ -99,7 +99,7 @@ impl std::fmt::Debug for ThisComputer {
 pub(crate) async fn start_with(
     paths: &DesktopPaths,
     serve: bool,
-    proxy_password: Arc<dyn ProxyPasswordStore>,
+    proxy_password: Arc<KeychainWorker>,
     settings: impl FnOnce(&Config) -> fbt::Settings,
 ) -> Result<ThisComputer, String> {
     let library = paths.library();
@@ -114,8 +114,9 @@ pub(crate) async fn start_with(
         }
     };
     let config = library_config(&library)?;
-    // The keychain and the file are asked off the runtime's threads, and the keychain under a deadline
-    // (`keychain_answer`): a Secret Service that hangs must not leave the window with nothing in it.
+    // The keychain and the file are asked off the runtime's threads, and the keychain through its one
+    // worker under its deadline: a Secret Service that hangs must not leave the window with nothing in it,
+    // and a call that lands late still lands in order.
     let store = Arc::clone(&proxy_password);
     let paths_for = library.clone();
     let (config, engine) = tokio::task::spawn_blocking(move || {
@@ -130,8 +131,13 @@ pub(crate) async fn start_with(
             && proxy.password.as_deref().is_none_or(str::is_empty)
             && store.available()
         {
-            let asking = Arc::clone(&store);
-            proxy.password = keychain_answer(move || asking.get()).flatten();
+            proxy.password = match store.get_blocking() {
+                Ok(password) => password,
+                Err(problem) => {
+                    eprintln!("{}", problem.message());
+                    None
+                }
+            };
         }
         (config, engine)
     })
@@ -191,11 +197,7 @@ fn library_config(paths: &Paths) -> Result<Config, String> {
 ///
 /// A keychain that does not answer within its deadline counts as one that would not take it: the file is
 /// kept as it is.
-fn move_password_to_keychain(
-    config: &mut Config,
-    paths: &Paths,
-    store: &Arc<dyn ProxyPasswordStore>,
-) {
+fn move_password_to_keychain(config: &mut Config, paths: &Paths, store: &KeychainWorker) {
     let Some(password) = config
         .proxy
         .as_ref()
@@ -207,16 +209,16 @@ fn move_password_to_keychain(
     if !store.available() {
         return;
     }
-    let setting = Arc::clone(store);
-    match keychain_answer(move || setting.set(&password)) {
-        Some(Ok(())) => {}
-        Some(Err(problem)) => {
-            eprintln!("The proxy password stays in config.yaml: {problem}");
+    match store.set_blocking(&password) {
+        Ok(()) => {}
+        Err(KeychainCallError::TimedOut) => {
+            eprintln!("{}", KeychainCallError::TimedOut.message());
             return;
         }
-        None => {
+        Err(problem) => {
             eprintln!(
-                "The keychain did not answer in time; the proxy password stays in config.yaml."
+                "The proxy password stays in config.yaml: {}",
+                problem.message()
             );
             return;
         }
@@ -242,12 +244,6 @@ fn move_password_to_keychain(
             "The proxy password is in the keychain, but config.yaml still holds it: {problem}"
         ),
     }
-}
-
-/// What `call` on the keychain answers within the session bus deadline, or `None` when it does not answer
-/// in time ([`crate::deadline::answer_within`]).
-fn keychain_answer<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    crate::deadline::answer_within(crate::deadline::SESSION_BUS_DEADLINE, call)
 }
 
 /// `config` as the engine runs it: a library whose file names no `server:` section (the desktop's default)
@@ -312,7 +308,7 @@ pub(crate) mod tests {
     use fbtt_core::scratch::ScratchDir;
     use fbtt_core::{Config, ProxySetting, ProxyType};
     use fbtt_desktop_core::DesktopPaths;
-    use fbtt_server::ProxyPasswordStore;
+    use fbtt_server::{KeychainWorker, ProxyPasswordStore};
     use reqwest::StatusCode;
 
     use super::{ALREADY_RUNNING, ThisComputer, paths_problem, start_with};
@@ -353,7 +349,11 @@ pub(crate) mod tests {
 
     /// This computer on `paths`, kept off the network.
     pub(crate) async fn start_offline(paths: &DesktopPaths) -> Result<ThisComputer, String> {
-        start_keychained(paths, memory_store()).await
+        start_keychained(
+            paths,
+            Arc::new(ProxyKeychain::new(Arc::new(MemoryKeychain::new()))),
+        )
+        .await
     }
 
     /// This computer on `paths`, kept off the network, with its proxy password in `store`.
@@ -361,14 +361,19 @@ pub(crate) mod tests {
         paths: &DesktopPaths,
         store: Arc<dyn ProxyPasswordStore>,
     ) -> Result<ThisComputer, String> {
-        tokio::time::timeout(DEADLINE, start_with(paths, false, store, offline))
-            .await
-            .expect("This computer started within the deadline")
+        tokio::time::timeout(
+            DEADLINE,
+            start_with(paths, false, KeychainWorker::new(store), offline),
+        )
+        .await
+        .expect("This computer started within the deadline")
     }
 
     /// A proxy password store over an empty keychain in memory.
-    pub(crate) fn memory_store() -> Arc<dyn ProxyPasswordStore> {
-        Arc::new(ProxyKeychain::new(Arc::new(MemoryKeychain::new())))
+    pub(crate) fn memory_store() -> Arc<KeychainWorker> {
+        KeychainWorker::new(Arc::new(ProxyKeychain::new(
+            Arc::new(MemoryKeychain::new()),
+        )))
     }
 
     /// The proxy password the tests below store. A test value, not anybody's credential.
@@ -455,13 +460,18 @@ pub(crate) mod tests {
         let seeing = Arc::clone(&seen);
         let this = tokio::time::timeout(
             DEADLINE,
-            start_with(&paths, false, store, move |config: &Config| {
-                *seeing.lock().expect("the lock") = config
-                    .proxy
-                    .as_ref()
-                    .and_then(|proxy| proxy.password.clone());
-                offline(config)
-            }),
+            start_with(
+                &paths,
+                false,
+                KeychainWorker::new(store),
+                move |config: &Config| {
+                    *seeing.lock().expect("the lock") = config
+                        .proxy
+                        .as_ref()
+                        .and_then(|proxy| proxy.password.clone());
+                    offline(config)
+                },
+            ),
         )
         .await
         .expect("within the deadline")
