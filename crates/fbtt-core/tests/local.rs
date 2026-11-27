@@ -944,7 +944,25 @@ async fn played_file_downloads_its_pieces_in_order() {
     wait_until_seeding(&seed).await;
     let seed_addr = seed.local_addr();
 
-    let (mut client, task, engine) = lib.start().await;
+    // One piece's worth of block requests in flight to the one peer, and no more. The order the engine
+    // reports pieces *finished* in is the order their requests were answered and then hashed, and the
+    // engine hashes on a pool of threads: with the default of hundreds of requests in flight, all 16
+    // pieces are asked for at once and a loaded machine finishes them in any order (a run under load saw
+    // 17 first, another 27 before 25). With a single piece in flight the next piece is only asked for
+    // after the previous one's blocks have arrived, so what the test reads - the first piece to finish,
+    // and a bounded inversion - is a fact about the order the picker chose, not about thread scheduling.
+    let mut settings = loopback(&lib.config);
+    settings.max_outstanding_requests =
+        usize::try_from(PIECE64 / (16 * 1024)).expect("a small count");
+    let lock = fbtt_core::LibraryLock::acquire(&lib.paths.lock_file()).expect("lock the library");
+    let (mut client, task, engine, _automation) = within(fbtt_core::LocalBackend::start_for_test(
+        settings,
+        lib.config.clone(),
+        &lib.paths,
+        lock,
+    ))
+    .await
+    .expect("start the backend");
     assert!(
         client.send(Command::Add {
             source: AddSource::File(bytes),
