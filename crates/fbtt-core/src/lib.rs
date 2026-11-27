@@ -49,8 +49,9 @@ pub use proxy::{
 };
 pub use remote::{RemoteBackend, Secret};
 pub use settings::{
-    DownloadsChange, DownloadsView, OnCompleteSet, OnCompleteView, PasswordChange, PasswordStorage,
-    ProxyChange, ProxyView, SettingsProblem, SettingsView, validate_downloads,
+    DownloadsChange, DownloadsView, OnCompleteSet, OnCompleteView, PROXY_PASSWORD_IN_CONFIG,
+    PasswordChange, PasswordStorage, ProxyChange, ProxyView, SettingsProblem, SettingsView,
+    validate_downloads,
 };
 pub use ui_state::{LastUsed, LoginMethod, RemoteTarget, UiState};
 

@@ -79,6 +79,8 @@ zbus.workspace = true
 [dev-dependencies]
 # `fbtt_core::scratch`: each test runs This computer on a library of its own.
 fbtt-core = { workspace = true, features = ["test-support"] }
+# `Server::network_settings`: the tests read the engine's proxy, its password and its switches.
+fbtt-server = { workspace = true, features = ["web-ui", "test-support"] }
 # The tests' runtime, the deadline every wait is under, and the raw loopback socket of the stand-in server
 # that answers a sign-in with a body over the cap.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }

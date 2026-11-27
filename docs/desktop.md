@@ -309,6 +309,54 @@ the app says so beside the option instead of offering it: `This system has no ke
 saved.` It asks for the password at every connect. It never falls back to a plain file, because a plain file
 is where a password is read by whoever can read the file.
 
+### This computer's proxy password
+
+The proxy password of This computer's own engine goes into the same keychain, under the account
+`proxy:this-computer`, and This computer's `config.yaml` keeps the rest of the proxy (type, host, port and user
+name) without it. A password already in `config.yaml`, written by hand or by a run on a system with no
+keychain, is moved into the keychain the next time the app starts, and taken out of the file in the same
+start. If the keychain will not take it, the file is left as it is and the engine uses the password from the
+file; the app tries again at the next start.
+
+Saving the Proxy section writes the password to the keychain and never to the file. The password is never
+shown again: the field says `saved`, and you can replace it or clear it. If the keychain will not save it, or
+will not let the old one go, nothing changes: not the file, not the keychain, not the engine. If the engine
+cannot switch to the new proxy, the previous proxy goes back into `config.yaml` and the previous password back
+into the keychain.
+
+Where the system has no keychain, the proxy password is kept in `config.yaml` as the terminal client keeps it,
+and the Proxy section says so: `This system has no keychain, so the proxy password is kept in config.yaml.`
+Unlike an instance password, the proxy password has to be stored somewhere, or the app could not log in to the
+proxy at its next start. If the keychain loses the password (an entry removed by hand), This computer still
+starts on the proxy, with no login: the proxy refuses it, and typing the password again in the Proxy section
+fixes it. It never connects directly.
+
+The same happens when the keychain is out of reach for one run after the password has moved into it, for
+example a Linux session whose Secret Service does not answer in time when the app starts. This computer starts
+on the proxy with no login, the Proxy section shows no saved password, and the proxy refuses the login until
+the keychain is back (the next start finds the password again) or you type the password, which then goes into
+`config.yaml` for as long as the keychain is out of reach.
+
+The app never waits on a keychain that does not answer (a Secret Service that hangs, or a collection
+waiting on an unlock prompt) for more than two seconds. At the start, a keychain that has not answered by then
+counts as no password at hand: a password still in `config.yaml` stays there, and otherwise This computer
+starts on the proxy with no login, as above. Saving the Proxy section with such a keychain answers `The
+system keychain did not answer in time, so the saved proxy password may still change.`
+
+A call the keychain answers late still lands, so the app hands every call for the proxy password to one
+worker that runs them in order, the start and the Proxy section alike: a password put back after a failed save
+always lands after the write it undoes. While that worker still has a call from an earlier save, a new save is
+refused before anything is written, with `The system keychain is still busy with the last change. Try again
+in a moment.`, and the Proxy section shows whether a password was saved as the keychain last said.
+
+If the engine cannot switch to a new proxy, `config.yaml` goes back first, and the previous password goes
+back into the keychain only once the file names the previous proxy again. If the file cannot be put back, the
+previous password is not put back either, the message says so, and you type it again in the Proxy section.
+
+When you change the proxy's host or port, the old password leaves the keychain before `config.yaml` names the
+new address, and the new password goes in after. An app that stops between the two writes can leave no
+password, which shows as a refused login, but never sends the old address's password to the new one.
+
 ## The window
 
 The app draws its own top bar: the instance switcher, the web UI's own header actions, and on Windows and

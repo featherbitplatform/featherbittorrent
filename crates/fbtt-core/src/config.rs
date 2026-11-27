@@ -590,8 +590,25 @@ impl Config {
     /// That is an address leak, and no default is the right answer to it. A file
     /// with no `proxy:` line keeps the behaviour above, `.bad` rename included.
     pub fn load(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
+        Self::load_checked(paths, PasswordPlace::ConfigFile)
+    }
+
+    /// [`load`](Self::load) for the desktop app's own library on a system with a keychain, where the
+    /// proxy password is kept in the keychain and `config.yaml` holds the rest of the login: a SOCKS5
+    /// user name with no password beside it is the password kept elsewhere, not half a login
+    /// ([`ProxySetting::validate_password_elsewhere`]). Everything else is refused exactly as `load`
+    /// refuses it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`load`](Self::load).
+    pub fn load_keychained(paths: &Paths) -> Result<ConfigLoad, ConfigError> {
+        Self::load_checked(paths, PasswordPlace::Keychain)
+    }
+
+    fn load_checked(paths: &Paths, place: PasswordPlace) -> Result<ConfigLoad, ConfigError> {
         let path = paths.config_file();
-        match read_and_parse(&path)? {
+        match read_and_parse(&path, place)? {
             Reading::Absent => Ok(ConfigLoad::Missing),
             Reading::Parsed(config) => Ok(ConfigLoad::Loaded(*config)),
             Reading::PlayerProblem(config, problem) => {
@@ -642,7 +659,22 @@ impl Config {
     /// [`load`](Self::load) refuses with: an editor must never rewrite a file whose proxy it did not
     /// understand, because the write would drop the line and leave a config that connects directly.
     pub fn load_for_edit(path: &Path) -> Result<Option<Config>, String> {
-        match read_and_parse(path) {
+        Self::load_for_edit_checked(path, PasswordPlace::ConfigFile)
+    }
+
+    /// [`load_for_edit`](Self::load_for_edit) for the desktop app's own library on a system with a
+    /// keychain: a SOCKS5 user name with no password beside it is the password kept in the keychain, as
+    /// [`load_keychained`](Self::load_keychained) reads it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`load_for_edit`](Self::load_for_edit).
+    pub fn load_for_edit_keychained(path: &Path) -> Result<Option<Config>, String> {
+        Self::load_for_edit_checked(path, PasswordPlace::Keychain)
+    }
+
+    fn load_for_edit_checked(path: &Path, place: PasswordPlace) -> Result<Option<Config>, String> {
+        match read_and_parse(path, place) {
             Ok(Reading::Absent) => Ok(None),
             Ok(Reading::Parsed(config)) => Ok(Some(*config)),
             // The file read as this config; the player's setting is not what a run may act on, but a
@@ -798,6 +830,13 @@ enum Reading {
     },
 }
 
+/// Where the proxy password of the file being read is kept: in it, or in the desktop app's keychain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordPlace {
+    ConfigFile,
+    Keychain,
+}
+
 /// Reads `path` and parses it: [`Reading::Absent`] for no file, [`Reading::Unparsable`] for bytes that
 /// are not this config, and [`ConfigError`] only for a file that cannot be opened at all (no permission,
 /// a directory in the way), where there is no way to tell "empty" from "unavailable". A file that reads
@@ -808,7 +847,7 @@ enum Reading {
 /// connect directly is more important than a per-torrent one that is merely unusable. This is the one
 /// place a config file is read; [`Config::load`] and [`Config::load_for_edit`] differ in what they do
 /// with an unreadable file, not in how they find out about it.
-fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
+fn read_and_parse(path: &Path, place: PasswordPlace) -> Result<Reading, ConfigError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Reading::Absent),
@@ -846,7 +885,10 @@ fn read_and_parse(path: &Path) -> Result<Reading, ConfigError> {
     // A `proxy:` section this run may not use stops it here, before the player's setting is looked at:
     // everything a bypass could leak is a larger fact than a player line a person mistyped.
     if let Some(proxy) = &config.proxy
-        && let Err(problem) = proxy.validate()
+        && let Err(problem) = match place {
+            PasswordPlace::ConfigFile => proxy.validate(),
+            PasswordPlace::Keychain => proxy.validate_password_elsewhere(),
+        }
     {
         return Ok(Reading::ProxyProblem(problem));
     }
@@ -1374,6 +1416,42 @@ mod tests {
     /// A caller that is about to *edit* the file gets the unreadable one as an error with the bytes left
     /// where they are: nothing is renamed and nothing is written, so a failed request cannot move the
     /// person's own config out from under them, and it has no defaults to overwrite it with either.
+    /// A SOCKS5 login whose password is in the desktop app's keychain reads as a config there, and only
+    /// there: the CLI's loaders still refuse the half login.
+    #[test]
+    fn a_keychained_library_reads_a_login_without_its_password() {
+        let dir = ScratchDir::new("config_keychained");
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        let path = paths.config_file();
+        fs::create_dir_all(path.parent().expect("a directory")).expect("make it");
+        fs::write(
+            &path,
+            "proxy:\n  type: socks5\n  host: 127.0.0.1\n  port: 1080\n  username: bob\n",
+        )
+        .expect("write a config");
+
+        let edit = Config::load_for_edit_keychained(&path)
+            .expect("the password is in the keychain")
+            .expect("the file is there");
+        assert_eq!(
+            edit.proxy.expect("a proxy").username.as_deref(),
+            Some("bob")
+        );
+        assert!(matches!(
+            Config::load_keychained(&paths),
+            Ok(ConfigLoad::Loaded(_))
+        ));
+        assert_eq!(
+            Config::load_for_edit(&path).err().as_deref(),
+            Some("A SOCKS5 login needs both a user name and a password.")
+        );
+        assert!(matches!(Config::load(&paths), Err(ConfigError::Proxy(_))));
+        assert!(path.exists(), "nothing was set aside");
+    }
+
     #[test]
     fn load_for_edit_does_not_touch_the_file() {
         let dir = ScratchDir::new("config_load_for_edit");

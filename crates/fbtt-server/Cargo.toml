@@ -117,3 +117,9 @@ required-features = ["test-support"]
 [[test]]
 name = "settings"
 required-features = ["test-support"]
+
+# The desktop access mode, and the proxy password in the desktop app's keychain: the keychain tests read the
+# engine's proxy and take its port away through `test-support`.
+[[test]]
+name = "desktop_access"
+required-features = ["test-support"]

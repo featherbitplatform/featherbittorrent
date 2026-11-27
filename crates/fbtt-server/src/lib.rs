@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod keychain;
 mod media_io;
 mod routes;
 mod server;
@@ -20,4 +21,7 @@ mod server;
 mod web;
 
 pub use auth::{Clock, FbttAuth, LOGIN_NAMESPACE};
-pub use server::{DesktopAccess, MIN_LAUNCH_SECRET_CHARS, Server, ServerError};
+pub use keychain::{
+    KEYCHAIN_BUSY, KEYCHAIN_DEADLINE, KEYCHAIN_TIMED_OUT, KeychainCallError, KeychainWorker,
+};
+pub use server::{DesktopAccess, MIN_LAUNCH_SECRET_CHARS, ProxyPasswordStore, Server, ServerError};

@@ -11,9 +11,13 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use fbtt_server::ProxyPasswordStore;
 use keyring::{Entry, Error as KeychainError};
 
 /// The service every entry of this app is filed under: the app's identifier, so nothing of ours lands in
@@ -31,6 +35,9 @@ pub trait Keychain: Send + Sync {
     fn set(&self, id: &str, password: &str) -> Result<(), String>;
     /// Takes the password for `id` out. Nothing saved is already done.
     fn delete(&self, id: &str);
+    /// [`delete`](Self::delete), saying when the store would not take it out. The error is one line to
+    /// show.
+    fn remove(&self, id: &str) -> Result<(), String>;
     /// Whether this system has a store to save in at all.
     fn available(&self) -> bool;
 }
@@ -92,12 +99,19 @@ impl Keychain for SystemKeychain {
     }
 
     fn delete(&self, id: &str) {
+        // Nothing saved, or a store that will not answer: either way there is nothing left to do.
+        let _ = self.remove(id);
+    }
+
+    fn remove(&self, id: &str) -> Result<(), String> {
         if !self.available {
-            return;
+            return Ok(());
         }
-        if let Ok(entry) = Entry::new(SERVICE, id) {
-            // Nothing saved, or a store that will not answer: either way there is nothing left to do.
-            let _ = entry.delete_credential();
+        match Entry::new(SERVICE, id).and_then(|entry| entry.delete_credential()) {
+            Ok(()) | Err(KeychainError::NoEntry) => Ok(()),
+            Err(problem) => Err(format!(
+                "The keychain did not remove the password: {problem}"
+            )),
         }
     }
 
@@ -109,13 +123,83 @@ impl Keychain for SystemKeychain {
 /// What the page says, and what saving answers, on a system with no keychain.
 pub const NO_KEYCHAIN: &str = "This system has no keychain, so passwords are not saved.";
 
-/// A keychain in a map, for tests: available or not, as the test asks.
+/// The account This computer's proxy password is filed under, beside the instances' under [`SERVICE`].
+/// No instance id looks like it: those are generated without a colon.
+pub const PROXY_ACCOUNT: &str = "proxy:this-computer";
+
+/// This computer's proxy password in the keychain: the server's [`ProxyPasswordStore`] on the same store
+/// the instance passwords use, under [`PROXY_ACCOUNT`].
+///
+/// Its `Debug` says only whether the store saves; never what it holds.
+pub struct ProxyKeychain {
+    keychain: Arc<dyn Keychain>,
+}
+
+impl ProxyKeychain {
+    /// The proxy password's place in `keychain`.
+    pub fn new(keychain: Arc<dyn Keychain>) -> Self {
+        ProxyKeychain { keychain }
+    }
+}
+
+impl std::fmt::Debug for ProxyKeychain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyKeychain")
+            .field("available", &self.keychain.available())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyPasswordStore for ProxyKeychain {
+    fn get(&self) -> Option<String> {
+        self.keychain
+            .get(PROXY_ACCOUNT)
+            .filter(|password| !password.is_empty())
+    }
+
+    fn set(&self, password: &str) -> Result<(), String> {
+        self.keychain.set(PROXY_ACCOUNT, password)
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        self.keychain.remove(PROXY_ACCOUNT)
+    }
+
+    fn available(&self) -> bool {
+        self.keychain.available()
+    }
+}
+
+/// A keychain in a map, for tests: available or not, as the test asks, and refusing every write when a
+/// test says so ([`fail_writes`](Self::fail_writes)). Its `Debug` prints how many entries it holds, never
+/// what they are.
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryKeychain {
     entries: Mutex<HashMap<String, String>>,
     missing: bool,
+    failing: AtomicBool,
+    hanging: AtomicBool,
 }
+
+#[cfg(test)]
+impl std::fmt::Debug for MemoryKeychain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryKeychain")
+            .field("entries", &self.entries().len())
+            .field("missing", &self.missing)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long a [`MemoryKeychain`] told to [`hang`](MemoryKeychain::hang) takes to answer: far past the
+/// session bus deadline.
+#[cfg(test)]
+pub const HANG: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What [`MemoryKeychain`] answers a write it was told to refuse.
+#[cfg(test)]
+pub const REFUSED: &str = "The keychain did not save the password: the test refused it";
 
 #[cfg(test)]
 impl MemoryKeychain {
@@ -127,9 +211,26 @@ impl MemoryKeychain {
     /// A system with no keychain: nothing is saved and nothing is found.
     pub fn unavailable() -> Self {
         MemoryKeychain {
-            entries: Mutex::default(),
             missing: true,
+            ..MemoryKeychain::default()
         }
+    }
+
+    /// From now on every `get`, `set` and `remove` takes [`HANG`] before it answers, like a Secret Service
+    /// that does not answer (or answers at once again, with `false`).
+    pub fn hang(&self, hanging: bool) {
+        self.hanging.store(hanging, Ordering::SeqCst);
+    }
+
+    fn wait_if_hanging(&self) {
+        if self.hanging.load(Ordering::SeqCst) {
+            std::thread::sleep(HANG);
+        }
+    }
+
+    /// From now on every `set` and `remove` fails with [`REFUSED`] (or works again, with `false`).
+    pub fn fail_writes(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -142,12 +243,17 @@ impl MemoryKeychain {
 #[cfg(test)]
 impl Keychain for MemoryKeychain {
     fn get(&self, id: &str) -> Option<String> {
+        self.wait_if_hanging();
         self.entries().get(id).cloned()
     }
 
     fn set(&self, id: &str, password: &str) -> Result<(), String> {
+        self.wait_if_hanging();
         if self.missing {
             return Err(NO_KEYCHAIN.to_string());
+        }
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(REFUSED.to_string());
         }
         self.entries().insert(id.to_string(), password.to_string());
         Ok(())
@@ -155,6 +261,15 @@ impl Keychain for MemoryKeychain {
 
     fn delete(&self, id: &str) {
         self.entries().remove(id);
+    }
+
+    fn remove(&self, id: &str) -> Result<(), String> {
+        self.wait_if_hanging();
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(REFUSED.to_string());
+        }
+        self.entries().remove(id);
+        Ok(())
     }
 
     fn available(&self) -> bool {
