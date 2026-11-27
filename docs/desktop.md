@@ -231,7 +231,7 @@ torrent whose move or program failed keeps the files it has, where they are, and
 
 ## Settings in the app
 
-Settings shows one section at a time, with the list of sections on the left ([docs/web-ui.md](web-ui.md) describes the page). The desktop app adds a `This app` group to it with three sections of their own: `Window` (what closing the window does, `Start at login` and, on Linux, `Use the system title bar`), `Serve the web UI` and `Instances`. `Keyboard shortcuts` sits under `Access` and is editable here. The Torrents and Access sections belong to the instance you are connected to; the `This app` sections are the app's own and do not change when you switch instance.
+Settings shows one section at a time, with the list of sections on the left ([docs/web-ui.md](web-ui.md) describes the page). The desktop app adds a `This app` group to it with three sections of their own: `Window` (what closing the window does, `Start at login` and, on Linux, `Use the system title bar`), `Serve the web UI` and `Instances`. `Keyboard shortcuts` sits under `Access` and is editable here. `Torrents` also has a `Proxy` section: the proxy type, host, port and login of the instance you are connected to, described in [docs/web-ui.md](web-ui.md). On This computer the password goes into the system keychain, and where there is no keychain it stays in `config.yaml` and the section says so (see [Saved passwords, and the keychain](#saved-passwords-and-the-keychain)). The Torrents and Access sections belong to the instance you are connected to; the `This app` sections are the app's own and do not change when you switch instance.
 
 ## Instances
 

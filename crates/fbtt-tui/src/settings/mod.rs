@@ -14,12 +14,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use fbtt_core::proxy::ProxyHealth;
 use fbtt_core::{
-    Command, DownloadsChange, DownloadsView, LiveLimits, Notice, OnCompleteSet, SettingsChange,
-    SettingsCommand, SettingsState, SettingsView, Snapshot,
+    Command, DownloadsChange, DownloadsView, LiveLimits, Notice, OnCompleteSet, PasswordChange,
+    PasswordStorage, ProxyChange, ProxyType, ProxyView, SettingsChange, SettingsCommand,
+    SettingsState, SettingsView, Snapshot,
 };
 
-use crate::modal::{Input, type_into};
+use crate::modal::{Input, Masked, type_into, type_into_masked};
 
 /// The refusal a server too old for the settings routes gets, in the plan's words.
 pub(crate) const TOO_OLD: &str =
@@ -27,17 +29,36 @@ pub(crate) const TOO_OLD: &str =
 /// Where the run-a-program setting lives when this screen may not change it.
 pub(crate) const SET_IN_CONFIG: &str = "Set in the server's config file";
 
-/// The sections the terminal has, in the order the web page lists them. The proxy joins later.
+/// The sections the terminal has, in the order the web page lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiSection {
     /// Folders, the paused switch, the watch folder and the program run on completion.
     Downloads,
     /// The rates and the queue counts.
     Speed,
+    /// The proxy: its type, address and login.
+    Proxy,
 }
 
 /// Every section, top to bottom.
-pub(crate) const SECTIONS: [TuiSection; 2] = [TuiSection::Downloads, TuiSection::Speed];
+pub(crate) const SECTIONS: [TuiSection; 3] =
+    [TuiSection::Downloads, TuiSection::Speed, TuiSection::Proxy];
+
+/// What the proxy section says when the host is empty.
+pub(crate) const NO_HOST: &str = "Enter the proxy's host name or address.";
+/// What it says when the port is not a number from 1 to 65535.
+pub(crate) const BAD_PORT: &str = "The port must be a number from 1 to 65535.";
+/// Shown under the password field when the host or port was edited while a password is saved.
+pub(crate) const NEW_ADDRESS: &str =
+    "Enter the password again when the proxy's host or port changes.";
+/// What a set proxy turns off.
+pub(crate) const PROXY_HELP: &str = "While a proxy is set, every connection goes through it. Incoming connections, port forwarding and local peer discovery are off, so you may see fewer peers.";
+/// What an HTTP proxy turns off on top of that.
+pub(crate) const HTTP_HELP: &str =
+    "An HTTP proxy carries TCP only, so the DHT, uTP and UDP trackers are off too.";
+/// Shown when the proxy answers TCP but will not relay UDP.
+pub(crate) const UDP_LINE: &str =
+    "This proxy does not relay UDP, so the DHT and UDP trackers are off";
 
 impl TuiSection {
     /// The title the list and the section's heading show.
@@ -45,6 +66,7 @@ impl TuiSection {
         match self {
             TuiSection::Downloads => "Downloads",
             TuiSection::Speed => "Speed",
+            TuiSection::Proxy => "Proxy",
         }
     }
 }
@@ -87,6 +109,16 @@ enum SentValues {
     Speed([String; 5], Option<LiveLimits>),
     /// The downloads texts and the switch.
     Downloads([String; 4], bool),
+    /// The proxy's texts, and what was done with the password. Never the password itself.
+    Proxy(ProxyBase, PasswordSent),
+}
+
+/// What a proxy save did with the password, without holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordSent {
+    Keep,
+    Clear,
+    Set,
 }
 
 /// A save that went out and has not been answered yet.
@@ -322,6 +354,245 @@ impl DownloadsForm {
     }
 }
 
+/// The proxy fields as texts: what a form was filled with and what a save carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyBase {
+    pub(crate) kind: ProxyType,
+    pub(crate) host: String,
+    pub(crate) port: String,
+    pub(crate) username: String,
+}
+
+/// One row of the proxy section a cursor can stand on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyRow {
+    Type,
+    Host,
+    Port,
+    User,
+    Password,
+    ClearPassword,
+    Save,
+}
+
+/// The proxy section: a type, an address, a login. The password lives only in a masked field and is
+/// never filled in from a view: the view says whether one is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyForm {
+    pub(crate) kind: ProxyType,
+    pub(crate) host: Input,
+    pub(crate) port: Input,
+    pub(crate) username: Input,
+    pub(crate) password: Masked,
+    /// The stored password is to be removed with the next save.
+    pub(crate) clear: bool,
+    /// Whether a password is stored, and where it is kept.
+    pub(crate) stored: bool,
+    pub(crate) storage: PasswordStorage,
+    base: ProxyBase,
+    /// The field refused last, drawn red.
+    pub(crate) invalid: Option<ProxyRow>,
+    /// The row the cursor is on, as an index into [`ProxyForm::rows`].
+    pub(crate) row: usize,
+}
+
+/// The proxy type after `kind`, in the order the form lists them.
+fn next_kind(kind: &ProxyType) -> ProxyType {
+    match kind {
+        ProxyType::None => ProxyType::Http,
+        ProxyType::Http => ProxyType::Socks5,
+        _ => ProxyType::None,
+    }
+}
+
+impl ProxyForm {
+    fn new(view: &ProxyView) -> ProxyForm {
+        let kind = match view.kind {
+            ProxyType::Http => ProxyType::Http,
+            ProxyType::Socks5 => ProxyType::Socks5,
+            _ => ProxyType::None,
+        };
+        let set = kind != ProxyType::None;
+        let base = ProxyBase {
+            host: if set {
+                view.host.clone()
+            } else {
+                String::new()
+            },
+            port: if set && view.port != 0 {
+                view.port.to_string()
+            } else {
+                String::new()
+            },
+            username: if set {
+                view.username.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
+            kind: kind.clone(),
+        };
+        ProxyForm {
+            kind,
+            host: Input::new(base.host.clone()),
+            port: Input::new(base.port.clone()),
+            username: Input::new(base.username.clone()),
+            password: Masked::new(),
+            clear: false,
+            stored: set && view.password_saved,
+            storage: view.password_storage,
+            base,
+            invalid: None,
+            row: 0,
+        }
+    }
+
+    /// The rows the cursor visits: with no proxy only the type and Save.
+    pub(crate) fn rows(&self) -> Vec<ProxyRow> {
+        let mut rows = vec![ProxyRow::Type];
+        if self.kind != ProxyType::None {
+            rows.extend([
+                ProxyRow::Host,
+                ProxyRow::Port,
+                ProxyRow::User,
+                ProxyRow::Password,
+            ]);
+            if self.stored && !self.clear {
+                rows.push(ProxyRow::ClearPassword);
+            }
+        }
+        rows.push(ProxyRow::Save);
+        rows
+    }
+
+    fn current(&self) -> ProxyRow {
+        let rows = self.rows();
+        rows[self.row.min(rows.len() - 1)]
+    }
+
+    fn texts(&self) -> ProxyBase {
+        ProxyBase {
+            kind: self.kind.clone(),
+            host: self.host.text.clone(),
+            port: self.port.text.clone(),
+            username: self.username.text.clone(),
+        }
+    }
+
+    /// Whether the host or port differs from what the proxy was filled with.
+    pub(crate) fn address_changed(&self) -> bool {
+        self.host.text.trim() != self.base.host || self.port.text.trim() != self.base.port
+    }
+
+    /// The stored password cannot be kept for a new address: it has to be typed again or cleared.
+    pub(crate) fn needs_password(&self) -> bool {
+        self.stored
+            && self.kind != ProxyType::None
+            && self.address_changed()
+            && self.password.is_empty()
+            && !self.clear
+    }
+
+    /// Whether the placeholder `saved` belongs in the password field.
+    pub(crate) fn shows_saved(&self) -> bool {
+        self.stored && !self.clear && !self.address_changed()
+    }
+
+    fn dirty(&self) -> bool {
+        self.texts() != self.base || !self.password.is_empty() || self.clear
+    }
+
+    fn discard(&mut self) {
+        let row = self.row;
+        let view_stored = self.stored;
+        let storage = self.storage;
+        let base = self.base.clone();
+        *self = ProxyForm {
+            kind: base.kind.clone(),
+            host: Input::new(base.host.clone()),
+            port: Input::new(base.port.clone()),
+            username: Input::new(base.username.clone()),
+            password: Masked::new(),
+            clear: false,
+            stored: view_stored,
+            storage,
+            base,
+            invalid: None,
+            row,
+        };
+    }
+
+    fn cycle_kind(&mut self) {
+        self.kind = next_kind(&self.kind);
+        self.invalid = None;
+    }
+
+    /// The form as a change, or `None` with the refusal and the field it is about.
+    fn change(&mut self) -> Result<(ProxyChange, PasswordSent), &'static str> {
+        if self.kind == ProxyType::None {
+            return Ok((
+                ProxyChange {
+                    kind: ProxyType::None,
+                    host: String::new(),
+                    port: 0,
+                    username: None,
+                    password: PasswordChange::Clear,
+                },
+                PasswordSent::Clear,
+            ));
+        }
+        let host = self.host.text.trim().to_string();
+        if host.is_empty() {
+            self.invalid = Some(ProxyRow::Host);
+            self.row = self
+                .rows()
+                .iter()
+                .position(|r| *r == ProxyRow::Host)
+                .unwrap_or(0);
+            return Err(NO_HOST);
+        }
+        let port = self.port.text.trim();
+        let port = if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            port.parse::<u16>().ok().filter(|port| *port != 0)
+        } else {
+            None
+        };
+        let Some(port) = port else {
+            self.invalid = Some(ProxyRow::Port);
+            self.row = self
+                .rows()
+                .iter()
+                .position(|r| *r == ProxyRow::Port)
+                .unwrap_or(0);
+            return Err(BAD_PORT);
+        };
+        let username = self.username.text.trim();
+        let (password, sent) = if self.clear {
+            (PasswordChange::Clear, PasswordSent::Clear)
+        } else if !self.password.is_empty() {
+            (
+                PasswordChange::Set(self.password.text().to_string()),
+                PasswordSent::Set,
+            )
+        } else {
+            (PasswordChange::Keep, PasswordSent::Keep)
+        };
+        Ok((
+            ProxyChange {
+                kind: self.kind.clone(),
+                host,
+                port,
+                username: (!username.is_empty()).then(|| username.to_string()),
+                password,
+            },
+            sent,
+        ))
+    }
+}
+
+fn empty_proxy() -> ProxyView {
+    ProxyView::default()
+}
+
 /// The settings screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsScreen {
@@ -331,6 +602,11 @@ pub struct SettingsScreen {
     pub(crate) focus: Focus,
     pub(crate) speed: SpeedForm,
     pub(crate) downloads: DownloadsForm,
+    pub(crate) proxy: ProxyForm,
+    /// How the proxy is doing, as the last snapshot said.
+    pub(crate) health: ProxyHealth,
+    /// Whether the proxy values have arrived.
+    pub(crate) proxy_loaded: bool,
     /// Whether the downloads values have arrived.
     pub(crate) downloads_loaded: bool,
     /// Whether the speed values have arrived.
@@ -366,6 +642,9 @@ impl SettingsScreen {
             focus: Focus::List,
             speed: SpeedForm::new(&zero_limits()),
             downloads: DownloadsForm::new(&empty_downloads()),
+            proxy: ProxyForm::new(&empty_proxy()),
+            health: ProxyHealth::Off,
+            proxy_loaded: false,
             downloads_loaded: false,
             speed_loaded: false,
             unsupported: false,
@@ -386,6 +665,11 @@ impl SettingsScreen {
     pub(crate) fn open(snap: &Snapshot) -> SettingsScreen {
         let mut screen = SettingsScreen::new(&snap.settings);
         screen.sync(snap);
+        // The header's `S: Proxy` hint is shown while the proxy cannot be reached: that is the
+        // section the key goes to then.
+        if snap.proxy.headline().is_some() {
+            screen.section = TuiSection::Proxy;
+        }
         screen
     }
 
@@ -393,6 +677,7 @@ impl SettingsScreen {
     /// the server has no settings routes to read them from.
     pub(crate) fn sync(&mut self, snap: &Snapshot) {
         self.refresh(&snap.settings);
+        self.health = snap.proxy.clone();
         if self.unsupported {
             // `SetLimits` has no acknowledgement: the snapshot that carries the numbers sent is it.
             if let Some(InFlight {
@@ -442,6 +727,19 @@ impl SettingsScreen {
             };
         }
         self.downloads_loaded = true;
+        let fresh = ProxyForm::new(&view.proxy);
+        if !self.proxy.dirty()
+            && (!self.proxy_loaded
+                || fresh.base != self.proxy.base
+                || fresh.stored != self.proxy.stored
+                || fresh.storage != self.proxy.storage)
+        {
+            self.proxy = ProxyForm {
+                row: self.proxy.row,
+                ..fresh
+            };
+        }
+        self.proxy_loaded = true;
         self.load_error = None;
     }
 
@@ -462,6 +760,7 @@ impl SettingsScreen {
         match self.section {
             TuiSection::Downloads => self.downloads.dirty(),
             TuiSection::Speed => self.speed.dirty(),
+            TuiSection::Proxy => self.proxy.dirty(),
         }
     }
 
@@ -475,6 +774,7 @@ impl SettingsScreen {
         match self.section {
             TuiSection::Downloads => self.downloads_loaded && !self.unsupported,
             TuiSection::Speed => self.speed_loaded,
+            TuiSection::Proxy => self.proxy_loaded && !self.unsupported,
         }
     }
 
@@ -561,6 +861,7 @@ impl SettingsScreen {
         match self.section {
             TuiSection::Downloads => self.downloads.discard(),
             TuiSection::Speed => self.speed.discard(),
+            TuiSection::Proxy => self.proxy.discard(),
         }
     }
 
@@ -613,6 +914,7 @@ impl SettingsScreen {
         match self.section {
             TuiSection::Downloads => self.downloads.rows().len(),
             TuiSection::Speed => SPEED_SAVE_ROW + 1,
+            TuiSection::Proxy => self.proxy.rows().len(),
         }
     }
 
@@ -620,6 +922,7 @@ impl SettingsScreen {
         match self.section {
             TuiSection::Downloads => &mut self.downloads.row,
             TuiSection::Speed => &mut self.speed.row,
+            TuiSection::Proxy => &mut self.proxy.row,
         }
     }
 
@@ -648,18 +951,46 @@ impl SettingsScreen {
                 self.toggle();
                 ScreenAnswer::Stay
             }
+            KeyCode::Left | KeyCode::Right if self.on_proxy_type() => {
+                self.proxy.cycle_kind();
+                self.error = None;
+                ScreenAnswer::Stay
+            }
             KeyCode::Enter => self.activate(),
             _ => ScreenAnswer::Stay,
         }
     }
 
-    /// Space: flips the switch when the cursor is on it.
+    /// Whether the cursor is on the proxy type.
+    fn on_proxy_type(&self) -> bool {
+        self.section == TuiSection::Proxy && self.proxy.current() == ProxyRow::Type
+    }
+
+    /// Space: flips the switch when the cursor is on it, or the proxy type or `Clear password`.
     fn toggle(&mut self) {
+        if self.section == TuiSection::Proxy {
+            match self.proxy.current() {
+                ProxyRow::Type => {
+                    self.proxy.cycle_kind();
+                    self.error = None;
+                }
+                ProxyRow::ClearPassword => self.clear_password(),
+                _ => {}
+            }
+            return;
+        }
         if self.section == TuiSection::Downloads && self.downloads.current() == DownloadsRow::Paused
         {
             self.downloads.paused = !self.downloads.paused;
             self.error = None;
         }
+    }
+
+    /// Chooses `Clear password`: the stored password is removed with the next save.
+    fn clear_password(&mut self) {
+        self.proxy.clear = true;
+        self.proxy.password.clear();
+        self.error = None;
     }
 
     /// Enter: edits a text field, flips the switch, or saves, by the row it is on.
@@ -676,6 +1007,11 @@ impl SettingsScreen {
                 }
                 self.editing = true;
             }
+            TuiSection::Proxy => match self.proxy.current() {
+                ProxyRow::Save => return self.save(None),
+                ProxyRow::Type | ProxyRow::ClearPassword => self.toggle(),
+                _ => self.editing = true,
+            },
         }
         ScreenAnswer::Stay
     }
@@ -705,6 +1041,27 @@ impl SettingsScreen {
                             .is_some_and(|field| type_into(field, key));
                         if typed && self.speed.invalid == Some(at) {
                             self.speed.invalid = None;
+                        }
+                        typed
+                    }
+                    TuiSection::Proxy => {
+                        let row = self.proxy.current();
+                        let typed = match row {
+                            ProxyRow::Host => type_into(&mut self.proxy.host, key),
+                            ProxyRow::Port => type_into(&mut self.proxy.port, key),
+                            ProxyRow::User => type_into(&mut self.proxy.username, key),
+                            ProxyRow::Password => {
+                                let typed = type_into_masked(&mut self.proxy.password, key);
+                                if typed {
+                                    // Typing a password replaces a request to clear it.
+                                    self.proxy.clear = false;
+                                }
+                                typed
+                            }
+                            _ => false,
+                        };
+                        if typed && self.proxy.invalid == Some(row) {
+                            self.proxy.invalid = None;
                         }
                         typed
                     }
@@ -759,6 +1116,25 @@ impl SettingsScreen {
                     )
                 }
             }
+            TuiSection::Proxy => {
+                if self.unsupported || !self.proxy_loaded {
+                    return ScreenAnswer::Stay;
+                }
+                // Save stays off until the stored password is typed again or cleared.
+                if self.proxy.needs_password() {
+                    return ScreenAnswer::Stay;
+                }
+                match self.proxy.change() {
+                    Ok((change, sent)) => (
+                        Command::Settings(SettingsCommand::Save(SettingsChange::Proxy(change))),
+                        SentValues::Proxy(self.proxy.texts(), sent),
+                    ),
+                    Err(refusal) => {
+                        self.error = Some(refusal.to_string());
+                        return ScreenAnswer::Stay;
+                    }
+                }
+            }
         };
         self.in_flight = Some(InFlight {
             section: self.section,
@@ -778,12 +1154,28 @@ impl SettingsScreen {
         match flight.sent {
             SentValues::Speed(values, _) => self.speed.base = values,
             SentValues::Downloads(texts, paused) => self.downloads.base = (texts, paused),
+            SentValues::Proxy(base, password) => {
+                self.proxy.base = base;
+                match password {
+                    PasswordSent::Keep => {}
+                    PasswordSent::Set => {
+                        self.proxy.stored = true;
+                        self.proxy.password.clear();
+                    }
+                    PasswordSent::Clear => {
+                        self.proxy.stored = false;
+                        self.proxy.clear = false;
+                        self.proxy.password.clear();
+                    }
+                }
+            }
         }
         // Edited since: the section still has unsaved changes, so the question that was waiting on
         // this save is asked again rather than answered.
         let clean = match flight.section {
             TuiSection::Downloads => !self.downloads.dirty(),
             TuiSection::Speed => !self.speed.dirty(),
+            TuiSection::Proxy => !self.proxy.dirty(),
         };
         match flight.pending {
             Some(Pending::Leave) if clean => return true,
@@ -831,6 +1223,7 @@ impl SettingsScreen {
         if self.in_flight.is_none() {
             if let Notice::Error(text) = notice
                 && !self.speed_loaded
+                && !self.proxy_loaded
                 && !self.downloads_loaded
                 && !self.unsupported
             {

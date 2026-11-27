@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use fbtt_core::proxy::ProxyHealth;
 use fbtt_core::{
     Command, DownloadsChange, DownloadsView, LiveLimits, Notice, OnCompleteSet, OnCompleteView,
-    SettingsChange, SettingsCommand, SettingsState, SettingsView, Snapshot,
+    PasswordChange, PasswordStorage, ProxyChange, ProxyType, ProxyView, SettingsChange,
+    SettingsCommand, SettingsState, SettingsView, Snapshot,
 };
 use fbtt_tui::{Action, Model};
 
@@ -764,5 +766,305 @@ fn a_discarded_save_answer_after_its_deadline_is_not_swallowed() {
     assert!(
         !is_dirty(&mut model, &snap),
         "an expired stale entry swallowed the answer"
+    );
+}
+
+// The proxy section.
+
+fn proxy_view(storage: PasswordStorage) -> ProxyView {
+    ProxyView {
+        kind: ProxyType::Socks5,
+        host: "proxy.example".to_string(),
+        port: 1080,
+        username: Some("ana".to_string()),
+        password_saved: true,
+        password_storage: storage,
+    }
+}
+
+fn with_proxy(view: ProxyView) -> Snapshot {
+    let mut snap = loaded(false);
+    if let SettingsState::Loaded(settings) = &mut snap.settings {
+        settings.proxy = view;
+    }
+    snap
+}
+
+/// The proxy section open with the cursor on its type.
+fn open_proxy(snap: &Snapshot) -> Model {
+    let mut model = open(snap);
+    press(&mut model, snap, KeyCode::Down);
+    press(&mut model, snap, KeyCode::Down);
+    press(&mut model, snap, KeyCode::Tab);
+    model
+}
+
+fn down(model: &mut Model, snap: &Snapshot, times: usize) {
+    for _ in 0..times {
+        press(model, snap, KeyCode::Down);
+    }
+}
+
+fn saved_proxy(actions: &[Action]) -> ProxyChange {
+    match actions {
+        [
+            Action::Command(Command::Settings(SettingsCommand::Save(SettingsChange::Proxy(
+                change,
+            )))),
+        ] => change.clone(),
+        other => panic!("expected one proxy save, got {other:?}"),
+    }
+}
+
+#[test]
+fn proxy_section_saves_change() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    // Host is the second row: change only the user name, so the password is untouched.
+    down(&mut model, &snap, 3);
+    replace_field(&mut model, &snap, "bob");
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(
+        change,
+        ProxyChange {
+            kind: ProxyType::Socks5,
+            host: "proxy.example".to_string(),
+            port: 1080,
+            username: Some("bob".to_string()),
+            password: PasswordChange::Keep,
+        }
+    );
+}
+
+#[test]
+fn proxy_section_shows_udp_line() {
+    let mut snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    snap.proxy = ProxyHealth::UdpNotRelayed;
+    let model = open_proxy(&snap);
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        text.contains("This proxy does not relay UDP, so the DHT and UDP trackers are off"),
+        "{text}"
+    );
+}
+
+#[test]
+fn proxy_section_shows_the_headline_and_the_help() {
+    let mut snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    snap.proxy = ProxyHealth::LoginRefused;
+    let model = open_proxy(&snap);
+    let text = Screen::new(&model, &snap, 160, 40).text();
+    assert!(
+        text.contains("Can't reach the proxy: it refused the login"),
+        "{text}"
+    );
+    assert!(
+        text.contains("While a proxy is set, every connection goes through it."),
+        "{text}"
+    );
+    assert!(!text.contains("carries TCP only"), "{text}");
+}
+
+#[test]
+fn proxy_http_shows_the_tcp_only_line() {
+    let mut view = proxy_view(PasswordStorage::ConfigFile);
+    view.kind = ProxyType::Http;
+    let snap = with_proxy(view);
+    let model = open_proxy(&snap);
+    let text = Screen::new(&model, &snap, 160, 40).text();
+    assert!(
+        text.contains(
+            "An HTTP proxy carries TCP only, so the DHT, uTP and UDP trackers are off too."
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_typed_password_is_sent_as_set_and_never_drawn() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 4);
+    let before = Screen::new(&model, &snap, 140, 40).text();
+    assert!(before.contains("saved"), "no placeholder:\n{before}");
+    press(&mut model, &snap, KeyCode::Enter);
+    type_text(&mut model, &snap, "hunter2");
+    let editing = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        !editing.contains("hunter2"),
+        "the password was drawn:\n{editing}"
+    );
+    assert!(editing.contains("*******"), "{editing}");
+    press(&mut model, &snap, KeyCode::Enter);
+    let after = Screen::new(&model, &snap, 140, 40).text();
+    assert!(!after.contains("hunter2"), "{after}");
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(change.password, PasswordChange::Set("hunter2".to_string()));
+    assert!(
+        !format!("{model:?}").contains("hunter2"),
+        "Debug printed the password"
+    );
+}
+
+#[test]
+fn clear_password_sends_clear() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    // Type, user, ... the row after Password is Clear password.
+    down(&mut model, &snap, 5);
+    press(&mut model, &snap, KeyCode::Enter);
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(change.password, PasswordChange::Clear);
+}
+
+#[test]
+fn changing_the_address_asks_for_the_password_again() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 2);
+    replace_field(&mut model, &snap, "1081");
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        text.contains("Enter the password again when the proxy's host or port changes."),
+        "{text}"
+    );
+    assert!(!text.contains("saved"), "the placeholder stayed:\n{text}");
+    // Save is off.
+    assert!(model.handle_key(ctrl_s(), &snap).is_empty());
+    // Typing the password turns it on.
+    down(&mut model, &snap, 2);
+    press(&mut model, &snap, KeyCode::Enter);
+    type_text(&mut model, &snap, "again");
+    press(&mut model, &snap, KeyCode::Enter);
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(change.port, 1081);
+    assert_eq!(change.password, PasswordChange::Set("again".to_string()));
+}
+
+#[test]
+fn changing_the_address_can_be_saved_with_clear() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 1);
+    replace_field(&mut model, &snap, "other.example");
+    down(&mut model, &snap, 4);
+    press(&mut model, &snap, KeyCode::Enter);
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(change.host, "other.example");
+    assert_eq!(change.password, PasswordChange::Clear);
+}
+
+#[test]
+fn none_removes_the_proxy_and_hides_the_fields() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    // Socks5 -> None is one step forward.
+    press(&mut model, &snap, KeyCode::Right);
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(!text.contains("User name"), "{text}");
+    assert!(!text.contains("While a proxy is set"), "{text}");
+    let change = saved_proxy(&model.handle_key(ctrl_s(), &snap));
+    assert_eq!(change.kind, ProxyType::None);
+}
+
+#[test]
+fn an_invalid_port_or_host_is_refused_with_nothing_sent() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 2);
+    replace_field(&mut model, &snap, "70000");
+    // A new port also needs the password again, so clear it to turn Save on.
+    down(&mut model, &snap, 3);
+    press(&mut model, &snap, KeyCode::Enter);
+    assert!(model.handle_key(ctrl_s(), &snap).is_empty());
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        text.contains("The port must be a number from 1 to 65535."),
+        "{text}"
+    );
+
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 1);
+    replace_field(&mut model, &snap, "");
+    // An empty host with a stored password also needs the password again, so clear it first.
+    down(&mut model, &snap, 4);
+    press(&mut model, &snap, KeyCode::Enter);
+    assert!(model.handle_key(ctrl_s(), &snap).is_empty());
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        text.contains("Enter the proxy's host name or address."),
+        "{text}"
+    );
+}
+
+#[test]
+fn no_keychain_shows_the_kept_in_config_line() {
+    let snap = with_proxy(proxy_view(PasswordStorage::Unavailable));
+    let model = open_proxy(&snap);
+    let text = Screen::new(&model, &snap, 160, 40).text();
+    assert!(
+        text.contains("This system has no keychain, so the proxy password is kept in config.yaml."),
+        "{text}"
+    );
+    let snap = with_proxy(proxy_view(PasswordStorage::Keychain));
+    let model = open_proxy(&snap);
+    assert!(
+        !Screen::new(&model, &snap, 160, 40)
+            .text()
+            .contains("no keychain")
+    );
+}
+
+#[test]
+fn a_refused_proxy_save_is_shown_with_the_fields_kept() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 3);
+    replace_field(&mut model, &snap, "bob");
+    model.handle_key(ctrl_s(), &snap);
+    model.push_notice(
+        Notice::Error("The keychain did not save the   proxy password.\u{7}".to_string()),
+        Instant::now(),
+    );
+    let text = Screen::new(&model, &snap, 160, 40).text();
+    assert!(
+        text.contains("The keychain did not save the proxy password."),
+        "{text}"
+    );
+    assert!(text.contains("bob"), "{text}");
+}
+
+#[test]
+fn s_opens_proxy_while_the_header_says_the_proxy_is_down() {
+    let mut snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    snap.proxy = ProxyHealth::Unreachable {
+        reason: "Connection refused".to_string(),
+    };
+    let mut model = model_of(&snap);
+    model.handle_key(letter('S'), &snap);
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(text.contains("Proxy type"), "{text}");
+    // And without the hint the first section opens as before.
+    snap.proxy = ProxyHealth::Ok;
+    let mut model = model_of(&snap);
+    model.handle_key(letter('S'), &snap);
+    assert!(
+        Screen::new(&model, &snap, 140, 40)
+            .text()
+            .contains("Default folder")
+    );
+}
+
+#[test]
+fn proxy_edits_are_unsaved_changes() {
+    let snap = with_proxy(proxy_view(PasswordStorage::ConfigFile));
+    let mut model = open_proxy(&snap);
+    down(&mut model, &snap, 3);
+    replace_field(&mut model, &snap, "bob");
+    press(&mut model, &snap, KeyCode::Esc);
+    let text = Screen::new(&model, &snap, 140, 40).text();
+    assert!(
+        text.contains("You have unsaved changes in Proxy."),
+        "{text}"
     );
 }

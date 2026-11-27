@@ -65,18 +65,28 @@ it('shows_one_section_at_a_time', async () => {
   expect(screen.queryByLabelText('Download limit KiB/s')).toBeNull()
 })
 
+it('the_proxy_section_is_the_proxy_form', async () => {
+  const { client } = fakeClient()
+  const none = { type: 'none', host: '', port: 0, username: null, password_saved: false, password_storage: 'config_file' }
+  ;(client as unknown as { settings: () => Promise<unknown> }).settings = () =>
+    Promise.resolve({ speed: { ...SPEED }, downloads: {}, proxy: none })
+  ;(client as unknown as { proxyState: () => Promise<unknown> }).proxyState = () => Promise.resolve({ state: 'off' })
+  render(<Settings client={client} onBack={() => {}} section="proxy" />)
+  expect(await screen.findByLabelText('Proxy type')).toBeTruthy()
+})
+
 it('arrow_keys_move_and_focus_the_heading', async () => {
   await open()
   const speed = within(list()).getByRole('button', { name: 'Speed' })
   speed.focus()
   expect(speed.tabIndex).toBe(0)
-  expect(within(list()).getByRole('button', { name: 'Devices' }).tabIndex).toBe(-1)
+  expect(within(list()).getByRole('button', { name: 'Proxy' }).tabIndex).toBe(-1)
   fireEvent.keyDown(speed, { key: 'ArrowDown' })
-  const devices = within(list()).getByRole('button', { name: 'Devices' })
-  expect(devices.getAttribute('aria-current')).toBe('page')
-  expect(screen.getByRole('heading', { name: 'Devices', level: 2 })).toBeTruthy()
+  const proxy = within(list()).getByRole('button', { name: 'Proxy' })
+  expect(proxy.getAttribute('aria-current')).toBe('page')
+  expect(screen.getByRole('heading', { name: 'Proxy', level: 2 })).toBeTruthy()
   // Arrow keys keep the focus on the list, so the next arrow press goes on from there.
-  expect(document.activeElement, 'an arrow key pulled the focus out of the list').toBe(devices)
+  expect(document.activeElement, 'an arrow key pulled the focus out of the list').toBe(proxy)
   fireEvent.keyDown(list(), { key: 'End' })
   expect(screen.getByRole('heading', { name: 'Keyboard shortcuts', level: 2 })).toBeTruthy()
   expect(document.activeElement).toBe(within(list()).getByRole('button', { name: 'Keyboard shortcuts' }))

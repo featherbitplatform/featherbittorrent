@@ -243,7 +243,7 @@ creates parent folders, and a name that already exists is refused. The server al
 The `Settings` button in the header opens the Settings page; `Back to torrents` stays at the top of it and
 returns to the list, and so does the browser's back button or a phone's back gesture.
 
-The page shows one section at a time. A list of sections is on the left, in groups: `Torrents` (Downloads, Speed),
+The page shows one section at a time. A list of sections is on the left, in groups: `Torrents` (Downloads, Speed, Proxy),
 `Access` (Devices, Keyboard shortcuts) and, in the desktop app only, `This app` (Window, Serve the web UI,
 Instances). Pick a section with a click, `Enter` or `Space` and its heading is focused; the arrow keys (`Home` and
 `End` go to the first and last) move through the list and open each section as they go, but keep the focus
@@ -288,6 +288,25 @@ unlimited. `Save` applies them to the running server and writes them to the serv
 are there again the next time it starts. A server older than this page answers without a settings route: the
 section then says `This server is too old to change its settings here. Update it to change them.` and
 still saves the same five numbers through the engine's own routes.
+
+### Proxy
+
+`Proxy type` is `None`, `HTTP` or `SOCKS5`. With a proxy, `Host`, `Port`, an optional `User name` and `Password` follow; with `None`
+they are hidden and `Save` removes the proxy. While a proxy is set, every connection goes through it, so incoming connections,
+port forwarding and local peer discovery are off, and an HTTP proxy also turns off the DHT, uTP and UDP trackers; the section says
+so under the fields. `Save` switches the running engine to the new setting at once and writes it to the server's `config.yaml`.
+
+The password is never shown or filled in. When one is stored the field says `saved`; leave it alone to keep it, type to replace it,
+or press `Clear password` to remove it. The server keeps a stored password only for the same host and port, so after you edit
+either one the field asks `Enter the password again when the proxy's host or port changes.` and `Save` stays off until you type
+the password or choose `Clear password`. Changing only the type or the user name keeps `saved`. Where there is no system
+keychain the section adds `This system has no keychain, so the proxy password is kept in config.yaml.`
+
+A proxy that cannot be reached, or that refuses the login, is said at the top of the section (`Can't reach the proxy`, with the
+reason) and in a button in the header of the torrent list that opens this section. `This proxy does not relay UDP, so the DHT and
+UDP trackers are off` is shown when the proxy answers TCP only. When the server refuses a change, its reason is shown under the
+form and what you typed is kept. A server older than the proxy setting says `This server is too old to change its settings
+here. Update it to change them.`
 
 ### Devices
 

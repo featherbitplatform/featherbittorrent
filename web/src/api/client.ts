@@ -110,9 +110,29 @@ export interface OnCompleteChange {
   program: string | null
 }
 
-/** The proxy section of the settings: only whether one is set is read here (`type` is `none` when there is none). */
+/**
+ * The proxy section of the settings (`type` is `none` when there is none). The password is never in it:
+ * `password_saved` says whether one is stored and `password_storage` where it is kept.
+ */
 export interface ProxySettings {
   type: string
+  host?: string
+  port?: number
+  username?: string | null
+  password_saved?: boolean
+  password_storage?: 'config_file' | 'keychain' | 'unavailable'
+}
+
+/** What to do with the stored proxy password: keep it, remove it, or replace it. */
+export type PasswordChange = 'keep' | 'clear' | { set: string }
+
+/** What `PUT /api/v1/settings/proxy` takes: every field of the form and what to do with the password. */
+export interface ProxyChange {
+  type: 'none' | 'http' | 'socks5'
+  host: string
+  port: number
+  username: string | null
+  password: PasswordChange
 }
 
 /**
@@ -266,6 +286,7 @@ export interface Api {
   settings(): Promise<ProductSettings>
   proxyState(): Promise<ProxyHealth>
   saveSpeed(speed: SpeedSettings): Promise<ProductSettings>
+  saveProxy(change: ProxyChange): Promise<ProductSettings>
   saveDownloads(downloads: DownloadsInput, options?: { onComplete?: OnCompleteChange }): Promise<ProductSettings>
   devices(): Promise<DeviceRow[]>
   addDevice(name: string, publicKey: string): Promise<DeviceRow>
@@ -472,6 +493,20 @@ export function createClient(
           active_downloads: speed.active_downloads,
           active_seeds: speed.active_seeds,
           active_total: speed.active_total,
+        }),
+        'application/json',
+      ),
+    // Picked field by field, so nothing but the form's own fields goes out.
+    saveProxy: (change) =>
+      json(
+        `${SETTINGS}/proxy`,
+        'PUT',
+        JSON.stringify({
+          type: change.type,
+          host: change.host,
+          port: change.port,
+          username: change.username,
+          password: change.password,
         }),
         'application/json',
       ),

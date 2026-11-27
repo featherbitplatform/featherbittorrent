@@ -3,7 +3,8 @@
 //! Every path drawn here goes through [`format::safe`] (`fbt::display_safe`), whether it came from the
 //! snapshot or was typed: the forms keep the raw values, because those are what get sent back.
 
-use fbtt_core::Notice;
+use fbtt_core::proxy::ProxyHealth;
+use fbtt_core::{Notice, ProxyType};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -12,11 +13,11 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use crate::format;
-use crate::modal::{Input, keys_hint};
+use crate::modal::{Input, Masked, keys_hint};
 use crate::model::Model;
 use crate::settings::{
-    DownloadsRow, Focus, SECTIONS, SET_IN_CONFIG, SPEED_SAVE_ROW, SettingsScreen, TOO_OLD,
-    TuiSection,
+    DownloadsRow, Focus, HTTP_HELP, NEW_ADDRESS, PROXY_HELP, ProxyRow, SECTIONS, SET_IN_CONFIG,
+    SPEED_SAVE_ROW, SettingsScreen, TOO_OLD, TuiSection, UDP_LINE,
 };
 use crate::theme;
 
@@ -279,7 +280,7 @@ fn section_lines(screen: &SettingsScreen, width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(2 + LABEL_WIDTH + 2);
     let mut lines = vec![heading(screen.section.title()), Line::default()];
     if !screen.section_ready() {
-        let text = if screen.unsupported && screen.section == TuiSection::Downloads {
+        let text = if screen.unsupported && screen.section != TuiSection::Speed {
             TOO_OLD
         } else {
             "Loading settings."
@@ -393,6 +394,170 @@ fn section_lines(screen: &SettingsScreen, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::default());
             lines.push(save_row(on(SPEED_SAVE_ROW), screen.saving()));
         }
+        TuiSection::Proxy => proxy_lines(&mut lines, screen, width, room),
     }
     lines
+}
+
+/// `text` broken into muted lines no wider than `width`, each indented two cells.
+fn wrapped(text: &str, width: usize, colour: ratatui::style::Color) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(2).max(10);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::new().fg(colour)),
+            ])
+        })
+        .collect()
+}
+
+/// A choice row: the value is inverted while the cursor is on it, which is what says Left and Right
+/// change it.
+fn choice_row(text: &str, value: &str, on_row: bool) -> Line<'static> {
+    let style = if on_row {
+        Style::new().fg(theme::INK_950).bg(theme::INK_50)
+    } else {
+        Style::new().fg(theme::INK_300)
+    };
+    let mut spans = label(text, on_row);
+    spans.push(Span::styled(format!(" {value} "), style));
+    Line::from(spans)
+}
+
+/// The password row: stars for what was typed (never the characters), the placeholder `saved` when a
+/// password is stored and the field is untouched, and a caret while it is being edited.
+fn password_row(form: &Masked, saved: bool, on_row: bool, editing: bool) -> Line<'static> {
+    let text = Style::new().fg(theme::INK_300);
+    let mut spans = label("Password", on_row);
+    let (before, at_cursor) = form.split_at_cursor();
+    if on_row && editing {
+        let caret = Style::new().fg(theme::INK_950).bg(theme::INK_50);
+        spans.push(Span::styled("*".repeat(before), text));
+        if at_cursor > 0 {
+            spans.push(Span::styled("*", caret));
+            spans.push(Span::styled("*".repeat(at_cursor - 1), text));
+        } else {
+            spans.push(Span::styled(" ", caret));
+        }
+    } else if form.is_empty() {
+        if saved {
+            spans.push(Span::styled("saved", Style::new().fg(theme::INK_400)));
+        }
+    } else {
+        spans.push(Span::styled("*".repeat(before + at_cursor), text));
+    }
+    Line::from(spans)
+}
+
+fn proxy_lines(lines: &mut Vec<Line<'static>>, screen: &SettingsScreen, width: usize, room: usize) {
+    let form = &screen.proxy;
+    let fields = screen.focus == Focus::Fields;
+    let editing = screen.editing;
+    let rows = form.rows();
+    let at = rows[form.row.min(rows.len() - 1)];
+    let on = |row: ProxyRow| fields && at == row;
+    let set = form.kind != ProxyType::None;
+
+    // What the proxy is doing now, for the proxy that is saved (not for one still being typed).
+    if let Some(headline) = screen.health.headline() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format::safe(&headline), Style::new().fg(theme::RED_500)),
+        ]));
+        lines.push(Line::default());
+    } else if screen.health == ProxyHealth::UdpNotRelayed {
+        lines.extend(wrapped(UDP_LINE, width, theme::AMBER_500));
+        lines.push(Line::default());
+    }
+
+    let kind = match form.kind {
+        ProxyType::Http => "HTTP",
+        ProxyType::Socks5 => "SOCKS5",
+        _ => "None",
+    };
+    lines.push(choice_row("Proxy type", kind, on(ProxyRow::Type)));
+    if set {
+        lines.push(field(
+            "Host",
+            &form.host,
+            on(ProxyRow::Host),
+            editing,
+            form.invalid == Some(ProxyRow::Host),
+            room,
+        ));
+        lines.push(field(
+            "Port",
+            &form.port,
+            on(ProxyRow::Port),
+            editing,
+            form.invalid == Some(ProxyRow::Port),
+            room,
+        ));
+        lines.push(field(
+            "User name",
+            &form.username,
+            on(ProxyRow::User),
+            editing,
+            false,
+            room,
+        ));
+        lines.push(password_row(
+            &form.password,
+            form.shows_saved(),
+            on(ProxyRow::Password),
+            editing,
+        ));
+        if form.needs_password() {
+            lines.extend(wrapped(NEW_ADDRESS, width, theme::AMBER_500));
+        }
+        if form.clear {
+            lines.extend(wrapped(
+                "The saved password is removed when you save.",
+                width,
+                theme::INK_400,
+            ));
+        }
+        if let Some(explanation) = form.storage.explanation() {
+            lines.extend(wrapped(explanation, width, theme::INK_400));
+        }
+        if rows.contains(&ProxyRow::ClearPassword) {
+            let style = if on(ProxyRow::ClearPassword) {
+                Style::new().fg(theme::INK_950).bg(theme::INK_50)
+            } else {
+                Style::new().fg(theme::VIOLET_400)
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(" Clear password ", style),
+            ]));
+        }
+        lines.push(Line::default());
+        lines.extend(wrapped(PROXY_HELP, width, theme::INK_400));
+        if form.kind == ProxyType::Http {
+            lines.extend(wrapped(HTTP_HELP, width, theme::INK_400));
+        }
+    }
+    lines.push(Line::default());
+    let mut save = save_row(on(ProxyRow::Save), screen.saving());
+    if form.needs_password() {
+        // Save is off until the password is typed or cleared.
+        save.spans[1].style = Style::new().fg(theme::INK_400);
+    }
+    lines.push(save);
 }
