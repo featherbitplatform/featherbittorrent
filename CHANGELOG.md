@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The Proxy section and the proxy health show the proxy the engine is running. A `proxy:` section edited in `config.yaml` by hand takes effect at the next start, and saving another section no longer makes Settings show it before then. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
+- The Proxy section and the proxy health show the proxy the engine is running. A `proxy:` section edited in `config.yaml` by hand takes effect at the next start, and saving another section no longer makes Settings show it before then. ([#57](https://github.com/featherbitplatform/featherbittorrent/pull/57))
 - Speed limits and queue counts set from the web UI or the desktop app are now saved to the server's `config.yaml` and survive a restart. ([#47](https://github.com/featherbitplatform/featherbittorrent/pull/47))
 
 ## [0.4.1] - 2026-11-24
