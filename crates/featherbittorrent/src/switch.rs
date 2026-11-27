@@ -2484,6 +2484,7 @@ mod tests {
             dirs: None,
             devices: None,
             settings: fbtt_core::SettingsState::NotLoaded,
+            proxy: fbtt_core::proxy::ProxyHealth::Off,
         }
     }
 

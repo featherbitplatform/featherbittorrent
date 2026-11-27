@@ -45,6 +45,24 @@ fn title_span() -> Span<'static> {
 /// link still dialling may not have arrived yet, and one behind a lost link is whatever was last good
 /// while the client keeps trying. A person who cannot tell those apart reads a frozen figure as a slow one.
 fn connection_line(snap: &Snapshot) -> Line<'static> {
+    let mut line = link_line(snap);
+    // A proxy that cannot be reached is said here, in the error colour, whatever the link to the
+    // server is doing: nothing is moving through it, which is worth more than the name of the server.
+    // The reason came from the engine or a server, so it is drawn through `safe`.
+    if let Some(headline) = snap.proxy.headline() {
+        line.spans.push(Span::raw("  "));
+        line.spans.push(Span::styled(
+            format::safe(&headline),
+            Style::new().fg(theme::RED_500),
+        ));
+        line.spans
+            .push(Span::styled("  S: Proxy", Style::new().fg(theme::INK_400)));
+    }
+    line
+}
+
+/// The connection line without the proxy: which engine or server, and how its link stands.
+fn link_line(snap: &Snapshot) -> Line<'static> {
     let muted = Style::new().fg(theme::INK_400);
     match snap.connection {
         Connection::Local => Line::from(vec![

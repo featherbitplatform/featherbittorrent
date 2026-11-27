@@ -169,6 +169,42 @@ fn refusing_login_proxy(listener: TcpListener) {
     });
 }
 
+/// The snapshot a screen draws carries the proxy's health: `Off` without a proxy, and `Unreachable`
+/// with the reason once the engine has found a proxy it cannot reach. A screen reads it from the
+/// snapshot and never asks the engine itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_snapshot_carries_proxy_health() {
+    let lib = Library::new("proxy_snapshot_off");
+    let (mut client, task, _session) = start(&lib, lib.config.clone()).await;
+    let snapshot = wait_for(&mut client, |snapshot| {
+        matches!(snapshot.connection, Connection::Local)
+    })
+    .await;
+    assert_eq!(snapshot.proxy, ProxyHealth::Off, "no proxy, nothing to say");
+    shutdown(client, task).await;
+
+    // A proxy saved while the app runs: the health arrives in a later snapshot, not only in the first.
+    let lib = Library::new("proxy_snapshot_down");
+    let (mut client, task, _session) = start(&lib, lib.config.clone()).await;
+    assert_eq!(
+        info_text(save_proxy(&mut client, socks5_change(closed_port())).await),
+        "Saved."
+    );
+    let snapshot = wait_for(&mut client, |snapshot| {
+        matches!(snapshot.proxy, ProxyHealth::Unreachable { .. })
+    })
+    .await;
+    assert!(
+        snapshot
+            .proxy
+            .headline()
+            .is_some_and(|line| line.starts_with("Can't reach the proxy: ")),
+        "{:?}",
+        snapshot.proxy
+    );
+    shutdown(client, task).await;
+}
+
 /// A proxy that is down when the engine starts does not stop it: the library opens, a snapshot
 /// arrives, and the health settles on "unreachable" rather than the run failing. This is the rule
 /// the setting lives or dies by - a proxy nobody can reach must not put the app in a state where it

@@ -15,9 +15,14 @@ use crate::client::{
     Command, Connection, Detail, DetailTab, LinkState, Notice, SettingsCommand, Snapshot,
     TorrentId, Totals,
 };
+use crate::engine::map::clean;
+use crate::proxy::ProxyHealth;
 use crate::remote::bodies::ApiError;
 use crate::remote::routes::{tab_path, torrent_route};
 use crate::remote::{BACKOFF, Backend, Gate, REFRESH, SLOW_REFRESH, map};
+
+/// How often a connected backend asks the server for its proxy health.
+const PROXY_EVERY: Duration = Duration::from_secs(5);
 
 impl Backend {
     /// Answers commands and keeps the snapshot fresh until asked to stop, or until nobody is watching any
@@ -214,6 +219,8 @@ impl Backend {
             self.want_limits = false;
         }
 
+        self.poll_proxy(Instant::now()).await;
+
         let (torrents, totals) = map::rows(&torrents, &mut self.stalled, Instant::now());
         self.torrents = torrents;
         self.totals = Totals {
@@ -228,6 +235,43 @@ impl Backend {
             None => None,
         };
         Ok(())
+    }
+
+    /// Asks the server how its proxy is doing, at most once in [`PROXY_EVERY`], and only from a round that
+    /// has just read the table, so it is only ever asked while the link is up. Nothing here fails the
+    /// round or says anything: a network error keeps the last value, a `404` means an older server, which
+    /// is `Off` and is not asked again on this connection, and an answer this client cannot read is kept
+    /// out. It is a call inside the loop, not a task of its own, so nothing is left running when the
+    /// backend stops.
+    pub(crate) async fn poll_proxy(&mut self, now: Instant) {
+        if self.proxy_old
+            || self
+                .proxy_polled
+                .is_some_and(|at| now.duration_since(at) < PROXY_EVERY)
+        {
+            return;
+        }
+        self.proxy_polled = Some(now);
+        match self
+            .api
+            .json::<ProxyHealth>(self.api.get("/api/v1/settings/proxy/state"))
+            .await
+        {
+            Ok(health) => {
+                // The reason is the server's text, drawn on a screen: it is cleaned like every other.
+                self.proxy = match health {
+                    ProxyHealth::Unreachable { reason } => ProxyHealth::Unreachable {
+                        reason: clean(&reason),
+                    },
+                    other => other,
+                };
+            }
+            Err(ApiError::NotFound(_)) => {
+                self.proxy_old = true;
+                self.proxy = ProxyHealth::Off;
+            }
+            Err(_) => {}
+        }
     }
 
     /// The watched pane, or `None` when there is nothing to show for it: the torrent went away, or this
@@ -294,6 +338,7 @@ impl Backend {
             dirs: self.dirs.clone(),
             devices: self.devices.clone(),
             settings: self.settings.clone(),
+            proxy: self.proxy.clone(),
         });
         if next == self.published {
             return;
@@ -368,6 +413,9 @@ mod tests {
             devices: None,
             settings: SettingsState::NotLoaded,
             settings_asked: false,
+            proxy: ProxyHealth::Off,
+            proxy_old: false,
+            proxy_polled: None,
             relay: None,
             torrents: Vec::new(),
             totals: Totals {
@@ -412,5 +460,180 @@ mod tests {
             initial,
             "the screen keeps the last good snapshot, not a lost link worked out on the way out"
         );
+    }
+
+    /// What the stand-in server answers the proxy state route with: a status and a body, or `None` to
+    /// drop the connection, and how many times it was asked.
+    #[derive(Default)]
+    struct Answer {
+        reply: std::sync::Mutex<Option<(u16, String)>>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A one-route HTTP server on loopback that answers every request from `answer`, and a backend
+    /// pointed at it. Nothing leaves the machine.
+    async fn backend_against(answer: Arc<Answer>) -> Backend {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let url = format!("http://{}", listener.local_addr().expect("its address"));
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    answer
+                        .asked
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let reply = answer.reply.lock().expect("the reply").clone();
+                    let Some((status, body)) = reply else {
+                        return;
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        let target = RemoteTarget {
+            url,
+            login: LoginMethod::None,
+            user: None,
+            key_path: None,
+            token_url: None,
+            gateway_key_header: None,
+            client_id: None,
+        };
+        let api = Arc::new(
+            Api::try_new(&target, Secret::None, None, Arc::new(Stopping::default()))
+                .expect("an address that is one"),
+        );
+        let initial = Arc::new(blank(
+            "a server".to_string(),
+            false,
+            "open".to_string(),
+            LinkState::Connected,
+        ));
+        let (snapshot_tx, _snapshots) = watch::channel(Arc::clone(&initial));
+        let (notices, _lines) = mpsc::channel(1);
+        let (gate, _up) = watch::channel(Gate::Down);
+        Backend {
+            api,
+            name: "a server".to_string(),
+            secure: false,
+            auth: "open".to_string(),
+            roots: Vec::new(),
+            default_dir: PathBuf::new(),
+            watching: None,
+            dirs: None,
+            devices: None,
+            settings: SettingsState::NotLoaded,
+            settings_asked: false,
+            proxy: ProxyHealth::Off,
+            proxy_old: false,
+            proxy_polled: None,
+            relay: None,
+            torrents: Vec::new(),
+            totals: Totals {
+                down_rate: 0,
+                up_rate: 0,
+                dht_nodes: None,
+            },
+            limits: LiveLimits {
+                download_kib: 0,
+                upload_kib: 0,
+                active_downloads: None,
+                active_seeds: None,
+                active_total: None,
+            },
+            detail: None,
+            queue: None,
+            want_limits: false,
+            stalled: HashMap::new(),
+            state: LinkState::Connected,
+            backoff: 0,
+            complained: false,
+            published: Arc::clone(&initial),
+            snapshot_tx,
+            notices,
+            wake: Arc::new(Notify::new()),
+            gate,
+        }
+    }
+
+    fn asked(answer: &Answer) -> usize {
+        answer.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The server's answer is taken in, its reason cleaned, and the route is asked at most every five
+    /// seconds, not every round; an error keeps the last value and says nothing.
+    #[tokio::test]
+    async fn remote_polls_proxy_state_every_five_seconds() {
+        let answer = Arc::new(Answer::default());
+        *answer.reply.lock().expect("reply") = Some((
+            200,
+            r#"{"state":"unreachable","reason":"\u001b[31mdown"}"#.to_string(),
+        ));
+        let mut backend = backend_against(Arc::clone(&answer)).await;
+        let start = Instant::now();
+
+        backend.poll_proxy(start).await;
+        let ProxyHealth::Unreachable { reason } = backend.proxy.clone() else {
+            panic!("the server's answer is taken in: {:?}", backend.proxy);
+        };
+        assert!(!reason.contains('\u{1b}'), "{reason:?}");
+        assert_eq!(asked(&answer), 1);
+
+        // Within five seconds: not asked again.
+        backend.poll_proxy(start + Duration::from_secs(4)).await;
+        assert_eq!(asked(&answer), 1, "asked again inside five seconds");
+
+        // After five seconds: asked, and a change is taken in.
+        *answer.reply.lock().expect("reply") = Some((200, r#"{"state":"ok"}"#.to_string()));
+        backend.poll_proxy(start + Duration::from_secs(6)).await;
+        assert_eq!(asked(&answer), 2);
+        assert_eq!(backend.proxy, ProxyHealth::Ok);
+
+        // The connection drops: the last value stays, and nothing is raised.
+        *answer.reply.lock().expect("reply") = None;
+        backend.poll_proxy(start + Duration::from_secs(12)).await;
+        assert_eq!(asked(&answer), 3);
+        assert_eq!(backend.proxy, ProxyHealth::Ok, "a network error keeps it");
+        assert!(!backend.proxy_old);
+    }
+
+    /// A `404` is an older server: `Off`, and this connection never asks again.
+    #[tokio::test]
+    async fn old_server_is_off_and_not_asked_again() {
+        let answer = Arc::new(Answer::default());
+        *answer.reply.lock().expect("reply") = Some((
+            404,
+            r#"{"error":"not_found","message":"no such route"}"#.to_string(),
+        ));
+        let mut backend = backend_against(Arc::clone(&answer)).await;
+        backend.proxy = ProxyHealth::LoginRefused;
+        let start = Instant::now();
+
+        backend.poll_proxy(start).await;
+        assert_eq!(backend.proxy, ProxyHealth::Off);
+        assert_eq!(asked(&answer), 1);
+
+        backend.poll_proxy(start + Duration::from_secs(6)).await;
+        backend.poll_proxy(start + Duration::from_secs(60)).await;
+        assert_eq!(asked(&answer), 1, "an older server is not asked again");
     }
 }

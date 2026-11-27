@@ -2256,3 +2256,54 @@ async fn put_proxy_failed_apply_rolls_back() {
     drop(squatter);
     served.stop().await;
 }
+
+/// `GET /api/v1/settings/proxy/state` on an engine whose proxy is a closed loopback port: it reports
+/// `unreachable` with a reason, the reason carries neither the proxy's login nor its address, and the
+/// route is behind the same sign-in as the other settings routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_state_route_reports_unreachable() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-state", with_proxy(proxy_port)).await;
+    let client = http();
+    let token = bearer(&served).await;
+    let url = served.url("/api/v1/settings/proxy/state");
+
+    // Nobody signed in: refused like the rest.
+    let anonymous = within(client.get(&url).send())
+        .await
+        .expect("the server answered");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    // The engine probes the proxy by itself and says so once it has tried.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let state = loop {
+        let response = get_bearer(&client, &url, &token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let state = body(response).await;
+        if state["state"] == "unreachable" {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the proxy never reported unreachable: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let text = state.to_string();
+    for leaked in [PROXY_PASSWORD, "bob", "127.0.0.1"] {
+        assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+    }
+
+    served.stop().await;
+}
+
+/// Without a proxy the route answers `off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_state_route_is_off_without_a_proxy() {
+    let served = Served::start("settings-proxy-state-off", with_alice).await;
+    let token = bearer(&served).await;
+    let state =
+        body(get_bearer(&http(), &served.url("/api/v1/settings/proxy/state"), &token).await).await;
+    assert_eq!(state, json!({ "state": "off" }));
+    served.stop().await;
+}

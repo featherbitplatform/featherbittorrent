@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::config::Limits;
+use crate::proxy::ProxyHealth;
 use crate::settings::{DownloadsChange, ProxyChange, SettingsView};
 
 /// Commands the backend queues before [`Client::send`] starts refusing them. It
@@ -361,6 +362,9 @@ pub struct Snapshot {
     /// What the Settings screen shows, from the last [`SettingsCommand::Load`] or save; see
     /// [`SettingsState`].
     pub settings: SettingsState,
+    /// How the proxy is doing, in the product's own words: `Off` without a proxy. A remote backend reads
+    /// it from the server every few seconds, a local one from its own engine, and a screen only draws it.
+    pub proxy: ProxyHealth,
 }
 
 /// What the screen asks of a backend's settings.
