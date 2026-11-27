@@ -477,8 +477,9 @@ impl ProxyHealth {
     ///
     /// The engine's reasons are I/O and protocol wording that does not carry the address today, but
     /// that is the engine's to change, and a login must never travel on the strength of that. Every
-    /// occurrence of the password, the user name, `host:port`, the host and the port is replaced by
-    /// `<proxy>` or `<hidden>`, longest first so a password that contains the host is gone whole.
+    /// occurrence of the password and the user name is replaced by `<hidden>`, and of `host:port`
+    /// and the host by `<proxy>`, longest first so a password that contains the host is gone whole. The
+    /// port on its own is not replaced: a bare number is too common in a reason to mean the proxy.
     pub fn redacted(self, proxy: Option<&ProxySetting>) -> ProxyHealth {
         let (ProxyHealth::Unreachable { reason }, Some(proxy)) = (&self, proxy) else {
             return self;

@@ -120,6 +120,10 @@ impl Backend {
             Ok(()) => {
                 if matches!(self.state, LinkState::Lost { .. }) {
                     line = Some(Notice::Info(format!("reached {} again", self.name)));
+                    // A new connection: a server that was too old to report its proxy may have been
+                    // upgraded since, so it is asked again.
+                    self.proxy_old = false;
+                    self.proxy_polled = None;
                 }
                 self.state = LinkState::Connected;
                 self.backoff = 0;
@@ -493,10 +497,31 @@ mod tests {
                             Ok(n) => request.extend_from_slice(&chunk[..n]),
                         }
                     }
-                    answer
-                        .asked
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let reply = answer.reply.lock().expect("the reply").clone();
+                    let first = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    // The routes a round reads besides the proxy state get plain answers.
+                    let other = match first.split(' ').nth(1).unwrap_or_default() {
+                        "/api/v1/torrents" => Some((200, "[]".to_string())),
+                        "/api/v1/session" => Some((
+                            200,
+                            r#"{"dht_nodes":null,"download_limit":0,"upload_limit":0}"#.to_string(),
+                        )),
+                        "/api/v1/fs/roots" => Some((200, r#"["/d"]"#.to_string())),
+                        "/api/v1/settings" => Some((404, "{}".to_string())),
+                        _ => None,
+                    };
+                    let reply = match other {
+                        Some(reply) => Some(reply),
+                        None => {
+                            answer
+                                .asked
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            answer.reply.lock().expect("the reply").clone()
+                        }
+                    };
                     let Some((status, body)) = reply else {
                         return;
                     };
@@ -614,6 +639,31 @@ mod tests {
         assert_eq!(asked(&answer), 3);
         assert_eq!(backend.proxy, ProxyHealth::Ok, "a network error keeps it");
         assert!(!backend.proxy_old);
+    }
+
+    /// A `404` is an older server for the connection it was said on: after the link is lost and comes
+    /// back, the route is asked again, so a server upgraded in between is reported.
+    #[tokio::test]
+    async fn an_upgraded_server_is_asked_again_after_a_reconnect() {
+        let answer = Arc::new(Answer::default());
+        *answer.reply.lock().expect("reply") = Some((404, "{}".to_string()));
+        let mut backend = backend_against(Arc::clone(&answer)).await;
+        backend.poll_proxy(Instant::now()).await;
+        assert!(backend.proxy_old);
+        assert_eq!(asked(&answer), 1);
+
+        // The server is upgraded while the link is down; the next good round is a reconnect.
+        *answer.reply.lock().expect("reply") =
+            Some((200, r#"{"state":"login_refused"}"#.to_string()));
+        backend.state = LinkState::Lost { retry_in_secs: 1 };
+        backend.refresh().await;
+        assert!(matches!(backend.state, LinkState::Connected));
+
+        backend
+            .poll_proxy(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert_eq!(asked(&answer), 2, "asked again after the reconnect");
+        assert_eq!(backend.proxy, ProxyHealth::LoginRefused);
     }
 
     /// A `404` is an older server: `Off`, and this connection never asks again.
