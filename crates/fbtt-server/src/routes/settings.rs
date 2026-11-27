@@ -294,21 +294,17 @@ pub(super) async fn put_proxy(
                     if let Err(problem) = written {
                         let problem = clean(&problem);
                         tracing::warn!(problem = %problem, "the proxy password could not be saved");
-                        let keychain_back = restore_keychain(
-                            store,
+                        // The file first, and the previous password back only once the file names
+                        // the previous address again (`roll_back`).
+                        let rollback = roll_back(
+                            &applying,
+                            &previous,
+                            Some(store),
                             keychain_now.as_ref() != keychain_before.as_ref(),
                             keychain_before,
                         )
                         .await;
-                        let file = locked(&previous).file.take();
-                        let file_back = applying
-                            .rewrite_from_apply(move |config| config.proxy = file)
-                            .await;
-                        return Err(not_saved(keychain_refused(
-                            &problem,
-                            file_back.err(),
-                            keychain_back.err(),
-                        )));
+                        return Err(not_saved(keychain_refused(&problem, &rollback)));
                     }
                 }
                 // The setting just resolved, applied over the settings this run started on: the
@@ -327,17 +323,16 @@ pub(super) async fn put_proxy(
                 // back to it too, still under the same lock, so nothing claims a proxy the engine is not
                 // using and the engine is never on a password the keychain does not hold.
                 tracing::warn!(problem = %problem, "the saved proxy could not be applied");
-                let keychain_back = match &keychain {
-                    Some(store) => {
-                        restore_keychain(store, wanted != keychain_before, keychain_before).await
-                    }
-                    None => Ok(()),
-                };
-                let file = locked(&previous).file.take();
-                let file_back = applying
-                    .rewrite_from_apply(move |config| config.proxy = file)
-                    .await;
-                let message = engine_refused(&problem, file_back.err(), keychain_back.err());
+                let changed = wanted != keychain_before;
+                let rollback = roll_back(
+                    &applying,
+                    &previous,
+                    keychain.as_ref(),
+                    changed,
+                    keychain_before,
+                )
+                .await;
+                let message = engine_refused(&problem, &rollback);
                 Err(RouteError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "proxy_not_applied",
@@ -366,28 +361,63 @@ struct Previous {
     engine: Option<ProxySetting>,
 }
 
-/// Puts `password` back in the keychain (or clears it, for none) when `changed` says the keychain no
-/// longer holds it. The error is the display-safe line saying the keychain would not.
-async fn restore_keychain(
-    store: &Arc<dyn ProxyPasswordStore>,
+/// What a failed proxy save could not put back. Every reason is display-safe.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Rollback {
+    /// Why `config.yaml` could not be written back, when it could not.
+    file: Option<String>,
+    /// Why the keychain would not take the previous password again, when it would not.
+    keychain: Option<String>,
+    /// The file could not go back, so the previous password was left out of the keychain, which now holds
+    /// none: putting it back beside a file that names the new address would hand it to the new host.
+    keychain_left_empty: bool,
+}
+
+/// Puts a failed proxy save back: `config.yaml` first, then (only once the file names the previous
+/// address again, and only when `changed` says the keychain no longer holds it) the previous password
+/// into the keychain, or nothing for none.
+async fn roll_back(
+    shared: &Shared,
+    previous: &Mutex<Previous>,
+    store: Option<&Arc<dyn ProxyPasswordStore>>,
     changed: bool,
     password: Option<String>,
-) -> Result<(), String> {
-    if !changed {
-        return Ok(());
+) -> Rollback {
+    let file = locked(previous).file.take();
+    if let Err(problem) = shared
+        .rewrite_from_apply(move |config| config.proxy = file)
+        .await
+    {
+        return Rollback {
+            file: Some(problem),
+            keychain: None,
+            keychain_left_empty: store.is_some() && changed && password.is_some(),
+        };
     }
-    Shared::keychain_call(store, move |store| match &password {
+    let Some(store) = store.filter(|_| changed) else {
+        return Rollback::default();
+    };
+    let restored = Shared::keychain_call(store, move |store| match &password {
         Some(password) => store.set(password),
         None => store.clear(),
     })
     .await
-    .and_then(|restored| restored)
-    .map_err(|problem| {
-        let problem = clean(&problem);
-        tracing::warn!(problem = %problem, "the previous proxy password could not be put back");
-        problem
-    })
+    .and_then(|restored| restored);
+    match restored {
+        Ok(()) => Rollback::default(),
+        Err(problem) => {
+            let problem = clean(&problem);
+            tracing::warn!(problem = %problem, "the previous proxy password could not be put back");
+            Rollback {
+                keychain: Some(problem),
+                ..Rollback::default()
+            }
+        }
+    }
 }
+
+/// The sentence a message ends with when the keychain was left without the previous password.
+const KEYCHAIN_LEFT_EMPTY: &str = "The previous password was not put back in the keychain, so type it again in the Proxy section.";
 
 /// A proxy save the keychain refused: `500 proxy_password_not_saved` with `message`.
 fn not_saved(message: String) -> RouteError {
@@ -408,44 +438,47 @@ fn password_not_saved(problem: &str) -> String {
 
 /// The answer to a keychain that refused the new password after the file was written: what failed, and
 /// what could not be put back. The engine was never asked. Every reason is display-safe.
-fn keychain_refused(problem: &str, file: Option<String>, keychain: Option<String>) -> String {
-    match (file, keychain) {
-        (None, None) => password_not_saved(problem),
-        (Some(file), None) => format!(
-            "The keychain did not save the proxy password, and config.yaml could not be put back and \
-             names the new proxy: {file}. The engine is still on the previous setting. The keychain's \
-             reason: {problem}"
-        ),
+fn keychain_refused(problem: &str, rollback: &Rollback) -> String {
+    match (&rollback.file, &rollback.keychain) {
+        (Some(file), _) => {
+            let mut message = format!(
+                "The keychain did not save the proxy password, and config.yaml could not be put back \
+                 and names the new proxy: {file}. The engine is still on the previous setting."
+            );
+            if rollback.keychain_left_empty {
+                message.push(' ');
+                message.push_str(KEYCHAIN_LEFT_EMPTY);
+            }
+            message.push_str(&format!(" The keychain's reason: {problem}"));
+            message
+        }
         (None, Some(keychain)) => format!(
             "The keychain did not save the proxy password, and it could not get the previous password \
              back: {keychain}. config.yaml names the previous proxy again and the engine is still on it. \
              The keychain's reason: {problem}"
         ),
-        (Some(file), Some(keychain)) => format!(
-            "The keychain did not save the proxy password, config.yaml could not be put back and names \
-             the new proxy ({file}), and the keychain could not get the previous password back \
-             ({keychain}). The engine is still on the previous setting. The keychain's reason: {problem}"
-        ),
+        (None, None) => password_not_saved(problem),
     }
 }
 
 /// The answer to an engine that refused to switch: what was put back, and what could not be. Every reason
 /// is display-safe.
-fn engine_refused(problem: &str, file: Option<String>, keychain: Option<String>) -> String {
-    match (file, keychain) {
-        (None, None) => fbtt_core::proxy::not_applied(problem),
-        (Some(file), None) => fbtt_core::proxy::not_rolled_back(problem, &file),
+fn engine_refused(problem: &str, rollback: &Rollback) -> String {
+    match (&rollback.file, &rollback.keychain) {
+        (Some(file), _) => {
+            let message = fbtt_core::proxy::not_rolled_back(problem, file);
+            if rollback.keychain_left_empty {
+                format!("{message}. {KEYCHAIN_LEFT_EMPTY}")
+            } else {
+                message
+            }
+        }
         (None, Some(keychain)) => format!(
             "The engine could not switch to this proxy and is still on the previous setting, and \
              config.yaml names it again, but the keychain could not get the previous password back: \
              {keychain}. The engine's reason: {problem}"
         ),
-        (Some(file), Some(keychain)) => fbtt_core::proxy::not_rolled_back(
-            problem,
-            &format!(
-                "{file}; the keychain could not get the previous password back either: {keychain}"
-            ),
-        ),
+        (None, None) => fbtt_core::proxy::not_applied(problem),
     }
 }
 
@@ -612,5 +645,97 @@ fn problem_error(problem: SettingsProblem) -> RouteError {
             "invalid_setting",
             problem.message(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rollback, engine_refused, keychain_refused};
+
+    /// A keychain refusal says what failed and what could not be put back, never that the engine was
+    /// asked.
+    #[test]
+    fn keychain_refused_says_what_failed() {
+        assert_eq!(
+            keychain_refused("locked", &Rollback::default()),
+            "The keychain did not save the proxy password, so the previous setting is kept: locked"
+        );
+        let file = keychain_refused(
+            "locked",
+            &Rollback {
+                file: Some("disk full".to_string()),
+                keychain: None,
+                keychain_left_empty: true,
+            },
+        );
+        assert_eq!(
+            file,
+            "The keychain did not save the proxy password, and config.yaml could not be put back and \
+             names the new proxy: disk full. The engine is still on the previous setting. The previous \
+             password was not put back in the keychain, so type it again in the Proxy section. The \
+             keychain's reason: locked"
+        );
+        let keychain = keychain_refused(
+            "locked",
+            &Rollback {
+                keychain: Some("still locked".to_string()),
+                ..Rollback::default()
+            },
+        );
+        assert!(keychain.contains("could not get the previous password back: still locked"));
+        assert!(!keychain.contains("could not be put back"), "{keychain}");
+        for message in [file, keychain] {
+            assert!(!message.contains("engine could not switch"), "{message}");
+        }
+    }
+
+    /// An engine refusal says what was put back and what was not.
+    #[test]
+    fn engine_refused_says_what_failed() {
+        assert_eq!(
+            engine_refused("port taken", &Rollback::default()),
+            "The engine could not switch to this proxy, so the previous setting is kept: port taken"
+        );
+        let file = engine_refused(
+            "port taken",
+            &Rollback {
+                file: Some("disk full".to_string()),
+                keychain: None,
+                keychain_left_empty: true,
+            },
+        );
+        assert!(
+            file.contains("could not be put back and names the new one: disk full"),
+            "{file}"
+        );
+        assert!(
+            file.ends_with(
+                "The previous password was not put back in the keychain, so type it again in the Proxy \
+                 section."
+            ),
+            "{file}"
+        );
+        let kept = engine_refused(
+            "port taken",
+            &Rollback {
+                file: Some("disk full".to_string()),
+                ..Rollback::default()
+            },
+        );
+        assert!(!kept.contains("keychain"), "{kept}");
+        let keychain = engine_refused(
+            "port taken",
+            &Rollback {
+                keychain: Some("locked".to_string()),
+                ..Rollback::default()
+            },
+        );
+        assert!(
+            keychain.contains(
+                "config.yaml names it again, but the keychain could not get the previous password back: \
+                 locked"
+            ),
+            "{keychain}"
+        );
     }
 }

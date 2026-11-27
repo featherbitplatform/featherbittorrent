@@ -487,7 +487,12 @@ struct MemoryStore {
     calls: Mutex<Vec<(&'static str, String)>>,
     /// When set, how many more writes are taken before every write is refused.
     writes_left: Mutex<Option<usize>>,
+    /// Every call takes [`HANG`] before it answers, like a Secret Service that does not answer.
+    hanging: AtomicBool,
 }
+
+/// How long a hanging [`MemoryStore`] takes to answer: far past the keychain deadline.
+const HANG: Duration = Duration::from_secs(10);
 
 impl MemoryStore {
     fn holding(password: Option<&str>) -> Arc<MemoryStore> {
@@ -506,6 +511,12 @@ impl MemoryStore {
 
     fn held(&self) -> Option<String> {
         self.password.lock().expect("the store's lock").clone()
+    }
+
+    fn wait_if_hanging(&self) {
+        if self.hanging.load(Ordering::SeqCst) {
+            std::thread::sleep(HANG);
+        }
     }
 
     /// Whether this write is refused: refused writes were asked for, or the writes left ran out.
@@ -539,6 +550,7 @@ impl MemoryStore {
 
 impl ProxyPasswordStore for MemoryStore {
     fn get(&self) -> Option<String> {
+        self.wait_if_hanging();
         if self.unavailable {
             return None;
         }
@@ -546,6 +558,7 @@ impl ProxyPasswordStore for MemoryStore {
     }
 
     fn set(&self, password: &str) -> Result<(), String> {
+        self.wait_if_hanging();
         if self.unavailable || self.refuses() {
             return Err("The keychain did not save the password: refused by the test".to_string());
         }
@@ -555,6 +568,7 @@ impl ProxyPasswordStore for MemoryStore {
     }
 
     fn clear(&self) -> Result<(), String> {
+        self.wait_if_hanging();
         if self.refuses() {
             return Err(
                 "The keychain did not remove the password: refused by the test".to_string(),
@@ -960,6 +974,110 @@ async fn desktop_failed_apply_says_when_only_the_keychain_could_not_go_back() {
     assert!(!text.contains("could not be put back"), "{text}");
     assert!(!text.contains(PROXY_PASSWORD), "{text}");
     assert_eq!(file_text(&paths), before, "the file went back");
+
+    drop(squatter);
+    served.stop().await;
+}
+
+/// The engine starts without waiting for a keychain that does not answer: on the proxy, with no login.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_engine_start_does_not_wait_for_the_keychain() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    store.hanging.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let (served, _paths) = start_keychained(
+        "desktop-proxy-start-hangs",
+        proxy_at(ProxyType::Socks5, closed_port(), None),
+        Some(store),
+    )
+    .await;
+    assert!(
+        started.elapsed() < HANG,
+        "the start waited for the keychain: {:?}",
+        started.elapsed()
+    );
+    let running = served.server.network_settings();
+    assert_eq!(running.proxy.kind, fbt::ProxyKind::Socks5);
+    assert_eq!(running.proxy.username, None, "no login");
+    served.stop().await;
+}
+
+/// A save whose keychain does not answer is a `500` with a plain reason, and nothing changes: not the
+/// file, not the keychain, not the engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_save_with_a_keychain_that_does_not_answer_changes_nothing() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-save-hangs",
+        proxy_at(ProxyType::Socks5, port, None),
+        Some(store.clone()),
+    )
+    .await;
+    let before = file_text(&paths);
+    let engine_before = served.server.network_settings();
+    store.hanging.store(true, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "socks5", "host": "127.0.0.1", "port": port, "username": "bob",
+               "password": {"set": "another-password"}}),
+    )
+    .await;
+    assert!(started.elapsed() < HANG, "the save waited for the keychain");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(
+        text.contains("the keychain did not answer in time"),
+        "{text}"
+    );
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    assert!(!text.contains("another-password"), "{text}");
+    assert_eq!(file_text(&paths), before, "the file is as it was");
+    assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
+    assert_eq!(served.server.network_settings(), engine_before);
+    served.stop().await;
+}
+
+/// A switch the engine refuses puts `config.yaml` back first, and the previous password into the
+/// keychain only once the file names the previous proxy again.
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_rollback_rewrites_the_file_before_the_keychain() {
+    let store = MemoryStore::holding(Some(PROXY_PASSWORD));
+    let proxy_port = closed_port();
+    let (served, paths) = start_keychained(
+        "desktop-proxy-rollback-order",
+        proxy_at(ProxyType::Http, proxy_port, None),
+        Some(store.clone()),
+    )
+    .await;
+    *store.watch.lock().expect("the store's lock") = Some(paths.config_file());
+    let engine_port = served
+        .server
+        .engine_local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+
+    let (status, text) = put_proxy(
+        &served,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    let calls = store.calls.lock().expect("the store's lock").clone();
+    let order: Vec<(&str, bool)> = calls
+        .iter()
+        .map(|(call, file)| (*call, file.contains("proxy:")))
+        .collect();
+    assert_eq!(
+        order,
+        vec![("clear", true), ("set", true)],
+        "cleared before the file dropped the proxy, set back once the file named it again"
+    );
+    assert_eq!(store.held().as_deref(), Some(PROXY_PASSWORD));
 
     drop(squatter);
     served.stop().await;

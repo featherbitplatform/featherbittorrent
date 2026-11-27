@@ -4,10 +4,8 @@
 //! over the session bus that block, and they run on the main thread before the window is made. A wedged
 //! bus would hang the app there with nothing on screen. [`answer_within`] runs such a call on a thread of
 //! its own and stops waiting at the deadline: a call that has not answered by then counts as "no", and
-//! its thread is left to finish (or not) on its own.
-
-// Asked only on Linux; the other systems ask nothing that can wedge.
-#![cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+//! its thread is left to finish (or not) on its own. This computer's start asks the keychain for the proxy
+//! password the same way, on every system.
 
 use std::sync::mpsc;
 use std::time::Duration;

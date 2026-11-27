@@ -113,18 +113,30 @@ pub(crate) async fn start_with(
             ));
         }
     };
-    let mut config = library_config(&library)?;
-    move_password_to_keychain(&mut config, &library, proxy_password.as_ref());
-    let config = with_allowed_roots(config, &library);
-    // The engine logs in with the keychain's password; `config` keeps saying what the file holds, which
-    // is what the server reports from and writes back.
-    let mut engine = config.clone();
-    if let Some(proxy) = engine.proxy.as_mut()
-        && proxy.password.as_deref().is_none_or(str::is_empty)
-        && proxy_password.available()
-    {
-        proxy.password = proxy_password.get();
-    }
+    let config = library_config(&library)?;
+    // The keychain and the file are asked off the runtime's threads, and the keychain under a deadline
+    // (`keychain_answer`): a Secret Service that hangs must not leave the window with nothing in it.
+    let store = Arc::clone(&proxy_password);
+    let paths_for = library.clone();
+    let (config, engine) = tokio::task::spawn_blocking(move || {
+        let mut config = config;
+        move_password_to_keychain(&mut config, &paths_for, &store);
+        let config = with_allowed_roots(config, &paths_for);
+        // The engine logs in with the keychain's password; `config` keeps saying what the file holds,
+        // which is what the server reports from and writes back. A keychain that does not answer in time
+        // is no password at hand: the engine then starts on the proxy with no login, never direct.
+        let mut engine = config.clone();
+        if let Some(proxy) = engine.proxy.as_mut()
+            && proxy.password.as_deref().is_none_or(str::is_empty)
+            && store.available()
+        {
+            let asking = Arc::clone(&store);
+            proxy.password = keychain_answer(move || asking.get()).flatten();
+        }
+        (config, engine)
+    })
+    .await
+    .map_err(|problem| format!("This computer could not start: {problem}"))?;
     let secret = launch_secret();
     let access = DesktopAccess {
         launch_secret: secret.clone(),
@@ -176,7 +188,14 @@ fn library_config(paths: &Paths) -> Result<Config, String> {
 /// password; a file that will not save after the keychain took it is left too, and the engine starts on
 /// the keychain's (the same password), and the next start tries again. Either is one line on stderr,
 /// which never carries the password.
-fn move_password_to_keychain(config: &mut Config, paths: &Paths, store: &dyn ProxyPasswordStore) {
+///
+/// A keychain that does not answer within its deadline counts as one that would not take it: the file is
+/// kept as it is.
+fn move_password_to_keychain(
+    config: &mut Config,
+    paths: &Paths,
+    store: &Arc<dyn ProxyPasswordStore>,
+) {
     let Some(password) = config
         .proxy
         .as_ref()
@@ -188,9 +207,19 @@ fn move_password_to_keychain(config: &mut Config, paths: &Paths, store: &dyn Pro
     if !store.available() {
         return;
     }
-    if let Err(problem) = store.set(&password) {
-        eprintln!("The proxy password stays in config.yaml: {problem}");
-        return;
+    let setting = Arc::clone(store);
+    match keychain_answer(move || setting.set(&password)) {
+        Some(Ok(())) => {}
+        Some(Err(problem)) => {
+            eprintln!("The proxy password stays in config.yaml: {problem}");
+            return;
+        }
+        None => {
+            eprintln!(
+                "The keychain did not answer in time; the proxy password stays in config.yaml."
+            );
+            return;
+        }
     }
     let file = paths.config_file();
     let saved = match Config::load_for_edit_keychained(&file) {
@@ -213,6 +242,12 @@ fn move_password_to_keychain(config: &mut Config, paths: &Paths, store: &dyn Pro
             "The proxy password is in the keychain, but config.yaml still holds it: {problem}"
         ),
     }
+}
+
+/// What `call` on the keychain answers within the session bus deadline, or `None` when it does not answer
+/// in time ([`crate::deadline::answer_within`]).
+fn keychain_answer<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    crate::deadline::answer_within(crate::deadline::SESSION_BUS_DEADLINE, call)
 }
 
 /// `config` as the engine runs it: a library whose file names no `server:` section (the desktop's default)
@@ -562,6 +597,45 @@ pub(crate) mod tests {
         .expect("a JSON view");
         assert_eq!(view["proxy"]["password_saved"], false, "{view}");
         assert_eq!(view["proxy"]["password_storage"], "unavailable", "{view}");
+        this.stop().await;
+    }
+
+    /// A keychain that does not answer (a Secret Service that hangs, a collection waiting on an unlock
+    /// prompt) never stops the start: This computer starts within the deadlines, on the proxy with no
+    /// login, never direct.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_start_does_not_wait_for_a_keychain_that_does_not_answer() {
+        let dir = ScratchDir::new("desktop-local-keychain-hangs");
+        let paths = scratch_paths(&dir);
+        write_proxy(&paths, ProxyType::Socks5, Some(PROXY_PASSWORD));
+        let file = paths.library().config_file();
+        let mut config = Config::load_for_edit(&file).expect("reads").expect("there");
+        if let Some(proxy) = config.proxy.as_mut() {
+            proxy.password = None;
+        }
+        config
+            .save(&file)
+            .expect("the file as the keychain left it");
+        let keychain = Arc::new(MemoryKeychain::new());
+        keychain
+            .set(PROXY_ACCOUNT, PROXY_PASSWORD)
+            .expect("the keychain holds it");
+        keychain.hang(true);
+        let store: Arc<dyn ProxyPasswordStore> = Arc::new(ProxyKeychain::new(keychain));
+
+        let started = std::time::Instant::now();
+        let this = start_keychained(&paths, store)
+            .await
+            .expect("This computer starts");
+        assert!(
+            started.elapsed() < crate::keychain::HANG,
+            "the start waited for the keychain: {:?}",
+            started.elapsed()
+        );
+        let running = this.network_settings();
+        assert_eq!(running.proxy.kind, fbt::ProxyKind::Socks5);
+        assert_eq!(running.proxy.username, None, "no login");
+        assert!(!running.enable_incoming_tcp, "nothing bypasses the proxy");
         this.stop().await;
     }
 

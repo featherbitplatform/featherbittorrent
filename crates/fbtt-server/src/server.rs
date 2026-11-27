@@ -79,10 +79,6 @@ pub enum ServerError {
         "the launch secret is too short: it needs at least {MIN_LAUNCH_SECRET_CHARS} characters"
     )]
     LaunchSecret,
-    /// The keychain could not be asked for the proxy password: the blocking pool refused the job, which
-    /// means this process is already being shut down.
-    #[error("the keychain could not be asked for the proxy password: {0}")]
-    Keychain(String),
 }
 
 /// How the desktop app reaches the engine it starts ([`Server::start_desktop`]).
@@ -315,7 +311,7 @@ impl Server {
         let base_settings = settings.clone();
         let mut settings = settings;
         // On the desktop app's engine the file holds no password: the keychain's is the one the engine
-        // logs in with, asked on the blocking pool. A password the file still holds (one the keychain
+        // logs in with, asked under a deadline. A password the file still holds (one the keychain
         // would not take at the app's start) is used as it is. A SOCKS5 login with no password to hand
         // (the keychain lost it, or is out of reach this run) cannot be handed to the engine, so the
         // engine starts on the proxy with no login: the proxy refuses it, the Proxy section says so, and
@@ -324,10 +320,12 @@ impl Server {
         if let (Some(setting), Some(store)) = (proxy.as_mut(), proxy_password.as_ref())
             && setting.password.as_deref().is_none_or(str::is_empty)
         {
+            // A keychain that does not answer in time is no password at hand, not a start that waits.
             if store.available() {
                 setting.password = routes::Shared::keychain_call(store, |store| store.get())
                     .await
-                    .map_err(ServerError::Keychain)?;
+                    .ok()
+                    .flatten();
             }
             if setting.validate().is_err() && setting.validate_password_elsewhere().is_ok() {
                 tracing::warn!(

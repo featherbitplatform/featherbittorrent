@@ -179,6 +179,7 @@ pub struct MemoryKeychain {
     entries: Mutex<HashMap<String, String>>,
     missing: bool,
     failing: AtomicBool,
+    hanging: AtomicBool,
 }
 
 #[cfg(test)]
@@ -190,6 +191,11 @@ impl std::fmt::Debug for MemoryKeychain {
             .finish_non_exhaustive()
     }
 }
+
+/// How long a [`MemoryKeychain`] told to [`hang`](MemoryKeychain::hang) takes to answer: far past the
+/// session bus deadline.
+#[cfg(test)]
+pub const HANG: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What [`MemoryKeychain`] answers a write it was told to refuse.
 #[cfg(test)]
@@ -210,6 +216,18 @@ impl MemoryKeychain {
         }
     }
 
+    /// From now on every `get`, `set` and `remove` takes [`HANG`] before it answers, like a Secret Service
+    /// that does not answer (or answers at once again, with `false`).
+    pub fn hang(&self, hanging: bool) {
+        self.hanging.store(hanging, Ordering::SeqCst);
+    }
+
+    fn wait_if_hanging(&self) {
+        if self.hanging.load(Ordering::SeqCst) {
+            std::thread::sleep(HANG);
+        }
+    }
+
     /// From now on every `set` and `remove` fails with [`REFUSED`] (or works again, with `false`).
     pub fn fail_writes(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
@@ -225,10 +243,12 @@ impl MemoryKeychain {
 #[cfg(test)]
 impl Keychain for MemoryKeychain {
     fn get(&self, id: &str) -> Option<String> {
+        self.wait_if_hanging();
         self.entries().get(id).cloned()
     }
 
     fn set(&self, id: &str, password: &str) -> Result<(), String> {
+        self.wait_if_hanging();
         if self.missing {
             return Err(NO_KEYCHAIN.to_string());
         }
@@ -244,6 +264,7 @@ impl Keychain for MemoryKeychain {
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
+        self.wait_if_hanging();
         if self.failing.load(Ordering::SeqCst) {
             return Err(REFUSED.to_string());
         }

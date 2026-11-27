@@ -63,6 +63,13 @@ fn load_for_edit(path: &std::path::Path, keychained: bool) -> Result<Option<Conf
     }
 }
 
+/// How long a keychain call may take before it counts as no answer: the desktop app's own deadline for the
+/// session bus (`SESSION_BUS_DEADLINE` in its `deadline` module), which this crate cannot reach.
+pub(crate) const KEYCHAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What a keychain call that ran past [`KEYCHAIN_DEADLINE`] answers.
+pub(crate) const KEYCHAIN_TIMED_OUT: &str = "the keychain did not answer in time";
+
 pub(crate) fn clean(text: &str) -> String {
     fbt::display_safe(text, fbt::MAX_DISPLAY_CHARS)
 }
@@ -279,20 +286,35 @@ impl Shared {
             .filter(|store| store.available())
     }
 
-    /// Runs `call` on the keychain on the blocking pool, as every other call that may wait on the system
-    /// is run: a Secret Service on a slow session bus must not hold a worker thread. A task that did not
-    /// finish is a failure with a line to show, never unwrapped.
+    /// Runs `call` on the keychain on a thread of its own and waits at most [`KEYCHAIN_DEADLINE`] for it,
+    /// as the desktop app waits for the session bus: a Secret Service that hangs, or a collection waiting
+    /// on an unlock prompt, must not hold a request (or the engine's start) for as long as it takes. A call
+    /// that has not answered by then, or that panicked, is a failure with a plain line to show; its thread
+    /// is left to finish (or not) on its own.
     pub(crate) async fn keychain_call<T: Send + 'static>(
         store: &Arc<dyn crate::ProxyPasswordStore>,
         call: impl FnOnce(&dyn crate::ProxyPasswordStore) -> T + Send + 'static,
     ) -> Result<T, String> {
         let store = Arc::clone(store);
-        tokio::task::spawn_blocking(move || call(store.as_ref()))
-            .await
-            .map_err(|problem| {
-                tracing::warn!(problem = %problem, "the keychain task did not finish");
-                "the keychain could not be asked".to_string()
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("keychain".to_string())
+            .spawn(move || {
+                // The receiver may be gone by now: the deadline passed, and nobody wants the answer.
+                let _ = answer.send(call(store.as_ref()));
             })
+            .map_err(|problem| {
+                tracing::warn!(problem = %problem, "the keychain thread did not start");
+                "the keychain could not be asked".to_string()
+            })?;
+        match tokio::time::timeout(KEYCHAIN_DEADLINE, answered).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err("the keychain could not be asked".to_string()),
+            Err(_) => {
+                tracing::warn!("the keychain did not answer in time");
+                Err(KEYCHAIN_TIMED_OUT.to_string())
+            }
+        }
     }
 
     /// Where this run keeps the proxy password: the keychain, `config.yaml` because the desktop app's
