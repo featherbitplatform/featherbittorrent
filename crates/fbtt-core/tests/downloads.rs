@@ -1232,6 +1232,16 @@ async fn watch_folder_marks_garbage_invalid() {
         line.contains("junk.torrent"),
         "the line names the file: {line}"
     );
+    // The field is read the moment the line arrives, before anything else this test waits for: it only
+    // carries one pass's complaint, and the next pass, two watch periods after this one began, finds the
+    // name already renamed away, has nothing left to say and clears it. A test thread that was descheduled
+    // for a couple of seconds between the line and this look would find it empty, which says nothing
+    // about the watch folder.
+    assert_eq!(
+        handle.problems().0.as_deref(),
+        Some(line.as_str()),
+        "the same line is what the watch folder's field shows"
+    );
     wait_for_file(watch.join("junk.torrent"), false).await;
     assert_eq!(
         list_dir(&watch),
@@ -1245,11 +1255,6 @@ async fn watch_folder_marks_garbage_invalid() {
         snapshot.torrents
     );
     drop(snapshot);
-    assert_eq!(
-        handle.problems().0.as_deref(),
-        Some(line.as_str()),
-        "the same line is what the watch folder's field shows"
-    );
 
     shutdown(client, task).await;
 }
@@ -2031,20 +2036,22 @@ async fn watch_folder_adds_the_real_file_beside_a_fifo_body() {
     // this pass's complaint, which is the moment the notice goes out.
     // The wait is bounded, and that is what makes a poisoned sweep *fail* this test instead of
     // hanging it: a pass whose `open()` blocks on the swapped-in pipe never produces this line, and
-    // a deadline is the only witness that will ever say so. Twelve seconds is many times what a
-    // healthy pass takes to settle on the name and complain about it (two watch periods and a
-    // wake), so the deadline never fires on working code, but a sweep stuck inside `open()` is
-    // named, out loud, within seconds of the pass failing to come back.
+    // a deadline is the only witness that will ever say so. The bound is the suite's own `DEADLINE`,
+    // not a multiple of what a healthy pass takes (two watch periods and a wake): that figure is a
+    // fact about an idle machine, and on a busy one the pass is late by however long the machine
+    // kept it waiting. Working code still gets there with a wide margin; a sweep stuck inside
+    // `open()` is named, out loud, within the same minute every other wait in this file allows.
     let line = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        DEADLINE,
         notice_where(&mut client, |text| text.contains("blocked.torrent")),
     )
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the watch sweep never came back from blocked.torrent within 12 seconds: the pass is \
+            "the watch sweep never came back from blocked.torrent within {} seconds: the pass is \
              sitting inside the candidate open() - without O_NONBLOCK a FIFO with no writer stops \
-             the whole scan, and the real torrent beside it waits behind that open too"
+             the whole scan, and the real torrent beside it waits behind that open too",
+            DEADLINE.as_secs()
         )
     });
     assert!(
