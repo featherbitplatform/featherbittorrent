@@ -89,10 +89,48 @@ pub(super) async fn get(
 /// ([`safe_health`]): a screen shows the headline and that reason and nothing else.
 pub(super) async fn get_proxy_state(State(shared): State<Arc<Shared>>) -> Json<ProxyHealth> {
     let config = shared.current_config();
-    Json(safe_health(
-        fbtt_core::proxy::health(shared.session()),
-        config.proxy.as_ref(),
-    ))
+    Json(
+        safe_health_with_keychain(
+            fbtt_core::proxy::health(shared.session()),
+            config.proxy.as_ref(),
+            shared.proxy_keychain().map(Arc::as_ref),
+        )
+        .await,
+    )
+}
+
+/// [`safe_health`] on the desktop app's engine, whose `config.yaml` holds no proxy password: the password
+/// the reason must not carry is the keychain's, asked through the one keychain worker. The keychain is
+/// asked only when there is a reason to redact and the config has no password of its own. A worker still
+/// busy with an earlier call is not queued behind, and one that does not answer within its deadline (or
+/// cannot be asked) leaves no way to know what to take out, so the reason goes and the headline alone is
+/// left.
+async fn safe_health_with_keychain(
+    health: ProxyHealth,
+    proxy: Option<&ProxySetting>,
+    keychain: Option<&KeychainWorker>,
+) -> ProxyHealth {
+    let asks = matches!(&health, ProxyHealth::Unreachable { reason } if !reason.is_empty());
+    let (Some(store), Some(setting), true) = (keychain, proxy, asks) else {
+        return safe_health(health, proxy);
+    };
+    if !setting.password.as_deref().is_none_or(str::is_empty) {
+        return safe_health(health, proxy);
+    }
+    let headline_only = ProxyHealth::Unreachable {
+        reason: String::new(),
+    };
+    if store.busy() {
+        return headline_only;
+    }
+    match store.get().await {
+        Ok(password) => {
+            let mut setting = setting.clone();
+            setting.password = password;
+            safe_health(health, Some(&setting))
+        }
+        Err(_) => headline_only,
+    }
 }
 
 /// `health` as it may leave this process: the proxy's address and login out of its reason, and what is
@@ -698,10 +736,112 @@ fn problem_error(problem: SettingsProblem) -> RouteError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rollback, engine_refused, keychain_refused, safe_health};
+    use super::{
+        Rollback, engine_refused, keychain_refused, safe_health, safe_health_with_keychain,
+    };
+    use crate::{KeychainWorker, ProxyPasswordStore};
     use fbtt_core::ProxySetting;
     use fbtt_core::ProxyType;
     use fbtt_core::proxy::ProxyHealth;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    const KEYCHAIN_PASSWORD: &str = "keychain-pass-hunter2";
+
+    /// A keychain holding [`KEYCHAIN_PASSWORD`] that, when `hold` is set, keeps every `get` waiting until
+    /// the test lets it go (or ten seconds pass).
+    struct HeldKeychain {
+        hold: Option<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl ProxyPasswordStore for HeldKeychain {
+        fn get(&self) -> Option<String> {
+            if let Some(hold) = &self.hold {
+                let hold = hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = hold.recv_timeout(Duration::from_secs(10));
+            }
+            Some(KEYCHAIN_PASSWORD.to_string())
+        }
+        fn set(&self, _password: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn available(&self) -> bool {
+            true
+        }
+    }
+
+    /// The proxy as This computer's `config.yaml` holds it: a login whose password is in the keychain.
+    fn keychained_proxy() -> ProxySetting {
+        ProxySetting {
+            kind: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: Some("bob".to_string()),
+            password: None,
+        }
+    }
+
+    fn unreachable_with_the_password() -> ProxyHealth {
+        ProxyHealth::Unreachable {
+            reason: format!("refused bob/{KEYCHAIN_PASSWORD}"),
+        }
+    }
+
+    /// On This computer the reason is redacted with the keychain's password, which the config never holds.
+    #[tokio::test]
+    async fn the_keychain_password_is_taken_out_of_a_reason() {
+        let worker = KeychainWorker::new(Arc::new(HeldKeychain { hold: None }));
+        let proxy = keychained_proxy();
+        let health =
+            safe_health_with_keychain(unreachable_with_the_password(), Some(&proxy), Some(&worker))
+                .await;
+        let line = health.headline().expect("a line");
+        assert!(!line.contains(KEYCHAIN_PASSWORD), "{line}");
+        assert!(line.starts_with("Can't reach the proxy: "), "{line}");
+    }
+
+    /// A keychain that does not answer in time leaves no way to know what to take out: the headline alone.
+    #[tokio::test]
+    async fn a_keychain_that_does_not_answer_leaves_the_headline_only() {
+        let (_release, hold) = mpsc::channel();
+        let worker = KeychainWorker::new(Arc::new(HeldKeychain {
+            hold: Some(Mutex::new(hold)),
+        }));
+        let proxy = keychained_proxy();
+        let health =
+            safe_health_with_keychain(unreachable_with_the_password(), Some(&proxy), Some(&worker))
+                .await;
+        assert_eq!(health.headline().as_deref(), Some("Can't reach the proxy"));
+    }
+
+    /// A keychain busy with an earlier call is not queued behind: the headline alone, at once.
+    #[tokio::test]
+    async fn a_busy_keychain_leaves_the_headline_only_at_once() {
+        let (release, hold) = mpsc::channel();
+        let worker = KeychainWorker::new(Arc::new(HeldKeychain {
+            hold: Some(Mutex::new(hold)),
+        }));
+        let earlier = Arc::clone(&worker);
+        let waiting = std::thread::spawn(move || earlier.get_blocking());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.busy() {
+            assert!(Instant::now() < deadline, "the earlier call never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let proxy = keychained_proxy();
+        let started = Instant::now();
+        let health =
+            safe_health_with_keychain(unreachable_with_the_password(), Some(&proxy), Some(&worker))
+                .await;
+        assert!(started.elapsed() < Duration::from_secs(1), "it waited");
+        assert_eq!(health.headline().as_deref(), Some("Can't reach the proxy"));
+        let _ = release.send(());
+        let _ = release.send(());
+        let _ = waiting.join();
+    }
 
     /// The reason leaves the server display-safe: an escape sequence is gone, and so are the proxy's
     /// address and its login, which are never part of what a screen is shown.

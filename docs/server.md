@@ -58,8 +58,9 @@ the rest as they are. Rates are whole KiB/s and the cache whole MiB because that
 them. A file that cannot be parsed is moved aside as `config.yaml.bad` and the run starts on defaults,
 with the problem logged after the first line; a file that cannot be read at all stops the run (exit 1).
 
-Keys this version does not know are kept when the app rewrites the file. Comments are not kept. So a
-setting a newer version wrote into this file survives a save made by this one, and a note you left
+Top-level keys this version does not know are kept when the app rewrites the file; a key it does not know
+inside a section it does know (under `limits:`, say) is not. Comments are not kept. So a top-level section
+a newer version wrote into this file survives a save made by this one, and a note you left
 beside a setting is gone the first time the app saves it - keep your own copy of an annotated file, or
 keep the annotations somewhere else.
 
@@ -237,6 +238,9 @@ client and for a server. The desktop app keeps This computer's password in the s
 saved. The proxy can be changed while the app runs, from the Proxy section of the terminal client's Settings
 (`S`), the web UI's Settings page or `PUT /api/v1/settings/proxy`, and takes effect without a restart.
 Saving writes the section back to `config.yaml` and, as with every settings save, drops the file's comments.
+A `proxy:` section you edit in `config.yaml` by hand takes effect at the next start. Until then the Proxy
+section and the proxy health show the proxy the engine is running, and saving another section keeps your
+edit in the file.
 
 A saved password is kept only while the host and port stay the same: a change of either asks for the password
 again (or `Clear password`), so a login is never sent to an address nobody typed it for.
@@ -304,12 +308,13 @@ product adds:
 | `GET /api/v1/settings` | The server's own settings as it is running: `speed` is the limits the session is under (read back off it, in KiB/s), `downloads` is the folders, the switch, the completion program and whether *this* request may change it, and `proxy` is the proxy (`type`, `host`, `port`, `username`) with `password_saved` saying whether a password is stored and `password_storage` where (`config_file` on a server). The password itself is never in an answer. |
 | `PUT /api/v1/settings/speed` | Sets the running rates and queue counts (`{"download_kib": .., "upload_kib": .., "active_downloads": .., "active_seeds": .., "active_total": ..}`) and saves them to `config.yaml`, so the next run starts under the same limits. Answers the settings it made. |
 | `PUT /api/v1/settings/downloads` | Sets the download folder, the unfinished folder, the start-paused switch and the watch folder (`{"default_dir": .., "unfinished_dir": .., "start_paused": .., "watch_dir": ..}`, with an optional `on_complete`) and saves them to `config.yaml`. Answers the settings it made. `400 invalid_setting` with the line to show for a section that cannot work, `403 outside_roots` for a folder outside the allowed folders and `403 set_in_config_file` when the body names `on_complete` without the launch secret. |
-| `PUT /api/v1/settings/proxy` | Sets the proxy (`{"type": "socks5", "host": .., "port": .., "username": .., "password": "keep"}`), saves it to `config.yaml` and switches the running engine to it without a restart: connections made under the old setting are closed and nothing connects directly in between. `password` is `"keep"` (whatever is stored), `"clear"` or `{"set": "<new password>"}`; `"keep"` with a stored password is refused `400 invalid_setting` when the host or port changes, so a login is never sent to an address it was not typed for; `"type": "none"` removes the `proxy:` section and brings back what the proxy had turned off. Answers the settings it made. `400 invalid_setting` with the line to show for a setting that cannot work (checked with the stored password put back in), and `500 proxy_not_applied` if the engine could not switch after the file was written (its new network stack would not build): the engine stays on the previous setting, and the previous setting is written back to `config.yaml`, so the file and the settings never name a proxy the engine is not using. |
+| `PUT /api/v1/settings/proxy` | Sets the proxy (`{"type": "socks5", "host": .., "port": .., "username": .., "password": "keep"}`), saves it to `config.yaml` and switches the running engine to it without a restart: connections made under the old setting are closed and nothing connects directly in between. `password` is `"keep"` (whatever is stored), `"clear"` or `{"set": "<new password>"}`; `"keep"` with a stored password is refused `400 invalid_setting` when the host or port changes, so a login is never sent to an address it was not typed for; `"type": "none"` removes the `proxy:` section and brings back what the proxy had turned off. Answers the settings it made. `400 invalid_setting` with the line to show for a setting that cannot work (checked with the stored password put back in), and `500 proxy_not_applied` if the engine could not switch after the file was written (its new network stack would not build): the engine stays on the previous setting, and the previous setting is written back to `config.yaml`. The `proxy` in the settings is always the one the engine is running: a `proxy:` section edited in `config.yaml` by hand takes effect at the next start, and is shown from then on. |
 
 The settings `PUT`s are the only product routes that write `config.yaml`, beside the device routes, and they
 share one lock with them so two saves started together both survive. A save writes the file atomically
-(a temp file beside it, renamed over it) and keeps every key it did not change, including keys from a
-version this one does not know; comments are not kept, because a save writes new bytes rather than
+(a temp file beside it, renamed over it) and keeps every key it did not change, including top-level keys
+from a version this one does not know (a key it does not know inside a section it knows, such as `limits:`,
+is not kept); comments are not kept, because a save writes new bytes rather than
 editing the old ones. A file this server cannot read is answered `500 config_unreadable` and left exactly
 where it is, with nothing written and nothing applied; a file it can read but cannot write is answered
 `500 config_unwritable`, saying what the operating system said, and left as it was too. Neither answer

@@ -343,7 +343,8 @@ impl Shared {
         change: impl FnOnce(&mut Config) -> Result<(), RouteError> + Send + 'static,
         apply: impl FnOnce(&Config) + Send + 'static,
     ) -> Result<Config, RouteError> {
-        self.write_config_then(
+        self.write_config_with(
+            ProxyFrom::Running,
             move |mut config| std::future::ready(change(&mut config).map(|()| config)),
             move |config| {
                 apply(config);
@@ -366,8 +367,27 @@ impl Shared {
     ///
     /// `change` is a future too, handed the config as read and answering the config to save: the proxy's
     /// asks the keychain (on the blocking pool) before the save, still under the guard.
+    ///
+    /// This is the proxy's save, and the one save whose `proxy:` the config this run reports from takes,
+    /// once `apply` has switched the engine to it ([`ProxyFrom::Saved`]).
     pub(crate) async fn write_config_then<C, F>(
         self: &Arc<Self>,
+        change: impl FnOnce(Config) -> C + Send + 'static,
+        apply: impl FnOnce(&Config) -> F + Send + 'static,
+    ) -> Result<Config, RouteError>
+    where
+        C: std::future::Future<Output = Result<Config, RouteError>> + Send,
+        F: std::future::Future<Output = Result<(), RouteError>> + Send,
+    {
+        self.write_config_with(ProxyFrom::Saved, change, apply)
+            .await
+    }
+
+    /// The task [`write_config`](Self::write_config) and [`write_config_then`](Self::write_config_then)
+    /// share; `proxy` says whose `proxy:` the config this run reports from ends up with.
+    async fn write_config_with<C, F>(
+        self: &Arc<Self>,
+        proxy: ProxyFrom,
         change: impl FnOnce(Config) -> C + Send + 'static,
         apply: impl FnOnce(&Config) -> F + Send + 'static,
     ) -> Result<Config, RouteError>
@@ -381,7 +401,7 @@ impl Shared {
         // is the request being gone, and this is the request (see [`ChangeGuard`]).
         #[cfg(feature = "test-support")]
         let _ending = ChangeGuard(Arc::clone(&self.config_saves));
-        tokio::spawn(async move { shared.change_config(change, apply).await })
+        tokio::spawn(async move { shared.change_config(proxy, change, apply).await })
             .await
             .map_err(|problem| {
                 tracing::warn!(problem = %problem, "the config change task did not finish");
@@ -396,6 +416,7 @@ impl Shared {
     /// were written.
     async fn change_config<C, F>(
         &self,
+        proxy: ProxyFrom,
         change: impl FnOnce(Config) -> C + Send,
         apply: impl FnOnce(&Config) -> F + Send,
     ) -> Result<Config, RouteError>
@@ -473,9 +494,26 @@ impl Shared {
         // becomes the folder the run works in rather than the spelling the file happened to use. Stored and
         // applied here, before the guard is released, so two changes take effect in the order they were
         // written and never in the reverse.
-        let resolved = config.resolve(&self.paths);
-        *locked(&self.current) = resolved.clone();
+        //
+        // The one exception is `proxy:`. Only the proxy's own save switches the engine, so every other save
+        // keeps the proxy the engine runs, whatever the file says: a `proxy:` somebody typed into the file
+        // by hand takes effect at the next start, and until then the Proxy section and the health say what
+        // the engine is doing, not what the file says. The proxy's save takes its own once the engine has
+        // switched to it; an apply that fails has put the running one back ([`rewrite_from_apply`]).
+        let mut resolved = config.resolve(&self.paths);
+        {
+            let mut current = locked(&self.current);
+            let running = current.proxy.take();
+            *current = resolved.clone();
+            current.proxy.clone_from(&running);
+            if proxy == ProxyFrom::Running {
+                resolved.proxy = running;
+            }
+        }
         apply(&resolved).await?;
+        if proxy == ProxyFrom::Saved {
+            locked(&self.current).proxy.clone_from(&resolved.proxy);
+        }
         Ok(resolved)
     }
 
@@ -510,7 +548,12 @@ impl Shared {
         .await
         .map_err(|problem| clean(&problem.to_string()))?
         .map_err(|problem| clean(&problem))?;
-        *locked(&self.current) = written.resolve(&self.paths);
+        // The proxy the engine runs stays what this run reports, whatever `edit` wrote: the proxy save's
+        // rollback calls this because the engine stayed where it was.
+        let mut written = written.resolve(&self.paths);
+        let mut current = locked(&self.current);
+        written.proxy = current.proxy.take();
+        *current = written;
         Ok(())
     }
 
@@ -948,6 +991,15 @@ impl ConfigSaves {
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
 struct ChangeGuard(Arc<ConfigSaves>);
+
+/// Whose `proxy:` the config a run reports from takes after a save ([`Shared::change_config`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyFrom {
+    /// The proxy the engine already runs: every save but the proxy's, which never switch the engine.
+    Running,
+    /// The proxy just saved, once the engine has switched to it: the proxy's own save.
+    Saved,
+}
 
 #[cfg(feature = "test-support")]
 impl Drop for ChangeGuard {

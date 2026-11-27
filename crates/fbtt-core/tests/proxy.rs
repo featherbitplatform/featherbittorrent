@@ -692,3 +692,150 @@ async fn local_failed_apply_rolls_back() {
     drop(squatter);
     shutdown(client, task).await;
 }
+
+/// Sends one Speed save, which has to be answered "Saved.", and returns the settings view the snapshot
+/// carries after it.
+async fn save_speed(client: &mut Client) -> fbtt_core::SettingsView {
+    assert!(
+        client.send(Command::Settings(SettingsCommand::Save(
+            SettingsChange::Speed(LiveLimits {
+                download_kib: 10,
+                upload_kib: 0,
+                active_downloads: None,
+                active_seeds: None,
+                active_total: None,
+            })
+        ))),
+        "the queue takes the save"
+    );
+    assert_eq!(info_text(notice(client).await), "Saved.");
+    let snapshot = wait_for(client, |snapshot| {
+        matches!(snapshot.settings, fbtt_core::SettingsState::Loaded(_))
+    })
+    .await;
+    let fbtt_core::SettingsState::Loaded(view) = &snapshot.settings else {
+        unreachable!("the wait above only returns a loaded view");
+    };
+    view.clone()
+}
+
+/// Writes `proxy` into the library's `config.yaml` the way a person editing it by hand would, keeping the
+/// rest of the run's config.
+fn hand_edit(lib: &Library, proxy: Option<ProxySetting>) {
+    let config = Config {
+        proxy,
+        ..lib.config.clone()
+    };
+    std::fs::create_dir_all(&lib.paths.config_dir).expect("make the config directory");
+    config
+        .save(&lib.paths.config_file())
+        .expect("write the config file");
+}
+
+/// A proxy typed into `config.yaml` by hand takes effect at the next start: a Speed save in the meantime
+/// keeps it in the file, and the view, the health and the engine all go on saying there is no proxy.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_hand_added_proxy_is_not_shown_before_a_restart() {
+    let lib = Library::new("proxy_hand_added");
+    let (mut client, task, session) = start(&lib, lib.config.clone()).await;
+    let proxy_port = closed_port();
+    hand_edit(&lib, Some(socks5(proxy_port)));
+
+    let view = save_speed(&mut client).await;
+    assert_eq!(view.proxy.kind, ProxyType::None, "{view:?}");
+    assert_eq!(client.snapshot().proxy, ProxyHealth::Off);
+    assert_eq!(session.network_settings().proxy.kind, fbt::ProxyKind::None);
+    let written = std::fs::read_to_string(lib.paths.config_file()).expect("the file is there");
+    assert!(
+        written.contains(&proxy_port.to_string()),
+        "the hand edit stays for the next start: {written}"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// The reverse: a proxy taken out of `config.yaml` by hand is still the one the engine runs until the next
+/// start, so after a Speed save the view still shows it and the health does not say `Off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_hand_removed_proxy_is_still_shown_before_a_restart() {
+    let lib = Library::new("proxy_hand_removed");
+    let proxy_port = closed_port();
+    let (mut client, task, session) = start(&lib, proxied(&lib, socks5(proxy_port))).await;
+    hand_edit(&lib, None);
+
+    let view = save_speed(&mut client).await;
+    assert_eq!(view.proxy.kind, ProxyType::Socks5, "{view:?}");
+    assert_eq!(view.proxy.port, proxy_port, "{view:?}");
+    assert_eq!(
+        session.network_settings().proxy.kind,
+        fbt::ProxyKind::Socks5
+    );
+    let health = health_becomes(&session, |health| *health != ProxyHealth::Off).await;
+    assert_ne!(health, ProxyHealth::Off);
+    let written = std::fs::read_to_string(lib.paths.config_file()).expect("the file is there");
+    assert!(
+        !written.contains("proxy:"),
+        "the file keeps the hand edit: {written}"
+    );
+
+    shutdown(client, task).await;
+}
+
+/// A proxy change the engine refuses, on a file whose `proxy:` was changed by hand: the file gets its own
+/// section back, and the view keeps showing the proxy the engine stayed on, not the hand-edited one.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_failed_apply_over_a_hand_edit_shows_the_running_proxy() {
+    let lib = Library::new("proxy_hand_rollback");
+    let proxy_port = closed_port();
+    let http = ProxySetting {
+        kind: ProxyType::Http,
+        ..socks5(proxy_port)
+    };
+    let (mut client, task, session) = start(&lib, proxied(&lib, http)).await;
+    let engine_port = session
+        .local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+    let hand_port = closed_port();
+    hand_edit(&lib, Some(socks5(hand_port)));
+
+    let none = ProxyChange {
+        kind: ProxyType::None,
+        host: String::new(),
+        port: 0,
+        username: None,
+        password: PasswordChange::Keep,
+    };
+    let line = error_text(save_proxy(&mut client, none).await);
+    assert!(
+        line.starts_with(
+            "The engine could not switch to this proxy, so the previous setting is kept: "
+        ),
+        "{line}"
+    );
+    let written = std::fs::read_to_string(lib.paths.config_file()).expect("the file is there");
+    assert!(
+        written.contains(&hand_port.to_string()),
+        "the file gets its own section back: {written}"
+    );
+    assert!(
+        client.send(Command::Settings(SettingsCommand::Load)),
+        "the queue takes the load"
+    );
+    let snapshot = wait_for(&mut client, |snapshot| {
+        matches!(snapshot.settings, fbtt_core::SettingsState::Loaded(_))
+    })
+    .await;
+    let fbtt_core::SettingsState::Loaded(view) = &snapshot.settings else {
+        unreachable!("the wait above only returns a loaded view");
+    };
+    assert_eq!(view.proxy.kind, ProxyType::Http, "{view:?}");
+    assert_eq!(view.proxy.port, proxy_port, "{view:?}");
+    assert_eq!(session.network_settings().proxy.kind, fbt::ProxyKind::Http);
+
+    drop(squatter);
+    shutdown(client, task).await;
+}
