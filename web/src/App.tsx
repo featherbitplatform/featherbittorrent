@@ -225,7 +225,9 @@ export default function App() {
           <div hidden={settingsOpen} className="contents">
             <Torrents
               hidden={settingsOpen}
-              onSettings={() => openSettings()}
+              onSettings={(section) => {
+                openSettings(section ?? null)
+              }}
               onShowTorrents={showTorrents}
               signedIn={state.phase === 'signedIn' && !launched}
               signOutError={signOutError}

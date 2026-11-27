@@ -110,10 +110,24 @@ export interface OnCompleteChange {
   program: string | null
 }
 
-/** The whole settings object, as every settings route answers it. */
+/** The proxy section of the settings: only whether one is set is read here (`type` is `none` when there is none). */
+export interface ProxySettings {
+  type: string
+}
+
+/**
+ * How the proxy is doing, as `GET /api/v1/settings/proxy/state` answers. The reason is display-safe
+ * and never carries the proxy's address or login.
+ */
+export type ProxyHealth =
+  | { state: 'off' | 'ok' | 'udp_not_relayed' | 'login_refused' }
+  | { state: 'unreachable'; reason?: string }
+
+/** The whole settings object, as every settings route answers it. A server older than the proxy setting has no `proxy`. */
 export interface ProductSettings {
   speed: SpeedSettings
   downloads: DownloadsSettings
+  proxy?: ProxySettings
 }
 
 /** The kind of track a file carries, as the media probe says it. */
@@ -250,6 +264,7 @@ export interface Api {
   queueSettings(): Promise<components['schemas']['QueueSettingsDto']>
   setQueueSettings(settings: components['schemas']['QueueSettingsDto']): Promise<void>
   settings(): Promise<ProductSettings>
+  proxyState(): Promise<ProxyHealth>
   saveSpeed(speed: SpeedSettings): Promise<ProductSettings>
   saveDownloads(downloads: DownloadsInput, options?: { onComplete?: OnCompleteChange }): Promise<ProductSettings>
   devices(): Promise<DeviceRow[]>
@@ -446,6 +461,7 @@ export function createClient(
     queueSettings: () => json('/api/v1/session/queue', 'GET'),
     setQueueSettings: (settings) => sendJson('/api/v1/session/queue', 'PUT', settings),
     settings: () => json(SETTINGS, 'GET'),
+    proxyState: () => json(`${SETTINGS}/proxy/state`, 'GET'),
     saveSpeed: (speed) =>
       json(
         `${SETTINGS}/speed`,

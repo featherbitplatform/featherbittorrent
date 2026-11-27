@@ -470,6 +470,37 @@ impl ProxyHealth {
             ProxyHealth::Off | ProxyHealth::Ok | ProxyHealth::UdpNotRelayed => None,
         }
     }
+
+    /// This health with the proxy's own address and login taken out of its reason: what leaves the
+    /// process (the health route, a snapshot) is the headline and a reason that names neither the
+    /// proxy's URL nor its user name or password.
+    ///
+    /// The engine's reasons are I/O and protocol wording that does not carry the address today, but
+    /// that is the engine's to change, and a login must never travel on the strength of that. Every
+    /// occurrence of the password and the user name is replaced by `<hidden>`, and of `host:port`
+    /// and the host by `<proxy>`, longest first so a password that contains the host is gone whole. The
+    /// port on its own is not replaced: a bare number is too common in a reason to mean the proxy.
+    pub fn redacted(self, proxy: Option<&ProxySetting>) -> ProxyHealth {
+        let (ProxyHealth::Unreachable { reason }, Some(proxy)) = (&self, proxy) else {
+            return self;
+        };
+        let mut secrets: Vec<(String, &str)> = Vec::new();
+        for secret in [&proxy.password, &proxy.username].into_iter().flatten() {
+            if !secret.is_empty() {
+                secrets.push((secret.clone(), "<hidden>"));
+            }
+        }
+        if !proxy.host.is_empty() {
+            secrets.push((format!("{}:{}", proxy.host, proxy.port), "<proxy>"));
+            secrets.push((proxy.host.clone(), "<proxy>"));
+        }
+        secrets.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
+        let mut safe = reason.clone();
+        for (text, mask) in secrets {
+            safe = safe.replace(&text, mask);
+        }
+        ProxyHealth::Unreachable { reason: safe }
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +508,33 @@ mod tests {
     use super::{
         ProxyHealth, ProxyProblem, ProxySetting, ProxyType, apply_to_settings, network_for,
     };
+
+    /// A reason built from a proxy with a login never carries the password, the user name or the
+    /// proxy's address, whichever way the engine words it.
+    #[test]
+    fn a_reason_never_carries_the_proxy_address_or_login() {
+        let proxy = ProxySetting {
+            kind: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: Some("alice".to_string()),
+            password: Some("hunter2pw".to_string()),
+        };
+        let health = ProxyHealth::Unreachable {
+            reason: "dial socks5://alice:hunter2pw@proxy.internal:1080 failed: proxy.internal"
+                .to_string(),
+        }
+        .redacted(Some(&proxy));
+        let line = health.headline().expect("a line");
+        for leaked in ["hunter2pw", "alice", "proxy.internal", "1080"] {
+            assert!(!line.contains(leaked), "{leaked} leaked: {line}");
+        }
+        // A reason that names none of them is left as it is.
+        let plain = ProxyHealth::Unreachable {
+            reason: "Connection refused (os error 61)".to_string(),
+        };
+        assert_eq!(plain.clone().redacted(Some(&proxy)), plain);
+    }
 
     /// A SOCKS5 proxy at `host:port`, with credentials when they are given.
     fn socks5(host: &str, port: u16) -> ProxySetting {

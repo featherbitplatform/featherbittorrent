@@ -24,6 +24,7 @@
  * @module components/Header
  */
 import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { LogOut, Plus, Settings } from 'lucide-react'
 import { formatRate } from '../format'
@@ -50,6 +51,8 @@ export interface HeaderProps {
   onAdd(): void
   /** Whether a modal view covers the page: the header is then out of reach. */
   inert?: boolean
+  /** The proxy warning, when the screen has one to show: it sits beside the connection pill, in the desktop app's title bar too. */
+  proxyBanner?: ReactNode
 }
 
 /** The pill's words while a retry pause is running: it counts down once per second and, when the pause is spent, says the retry is happening rather than showing a frozen number. The header keys it on the loop's failure count rather than on the pause, because the top of the ladder repeats: two 30-second pauses in a row are two failures, and the second one starts its count over instead of inheriting the first one's spent zero. */
@@ -78,6 +81,7 @@ export default function Header({
   onSettings,
   onAdd,
   inert = false,
+  proxyBanner = null,
 }: HeaderProps) {
   const lost = link.phase === 'lost'
   const slots = useTitleBarSlots()
@@ -124,7 +128,7 @@ export default function Header({
         <Plus className="h-4 w-4" aria-hidden="true" />
         Add torrent
       </Button>
-      <Button size={size} variant="secondary" data-settings-opener onClick={onSettings}>
+      <Button size={size} variant="secondary" data-settings-opener onClick={() => { onSettings() }}>
         <Settings className="h-4 w-4" aria-hidden="true" />
         Settings
       </Button>
@@ -146,6 +150,7 @@ export default function Header({
             <div inert={inert} className="flex min-w-0 items-center gap-4">
               {brand}
               {pill}
+              {proxyBanner}
             </div>,
             slots.lead,
           )}
@@ -165,6 +170,7 @@ export default function Header({
     <header inert={inert} className="flex flex-wrap items-center gap-4 border-b border-rule bg-sunken px-5 py-3">
       {brand}
       {pill}
+      {proxyBanner}
       {rates}
       {buttons}
     </header>

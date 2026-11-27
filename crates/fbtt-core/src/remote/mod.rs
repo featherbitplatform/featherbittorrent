@@ -49,6 +49,7 @@ use crate::client::{
     LinkState, LiveLimits, Notice, SettingsState, Snapshot, TorrentId, TorrentRow, Totals,
 };
 use crate::engine::map::clean;
+use crate::proxy::ProxyHealth;
 use crate::ui_state::{LoginMethod, RemoteTarget};
 
 use http::Api;
@@ -203,6 +204,9 @@ impl RemoteBackend {
                     devices: None,
                     settings: SettingsState::NotLoaded,
                     settings_asked: false,
+                    proxy: ProxyHealth::Off,
+                    proxy_old: false,
+                    proxy_polled: None,
                     // The relay starts on the first `Stream` a gateway target is asked
                     // for, and is kept for the run. A plain field: commands are answered
                     // one at a time by the loop, so a second `Stream` cannot race the
@@ -260,6 +264,7 @@ fn blank(name: String, secure: bool, auth: String, state: LinkState) -> Snapshot
         dirs: None,
         devices: None,
         settings: SettingsState::NotLoaded,
+        proxy: ProxyHealth::Off,
     }
 }
 
@@ -332,6 +337,13 @@ struct Backend {
     settings: SettingsState,
     /// Whether the read made on connecting has been tried, once, whatever it answered.
     settings_asked: bool,
+    /// The proxy health the server last reported, `Off` until it has, and for a server too old to say.
+    proxy: ProxyHealth,
+    /// Whether this server answered `404` to the proxy state route: it is an older release, and this
+    /// connection stops asking.
+    proxy_old: bool,
+    /// When the proxy state was last asked for, so that it is asked every few seconds, not every round.
+    proxy_polled: Option<Instant>,
     /// The loopback relay a gateway target streams through: started on the first
     /// `Stream` that needs it and kept for the run, the same arrangement as the local
     /// endpoint (see [`crate::stream::local::LocalEndpoint`]). A plain field rather than

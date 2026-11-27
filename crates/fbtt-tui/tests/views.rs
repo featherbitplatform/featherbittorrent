@@ -921,6 +921,56 @@ fn renders_only_visible_rows_with_10k_torrents() {
 }
 
 #[test]
+fn header_shows_cant_reach_the_proxy() {
+    // A proxy nobody can reach is said in the header, in the error colour, with the key that opens
+    // the setting.
+    let snap = Snapshot {
+        proxy: fbtt_core::proxy::ProxyHealth::Unreachable {
+            reason: "Connection refused".to_string(),
+        },
+        ..library()
+    };
+    let model = model_of(&snap);
+    let screen = Screen::new(&model, &snap, 120, 30);
+    let text = screen.text();
+    assert!(
+        text.contains("Can't reach the proxy: Connection refused"),
+        "{text:?}"
+    );
+    assert!(text.contains("S: Proxy"), "{text:?}");
+    let (column, row) = screen.find("Can't reach").expect("the line is drawn");
+    assert_eq!(screen.fg(column, row), theme::RED_500);
+
+    let refused = Snapshot {
+        proxy: fbtt_core::proxy::ProxyHealth::LoginRefused,
+        ..library()
+    };
+    let text = Screen::new(&model_of(&refused), &refused, 120, 30).text();
+    assert!(
+        text.contains("Can't reach the proxy: it refused the login"),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn header_shows_nothing_for_udp_not_relayed() {
+    // Off, working and "no UDP" have their own place in Settings; none of them is a header line.
+    for health in [
+        fbtt_core::proxy::ProxyHealth::Off,
+        fbtt_core::proxy::ProxyHealth::Ok,
+        fbtt_core::proxy::ProxyHealth::UdpNotRelayed,
+    ] {
+        let snap = Snapshot {
+            proxy: health.clone(),
+            ..library()
+        };
+        let text = Screen::new(&model_of(&snap), &snap, 120, 30).text();
+        assert!(!text.contains("proxy"), "{health:?}: {text:?}");
+        assert!(!text.contains("S: Proxy"), "{health:?}: {text:?}");
+    }
+}
+
+#[test]
 fn header_shows_lost_link() {
     // A server that goes away does not stop the screen: the last snapshot stays on it and the header says
     // why. A person who cannot tell a lost link from a slow one reads frozen numbers as a stalled torrent.

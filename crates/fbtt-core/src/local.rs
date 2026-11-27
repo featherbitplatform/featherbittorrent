@@ -180,6 +180,7 @@ async fn spawn(
         dirs: None,
         devices: None,
         settings: SettingsState::NotLoaded,
+        proxy: crate::proxy::health(engine.session()).redacted(config.proxy.as_ref()),
     });
     let (client, channels) = Client::paired(Arc::clone(&initial));
     // The screen may not be reading yet, so these wait in the queue, and past its room they are
@@ -456,6 +457,9 @@ impl Backend {
             } else {
                 SettingsState::NotLoaded
             },
+            // Read off the engine at every tick: this is a field read, never the network, and the
+            // reason loses the proxy's address and login before it reaches a screen.
+            proxy: crate::proxy::health(self.engine.session()).redacted(self.config.proxy.as_ref()),
         });
         if next == self.published {
             return;

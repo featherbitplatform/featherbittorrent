@@ -1480,6 +1480,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             put(settings::put_downloads).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
         )
         .route(
+            "/api/v1/settings/proxy/state",
+            get(settings::get_proxy_state),
+        )
+        .route(
             "/api/v1/settings/proxy",
             put(settings::put_proxy).layer(DefaultBodyLimit::max(settings::MAX_SETTINGS_BODY)),
         )

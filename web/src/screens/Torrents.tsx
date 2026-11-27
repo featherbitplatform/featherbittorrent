@@ -55,6 +55,7 @@ import TorrentActions from '../components/TorrentActions'
 import ConfirmDelete from '../components/ConfirmDelete'
 import DetailPane from '../components/DetailPane'
 import Header from '../components/Header'
+import ProxyBanner from '../components/ProxyBanner'
 import StateFilters from '../components/StateFilters'
 import TorrentCards from '../components/TorrentCards'
 import TorrentFullView from '../components/TorrentFullView'
@@ -73,8 +74,8 @@ export interface TorrentsProps {
   /** Why the last sign-out attempt did not take, or null. The session is still live in that case, and the table keeps running under the notice. */
   signOutError: string | null
   onSignOut(): void
-  /** Opens the Settings screen, which replaces this one. */
-  onSettings(): void
+  /** Opens the Settings screen, which replaces this one, at a section when one is named. */
+  onSettings(section?: string): void
   /**
    * Settings covers this screen and something here needs the screen back: close Settings. The header's Add torrent lives in the desktop title bar where Settings cannot cover it, so its dialog must open on a visible screen, not inside a hidden subtree.
    * Answers `false` when Settings is asking about unsaved changes first and has not closed: nothing is opened over it.
@@ -442,7 +443,10 @@ export default function Torrents({
         dhtNodes={sessionInfo?.dht_nodes ?? null}
         signedIn={signedIn}
         onSignOut={onSignOut}
-        onSettings={onSettings}
+        onSettings={() => {
+          onSettings()
+        }}
+        proxyBanner={<ProxyBanner api={client} active={!hidden} onOpenSettings={onSettings} />}
         onAdd={() => {
           // The header's Add torrent lives in the desktop title bar, where Settings cannot cover
           // it: pressing it while Settings is up has to ask for this screen back in the same

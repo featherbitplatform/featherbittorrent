@@ -48,6 +48,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
 use fbt::{RateLimit, Session};
 use fbtt_core::fs_list::inside_roots;
+use fbtt_core::proxy::ProxyHealth;
 use fbtt_core::{
     Config, DownloadsChange, DownloadsView, LiveLimits, OnCompleteView, ProxyChange, ProxyProblem,
     ProxySetting, ProxyType, ProxyView, SettingsProblem, SettingsView, validate_downloads,
@@ -77,6 +78,32 @@ pub(super) async fn get(
 ) -> Result<Json<SettingsView>, RouteError> {
     let config = shared.current_config();
     Ok(Json(view(&shared, &config, &headers).await?))
+}
+
+/// `GET /api/v1/settings/proxy/state`: how the engine's proxy is doing, as the product's [`ProxyHealth`]
+/// (`{"state": "off" | "ok" | "unreachable" | "login_refused" | "udp_not_relayed"}`, and a `reason` with
+/// `unreachable`). It is read off the session, never probed here, and answers behind the same sign-in as
+/// the other settings routes.
+///
+/// The reason leaves the process display-safe and without the proxy's address, user name or password
+/// ([`safe_health`]): a screen shows the headline and that reason and nothing else.
+pub(super) async fn get_proxy_state(State(shared): State<Arc<Shared>>) -> Json<ProxyHealth> {
+    let config = shared.current_config();
+    Json(safe_health(
+        fbtt_core::proxy::health(shared.session()),
+        config.proxy.as_ref(),
+    ))
+}
+
+/// `health` as it may leave this process: the proxy's address and login out of its reason, and what is
+/// left made display-safe.
+fn safe_health(health: ProxyHealth, proxy: Option<&ProxySetting>) -> ProxyHealth {
+    match health.redacted(proxy) {
+        ProxyHealth::Unreachable { reason } => ProxyHealth::Unreachable {
+            reason: fbt::display_safe(&reason, fbt::MAX_DISPLAY_CHARS),
+        },
+        other => other,
+    }
 }
 
 /// `PUT /api/v1/settings/speed`: the running rates and queue counts, saved to `config.yaml` so the next run
@@ -671,7 +698,36 @@ fn problem_error(problem: SettingsProblem) -> RouteError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rollback, engine_refused, keychain_refused};
+    use super::{Rollback, engine_refused, keychain_refused, safe_health};
+    use fbtt_core::ProxySetting;
+    use fbtt_core::ProxyType;
+    use fbtt_core::proxy::ProxyHealth;
+
+    /// The reason leaves the server display-safe: an escape sequence is gone, and so are the proxy's
+    /// address and its login, which are never part of what a screen is shown.
+    #[test]
+    fn reason_is_display_safe() {
+        let proxy = ProxySetting {
+            kind: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: Some("bob".to_string()),
+            password: Some("proxy-pass-hunter2".to_string()),
+        };
+        let health = safe_health(
+            ProxyHealth::Unreachable {
+                reason: "\u{1b}[31mdown\u{1b}[0m at proxy.internal:1080 as bob/proxy-pass-hunter2"
+                    .to_string(),
+            },
+            Some(&proxy),
+        );
+        let line = health.headline().expect("a line");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        for leaked in ["proxy.internal", "proxy-pass-hunter2", "bob", "1080"] {
+            assert!(!line.contains(leaked), "{leaked} leaked: {line:?}");
+        }
+        assert!(line.starts_with("Can't reach the proxy: "), "{line}");
+    }
 
     /// A keychain refusal says what failed and what could not be put back, never that the engine was
     /// asked.
