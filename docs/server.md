@@ -205,6 +205,45 @@ produce, shown so you can see it before editing by hand. Note that a non-loopbac
 logins prints one warning line at startup: this server speaks plain HTTP, so passwords cross the
 network unencrypted unless something in front terminates TLS.
 
+## Proxy
+
+A `proxy:` section sends every connection through an HTTP or SOCKS5 proxy:
+
+```yaml
+proxy:
+  type: socks5        # none | http | socks5
+  host: proxy.example
+  port: 1080
+  username: ana       # optional
+  password: secret    # optional
+```
+
+While a proxy is set it is the only way out. Nothing connects directly, so an address is never leaked
+because a proxy was down: if the proxy cannot be reached, nothing moves and the clients say `Can't reach the
+proxy`. What a proxy cannot carry is off, whatever the other settings say: incoming connections, port
+forwarding and local peer discovery are off, so you may see fewer peers, and an HTTP proxy carries TCP only,
+so the DHT, uTP and UDP trackers are off too. A SOCKS5 proxy that will not relay UDP turns off the DHT and UDP
+trackers, and the clients say so (`This proxy does not relay UDP, so the DHT and UDP trackers are off`). A
+SOCKS5 login names both a user name and a password.
+
+The start is fail-closed. A `proxy:` section the app cannot use (an unknown `type` such as `socks4`, an empty
+host, a port outside 1 to 65535) or a `config.yaml` that cannot be parsed while it has a `proxy:` key stops
+the run with one line saying what to fix. It does not move the file aside and start on defaults, because that
+would connect directly.
+
+The password is kept in `config.yaml` in clear text, like the rest of this file's secrets, for the terminal
+client and for a server. The desktop app keeps This computer's password in the system keychain instead (see
+[docs/desktop.md](desktop.md)). The settings API never sends a password back: it says only whether one is
+saved. The proxy can be changed while the app runs, from the Proxy section of the terminal client's Settings
+(`S`), the web UI's Settings page or `PUT /api/v1/settings/proxy`, and takes effect without a restart.
+Saving writes the section back to `config.yaml` and, as with every settings save, drops the file's comments.
+
+A saved password is kept only while the host and port stay the same: a change of either asks for the password
+again (or `Clear password`), so a login is never sent to an address nobody typed it for.
+
+Going back to a 0.4.x version removes the proxy: 0.4.x ignores `proxy:` and connects directly, and may drop
+the key when it saves.
+
 ## Users and devices
 
 ```

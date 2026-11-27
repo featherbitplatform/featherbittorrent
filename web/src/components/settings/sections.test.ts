@@ -19,13 +19,11 @@ const ids = (desktop: boolean, built: ReadonlySet<SectionId> = BUILT_SECTIONS) =
 it('visible_sections_browser_has_no_this_app_group', () => {
   const sections = visibleSections({ desktop: false, built: BUILT_SECTIONS })
   expect(sections.some((s) => s.group === 'This app')).toBe(false)
-  expect(sections.map((s) => s.id)).toEqual(['downloads', 'speed', 'devices', 'shortcuts'])
+  expect(sections.map((s) => s.id)).toEqual(['downloads', 'speed', 'proxy', 'devices', 'shortcuts'])
 })
 
 it('visible_sections_desktop_order', () => {
-  expect(ids(true)).toEqual(['downloads', 'speed', 'devices', 'shortcuts', 'window', 'serving', 'instances'])
-  const all = new Set<SectionId>([...BUILT_SECTIONS, 'proxy'])
-  expect(ids(true, all)).toEqual([
+  expect(ids(true)).toEqual([
     'downloads', 'speed', 'proxy', 'devices', 'shortcuts', 'window', 'serving', 'instances',
   ])
 })
@@ -39,10 +37,16 @@ it('legacy_ids_resolve', () => {
   expect(resolveSection('devices', v)).toBe('devices')
 })
 
-it('unbuilt_sections_are_not_listed', () => {
-  expect(ids(true)).not.toContain('proxy')
-  // Nor can a link open one.
+it('a_link_opens_proxy', () => {
   const v = visibleSections({ desktop: true, built: BUILT_SECTIONS })
+  expect(resolveSection('proxy', v)).toBe('proxy')
+})
+
+it('unbuilt_sections_are_not_listed', () => {
+  // A section outside the built set is not listed, and no link can open it.
+  const built = new Set<SectionId>(['downloads', 'speed'])
+  expect(ids(true, built)).not.toContain('proxy')
+  const v = visibleSections({ desktop: true, built })
   expect(resolveSection('proxy', v)).toBe('downloads')
 })
 

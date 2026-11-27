@@ -96,7 +96,7 @@ off switch are in [docs/web-ui.md](docs/web-ui.md).
 | `m` | minimal |
 | `a` | add |
 | `d` | delete |
-| `S` | settings (Downloads, Speed) |
+| `S` | settings (Downloads, Speed, Proxy) |
 | `c` | connect |
 | `K` | devices |
 | `?` | help |
@@ -107,6 +107,8 @@ off switch are in [docs/web-ui.md](docs/web-ui.md).
 | `Esc` | close a dialog |
 | `y` | confirm quit |
 | `q` | quit |
+
+In Settings (`S`) the Proxy section sets an HTTP or SOCKS5 proxy: `Left` and `Right` (or `Space`) change the type, `Enter` edits a field, the password is drawn as stars and never shown, `Clear password` removes a stored one, and `Ctrl+S` or the Save row saves. While a proxy is set, every connection goes through it; [docs/server.md](docs/server.md) says what that turns off. When the header says `Can't reach the proxy`, `S` opens this section.
 
 The arrow keys do what `j` and `k` do, and Ctrl-C means the same as `q`. A key is an action, not a shortcut for whichever widget has focus: `p` stops or starts the torrent under the cursor wherever the cursor is. A dialog owns the keyboard while it is up, so a `q` typed into a magnet field adds a letter instead of quitting; `Esc` closes the dialog. `q` asks before leaving when something is still downloading: press `q` again or `y` to confirm, any other key to cancel.
 

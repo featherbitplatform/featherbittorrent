@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Proxy settings (HTTP and SOCKS5, with optional login) in the terminal client, the web UI and the desktop app. While a proxy is set, every connection goes through it. ([#56](https://github.com/featherbitplatform/featherbittorrent/pull/56))
 - When the proxy cannot be reached or refuses the login, the terminal client, the web UI and the desktop app say so (`Can't reach the proxy`, with the reason), and `GET /api/v1/settings/proxy/state` reports it on a server. The reason never carries the proxy's address or login. ([#55](https://github.com/featherbitplatform/featherbittorrent/pull/55))
 - Desktop app: This computer's proxy password is kept in the system keychain, and a password already in its `config.yaml` is moved there at the next start. On a system with no keychain it stays in `config.yaml`, and the Proxy section says so. ([#54](https://github.com/featherbitplatform/featherbittorrent/pull/54))
 - The proxy can be changed while the app runs, from the local engine or over `PUT /api/v1/settings/proxy` on a server, and takes effect without a restart. The stored proxy password is never sent back; the settings say only whether one is saved, and it is kept only while the host and port stay the same. A proxy the engine cannot switch to leaves the previous setting in place, in `config.yaml` as well. ([#53](https://github.com/featherbitplatform/featherbittorrent/pull/53))
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Going back to 0.4.x removes the proxy: 0.4.x ignores `proxy:` and connects directly, and may drop the key when it saves. ([#56](https://github.com/featherbitplatform/featherbittorrent/pull/56))
 - Leaving a Settings section with unsaved changes now asks on every way out (the header, the browser's back button), and the arrow keys keep the focus on the section list. ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Terminal client: `S` opens a full-screen Settings view with Downloads and Speed. ([#52](https://github.com/featherbitplatform/featherbittorrent/pull/52))
 - Settings shows one section at a time with a section list, in the web UI and the desktop app. ([#48](https://github.com/featherbitplatform/featherbittorrent/pull/48))

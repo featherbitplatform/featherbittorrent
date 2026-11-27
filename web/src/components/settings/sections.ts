@@ -39,10 +39,11 @@ const ALL: SectionDef[] = [
   { id: 'instances', title: 'Instances', group: 'This app' },
 ]
 
-/** The sections this build has: a later round adds `proxy`. */
+/** The sections this build has. */
 export const BUILT_SECTIONS: ReadonlySet<SectionId> = new Set<SectionId>([
   'downloads',
   'speed',
+  'proxy',
   'devices',
   'shortcuts',
   'window',

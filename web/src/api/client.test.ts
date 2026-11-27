@@ -566,6 +566,29 @@ it('the settings routes use the product paths and carry the csrf token on a chan
   expect(put.seen[0].headers.get('x-csrf-token')).toBe('tok')
 })
 
+it('save_proxy_puts_the_form_fields_only', async () => {
+  const { seen, client } = clientFor(200, SETTINGS_ANSWER)
+  const change = {
+    type: 'socks5' as const,
+    host: 'proxy.example',
+    port: 1080,
+    username: 'ana',
+    password: { set: 'pw' },
+    // Anything else on the object is not the form's and is not sent.
+    extra: 'no',
+  }
+  await client.saveProxy(change)
+  expect([seen[0].method, seen[0].url]).toEqual(['PUT', '/api/v1/settings/proxy'])
+  expect(JSON.parse(String(seen[0].body))).toEqual({
+    type: 'socks5',
+    host: 'proxy.example',
+    port: 1080,
+    username: 'ana',
+    password: { set: 'pw' },
+  })
+  expect(seen[0].headers.get('x-csrf-token')).toBe('tok')
+})
+
 it('save_downloads_never_sends_on_complete', async () => {
   const { seen, client } = clientFor(200, SETTINGS_ANSWER)
   const input = {

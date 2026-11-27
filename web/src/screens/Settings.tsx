@@ -1,7 +1,7 @@
 /**
  * The Settings screen: a list of sections on the left and one section at a time on the right.
  *
- * `Back to torrents` stays fixed at the top. Groups: Torrents (Downloads, Speed), Access (Devices, Keyboard
+ * `Back to torrents` stays fixed at the top. Groups: Torrents (Downloads, Speed, Proxy), Access (Devices, Keyboard
  * shortcuts) and, inside the desktop app only, This app (Window, Serve the web UI, Instances, supplied
  * by {@link useDesktopSettings}); a section that is not built yet is not listed. Each section has its
  * own Save and tells the page when it holds changes (`useSectionDirty`): switching section, pressing
@@ -28,6 +28,7 @@ import SectionList from '../components/settings/SectionList'
 import { BUILT_SECTIONS, resolveSection, visibleSections, writeLastSection } from '../components/settings/sections'
 import type { SectionId } from '../components/settings/sections'
 import { Shortcuts } from '../components/settings/Shortcuts'
+import ProxySection from '../components/settings/ProxySection'
 import SpeedSection from '../components/settings/SpeedSection'
 import UnsavedPrompt from '../components/settings/UnsavedPrompt'
 import { SectionDirtyContext } from '../components/settings/useSectionDirty'
@@ -169,6 +170,8 @@ export function Settings({ client: given, onExitGuard, onBack, section = null }:
         return <DownloadsSection client={client} />
       case 'speed':
         return <SpeedSection client={client} />
+      case 'proxy':
+        return <ProxySection client={client} />
       case 'devices':
         return <Devices client={client} />
       case 'shortcuts':
