@@ -642,7 +642,14 @@ impl Backend {
     /// address that will not bind again, say), and it then stays on the previous setting. The file and
     /// this run's view are put back to that previous setting too, so nothing claims a proxy the engine
     /// is not using, and the person is told.
+    ///
+    /// `self.config.proxy` is the proxy the engine runs, and only this save changes it: the other saves
+    /// write the file's own `proxy:` back as they found it, so a proxy somebody typed into the file by
+    /// hand takes effect at the next start and the view never shows one the engine is not using. A
+    /// rollback therefore puts back the proxy the engine kept, which a hand edit may have made different
+    /// from the one the file is given back.
     async fn save_proxy(&mut self, change: ProxyChange) -> bool {
+        let running = self.config.proxy.clone();
         let saved = self
             .save_config_with(move |config| {
                 let previous = config.proxy.clone();
@@ -670,7 +677,7 @@ impl Backend {
             return true;
         };
         // The engine kept the previous setting; so do the file and this run's view.
-        self.config.proxy = previous.clone();
+        self.config.proxy = running;
         let line = match self
             .write_config_with(move |config| {
                 config.proxy = previous;

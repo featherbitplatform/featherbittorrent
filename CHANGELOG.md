@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Leaving a Settings section with unsaved changes now asks on every way out (the header, the browser's back button), and the arrow keys keep the focus on the section list. ([#50](https://github.com/featherbitplatform/featherbittorrent/pull/50))
 - Terminal client: `S` opens a full-screen Settings view with Downloads and Speed. ([#52](https://github.com/featherbitplatform/featherbittorrent/pull/52))
 - Settings shows one section at a time with a section list, in the web UI and the desktop app. ([#48](https://github.com/featherbitplatform/featherbittorrent/pull/48))
-- Saving settings keeps keys in `config.yaml` that this version does not know about. ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
+- Saving settings keeps top-level keys in `config.yaml` that this version does not know about (keys inside a section it knows, such as `limits:`, are not kept). ([#44](https://github.com/featherbitplatform/featherbittorrent/pull/44))
 - Built on fbt-lib 0.13.0. ([#46](https://github.com/featherbitplatform/featherbittorrent/pull/46))
 
 ### Fixed
 
+- The Proxy section and the proxy health show the proxy the engine is running. A `proxy:` section edited in `config.yaml` by hand takes effect at the next start, and saving another section no longer makes Settings show it before then. ([#NN](https://github.com/featherbitplatform/featherbittorrent/pull/NN))
 - Speed limits and queue counts set from the web UI or the desktop app are now saved to the server's `config.yaml` and survive a restart. ([#47](https://github.com/featherbitplatform/featherbittorrent/pull/47))
 
 ## [0.4.1] - 2026-11-24

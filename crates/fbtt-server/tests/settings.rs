@@ -2307,3 +2307,122 @@ async fn proxy_state_route_is_off_without_a_proxy() {
     assert_eq!(state, json!({ "state": "off" }));
     served.stop().await;
 }
+
+/// A `PUT /api/v1/settings/speed` that has to succeed, answering the view it left behind.
+async fn save_speed(served: &Served, token: &str) -> Value {
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/speed"),
+        token,
+        speed(10, 0, (None, None, None)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body(response).await
+}
+
+/// A proxy somebody types into `config.yaml` by hand takes effect at the next start. A speed save in the
+/// meantime keeps it in the file, and the Proxy section, the health and the engine all go on saying there
+/// is no proxy: the view shows what the engine runs, never a proxy it is not using.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_added_proxy_is_not_shown_before_a_restart() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-hand-added", with_alice).await;
+    let token = bearer(&served).await;
+    served.save_config(&with_proxy(proxy_port)(served.dir.path()));
+
+    let answered = save_speed(&served, &token).await;
+    assert_eq!(answered["proxy"]["type"], "none", "{answered}");
+    let view = body(get_bearer(&http(), &served.url("/api/v1/settings"), &token).await).await;
+    assert_eq!(view["proxy"]["type"], "none", "{view}");
+    let state =
+        body(get_bearer(&http(), &served.url("/api/v1/settings/proxy/state"), &token).await).await;
+    assert_eq!(state, json!({ "state": "off" }));
+    assert_eq!(
+        served.server.network_settings().proxy.kind,
+        fbt::ProxyKind::None,
+        "the engine has no proxy"
+    );
+    assert_eq!(
+        file_proxy(&served).map(|proxy| proxy.port),
+        Some(proxy_port),
+        "the hand edit is still in the file for the next start"
+    );
+
+    served.stop().await;
+}
+
+/// The reverse: a proxy taken out of `config.yaml` by hand is still the one the engine runs until the next
+/// start, so after a speed save the Proxy section still shows it and the health does not say `off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_removed_proxy_is_still_shown_before_a_restart() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-hand-removed", with_proxy(proxy_port)).await;
+    let token = bearer(&served).await;
+    served.save_config(&with_alice(served.dir.path()));
+
+    let answered = save_speed(&served, &token).await;
+    assert_eq!(answered["proxy"]["type"], "socks5", "{answered}");
+    let view = body(get_bearer(&http(), &served.url("/api/v1/settings"), &token).await).await;
+    assert_eq!(view["proxy"]["type"], "socks5", "{view}");
+    assert_eq!(view["proxy"]["port"], proxy_port, "{view}");
+    assert_eq!(
+        served.server.network_settings().proxy.kind,
+        fbt::ProxyKind::Socks5,
+        "the engine is still on the proxy"
+    );
+    assert_ne!(
+        served.server.proxy_health(),
+        fbtt_core::ProxyHealth::Off,
+        "and its health does not say there is no proxy"
+    );
+    assert_eq!(file_proxy(&served), None, "the file keeps the hand edit");
+
+    served.stop().await;
+}
+
+/// A proxy change the engine refuses, on a file whose `proxy:` was changed by hand: the file gets its own
+/// section back, and the view keeps showing the proxy the engine stayed on, not the hand-edited one.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_proxy_failed_apply_over_a_hand_edit_shows_the_running_proxy() {
+    let proxy_port = closed_port();
+    let served = Served::start("settings-proxy-hand-rollback", with_http_proxy(proxy_port)).await;
+    let token = bearer(&served).await;
+    let engine_port = served
+        .server
+        .engine_local_addrs()
+        .first()
+        .expect("the engine bound its port")
+        .port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", engine_port))
+        .expect("the engine let its port go under an HTTP proxy");
+    let hand_port = closed_port();
+    served.save_config(&with_proxy(hand_port)(served.dir.path()));
+
+    let response = put_bearer(
+        &http(),
+        &served.url("/api/v1/settings/proxy"),
+        &token,
+        json!({"type": "none", "host": "", "port": 0, "username": null, "password": "keep"}),
+    )
+    .await;
+    let (status, code, message) = error_of(response).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{message}");
+    assert_eq!(code, "proxy_not_applied");
+    assert_eq!(
+        file_proxy(&served).map(|proxy| proxy.port),
+        Some(hand_port),
+        "the file gets its own section back"
+    );
+    let view = body(get_bearer(&http(), &served.url("/api/v1/settings"), &token).await).await;
+    assert_eq!(view["proxy"]["type"], "http", "{view}");
+    assert_eq!(view["proxy"]["port"], proxy_port, "{view}");
+    assert_eq!(
+        served.server.network_settings().proxy.kind,
+        fbt::ProxyKind::Http,
+        "the engine is still on the proxy"
+    );
+
+    drop(squatter);
+    served.stop().await;
+}
